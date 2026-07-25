@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/gocql/gocql"
+	"github.com/ivanjoz/genix-orm/db"
 	"github.com/viant/xunsafe"
 )
 
@@ -41,8 +42,8 @@ func getViewTableColumnType(sourceColumn IColInfo, useSliceElement bool) colType
 			panic(fmt.Sprintf(`ViewTables column "%v" must be a slice to fan out`, sourceColumn.GetName()))
 		}
 
-		physicalType = GetColTypeByName(elementFieldType, "")
-		if physicalType.Type == 0 || physicalType.ColType == "" {
+		physicalType = db.GetColTypeByName(elementFieldType)
+		if physicalType.Type == 0 || physicalType.DBType == "" {
 			panic(fmt.Sprintf(`ViewTables column "%v" fan-out element type "%v" is not supported`, sourceColumn.GetName(), elementFieldType))
 		}
 	}
@@ -159,7 +160,7 @@ func getViewTableMaintenanceIndexCreateScript(view *viewInfo, scyllaTable Scylla
 	// Maintenance reads are always scoped by partition + base ID, so the helper derives the one required local index.
 	partKey := scyllaTable.GetPartKey()
 	return fmt.Sprintf(`CREATE INDEX %v ON %v.%v ((%v), %v)`,
-		getViewTableMaintenanceIndexName(view), scyllaTable.keyspace, view.name, partKey.GetName(), view.maintenanceIDColumn.GetName())
+		getViewTableMaintenanceIndexName(view), scyllaTable.Namespace, view.name, partKey.GetName(), view.maintenanceIDColumn.GetName())
 }
 
 func makeNumericQueryValue(column IColInfo, value int64) any {
@@ -202,7 +203,7 @@ func fetchExistingViewTableDeleteRows(
 
 	query := fmt.Sprintf(`SELECT %v FROM %v.%v WHERE %v = ? AND %v IN (%v)`,
 		strings.Join(selectColumnNames, ", "),
-		scyllaTable.keyspace,
+		scyllaTable.Namespace,
 		view.name,
 		scyllaTable.GetPartKey().GetName(),
 		view.maintenanceIDColumn.GetName(),
@@ -310,7 +311,7 @@ func executeViewTableSyncChunk[T any](
 
 			// Deletes target the full derived primary key so only stale fan-out rows are removed.
 			deleteQuery := fmt.Sprintf(`DELETE FROM %v.%v WHERE %v`,
-				scyllaTable.keyspace,
+				scyllaTable.Namespace,
 				view.name,
 				strings.Join(whereClauses, " AND "),
 			)
@@ -328,7 +329,7 @@ func executeViewTableSyncChunk[T any](
 
 	// Reuse one insert statement shape per chunk; only the bound values vary across fan-out rows.
 	insertQuery := fmt.Sprintf(`INSERT INTO %v.%v (%v) VALUES (%v)`,
-		scyllaTable.keyspace,
+		scyllaTable.Namespace,
 		view.name,
 		strings.Join(columnNames, ", "),
 		strings.Join(columnPlaceholders, ", "),
@@ -339,7 +340,7 @@ func executeViewTableSyncChunk[T any](
 		fanoutValues := getViewTableFanoutValues(view, recordPointer)
 		if len(fanoutValues) == 0 {
 			if DebugFull {
-				fmt.Printf("ViewTable sync skipped empty fanout: table=%s view=%s\n", scyllaTable.name, view.name)
+				fmt.Printf("ViewTable sync skipped empty fanout: table=%s view=%s\n", scyllaTable.Name, view.name)
 			}
 			continue
 		}
@@ -361,7 +362,7 @@ func executeViewTableSyncChunk[T any](
 
 	if DebugFull {
 		fmt.Printf("ViewTable sync batch: base_table=%s view=%s deletes=%d inserts=%d records=%d\n",
-			scyllaTable.name, view.name, deleteStatementsCount, insertStatementsCount, len(*recordsChunk))
+			scyllaTable.Name, view.name, deleteStatementsCount, insertStatementsCount, len(*recordsChunk))
 	}
 
 	// Stale deletes and current inserts no longer target the same derived key, so one batch is enough.

@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/db"
 )
 
 type packedIndexScope int8
@@ -46,7 +48,7 @@ func registerPackedIndex(
 	// Build a stored packed numeric column plus an index on it.
 	// Rationale: this enables composite predicates like "Status IN (...) + Updated BETWEEN/GT".
 	if len(indexColumns) < 2 {
-		panic(fmt.Sprintf(`Table "%v": %v entries must have at least 2 columns. Found: %v`, dbTable.name, cfg.schemaFieldName, len(indexColumns)))
+		panic(fmt.Sprintf(`Table "%v": %v entries must have at least 2 columns. Found: %v`, dbTable.Name, cfg.schemaFieldName, len(indexColumns)))
 	}
 
 	sourceColumns := make([]IColInfo, 0, len(indexColumns))
@@ -58,16 +60,16 @@ func registerPackedIndex(
 
 	for columnIndex, indexColumnConfig := range indexColumns {
 		configInfo := indexColumnConfig.GetInfo()
-		column := dbTable.columnsMap[configInfo.Name]
+		column := dbTable.ColumnsMap[configInfo.Name]
 		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": %v column "%v" was not found`, dbTable.name, cfg.schemaFieldName, configInfo.Name))
+			panic(fmt.Sprintf(`Table "%v": %v column "%v" was not found`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
 		}
 
 		if column.GetType().IsComplexType || column.GetType().IsSlice || !isSupportedPackedIndexNumericFieldType(column.GetType().FieldType) {
-			panic(fmt.Sprintf(`Table "%v": %v packed column "%v" must be a scalar integer. Found: %v`, dbTable.name, cfg.schemaFieldName, column.GetName(), column.GetType().FieldType))
+			panic(fmt.Sprintf(`Table "%v": %v packed column "%v" must be a scalar integer. Found: %v`, dbTable.Name, cfg.schemaFieldName, column.GetName(), column.GetType().FieldType))
 		}
 
-		if configInfo.useInt32Packing {
+		if configInfo.UseInt32Packing {
 			isInt32Packed = true
 			totalDigits = 9
 		}
@@ -75,16 +77,16 @@ func registerPackedIndex(
 		// DecimalSize rules:
 		// - First component MUST NOT set DecimalSize() (its width is implied by remaining digit budget).
 		// - All remaining components MUST set DecimalSize().
-		if columnIndex == 0 && configInfo.decimalSize > 0 {
-			panic(fmt.Sprintf(`Table "%v": %v first column "%v" must not set DecimalSize()`, dbTable.name, cfg.schemaFieldName, configInfo.Name))
+		if columnIndex == 0 && configInfo.DecimalDigits > 0 {
+			panic(fmt.Sprintf(`Table "%v": %v first column "%v" must not set DecimalSize()`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
 		}
-		if columnIndex > 0 && configInfo.decimalSize <= 0 {
-			panic(fmt.Sprintf(`Table "%v": %v requires DecimalSize() for column "%v" (all columns after the first must set DecimalSize)`, dbTable.name, cfg.schemaFieldName, configInfo.Name))
+		if columnIndex > 0 && configInfo.DecimalDigits <= 0 {
+			panic(fmt.Sprintf(`Table "%v": %v requires DecimalSize() for column "%v" (all columns after the first must set DecimalSize)`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
 		}
 
 		sourceColumns = append(sourceColumns, column)
 		sourceColumnNames = append(sourceColumnNames, column.GetName())
-		slotDigitsPerColumn = append(slotDigitsPerColumn, int64(configInfo.decimalSize)) // first column set after digit budget calc
+		slotDigitsPerColumn = append(slotDigitsPerColumn, int64(configInfo.DecimalDigits)) // first column set after digit budget calc
 	}
 
 	sumTrailingDigits := int64(0)
@@ -94,23 +96,23 @@ func registerPackedIndex(
 
 	if isInt32Packed {
 		if sumTrailingDigits > 8 {
-			panic(fmt.Sprintf(`Table "%v": int32 packed %v requires sum(DecimalSize(columns[1:])) <= 8. Got: %v`, dbTable.name, cfg.schemaFieldName, sumTrailingDigits))
+			panic(fmt.Sprintf(`Table "%v": int32 packed %v requires sum(DecimalSize(columns[1:])) <= 8. Got: %v`, dbTable.Name, cfg.schemaFieldName, sumTrailingDigits))
 		}
 	} else {
 		if sumTrailingDigits > 18 {
-			panic(fmt.Sprintf(`Table "%v": int64 packed %v requires sum(DecimalSize(columns[1:])) <= 18. Got: %v`, dbTable.name, cfg.schemaFieldName, sumTrailingDigits))
+			panic(fmt.Sprintf(`Table "%v": int64 packed %v requires sum(DecimalSize(columns[1:])) <= 18. Got: %v`, dbTable.Name, cfg.schemaFieldName, sumTrailingDigits))
 		}
 	}
 
 	firstSlotDigits := totalDigits - sumTrailingDigits
 	if firstSlotDigits <= 0 {
-		panic(fmt.Sprintf(`Table "%v": %v invalid digit budget: totalDigits=%v sumTrailingDigits=%v`, dbTable.name, cfg.schemaFieldName, totalDigits, sumTrailingDigits))
+		panic(fmt.Sprintf(`Table "%v": %v invalid digit budget: totalDigits=%v sumTrailingDigits=%v`, dbTable.Name, cfg.schemaFieldName, totalDigits, sumTrailingDigits))
 	}
 	slotDigitsPerColumn[0] = firstSlotDigits
 
 	virtualPackedColName := fmt.Sprintf("%s%s", cfg.virtualColumnPrefix, strings.Join(sourceColumnNames, "_"))
-	if _, exists := dbTable.columnsMap[virtualPackedColName]; exists {
-		panic(fmt.Sprintf(`Table "%v": generated packed column already exists: %v`, dbTable.name, virtualPackedColName))
+	if _, exists := dbTable.ColumnsMap[virtualPackedColName]; exists {
+		panic(fmt.Sprintf(`Table "%v": generated packed column already exists: %v`, dbTable.Name, virtualPackedColName))
 	}
 
 	packedColumnTypeName := "int64"
@@ -123,20 +125,20 @@ func registerPackedIndex(
 	isInt32PackedLocal := isInt32Packed
 
 	virtualPackedColumn := &columnInfo{
-		colInfo: colInfo{
+		ColInfo: colInfo{
 			Name:      virtualPackedColName,
 			FieldName: virtualPackedColName,
 			IsVirtual: true,
-			Idx:       dbTable._maxColIdx,
+			Idx:       dbTable.MaxColIdx,
 		},
-		colType: GetColTypeByName(packedColumnTypeName, ""),
+		ColType: db.GetColTypeByName(packedColumnTypeName),
 	}
-	virtualPackedColumn.getRawValue = func(ptr unsafe.Pointer) any {
+	virtualPackedColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
 		componentValues := make([]int64, 0, len(sourceColumnsLocal))
 		for _, sourceColumn := range sourceColumnsLocal {
 			valueI64 := convertToInt64(sourceColumn.GetRawValue(ptr))
 			if valueI64 < 0 {
-				panic(fmt.Sprintf(`Table "%v": packed %v column "%v" produced negative value %d`, dbTable.name, cfg.schemaFieldName, sourceColumn.GetName(), valueI64))
+				panic(fmt.Sprintf(`Table "%v": packed %v column "%v" produced negative value %d`, dbTable.Name, cfg.schemaFieldName, sourceColumn.GetName(), valueI64))
 			}
 			componentValues = append(componentValues, valueI64)
 		}
@@ -151,18 +153,18 @@ func registerPackedIndex(
 		packedTrimmed := trimRightToDigitsNonNegative(packed, 9)
 		return any(int32(packedTrimmed))
 	}
-	virtualPackedColumn.getValue = virtualPackedColumn.getRawValue
+	virtualPackedColumn.GetValueFn = virtualPackedColumn.GetRawValueFn
 
-	dbTable._maxColIdx++
-	dbTable.columnsMap[virtualPackedColumn.GetName()] = virtualPackedColumn
+	dbTable.MaxColIdx++
+	dbTable.ColumnsMap[virtualPackedColumn.GetName()] = virtualPackedColumn
 
 	indexNameSuffix := "index_0"
 	if cfg.indexType == 2 {
 		indexNameSuffix = "index_1"
 	}
-	indexName := fmt.Sprintf(`%v__%v_%v`, dbTable.name, virtualPackedColName, indexNameSuffix)
+	indexName := fmt.Sprintf(`%v__%v_%v`, dbTable.Name, virtualPackedColName, indexNameSuffix)
 	if _, exists := dbTable.indexes[indexName]; exists {
-		panic(fmt.Sprintf(`Table "%v": %v index name already exists: %v`, dbTable.name, cfg.schemaFieldName, indexName))
+		panic(fmt.Sprintf(`Table "%v": %v index name already exists: %v`, dbTable.Name, cfg.schemaFieldName, indexName))
 	}
 
 	index := &viewInfo{
@@ -178,7 +180,7 @@ func registerPackedIndex(
 	case packedIndexScopeLocal:
 		partitionColumn := dbTable.GetPartKey()
 		if partitionColumn == nil || partitionColumn.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": %v requires a Partition column`, dbTable.name, cfg.schemaFieldName))
+			panic(fmt.Sprintf(`Table "%v": %v requires a Partition column`, dbTable.Name, cfg.schemaFieldName))
 		}
 		partitionName := partitionColumn.GetName()
 
@@ -211,7 +213,7 @@ func registerPackedIndex(
 			isInt32Packed:       isInt32Packed,
 		})
 	default:
-		panic(fmt.Sprintf(`Table "%v": unknown packedIndexScope=%v`, dbTable.name, cfg.scope))
+		panic(fmt.Sprintf(`Table "%v": unknown packedIndexScope=%v`, dbTable.Name, cfg.scope))
 	}
 
 	packedColumnNameLocal := virtualPackedColName
@@ -323,5 +325,5 @@ func registerPackedIndex(
 	dbTable.indexes[index.name] = index
 
 	fmt.Printf("Packed index registered: table=%s scope=%v index=%s packedCol=%s isInt32=%v slotDigits=%v\n",
-		dbTable.name, cfg.scope, index.name, virtualPackedColName, isInt32Packed, slotDigitsPerColumn)
+		dbTable.Name, cfg.scope, index.name, virtualPackedColName, isInt32Packed, slotDigitsPerColumn)
 }

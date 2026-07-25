@@ -435,15 +435,15 @@ func TestStructSizes(t *testing.T) {
 
 	// Create a sample columnInfo to measure actual allocation
 	sampleCol := &columnInfo{
-		colInfo: colInfo{
+		ColInfo: colInfo{
 			Name:      "test_column",
 			FieldName: "TestColumn",
 			Idx:       1,
 		},
-		colType: colType{
+		ColType: colType{
 			Type:      1,
 			FieldType: "string",
-			ColType:   "text",
+			DBType:    "text",
 		},
 	}
 
@@ -451,11 +451,11 @@ func TestStructSizes(t *testing.T) {
 	t.Logf("columnInfo struct: %d bytes", unsafe.Sizeof(*sampleCol))
 
 	// Compile accessors to see the impact
-	sampleCol.compileFastAccessors()
+	sampleCol.CompileFastAccessors()
 
 	t.Logf("\nAfter compiling accessors:")
 	t.Logf("columnInfo struct: %d bytes", unsafe.Sizeof(*sampleCol))
-	t.Logf("Function pointer size: %d bytes", unsafe.Sizeof(sampleCol.getValue))
+	t.Logf("Function pointer size: %d bytes", unsafe.Sizeof(sampleCol.GetValueFn))
 
 	// Test interface overhead
 	var iColInfo IColInfo = sampleCol
@@ -469,18 +469,18 @@ func TestStructSizes(t *testing.T) {
 	columns := make([]*columnInfo, numColumns)
 	for i := 0; i < numColumns; i++ {
 		col := &columnInfo{
-			colInfo: colInfo{
+			ColInfo: colInfo{
 				Name:      fmt.Sprintf("column_%d", i),
 				FieldName: fmt.Sprintf("Column%d", i),
 				Idx:       int16(i),
 			},
-			colType: colType{
+			ColType: colType{
 				Type:      1,
 				FieldType: "string",
-				ColType:   "text",
+				DBType:    "text",
 			},
 		}
-		col.compileFastAccessors()
+		col.CompileFastAccessors()
 		columns[i] = col
 	}
 
@@ -553,7 +553,7 @@ func TestMapMemoryOverhead(t *testing.T) {
 	// Populate maps
 	for i := 0; i < numEntries; i++ {
 		col := &columnInfo{
-			colInfo: colInfo{
+			ColInfo: colInfo{
 				Name: fmt.Sprintf("column_%d", i),
 				Idx:  int16(i),
 			},

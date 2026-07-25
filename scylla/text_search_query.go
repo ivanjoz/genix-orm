@@ -15,11 +15,6 @@ import (
 // IDWeight pairs a record key with the GenixSearch relevance score for a
 // text-search hit (higher weight = better match). Returned by SearchTextIDs
 // and SearchText so callers can rank results without reading ScyllaDB.
-type IDWeight struct {
-	ID     int32   `json:"id"`
-	Weight float32 `json:"w"`
-}
-
 // resolveTextSearchTable compiles table E and asserts it declares a
 // TextSearchColumn, returning the compiled ScyllaTable. Shared guard for
 // SearchTextIDs / SearchText so a misconfigured table fails with a clear
@@ -27,7 +22,7 @@ type IDWeight struct {
 func resolveTextSearchTable[T TableBaseInterface[E, T], E TableSchemaInterface[E]]() (ScyllaTable, error) {
 	scyllaTable := MakeScyllaTable[T, E]()
 	if scyllaTable.textSearchIndex == nil {
-		return scyllaTable, fmt.Errorf(`Table "%v": SearchText requires a TextSearchColumn in GetSchema`, scyllaTable.name)
+		return scyllaTable, fmt.Errorf(`Table "%v": SearchText requires a TextSearchColumn in GetSchema`, scyllaTable.Name)
 	}
 	return scyllaTable, nil
 }
@@ -47,7 +42,7 @@ func SearchTextIDs[T TableBaseInterface[E, T], E TableSchemaInterface[E]](partit
 	if normalized == "" {
 		return nil, nil
 	}
-	matches, err := text_search.SearchWeighted(context.Background(), scyllaTable.name, partition, statusGroup, normalized, limit, 0)
+	matches, err := text_search.SearchWeighted(context.Background(), scyllaTable.Name, partition, statusGroup, normalized, limit, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +93,7 @@ func SearchText[T TableBaseInterface[E, T], E TableSchemaInterface[E]](refSlice 
 // way the text-search write path reads it (the table's key column over an
 // unsafe pointer to the record).
 func recordKeyID[T any](scyllaTable ScyllaTable, record *T) int32 {
-	return convertToInt32(scyllaTable.keys[0].GetRawValue(xunsafe.AsPointer(record)))
+	return convertToInt32(scyllaTable.Keys[0].GetRawValue(xunsafe.AsPointer(record)))
 }
 
 // selectRecordsByPartitionIDs loads records by primary key within one
@@ -109,14 +104,14 @@ func selectRecordsByPartitionIDs[T any](scyllaTable ScyllaTable, partition int32
 	if len(ids) == 0 {
 		return nil
 	}
-	if len(scyllaTable.keyspace) == 0 {
-		scyllaTable.keyspace = connParams.Keyspace
+	if len(scyllaTable.Namespace) == 0 {
+		scyllaTable.Namespace = connParams.Keyspace
 	}
-	partitionColumn := scyllaTable.partKey
-	keyColumn := scyllaTable.keys[0]
+	partitionColumn := scyllaTable.PartKey
+	keyColumn := scyllaTable.Keys[0]
 
-	columnNames := make([]string, 0, len(scyllaTable.columns))
-	for _, column := range scyllaTable.columns {
+	columnNames := make([]string, 0, len(scyllaTable.Columns))
+	for _, column := range scyllaTable.Columns {
 		if column.GetInfo().IsVirtual {
 			continue
 		}
@@ -134,7 +129,7 @@ func selectRecordsByPartitionIDs[T any](scyllaTable ScyllaTable, partition int32
 		queryString := fmt.Sprintf(
 			"SELECT %v FROM %v.%v WHERE %v = ? AND %v IN (%v)",
 			strings.Join(columnNames, ", "),
-			scyllaTable.keyspace, scyllaTable.name,
+			scyllaTable.Namespace, scyllaTable.Name,
 			partitionColumn.GetName(), keyColumn.GetName(),
 			strings.Join(placeholders, ", "),
 		)

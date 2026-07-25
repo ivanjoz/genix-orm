@@ -2,8 +2,8 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"strings"
-	"sync"
 )
 
 // Generic by-IDs reads let one endpoint resolve "give me the label for these IDs" for any table,
@@ -17,35 +17,6 @@ import (
 //
 // Requirements are inherited from the cache-version feature: SaveCacheVersion enabled, exactly one
 // integer key column, integer partition. That is what makes "ID is an integer" always true here.
-
-// GenericRecordSchema declares which columns fill the generic shape. Name is required; the rest are
-// optional. ID and Status are not listed: they are always the table's single key column and its
-// "status" column, resolved automatically.
-type GenericRecordSchema struct {
-	Name Coln // string  — the display label
-	S1   Coln // string  — optional secondary text (e.g. SKU, document number)
-	S2   Coln // string  — optional
-	N1   Coln // integer — optional numeric (e.g. price, foreign key)
-	N2   Coln // integer — optional
-}
-
-func (schema GenericRecordSchema) isEmpty() bool {
-	return schema.Name == nil && schema.S1 == nil && schema.S2 == nil && schema.N1 == nil && schema.N2 == nil
-}
-
-// GenericRecord is the flat, table-agnostic row returned to the client. Short json tags keep the
-// payload small, which is the whole point of this endpoint. ID keeps its capitalised name and ccv/ss
-// are required by the frontend by-ID cache contract (IMinimalRecord).
-type GenericRecord struct {
-	ID           int64  `json:"ID"`
-	Name         string `json:"nm,omitempty"`
-	S1           string `json:"s1,omitempty"`
-	S2           string `json:"s2,omitempty"`
-	N1           int64  `json:"n1,omitempty"`
-	N2           int64  `json:"n2,omitempty"`
-	Status       int8   `json:"ss,omitempty"`
-	CacheVersion uint8  `json:"ccv,omitempty"`
-}
 
 // genericScanSlot binds a typed buffer gocql scans into to the assignment that moves it into the
 // record. Allocated once per query and reused for every row of that query.
@@ -135,10 +106,10 @@ func resolveGenericColumn(scyllaTable *ScyllaTable, declaredColumn Coln, fieldNa
 	if declaredColumn == nil {
 		return nil
 	}
-	column := scyllaTable.columnsMap[declaredColumn.GetInfo().Name]
+	column := scyllaTable.ColumnsMap[declaredColumn.GetInfo().Name]
 	if column == nil || column.IsNil() {
 		panic(fmt.Sprintf(`Table "%v": GenericRecord.%v column "%v" is not mapped in the table.`,
-			scyllaTable.name, fieldName, declaredColumn.GetInfo().Name))
+			scyllaTable.Name, fieldName, declaredColumn.GetInfo().Name))
 	}
 	return column
 }
@@ -153,53 +124,53 @@ func mustBeStringColumn(tableName string, column IColInfo, fieldName string) {
 // configureGenericRecordFields validates the GenericRecord config and precompiles its access plan
 // once per table build, so no query-time schema reflection is ever needed.
 func configureGenericRecordFields(scyllaTable *ScyllaTable, schema TableSchema) {
-	if schema.GenericRecord.isEmpty() {
+	if schema.GenericRecord.IsEmpty() {
 		return
 	}
 
 	// ccv is what makes the generic read incremental, so the two features are inseparable.
 	if !shouldUseCacheVersionFeature(*scyllaTable) {
-		panic(fmt.Sprintf(`Table "%v": GenericRecord requires SaveCacheVersion enabled.`, scyllaTable.name))
+		panic(fmt.Sprintf(`Table "%v": GenericRecord requires SaveCacheVersion enabled.`, scyllaTable.Name))
 	}
 	if schema.GenericRecord.Name == nil {
-		panic(fmt.Sprintf(`Table "%v": GenericRecord requires a Name column.`, scyllaTable.name))
+		panic(fmt.Sprintf(`Table "%v": GenericRecord requires a Name column.`, scyllaTable.Name))
 	}
 
 	plan := genericRecordPlan{}
 
 	// The ID accessor comes first and is always the cache-version key column, which the
 	// cache-version validation already guarantees to be a single integer key.
-	plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.name, scyllaTable.cacheVersionKeyCol,
+	plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.Name, scyllaTable.CacheVersionKeyCol,
 		func(record *GenericRecord, value int64) { record.ID = value }))
 
 	nameColumn := resolveGenericColumn(scyllaTable, schema.GenericRecord.Name, "Name")
-	mustBeStringColumn(scyllaTable.name, nameColumn, "Name")
+	mustBeStringColumn(scyllaTable.Name, nameColumn, "Name")
 	plan.accessors = append(plan.accessors, makeGenericStringAccessor(nameColumn,
 		func(record *GenericRecord, value string) { record.Name = value }))
 
 	if column := resolveGenericColumn(scyllaTable, schema.GenericRecord.S1, "S1"); column != nil {
-		mustBeStringColumn(scyllaTable.name, column, "S1")
+		mustBeStringColumn(scyllaTable.Name, column, "S1")
 		plan.accessors = append(plan.accessors, makeGenericStringAccessor(column,
 			func(record *GenericRecord, value string) { record.S1 = value }))
 	}
 	if column := resolveGenericColumn(scyllaTable, schema.GenericRecord.S2, "S2"); column != nil {
-		mustBeStringColumn(scyllaTable.name, column, "S2")
+		mustBeStringColumn(scyllaTable.Name, column, "S2")
 		plan.accessors = append(plan.accessors, makeGenericStringAccessor(column,
 			func(record *GenericRecord, value string) { record.S2 = value }))
 	}
 	if column := resolveGenericColumn(scyllaTable, schema.GenericRecord.N1, "N1"); column != nil {
-		plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.name, column,
+		plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.Name, column,
 			func(record *GenericRecord, value int64) { record.N1 = value }))
 	}
 	if column := resolveGenericColumn(scyllaTable, schema.GenericRecord.N2, "N2"); column != nil {
-		plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.name, column,
+		plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.Name, column,
 			func(record *GenericRecord, value int64) { record.N2 = value }))
 	}
 
 	// Status lets the client cache tombstones instead of re-requesting deleted rows forever. Every
 	// table has one, but stay tolerant: a table without it simply reports Status 0.
-	if statusColumn, exists := scyllaTable.columnsMap["status"]; exists && !statusColumn.IsNil() {
-		plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.name, statusColumn,
+	if statusColumn, exists := scyllaTable.ColumnsMap["status"]; exists && !statusColumn.IsNil() {
+		plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.Name, statusColumn,
 			func(record *GenericRecord, value int64) { record.Status = int8(value) }))
 	}
 
@@ -212,24 +183,6 @@ func configureGenericRecordFields(scyllaTable *ScyllaTable, schema TableSchema) 
 	scyllaTable.genericRecordPlan = &plan
 }
 
-/* Table name registry */
-
-// Resolving a table from a name string cannot use generics, so tables register a lazy factory. The
-// factory is cheap (a closure); the ScyllaTable is only compiled when a name is actually requested,
-// and MakeScyllaTable then memoizes it in scyllaTableCache.
-var (
-	tableFactoriesMutex  sync.RWMutex
-	tableFactoriesByName = map[string]func() ScyllaTable{}
-)
-
-// RegisterTableFactory is called from generated code (see scripts/controllers/controllers_generator.go)
-// for every table in the project.
-func RegisterTableFactory(tableName string, makeTableFunc func() ScyllaTable) {
-	tableFactoriesMutex.Lock()
-	defer tableFactoriesMutex.Unlock()
-	tableFactoriesByName[tableName] = makeTableFunc
-}
-
 // GenericRecordProjection returns the precompiled column list used for this table's generic by-IDs
 // reads, or "" when the table does not expose them. Kept exported for diagnostics and for tests that
 // verify a real schema's GenericRecord mapping without needing a live database.
@@ -238,23 +191,6 @@ func (e ScyllaTable) GenericRecordProjection() string {
 		return ""
 	}
 	return e.genericRecordPlan.projection
-}
-
-// ResolveTableByName exposes the name registry so callers outside db (tests, diagnostics) can force a
-// table's metadata to compile and surface any schema validation panic early.
-func ResolveTableByName(tableName string) (ScyllaTable, error) {
-	return resolveTableByName(tableName)
-}
-
-func resolveTableByName(tableName string) (ScyllaTable, error) {
-	tableFactoriesMutex.RLock()
-	makeTableFunc, exists := tableFactoriesByName[tableName]
-	tableFactoriesMutex.RUnlock()
-
-	if !exists {
-		return ScyllaTable{}, fmt.Errorf("la tabla %q no está registrada", tableName)
-	}
-	return makeTableFunc(), nil
 }
 
 /* Query */
@@ -268,9 +204,15 @@ func QueryCachedGenericByIDs(tableName string, cachedIDs []IDCacheVersion) ([]Ge
 		return nil, nil
 	}
 
-	scyllaTable, err := resolveTableByName(tableName)
+	resolvedTable, err := db.ResolveTableByName(tableName)
 	if err != nil {
 		return nil, err
+	}
+	// Only this driver's tables carry a generic-record plan, so a table compiled by
+	// another driver simply is not readable through the shared generic endpoint.
+	scyllaTable, isScyllaTable := resolvedTable.(ScyllaTable)
+	if !isScyllaTable {
+		return nil, fmt.Errorf("la tabla %q no fue compilada por el driver scylla", tableName)
 	}
 
 	// A nil plan is the opt-in allowlist: tables that did not declare GenericRecord are never
@@ -292,7 +234,7 @@ func QueryCachedGenericByIDs(tableName string, cachedIDs []IDCacheVersion) ([]Ge
 		return nil, nil
 	}
 
-	tableID := BasicHashInt(scyllaTable.name)
+	tableID := BasicHashInt(scyllaTable.Name)
 	records := []GenericRecord{}
 
 	err = forEachCachedIDsBatch(fetchPlan, scyllaTable, plan.projection,

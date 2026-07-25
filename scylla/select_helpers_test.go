@@ -41,7 +41,7 @@ func TestSingleColumnPartitionedViewRoutesRangeQueryToView(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[partitionedRangeViewRecord, partitionedRangeViewSchema]()
-	scyllaTable.keyspace = "genix_test"
+	scyllaTable.Namespace = "genix_test"
 
 	records := []partitionedRangeViewRecord{}
 	query := Query[partitionedRangeViewRecord, partitionedRangeViewSchema](&records)
@@ -110,7 +110,7 @@ func TestPartitionOverrideMovesViewPartition(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[relocatedPartitionViewRecord, relocatedPartitionViewSchema]()
-	scyllaTable.keyspace = "genix_test"
+	scyllaTable.Namespace = "genix_test"
 
 	records := []relocatedPartitionViewRecord{}
 	query := Query[relocatedPartitionViewRecord, relocatedPartitionViewSchema](&records)
@@ -159,7 +159,7 @@ func TestSelectStatementCacheReusesSameShape(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[int32PackedViewRecord, int32PackedViewSchema]()
-	scyllaTable.keyspace = "genix_test"
+	scyllaTable.Namespace = "genix_test"
 
 	recordsFirst := []int32PackedViewRecord{}
 	queryFirst := Query[int32PackedViewRecord, int32PackedViewSchema](&recordsFirst)
@@ -207,7 +207,7 @@ func TestCompiledSelectStatementBindsPackedViewFanout(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[int32PackedViewRecord, int32PackedViewSchema]()
-	scyllaTable.keyspace = "genix_test"
+	scyllaTable.Namespace = "genix_test"
 
 	records := []int32PackedViewRecord{}
 	query := Query[int32PackedViewRecord, int32PackedViewSchema](&records)
@@ -332,7 +332,7 @@ func TestCompiledSelectStatementSkipsWriteOnlyManagedColumns(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[Increment, IncrementTable]()
-	scyllaTable.keyspace = "genix_test"
+	scyllaTable.Namespace = "genix_test"
 
 	records := []Increment{}
 	query := Query[Increment, IncrementTable](&records)

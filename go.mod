@@ -20,6 +20,11 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 )
 
-require github.com/gocql/gocql v1.6.0
+require (
+	github.com/gocql/gocql v1.6.0
+	github.com/ivanjoz/genix-orm/db v0.0.0
+)
 
 replace github.com/gocql/gocql v1.6.0 => github.com/scylladb/gocql v1.13.0
+
+replace github.com/ivanjoz/genix-orm/db => ./db

@@ -152,7 +152,7 @@ func TestBuildNativeGroupByPlanWithPackedView(t *testing.T) {
 	query.Date.GreaterEqual(15)
 	query.GroupBy(query.Date, query.ProductID, query.Cantidad.Sum())
 
-	plan, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().statements, scyllaTable)
+	plan, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().Statements, scyllaTable)
 	if err != nil {
 		t.Fatalf("buildNativeGroupByPlan returned error: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestBuildNativeGroupByPlanRejectsAvgOnIntegerColumn(t *testing.T) {
 	query.CompanyID.Equals(1)
 	query.GroupBy(query.Date, query.Cantidad.Avg())
 
-	_, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().statements, scyllaTable)
+	_, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().Statements, scyllaTable)
 	if err == nil {
 		t.Fatal("expected Avg on an integer destination column to fail")
 	}
@@ -223,7 +223,7 @@ func TestBuildNativeGroupByPlanSupportsMax(t *testing.T) {
 
 	query.GroupBy(query.CompanyID, query.ID.Max())
 
-	plan, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().statements, scyllaTable)
+	plan, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().Statements, scyllaTable)
 	if err != nil {
 		t.Fatalf("buildNativeGroupByPlan returned error: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 	query.Status.Equals(6)
 	query.Updated.GreaterEqual(0)
 
-	bestCapability := MatchQueryCapability(query.GetTableInfo().statements, scyllaTable.capabilities)
+	bestCapability := MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
 	if bestCapability == nil {
 		t.Fatal("expected a packed view capability match")
 	}
@@ -327,7 +327,7 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 		t.Fatalf("expected a packed range view, got %+v", bestCapability.Source)
 	}
 
-	whereStatements := bestCapability.Source.getStatementPrepared(query.GetTableInfo().statements...)
+	whereStatements := bestCapability.Source.getStatementPrepared(query.GetTableInfo().Statements...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}
@@ -356,7 +356,7 @@ func TestInt32PackedViewUpperBoundKeepsCarryDigit(t *testing.T) {
 	query.StatusTrace.Equals(9)
 	query.Updated.GreaterEqual(38768176)
 
-	bestCapability := MatchQueryCapability(query.GetTableInfo().statements, scyllaTable.capabilities)
+	bestCapability := MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
 	if bestCapability == nil || bestCapability.Source == nil || bestCapability.Source.Type != 8 {
 		t.Fatalf("expected an int32 packed range view, got %+v", bestCapability)
 	}
@@ -364,7 +364,7 @@ func TestInt32PackedViewUpperBoundKeepsCarryDigit(t *testing.T) {
 		t.Fatal("expected int32 packed range views to skip post-filtering")
 	}
 
-	whereStatements := bestCapability.Source.getStatementPrepared(query.GetTableInfo().statements...)
+	whereStatements := bestCapability.Source.getStatementPrepared(query.GetTableInfo().Statements...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}

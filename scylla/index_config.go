@@ -4,7 +4,7 @@ import "fmt"
 
 func hasCompositeBucketing(indexCfg Index) bool {
 	for _, key := range indexCfg.Keys {
-		if len(key.GetInfo().compositeBucketing) > 0 {
+		if len(key.GetInfo().CompositeBucketSizes) > 0 {
 			return true
 		}
 	}
@@ -28,12 +28,12 @@ func registerSchemaLocalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Ind
 	if len(indexCfg.Keys) == 1 {
 		colCfg := indexCfg.Keys[0]
 		colInfo := colCfg.GetInfo()
-		column := dbTable.columnsMap[colInfo.Name]
+		column := dbTable.ColumnsMap[colInfo.Name]
 		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.name, colInfo.Name))
+			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.Name, colInfo.Name))
 		}
 
-		indexName := fmt.Sprintf(`%v__%v_index_1`, dbTable.name, column.GetName())
+		indexName := fmt.Sprintf(`%v__%v_index_1`, dbTable.Name, column.GetName())
 		if _, exists := dbTable.indexes[indexName]; exists {
 			return
 		}
@@ -72,12 +72,12 @@ func registerSchemaGlobalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg In
 	if len(indexCfg.Keys) == 1 {
 		colCfg := indexCfg.Keys[0]
 		colInfo := colCfg.GetInfo()
-		column := dbTable.columnsMap[colInfo.Name]
+		column := dbTable.ColumnsMap[colInfo.Name]
 		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.name, colInfo.Name))
+			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.Name, colInfo.Name))
 		}
 
-		indexName := fmt.Sprintf(`%v__%v_index_0`, dbTable.name, column.GetName())
+		indexName := fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, column.GetName())
 		if _, exists := dbTable.indexes[indexName]; exists {
 			return
 		}

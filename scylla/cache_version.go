@@ -22,13 +22,13 @@ import (
 // Table-level metadata is precomputed during ScyllaTable creation, so runtime hooks avoid repeated schema reflection.
 
 type tableStructCacheMetaGetter interface {
-	getCacheVersionFieldIndex() []int
+	CacheVersionFieldIndex() []int
 }
 
 // Feature is opt-in per schema and skipped for the cache-version table itself to avoid recursive writes.
 func shouldUseCacheVersionFeature(scyllaTable ScyllaTable) bool {
 	// Prevent recursive writes when the cache-version table itself is written.
-	return scyllaTable.saveCacheVersion && scyllaTable.name != "cache_version"
+	return scyllaTable.SaveCacheVersion && scyllaTable.Name != "cache_version"
 }
 
 func getJSONTagName(field reflect.StructField) string {
@@ -69,41 +69,41 @@ func configureCacheVersionFields[T TableSchemaInterface[T]](schemaStruct *T, scy
 		return
 	}
 
-	if len(scyllaTable.keys) != 1 {
-		panic(fmt.Sprintf(`Table "%v": SaveCacheVersion requires exactly one key column.`, scyllaTable.name))
+	if len(scyllaTable.Keys) != 1 {
+		panic(fmt.Sprintf(`Table "%v": SaveCacheVersion requires exactly one key column.`, scyllaTable.Name))
 	}
 
-	keyColumn := scyllaTable.keys[0]
+	keyColumn := scyllaTable.Keys[0]
 	keyFieldType := keyColumn.GetType().FieldType
 	if keyFieldType != "int16" && keyFieldType != "int32" && keyFieldType != "int64" {
 		panic(fmt.Sprintf(`Table "%v": SaveCacheVersion key column "%v" must be int16/int32/int64. Found: %v`,
-			scyllaTable.name, keyColumn.GetName(), keyFieldType))
+			scyllaTable.Name, keyColumn.GetName(), keyFieldType))
 	}
 
 	partitionColumn := scyllaTable.GetPartKey()
 	if partitionColumn == nil || partitionColumn.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": SaveCacheVersion requires a partition column.`, scyllaTable.name))
+		panic(fmt.Sprintf(`Table "%v": SaveCacheVersion requires a partition column.`, scyllaTable.Name))
 	}
 
 	partitionFieldType := partitionColumn.GetType().FieldType
 	if partitionFieldType != "int32" && partitionFieldType != "int64" {
 		panic(fmt.Sprintf(`Table "%v": SaveCacheVersion partition column "%v" must be int32/int64. Found: %v`,
-			scyllaTable.name, partitionColumn.GetName(), partitionFieldType))
+			scyllaTable.Name, partitionColumn.GetName(), partitionFieldType))
 	}
 
-	scyllaTable.cacheVersionPartitionCol = partitionColumn
-	scyllaTable.cacheVersionKeyCol = keyColumn
+	scyllaTable.CacheVersionPartitionCol = partitionColumn
+	scyllaTable.CacheVersionKeyCol = keyColumn
 
 	if schemaMeta, ok := any(schemaStruct).(tableStructCacheMetaGetter); ok {
-		fieldIndex := schemaMeta.getCacheVersionFieldIndex()
+		fieldIndex := schemaMeta.CacheVersionFieldIndex()
 		if len(fieldIndex) == 0 {
-			panic(fmt.Sprintf(`Table "%v": SaveCacheVersion requires a uint8 "CacheVersion" field or json tag "ccv".`, scyllaTable.name))
+			panic(fmt.Sprintf(`Table "%v": SaveCacheVersion requires a uint8 "CacheVersion" field or json tag "ccv".`, scyllaTable.Name))
 		}
-		scyllaTable.cacheVersionFieldIndex = append([]int(nil), fieldIndex...)
+		scyllaTable.CacheVersionFieldIndex = append([]int(nil), fieldIndex...)
 		return
 	}
 
-	panic(fmt.Sprintf(`Table "%v": could not resolve cache-version metadata from schema struct.`, scyllaTable.name))
+	panic(fmt.Sprintf(`Table "%v": could not resolve cache-version metadata from schema struct.`, scyllaTable.Name))
 }
 
 // Decodes compact [group,version,...] bytes into an in-memory map for mutations/lookups.
@@ -202,18 +202,18 @@ func assignCacheVersionsToRecords[T any](
 	scyllaTable ScyllaTable,
 	cacheVersionByPackedID map[int64]map[uint8]uint8,
 ) {
-	tableID := BasicHashInt(scyllaTable.name)
+	tableID := BasicHashInt(scyllaTable.Name)
 	for i := range *records {
 		record := &(*records)[i]
 		recordPtr := reflect.ValueOf(record)
 		rawRecordPtr := xunsafe.AsPointer(record)
 
-		partitionID := convertToInt32(scyllaTable.cacheVersionPartitionCol.GetRawValue(rawRecordPtr))
-		recordID := convertToInt64(scyllaTable.cacheVersionKeyCol.GetRawValue(rawRecordPtr))
+		partitionID := convertToInt32(scyllaTable.CacheVersionPartitionCol.GetRawValue(rawRecordPtr))
+		recordID := convertToInt64(scyllaTable.CacheVersionKeyCol.GetRawValue(rawRecordPtr))
 		packedID := makeCacheVersionPackedID(partitionID, tableID)
 
 		cacheVersion := resolveCacheVersionForID(cacheVersionByPackedID[packedID], recordID)
-		setRecordCacheVersion(recordPtr, scyllaTable.cacheVersionFieldIndex, cacheVersion)
+		setRecordCacheVersion(recordPtr, scyllaTable.CacheVersionFieldIndex, cacheVersion)
 	}
 }
 
@@ -223,7 +223,7 @@ func updateCacheVersionsAfterWrite[T any](records *[]T, scyllaTable ScyllaTable)
 		return nil
 	}
 
-	tableID := BasicHashInt(scyllaTable.name)
+	tableID := BasicHashInt(scyllaTable.Name)
 	cacheGroupsByPackedID := map[int64]map[uint8]struct{}{}
 
 	// Collect unique touched groups, so repeated IDs in the same batch increment only once.
@@ -231,8 +231,8 @@ func updateCacheVersionsAfterWrite[T any](records *[]T, scyllaTable ScyllaTable)
 		record := &(*records)[i]
 		rawRecordPtr := xunsafe.AsPointer(record)
 
-		partitionID := convertToInt32(scyllaTable.cacheVersionPartitionCol.GetRawValue(rawRecordPtr))
-		recordID := convertToInt64(scyllaTable.cacheVersionKeyCol.GetRawValue(rawRecordPtr))
+		partitionID := convertToInt32(scyllaTable.CacheVersionPartitionCol.GetRawValue(rawRecordPtr))
+		recordID := convertToInt64(scyllaTable.CacheVersionKeyCol.GetRawValue(rawRecordPtr))
 		cacheGroupID := uint8(recordID)
 		packedID := makeCacheVersionPackedID(partitionID, tableID)
 
@@ -245,7 +245,7 @@ func updateCacheVersionsAfterWrite[T any](records *[]T, scyllaTable ScyllaTable)
 	cacheVersionByPackedID := map[int64]map[uint8]uint8{}
 	// Read-modify-write per packed key keeps each table+partition group state independent.
 	for packedID, cacheGroupsToIncrement := range cacheGroupsByPackedID {
-		cacheVersionByGroup, err := getCacheVersionsByPackedID(scyllaTable.keyspace, packedID)
+		cacheVersionByGroup, err := getCacheVersionsByPackedID(scyllaTable.Namespace, packedID)
 		if err != nil {
 			return err
 		}
@@ -254,7 +254,7 @@ func updateCacheVersionsAfterWrite[T any](records *[]T, scyllaTable ScyllaTable)
 			cacheVersionByGroup[cacheGroupID] = nextCacheVersion(cacheVersionByGroup[cacheGroupID])
 		}
 
-		if err := saveCacheVersionsByPackedID(scyllaTable.keyspace, packedID, cacheVersionByGroup); err != nil {
+		if err := saveCacheVersionsByPackedID(scyllaTable.Namespace, packedID, cacheVersionByGroup); err != nil {
 			return err
 		}
 		cacheVersionByPackedID[packedID] = cacheVersionByGroup
@@ -270,21 +270,21 @@ func assignCacheVersionsAfterSelect[T any](records *[]T, scyllaTable ScyllaTable
 		return nil
 	}
 
-	tableID := BasicHashInt(scyllaTable.name)
+	tableID := BasicHashInt(scyllaTable.Name)
 	cacheVersionByPackedID := map[int64]map[uint8]uint8{}
 
 	// Fetch each packed table+partition state once, then reuse it for all matching records.
 	for i := range *records {
 		record := &(*records)[i]
 		rawRecordPtr := xunsafe.AsPointer(record)
-		partitionID := convertToInt32(scyllaTable.cacheVersionPartitionCol.GetRawValue(rawRecordPtr))
+		partitionID := convertToInt32(scyllaTable.CacheVersionPartitionCol.GetRawValue(rawRecordPtr))
 		packedID := makeCacheVersionPackedID(partitionID, tableID)
 
 		if _, exists := cacheVersionByPackedID[packedID]; exists {
 			continue
 		}
 
-		cacheVersionByGroup, err := getCacheVersionsByPackedID(scyllaTable.keyspace, packedID)
+		cacheVersionByGroup, err := getCacheVersionsByPackedID(scyllaTable.Namespace, packedID)
 		if err != nil {
 			return err
 		}
@@ -308,26 +308,20 @@ func ensureCacheVersionColumnsForSelect(columnNames []string, scyllaTable Scylla
 	if !shouldUseCacheVersionFeature(scyllaTable) {
 		return columnNames
 	}
-	if scyllaTable.cacheVersionPartitionCol == nil || scyllaTable.cacheVersionPartitionCol.IsNil() {
+	if scyllaTable.CacheVersionPartitionCol == nil || scyllaTable.CacheVersionPartitionCol.IsNil() {
 		return columnNames
 	}
-	if scyllaTable.cacheVersionKeyCol == nil || scyllaTable.cacheVersionKeyCol.IsNil() {
+	if scyllaTable.CacheVersionKeyCol == nil || scyllaTable.CacheVersionKeyCol.IsNil() {
 		return columnNames
 	}
 
 	// Ensure partition+id are available in scanned records so cache-group assignment is always accurate.
-	columnNames = appendColumnIfMissing(columnNames, scyllaTable.cacheVersionPartitionCol.GetName())
-	columnNames = appendColumnIfMissing(columnNames, scyllaTable.cacheVersionKeyCol.GetName())
+	columnNames = appendColumnIfMissing(columnNames, scyllaTable.CacheVersionPartitionCol.GetName())
+	columnNames = appendColumnIfMissing(columnNames, scyllaTable.CacheVersionKeyCol.GetName())
 	return columnNames
 }
 
 /* Selecting The Version */
-type IDCacheVersion struct {
-	ID           int64
-	PartitionID  int32
-	CacheVersion uint8
-}
-
 type cacheVersionMismatchDebugRow struct {
 	ID            int64
 	GroupID       uint8
@@ -404,19 +398,19 @@ func (plan cachedIDsFetchPlan) hasRecordsToFetch() bool {
 // keyspace resolvable, and the precomputed partition/key metadata present.
 func prepareCachedIDsTable(scyllaTable *ScyllaTable, callerName string) error {
 	if !shouldUseCacheVersionFeature(*scyllaTable) {
-		return fmt.Errorf(`Table "%v": %v requires SaveCacheVersion enabled`, scyllaTable.name, callerName)
+		return fmt.Errorf(`Table "%v": %v requires SaveCacheVersion enabled`, scyllaTable.Name, callerName)
 	}
-	if len(scyllaTable.keyspace) == 0 {
-		scyllaTable.keyspace = connParams.Keyspace
+	if len(scyllaTable.Namespace) == 0 {
+		scyllaTable.Namespace = connParams.Keyspace
 	}
-	if len(scyllaTable.keyspace) == 0 {
+	if len(scyllaTable.Namespace) == 0 {
 		return fmt.Errorf("%v: no keyspace configured", callerName)
 	}
-	if scyllaTable.cacheVersionPartitionCol == nil || scyllaTable.cacheVersionPartitionCol.IsNil() {
-		return fmt.Errorf(`Table "%v": %v cache-version partition metadata missing`, scyllaTable.name, callerName)
+	if scyllaTable.CacheVersionPartitionCol == nil || scyllaTable.CacheVersionPartitionCol.IsNil() {
+		return fmt.Errorf(`Table "%v": %v cache-version partition metadata missing`, scyllaTable.Name, callerName)
 	}
-	if scyllaTable.cacheVersionKeyCol == nil || scyllaTable.cacheVersionKeyCol.IsNil() {
-		return fmt.Errorf(`Table "%v": %v cache-version key metadata missing`, scyllaTable.name, callerName)
+	if scyllaTable.CacheVersionKeyCol == nil || scyllaTable.CacheVersionKeyCol.IsNil() {
+		return fmt.Errorf(`Table "%v": %v cache-version key metadata missing`, scyllaTable.Name, callerName)
 	}
 	return nil
 }
@@ -468,10 +462,10 @@ func planCachedIDsFetch(scyllaTable ScyllaTable, cachedIDs []IDCacheVersion) (ca
 	fullyCachedIDsByPartition := map[int32][]int64{}
 	mismatchDebugRowsByPartition := map[int32][]cacheVersionMismatchDebugRow{}
 
-	tableID := BasicHashInt(scyllaTable.name)
+	tableID := BasicHashInt(scyllaTable.Name)
 	for partitionID, idsSet := range uniqueIDsByPartition {
 		packedID := makeCacheVersionPackedID(partitionID, tableID)
-		cacheVersionByGroup, err := getCacheVersionsByPackedID(scyllaTable.keyspace, packedID)
+		cacheVersionByGroup, err := getCacheVersionsByPackedID(scyllaTable.Namespace, packedID)
 		if err != nil {
 			return plan, err
 		}
@@ -517,8 +511,8 @@ func forEachCachedIDsBatch(
 	projection string,
 	runBatch func(queryString string, queryValues []any, partitionID int32) error,
 ) error {
-	partitionColumnName := scyllaTable.cacheVersionPartitionCol.GetName()
-	keyColumnName := scyllaTable.cacheVersionKeyCol.GetName()
+	partitionColumnName := scyllaTable.CacheVersionPartitionCol.GetName()
+	keyColumnName := scyllaTable.CacheVersionKeyCol.GetName()
 
 	for partitionID, recordIDsToFetch := range plan.idsToFetchByPartition {
 		if len(recordIDsToFetch) == 0 {
@@ -527,7 +521,7 @@ func forEachCachedIDsBatch(
 
 		recordIDBatches := splitIDsIntoBatches(recordIDsToFetch, queryCachedIDsMaxBatchSize)
 		fmt.Println("forEachCachedIDsBatch: batched IDs selected from table", map[string]any{
-			"table":       scyllaTable.name,
+			"table":       scyllaTable.Name,
 			"partitionID": partitionID,
 			"totalIDs":    len(recordIDsToFetch),
 			"batchCount":  len(recordIDBatches),
@@ -545,15 +539,15 @@ func forEachCachedIDsBatch(
 			queryString := fmt.Sprintf(
 				"SELECT %v FROM %v.%v WHERE %v = ? AND %v IN (%v)",
 				projection,
-				scyllaTable.keyspace,
-				scyllaTable.name,
+				scyllaTable.Namespace,
+				scyllaTable.Name,
 				partitionColumnName,
 				keyColumnName,
 				strings.Join(valuePlaceholders, ", "),
 			)
 
 			fmt.Println("forEachCachedIDsBatch: executing batch", map[string]any{
-				"table":       scyllaTable.name,
+				"table":       scyllaTable.Name,
 				"partitionID": partitionID,
 				"batchIndex":  batchIndex,
 				"batchSize":   len(recordIDBatch),
@@ -590,8 +584,8 @@ func QueryCachedIDs[T TableBaseInterface[E, T], E TableSchemaInterface[E]](refSl
 	}
 
 	// The typed path returns whole records, so every non-virtual column is projected.
-	columnNames := make([]string, 0, len(scyllaTable.columns))
-	for _, column := range scyllaTable.columns {
+	columnNames := make([]string, 0, len(scyllaTable.Columns))
+	for _, column := range scyllaTable.Columns {
 		if column.GetInfo().IsVirtual {
 			continue
 		}

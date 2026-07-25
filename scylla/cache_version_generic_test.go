@@ -1,6 +1,7 @@
 package scylla
 
 import (
+	"github.com/ivanjoz/genix-orm/db"
 	"testing"
 )
 
@@ -202,7 +203,7 @@ func TestQueryCachedGenericByIDsRejectsUnregisteredAndOptedOutTables(t *testing.
 		t.Fatal("expected an error for a table name that was never registered")
 	}
 
-	RegisterTableFactory("generic_opted_out", func() ScyllaTable {
+	RegisterTableFactory("generic_opted_out", func() db.Table {
 		return MakeScyllaTable[genericOptedOutRecord, genericOptedOutSchema]()
 	})
 	if _, err := QueryCachedGenericByIDs("generic_opted_out", []IDCacheVersion{{ID: 1}}); err == nil {

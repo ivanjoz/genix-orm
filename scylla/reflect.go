@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/db"
 )
 
 var rangeOperators = []string{">", "<", ">=", "<="}
@@ -68,42 +70,42 @@ func isUpdateCounterFieldType(fieldType string) bool {
 }
 
 func ensureManagedIntColumn(dbTable *ScyllaTable, columnName string) IColInfo {
-	if currentColumn := dbTable.columnsMap[columnName]; currentColumn != nil {
+	if currentColumn := dbTable.ColumnsMap[columnName]; currentColumn != nil {
 		if currentColumn.GetType().IsSlice || !isUpdateCounterFieldType(currentColumn.GetType().FieldType) {
 			panic(fmt.Sprintf(`Table "%v": managed column "%v" must be an integer scalar. Found: %v`,
-				dbTable.name, columnName, currentColumn.GetType().FieldType))
+				dbTable.Name, columnName, currentColumn.GetType().FieldType))
 		}
 		return currentColumn
 	}
 
-	dbTable._maxColIdx++
+	dbTable.MaxColIdx++
 	managedColumn := &columnInfo{
-		colInfo: colInfo{
+		ColInfo: colInfo{
 			Name:      columnName,
 			FieldName: columnName,
-			Idx:       dbTable._maxColIdx,
+			Idx:       dbTable.MaxColIdx,
 			RefType:   reflect.TypeOf(int32(0)),
 		},
-		colType: GetColTypeByID(3),
+		ColType: db.GetColTypeByID(3),
 		// DB-only managed columns exist in Scylla even when a record struct does not expose them.
-		getRawValue:       func(ptr unsafe.Pointer) any { return nil },
-		getStatementValue: func(ptr unsafe.Pointer) any { return nil },
-		getValue:          func(ptr unsafe.Pointer) any { return nil },
+		GetRawValueFn:       func(ptr unsafe.Pointer) any { return nil },
+		GetStatementValueFn: func(ptr unsafe.Pointer) any { return nil },
+		GetValueFn:          func(ptr unsafe.Pointer) any { return nil },
 	}
-	dbTable.columnsMap[columnName] = managedColumn
+	dbTable.ColumnsMap[columnName] = managedColumn
 	return managedColumn
 }
 
 func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
-	dbTable.createdCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
-	dbTable.updatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
+	dbTable.CreatedCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
+	dbTable.UpdatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
 	if !schema.DisableUpdateCounter {
-		dbTable.updateCounterCol = ensureManagedIntColumn(dbTable, managedUpdateCounterColumnName)
+		dbTable.UpdateCounterCol = ensureManagedIntColumn(dbTable, managedUpdateCounterColumnName)
 	}
 
 	if schema.UseUpdateCounter != nil && schema.UseUpdateCounter.GetName() != managedUpdateCounterColumnName {
 		panic(fmt.Sprintf(`Table "%v": UseUpdateCounter is deprecated. Managed writes always use "%v".`,
-			dbTable.name, managedUpdateCounterColumnName))
+			dbTable.Name, managedUpdateCounterColumnName))
 	}
 }
 
@@ -192,20 +194,22 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 	}
 
 	dbTable := ScyllaTable{
-		keyspace:             schema.Keyspace,
-		name:                 schema.Name,
-		saveCacheVersion:     schema.SaveCacheVersion,
-		columnsMap:           map[string]IColInfo{},
-		columnsIdxMap:        map[int16]IColInfo{},
+		TableCore: db.TableCore{
+			Namespace:        schema.Namespace,
+			Name:             schema.Name,
+			SaveCacheVersion: schema.SaveCacheVersion,
+			ColumnsMap:       map[string]IColInfo{},
+			ColumnsIdxMap:    map[int16]IColInfo{},
+			UseSequences:     schema.UseSequences,
+			MaxColIdx:        int16(structRefValue.NumField()) + 1,
+		},
 		indexes:              map[string]*viewInfo{},
 		views:                map[string]*viewInfo{},
 		selectStatementCache: newSelectPlanCache(),
-		useSequences:         schema.UseSequences,
-		_maxColIdx:           int16(structRefValue.NumField()) + 1,
 	}
 
-	if dbTable.keyspace == "" {
-		dbTable.keyspace = connParams.Keyspace
+	if dbTable.Namespace == "" {
+		dbTable.Namespace = connParams.Keyspace
 	}
 
 	sequenceColumn := ""
@@ -251,21 +255,21 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 		}
 
 		if sequenceColumn == column.GetName() {
-			column.ColType = "counter"
-		} /* else if column.ColType == "" {
+			column.DBType = "counter"
+		} /* else if column.DBType == "" {
 			column.GetType().IsComplexType = true
 			column.Type = 9
 			column.GetType().IsSlice = false
-			column.ColType = "blob"
-		} else if column.GetType().IsSlice && column.ColType[0:3] != "set" {
-			column.ColType = fmt.Sprintf("set<%v>", column.ColType)
+			column.DBType = "blob"
+		} else if column.GetType().IsSlice && column.DBType[0:3] != "set" {
+			column.DBType = fmt.Sprintf("set<%v>", column.DBType)
 		} */
 
-		if _, ok := dbTable.columnsMap[column.GetName()]; ok {
+		if _, ok := dbTable.ColumnsMap[column.GetName()]; ok {
 			panic("The following column name is repeated:" + column.GetName())
 		} else {
 			column.GetInfo().Idx = int16(column.GetInfo().FieldIdx) + 1
-			dbTable.columnsMap[column.GetName()] = &column
+			dbTable.ColumnsMap[column.GetName()] = &column
 			if DebugFull {
 				// fmt.Printf("Mapped Col: %s, Field: %s, Offset: %d\n", column.GetName(), column.GetInfo().FieldName, column.GetInfo().Field.Offset)
 			}
@@ -276,90 +280,90 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 	bindManagedAuditColumns(&dbTable, schema)
 
 	if schema.Partition != nil {
-		dbTable.partKey = dbTable.columnsMap[schema.Partition.GetInfo().Name]
-		if dbTable.partKey != nil && !dbTable.partKey.IsNil() {
-			dbTable.keysIdx = append(dbTable.keysIdx, dbTable.partKey.GetInfo().Idx)
+		dbTable.PartKey = dbTable.ColumnsMap[schema.Partition.GetInfo().Name]
+		if dbTable.PartKey != nil && !dbTable.PartKey.IsNil() {
+			dbTable.KeysIdx = append(dbTable.KeysIdx, dbTable.PartKey.GetInfo().Idx)
 		}
 	}
 
 	for _, key := range schema.Keys {
-		col := dbTable.columnsMap[key.GetInfo().Name]
-		dbTable.keys = append(dbTable.keys, col)
-		dbTable.keysIdx = append(dbTable.keysIdx, col.GetInfo().Idx)
+		col := dbTable.ColumnsMap[key.GetInfo().Name]
+		dbTable.Keys = append(dbTable.Keys, col)
+		dbTable.KeysIdx = append(dbTable.KeysIdx, col.GetInfo().Idx)
 
-		// Transfer autoincrementRandSize from Key to the actual column in columnsMap
+		// Transfer AutoincrementRandDigits from Key to the actual column in columnsMap
 		// This enables autoincrement functionality when a Key is marked with .Autoincrement()
 		// Valid values: -1 (no random suffix) or >0 (with random suffix)
 		// Default value 0 means .Autoincrement() was never called
 		keyInfo := key.GetInfo()
-		if keyInfo.autoincrementRandSize != 0 {
-			col.SetAutoincrementRandSize(keyInfo.autoincrementRandSize)
+		if keyInfo.AutoincrementRandDigits != 0 {
+			col.SetAutoincrementRandSize(keyInfo.AutoincrementRandDigits)
 
 			// Set autoincrementCol if not already set
-			if dbTable.autoincrementCol == nil {
-				dbTable.autoincrementCol = col
-			} else if dbTable.autoincrementCol != col {
+			if dbTable.AutoincrementCol == nil {
+				dbTable.AutoincrementCol = col
+			} else if dbTable.AutoincrementCol != col {
 				panic(fmt.Sprintf(`Table "%v": Multiple autoincrement columns are not supported. Found autoincrement on both "%v" and "%v"`,
-					dbTable.name, dbTable.autoincrementCol.GetName(), col.GetName()))
+					dbTable.Name, dbTable.AutoincrementCol.GetName(), col.GetName()))
 			}
 		}
 	}
 
 	if schema.AutoincrementPart != nil {
-		dbTable.autoincrementPart = dbTable.columnsMap[schema.AutoincrementPart.GetInfo().Name]
+		dbTable.AutoincrementPart = dbTable.ColumnsMap[schema.AutoincrementPart.GetInfo().Name]
 	}
 
 	configureTextSearchIndex(&dbTable, schema)
 
 	// Identify autoincrement column from direct column definitions (backward compatibility)
 	// Only set if not already set during Keys processing
-	for _, col := range dbTable.columnsMap {
+	for _, col := range dbTable.ColumnsMap {
 		if c, ok := col.(*columnInfo); ok {
 			// Important: default is 0 (meaning "not autoincrement"). Valid autoincrement values are:
 			// -1  : autoincrement with no random suffix (Col.Autoincrement(0) normalizes to -1)
 			// > 0 : autoincrement with random suffix of that size
 			// The previous condition `>= 0` incorrectly treated the default 0 as autoincrement and
 			// caused tables without Autoincrement() to still query `sequences` on insert.
-			if c.autoincrementRandSize != 0 && dbTable.autoincrementCol == nil {
-				dbTable.autoincrementCol = col
+			if c.AutoincrementRandDigits != 0 && dbTable.AutoincrementCol == nil {
+				dbTable.AutoincrementCol = col
 			}
 		}
 	}
 
 	if len(schema.KeyIntPacking) > 0 {
-		if len(dbTable.keys) != 1 {
-			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires exactly one column in Keys. Found: %v`, dbTable.name, len(dbTable.keys)))
+		if len(dbTable.Keys) != 1 {
+			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires exactly one column in Keys. Found: %v`, dbTable.Name, len(dbTable.Keys)))
 		}
 
-		keyCol := dbTable.keys[0].(*columnInfo)
+		keyCol := dbTable.Keys[0].(*columnInfo)
 		if keyCol.Type != 2 { // 2 = int64
-			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires the key column to be an int64. Found: %v`, dbTable.name, keyCol.FieldType))
+			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires the key column to be an int64. Found: %v`, dbTable.Name, keyCol.FieldType))
 		}
 
 		for _, col := range schema.KeyIntPacking {
-			packedCol := dbTable.columnsMap[col.GetName()]
+			packedCol := dbTable.ColumnsMap[col.GetName()]
 			if packedCol == nil {
 				info := col.GetInfo()
-				if info.autoincrementRandSize >= 0 {
+				if info.AutoincrementRandDigits >= 0 {
 					// It's an autoincrement placeholder
 					placeholder := &columnInfo{
-						colInfo: colInfo{
+						ColInfo: colInfo{
 							Name:      "autoincrement_placeholder",
 							IsVirtual: true,
 						},
-						autoincrementRandSize: info.autoincrementRandSize,
-						decimalSize:           info.decimalSize,
+						AutoincrementRandDigits: info.AutoincrementRandDigits,
+						DecimalDigits:           info.DecimalDigits,
 					}
 					packedCol = placeholder
-					dbTable.autoincrementCol = placeholder
+					dbTable.AutoincrementCol = placeholder
 				} else {
-					panic(fmt.Sprintf(`Table "%v": Column "%v" in KeyIntPacking not found`, dbTable.name, col.GetName()))
+					panic(fmt.Sprintf(`Table "%v": Column "%v" in KeyIntPacking not found`, dbTable.Name, col.GetName()))
 				}
 			} else {
-				// If it's a real column, ensure decimalSize is transferred if set in KeyIntPacking
+				// If it's a real column, ensure DecimalDigits is transferred if set in KeyIntPacking
 				info := col.GetInfo()
-				if info.decimalSize > 0 {
-					packedCol.SetDecimalSize(info.decimalSize)
+				if info.DecimalDigits > 0 {
+					packedCol.SetDecimalSize(info.DecimalDigits)
 				}
 			}
 			dbTable.keyIntPacking = append(dbTable.keyIntPacking, packedCol)
@@ -367,22 +371,22 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 	}
 
 	if len(schema.KeyConcatenated) > 0 {
-		if len(dbTable.keys) != 1 {
-			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires exactly one column in Keys. Found: %v`, dbTable.name, len(dbTable.keys)))
+		if len(dbTable.Keys) != 1 {
+			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires exactly one column in Keys. Found: %v`, dbTable.Name, len(dbTable.Keys)))
 		}
-		keyCol := dbTable.keys[0].(*columnInfo)
+		keyCol := dbTable.Keys[0].(*columnInfo)
 		if keyCol.Type != 1 { // 1 = string
-			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires the key column to be a string. Found: %v`, dbTable.name, keyCol.FieldType))
+			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires the key column to be a string. Found: %v`, dbTable.Name, keyCol.FieldType))
 		}
 
 		concatCols := []IColInfo{}
 		for _, col := range schema.KeyConcatenated {
-			concatCol := dbTable.columnsMap[col.GetName()]
+			concatCol := dbTable.ColumnsMap[col.GetName()]
 			concatCols = append(concatCols, concatCol)
 			dbTable.keyConcatenated = append(dbTable.keyConcatenated, concatCol)
 		}
 
-		keyCol.getRawValue = func(ptr unsafe.Pointer) any {
+		keyCol.GetRawValueFn = func(ptr unsafe.Pointer) any {
 			values := []any{}
 			for _, col := range concatCols {
 				values = append(values, col.GetRawValue(ptr))
@@ -390,8 +394,8 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 			return MakeKeyConcat(values...)
 		}
 
-		keyCol.getValue = func(ptr unsafe.Pointer) any {
-			return "'" + strings.ReplaceAll(keyCol.getRawValue(ptr).(string), "'", "''") + "'"
+		keyCol.GetValueFn = func(ptr unsafe.Pointer) any {
+			return "'" + strings.ReplaceAll(keyCol.GetRawValueFn(ptr).(string), "'", "''") + "'"
 		}
 	}
 
@@ -399,20 +403,20 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 
 	if schema.SequencePartCol != nil {
 		gi := schema.SequencePartCol.GetInfo()
-		dbTable.sequencePartCol = &gi
+		dbTable.SequencePartCol = &gi
 	}
 
 	// Compile schema indexes in one pass to keep the public API and compiler flow simple.
 	for _, indexCfg := range schema.Indexes {
 		if len(indexCfg.Keys) == 0 {
-			panic(fmt.Sprintf(`Table "%v": Indexes entry must not be empty`, dbTable.name))
+			panic(fmt.Sprintf(`Table "%v": Indexes entry must not be empty`, dbTable.Name))
 		}
 		if indexCfg.Type == TypeInheritFromKey && !indexCfg.UseIndexGroup {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey requires UseIndexGroup: true`, dbTable.name))
+			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey requires UseIndexGroup: true`, dbTable.Name))
 		}
 		// Only views materialize their own partition, so an override is meaningless elsewhere.
 		if indexPartitionColumnName(indexCfg) != "" && resolveSchemaIndexType(indexCfg) != TypeView {
-			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView indexes`, dbTable.name))
+			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView indexes`, dbTable.Name))
 		}
 		if indexCfg.UseIndexGroup {
 			registerIndexGroup(&dbTable, &idxCount, indexCfg)
@@ -421,7 +425,7 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 		if hasCompositeBucketing(indexCfg) {
 			indexColumns := indexCfg.Keys
 			if len(indexColumns) < 2 || len(indexColumns) > 3 {
-				panic(fmt.Sprintf(`Table "%v": composite-bucketing index entries must have 2 to 3 columns. Found: %v`, dbTable.name, len(indexColumns)))
+				panic(fmt.Sprintf(`Table "%v": composite-bucketing index entries must have 2 to 3 columns. Found: %v`, dbTable.Name, len(indexColumns)))
 			}
 
 			sourceColumns := make([]IColInfo, 0, len(indexColumns))
@@ -432,32 +436,32 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 
 			for _, indexColumn := range indexColumns {
 				indexColumnInfo := indexColumn.GetInfo()
-				column := dbTable.columnsMap[indexColumnInfo.Name]
+				column := dbTable.ColumnsMap[indexColumnInfo.Name]
 				if column == nil {
-					panic(fmt.Sprintf(`Table "%v": composite-bucketing column "%v" was not found`, dbTable.name, indexColumnInfo.Name))
+					panic(fmt.Sprintf(`Table "%v": composite-bucketing column "%v" was not found`, dbTable.Name, indexColumnInfo.Name))
 				}
 				if !isCompositeNumericFieldType(column.GetType().FieldType) {
-					panic(fmt.Sprintf(`Table "%v": composite-bucketing column "%v" must be integer scalar/slice. Found: %v`, dbTable.name, column.GetName(), column.GetType().FieldType))
+					panic(fmt.Sprintf(`Table "%v": composite-bucketing column "%v" must be integer scalar/slice. Found: %v`, dbTable.Name, column.GetName(), column.GetType().FieldType))
 				}
 				sourceColumns = append(sourceColumns, column)
 				sourceColumnNames = append(sourceColumnNames, column.GetName())
 
-				bucketDefs := indexColumnInfo.compositeBucketing
+				bucketDefs := indexColumnInfo.CompositeBucketSizes
 				if len(bucketDefs) > 0 {
 					if bucketColumn != nil {
-						panic(fmt.Sprintf(`Table "%v": composite-bucketing supports exactly one CompositeBucketing column per index`, dbTable.name))
+						panic(fmt.Sprintf(`Table "%v": composite-bucketing supports exactly one CompositeBucketing column per index`, dbTable.Name))
 					}
 					if column.GetType().IsSlice {
-						panic(fmt.Sprintf(`Table "%v": CompositeBucketing column "%v" must be numeric (not a slice)`, dbTable.name, column.GetName()))
+						panic(fmt.Sprintf(`Table "%v": CompositeBucketing column "%v" must be numeric (not a slice)`, dbTable.Name, column.GetName()))
 					}
 					bucketColumn = column
-					bucketIsWeek = indexColumnInfo.isWeek
+					bucketIsWeek = indexColumnInfo.IsWeek
 					bucketSizes = normalizeCompositeBucketSizes(bucketDefs)
 				}
 			}
 
 			if bucketColumn == nil {
-				panic(fmt.Sprintf(`Table "%v": composite-bucketing requires one column marked with CompositeBucketing`, dbTable.name))
+				panic(fmt.Sprintf(`Table "%v": composite-bucketing requires one column marked with CompositeBucketing`, dbTable.Name))
 			}
 
 			compositeIndex := compositeBucketIndex{
@@ -471,8 +475,8 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 
 			for _, bucketSize := range bucketSizes {
 				virtualColName := fmt.Sprintf("zz_hb_%s_b%d", strings.Join(sourceColumnNames, "_"), bucketSize)
-				if _, exists := dbTable.columnsMap[virtualColName]; exists {
-					panic(fmt.Sprintf(`Table "%v": generated virtual composite bucket column already exists: %v`, dbTable.name, virtualColName))
+				if _, exists := dbTable.ColumnsMap[virtualColName]; exists {
+					panic(fmt.Sprintf(`Table "%v": generated virtual composite bucket column already exists: %v`, dbTable.Name, virtualColName))
 				}
 
 				bucketSizeLocal := bucketSize
@@ -480,36 +484,36 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 				bucketColumnLocal := bucketColumn
 
 				virtualColumn := &columnInfo{
-					colInfo: colInfo{
+					ColInfo: colInfo{
 						Name:      virtualColName,
 						FieldName: virtualColName,
 						IsVirtual: true,
-						Idx:       dbTable._maxColIdx,
+						Idx:       dbTable.MaxColIdx,
 					},
-					colType: colType{
+					ColType: colType{
 						Type:      13,
 						FieldType: "[]int32",
-						ColType:   "set<int>",
+						DBType:    "set<int>",
 						IsSlice:   true,
 					},
 				}
 
 				bucketIsWeekLocal := compositeIndex.bucketIsWeek
-				virtualColumn.getRawValue = func(ptr unsafe.Pointer) any {
+				virtualColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
 					return computeCompositeHashSet(ptr, sourceColumnsLocal, bucketColumnLocal, bucketSizeLocal, bucketIsWeekLocal)
 				}
-				virtualColumn.getValue = func(ptr unsafe.Pointer) any {
+				virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
 					hashValues := computeCompositeHashSet(ptr, sourceColumnsLocal, bucketColumnLocal, bucketSizeLocal, bucketIsWeekLocal)
-					return makeSignedIntCollectionLiteral(virtualColumn.ColType, hashValues)
+					return makeSignedIntCollectionLiteral(virtualColumn.DBType, hashValues)
 				}
 
-				dbTable._maxColIdx++
-				dbTable.columnsMap[virtualColumn.GetName()] = virtualColumn
+				dbTable.MaxColIdx++
+				dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
 				compositeIndex.virtualColumnsBySize[bucketSize] = virtualColumn
 
 				index := &viewInfo{
 					Type:    1,
-					name:    fmt.Sprintf(`%v__%v_index_0`, dbTable.name, virtualColumn.GetName()),
+					name:    fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumn.GetName()),
 					idx:     idxCount,
 					column:  virtualColumn,
 					columns: []string{virtualColumn.GetName()},
@@ -523,7 +527,7 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 			}
 
 			dbTable.compositeBucketIndexes = append(dbTable.compositeBucketIndexes, compositeIndex)
-			fmt.Printf("CompositeBucketing index registered: table=%s index=%s bucketSizes=%v\n", dbTable.name, compositeIndex.name, compositeIndex.bucketSizes)
+			fmt.Printf("CompositeBucketing index registered: table=%s index=%s bucketSizes=%v\n", dbTable.Name, compositeIndex.name, compositeIndex.bucketSizes)
 			continue
 		}
 
@@ -538,20 +542,20 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 		case TypeView:
 			compileSchemaView(&dbTable, indexCfg)
 		default:
-			panic(fmt.Sprintf(`Table "%v": unsupported index type %d`, dbTable.name, resolveSchemaIndexType(indexCfg)))
+			panic(fmt.Sprintf(`Table "%v": unsupported index type %d`, dbTable.Name, resolveSchemaIndexType(indexCfg)))
 		}
 	}
 
-	for _, col := range dbTable.columnsMap {
+	for _, col := range dbTable.ColumnsMap {
 		if columnMetadata, isColumnInfo := col.(*columnInfo); isColumnInfo {
 			// Compile fast accessors once per table build so row scan/write paths avoid generic branching.
-			columnMetadata.compileFastAccessors()
+			columnMetadata.CompileFastAccessors()
 		}
 	}
 
-	for _, col := range dbTable.columnsMap {
-		dbTable.columns = append(dbTable.columns, col)
-		dbTable.columnsIdxMap[col.GetInfo().Idx] = col
+	for _, col := range dbTable.ColumnsMap {
+		dbTable.Columns = append(dbTable.Columns, col)
+		dbTable.ColumnsIdxMap[col.GetInfo().Idx] = col
 	}
 
 	for _, e := range dbTable.indexes {
@@ -563,7 +567,7 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 
 	for _, idxview := range dbTable.indexViews {
 		for _, colname := range idxview.columns {
-			col := dbTable.columnsMap[colname]
+			col := dbTable.ColumnsMap[colname]
 			idxview.columnsIdx = append(idxview.columnsIdx, col.GetInfo().Idx)
 		}
 	}

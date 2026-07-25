@@ -3,7 +3,23 @@ package scylla
 import (
 	"errors"
 	"fmt"
+
+	"github.com/ivanjoz/genix-orm/db"
 )
+
+// Register installs this driver into the shared db layer: how ORM type IDs are
+// named in CQL, and the value paths that depend on Cassandra's type system.
+// It runs on import because the shared accessor engine consults both before any
+// table is compiled.
+func init() {
+	db.DBTypeResolver = func(typeID int8) string { return cqlTypeNames[typeID] }
+	db.SetCodec(scyllaValueCodec{})
+	// These two take a counter key or a table name rather than table types, so they
+	// cannot be generic Executor methods; the driver installs them instead.
+	db.GetAutoincrementID = GetAutoincrementID
+	db.QueryCachedGenericByIDs = QueryCachedGenericByIDs
+	db.SetDebugLogging = SetDebugLogging
+}
 
 // Init creates the ORM internal tables required before sequence or cache-version features are used.
 //

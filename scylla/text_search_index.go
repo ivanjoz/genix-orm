@@ -21,36 +21,36 @@ func configureTextSearchIndex(scyllaTable *ScyllaTable, schema TableSchema) {
 	if schema.TextSearchColumn == nil {
 		return
 	}
-	if scyllaTable.partKey == nil || scyllaTable.partKey.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn requires a partition column`, scyllaTable.name))
+	if scyllaTable.PartKey == nil || scyllaTable.PartKey.IsNil() {
+		panic(fmt.Sprintf(`Table "%v": TextSearchColumn requires a partition column`, scyllaTable.Name))
 	}
-	partitionFieldType := scyllaTable.partKey.GetType().FieldType
+	partitionFieldType := scyllaTable.PartKey.GetType().FieldType
 	if partitionFieldType != "int32" && partitionFieldType != "int" {
 		panic(fmt.Sprintf(`Table "%v": TextSearchColumn partition column "%v" must be int32. Found: %v`,
-			scyllaTable.name, scyllaTable.partKey.GetName(), partitionFieldType))
+			scyllaTable.Name, scyllaTable.PartKey.GetName(), partitionFieldType))
 	}
-	if len(scyllaTable.keys) != 1 {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn requires exactly one key column. Found: %v`, scyllaTable.name, len(scyllaTable.keys)))
+	if len(scyllaTable.Keys) != 1 {
+		panic(fmt.Sprintf(`Table "%v": TextSearchColumn requires exactly one key column. Found: %v`, scyllaTable.Name, len(scyllaTable.Keys)))
 	}
 
-	sourceColumn := scyllaTable.columnsMap[schema.TextSearchColumn.GetName()]
+	sourceColumn := scyllaTable.ColumnsMap[schema.TextSearchColumn.GetName()]
 	if sourceColumn == nil {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn "%v" was not found`, scyllaTable.name, schema.TextSearchColumn.GetName()))
+		panic(fmt.Sprintf(`Table "%v": TextSearchColumn "%v" was not found`, scyllaTable.Name, schema.TextSearchColumn.GetName()))
 	}
 	if sourceColumn.GetType().FieldType != "string" {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn "%v" must be string. Found: %v`, scyllaTable.name, sourceColumn.GetName(), sourceColumn.GetType().FieldType))
+		panic(fmt.Sprintf(`Table "%v": TextSearchColumn "%v" must be string. Found: %v`, scyllaTable.Name, sourceColumn.GetName(), sourceColumn.GetType().FieldType))
 	}
 
-	idColumn := scyllaTable.keys[0]
+	idColumn := scyllaTable.Keys[0]
 	idFieldType := idColumn.GetType().FieldType
 	if idFieldType != "int16" && idFieldType != "int32" && idFieldType != "int64" && idFieldType != "int" {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn key column "%v" must be numeric. Found: %v`, scyllaTable.name, idColumn.GetName(), idFieldType))
+		panic(fmt.Sprintf(`Table "%v": TextSearchColumn key column "%v" must be numeric. Found: %v`, scyllaTable.Name, idColumn.GetName(), idFieldType))
 	}
 
 	var statusColumn IColInfo
-	if column, exists := scyllaTable.columnsMap["status"]; exists {
+	if column, exists := scyllaTable.ColumnsMap["status"]; exists {
 		if column.GetType().FieldType != "int8" {
-			panic(fmt.Sprintf(`Table "%v": TextSearchColumn status column must be int8. Found: %v`, scyllaTable.name, column.GetType().FieldType))
+			panic(fmt.Sprintf(`Table "%v": TextSearchColumn status column must be int8. Found: %v`, scyllaTable.Name, column.GetType().FieldType))
 		}
 		statusColumn = column
 	}
@@ -127,13 +127,13 @@ func syncTextSearchIndexAfterWrite[T any](records *[]T, scyllaTable *ScyllaTable
 	ctx := context.Background()
 	for _, bucket := range buckets {
 		totalRecords += len(bucket.records)
-		if err := text_search.UpsertBatch(ctx, scyllaTable.name, bucket.partition, bucket.statusGroup, bucket.records); err != nil {
-			return fmt.Errorf("text search upsert %s_p%d_s%d: %w", scyllaTable.name, bucket.partition, bucket.statusGroup, err)
+		if err := text_search.UpsertBatch(ctx, scyllaTable.Name, bucket.partition, bucket.statusGroup, bucket.records); err != nil {
+			return fmt.Errorf("text search upsert %s_p%d_s%d: %w", scyllaTable.Name, bucket.partition, bucket.statusGroup, err)
 		}
 	}
 	if DebugFull {
 		fmt.Printf("TextSearchIndex sync: table=%s buckets=%d records=%d elapsed=%s\n",
-			scyllaTable.name, len(buckets), totalRecords, time.Since(start))
+			scyllaTable.Name, len(buckets), totalRecords, time.Since(start))
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func groupRecordsForTextSearch[T any](records *[]T, scyllaTable *ScyllaTable, sk
 	for i := range *records {
 		recordPointer := xunsafe.AsPointer(&(*records)[i])
 		partition := int32(scyllaTable.GetPartValue(recordPointer))
-		recordID := convertToInt32(scyllaTable.keys[0].GetRawValue(recordPointer))
+		recordID := convertToInt32(scyllaTable.Keys[0].GetRawValue(recordPointer))
 		// Records whose searchable content and status are unchanged were flagged by the caller
 		// (e.g. Merge) so we avoid a redundant GenixSearch re-upsert.
 		if skipRecordIDs != nil && skipRecordIDs[int64(recordID)] {

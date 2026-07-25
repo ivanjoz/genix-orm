@@ -39,7 +39,7 @@ func splitGroupByColumns(columns []columnInfo) ([]columnInfo, []columnInfo) {
 	groupedColumns := []columnInfo{}
 	aggregateColumns := []columnInfo{}
 	for _, column := range columns {
-		if column.aggregateFn != "" {
+		if column.AggregateFn != "" {
 			aggregateColumns = append(aggregateColumns, column)
 			continue
 		}
@@ -63,13 +63,13 @@ func canUseViewForAggregateColumns(aggregateColumns []columnInfo, view *viewInfo
 }
 
 func makeGroupByAggregateProjection(column columnInfo) (string, error) {
-	if column.aggregateFn == "" {
+	if column.AggregateFn == "" {
 		return column.GetName(), nil
 	}
-	if column.aggregateFn == "AVG" && column.Type != 6 && column.Type != 7 {
+	if column.AggregateFn == "AVG" && column.Type != 6 && column.Type != 7 {
 		return "", fmt.Errorf(`Avg() requires a float32 or float64 destination column. Column: "%v"`, column.GetName())
 	}
-	return fmt.Sprintf("%s(%s) AS %s", column.aggregateFn, column.GetName(), column.GetName()), nil
+	return fmt.Sprintf("%s(%s) AS %s", column.AggregateFn, column.GetName(), column.GetName()), nil
 }
 
 func sumSlotDigits(slotDigits []int64, fromIndex int) int64 {
@@ -270,14 +270,14 @@ func buildNativeGroupByPlan(
 	statements []ColumnStatement,
 	scyllaTable ScyllaTable,
 ) (*nativeGroupByPlan, error) {
-	if len(tableInfo.groupByColumns) == 0 {
+	if len(tableInfo.GroupByColumns) == 0 {
 		return nil, nil
 	}
-	if len(tableInfo.columnsInclude) > 0 || len(tableInfo.columnsExclude) > 0 {
+	if len(tableInfo.ColumnsInclude) > 0 || len(tableInfo.ColumnsExclude) > 0 {
 		return nil, fmt.Errorf("GroupBy cannot be combined with Select() or Exclude()")
 	}
 
-	groupedColumns, aggregateColumns := splitGroupByColumns(tableInfo.groupByColumns)
+	groupedColumns, aggregateColumns := splitGroupByColumns(tableInfo.GroupByColumns)
 	if len(groupedColumns) == 0 {
 		return nil, fmt.Errorf("GroupBy requires at least one non-aggregated column")
 	}
@@ -298,7 +298,7 @@ func buildNativeGroupByPlan(
 	}
 
 	if len(groupedColumns) == 1 {
-		groupedColumn := scyllaTable.columnsMap[groupedColumns[0].GetName()]
+		groupedColumn := scyllaTable.ColumnsMap[groupedColumns[0].GetName()]
 		if groupedColumn == nil {
 			return nil, fmt.Errorf(`GroupBy column "%v" was not found`, groupedColumns[0].GetName())
 		}
@@ -405,7 +405,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 	caps := []QueryCapability{}
 
 	// 1. Main Table Primary Key
-	pk := dbTable.partKey
+	pk := dbTable.PartKey
 	if pk != nil && !pk.IsNil() {
 		// Just partition
 		caps = append(caps, QueryCapability{
@@ -416,7 +416,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 
 		// Partition + Clustering Keys
 		currentSig := fmt.Sprintf("%v|=", pk.GetName())
-		for i, key := range dbTable.keys {
+		for i, key := range dbTable.Keys {
 			colName := key.GetName()
 			// Equality
 			caps = append(caps, QueryCapability{
@@ -556,7 +556,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 		if view.Type == 7 || view.Type == 3 { // Hash / Index-Group
 			cols := []string{}
 			for _, col := range view.columns {
-				column := dbTable.columnsMap[col]
+				column := dbTable.ColumnsMap[col]
 				// Hash view signatures inherit source column operator semantics.
 				cols = append(cols, col+"|"+capabilityDefaultOpForColumn(column))
 			}
@@ -570,13 +570,13 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			// Index groups support BETWEEN on each non-slice source column by
 			// enumerating discrete values and computing one hash per value.
 			for rangeColIdx, col := range view.columns {
-				colInfo := dbTable.columnsMap[col]
+				colInfo := dbTable.ColumnsMap[col]
 				if colInfo != nil && colInfo.GetType().IsSlice {
 					continue // slice columns only support CONTAINS, not range
 				}
 				rangeSigParts := make([]string, 0, len(view.columns)*2)
 				for i, c := range view.columns {
-					ci := dbTable.columnsMap[c]
+					ci := dbTable.ColumnsMap[c]
 					if i == rangeColIdx {
 						rangeSigParts = append(rangeSigParts, c, "~")
 					} else {
@@ -625,7 +625,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					currentSig += "|"
 				}
 
-				operatorToken := capabilityDefaultOpForColumn(dbTable.columnsMap[col])
+				operatorToken := capabilityDefaultOpForColumn(dbTable.ColumnsMap[col])
 				currentSig += col + "|" + operatorToken
 
 				priority := 10
@@ -678,7 +678,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 
 	// 4. KeyIntPacking
 	if len(dbTable.keyIntPacking) > 0 {
-		pk := dbTable.partKey
+		pk := dbTable.PartKey
 		if pk != nil && !pk.IsNil() {
 			pkName := pk.GetName()
 			currentSig := fmt.Sprintf("%v|=", pkName)
@@ -710,7 +710,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 
 	// 5. KeyConcatenated
 	if len(dbTable.keyConcatenated) > 0 {
-		pk := dbTable.partKey
+		pk := dbTable.PartKey
 		if pk != nil && !pk.IsNil() {
 			pkName := pk.GetName()
 			currentSig := fmt.Sprintf("%v|=", pkName)
@@ -794,14 +794,14 @@ func MatchQueryCapability(statements []ColumnStatement, capabilities []QueryCapa
 		}
 
 		if match {
-			/* 
-			sourceName := "base-key"
-			if cap.Source != nil {
-				sourceName = cap.Source.name
-			}
-			fmt.Printf("Capability match: signature=%s priority=%d source=%s isKey=%v\n",	cap.Signature, cap.Priority, sourceName, cap.IsKey)
+			/*
+				sourceName := "base-key"
+				if cap.Source != nil {
+					sourceName = cap.Source.name
+				}
+				fmt.Printf("Capability match: signature=%s priority=%d source=%s isKey=%v\n",	cap.Signature, cap.Priority, sourceName, cap.IsKey)
 			*/
-			
+
 			if bestMatch == nil || cap.Priority > bestMatch.Priority {
 				bestMatch = cap
 			} else if cap.Priority == bestMatch.Priority {

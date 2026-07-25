@@ -5,68 +5,15 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/viant/xunsafe"
+	"github.com/ivanjoz/genix-orm/db"
 )
-
-type structFieldMetadataCacheEntry struct {
-	recordType             reflect.Type
-	fieldMetadataByName    map[string]columnInfo
-	cacheVersionFieldIndex []int
-}
 
 type scyllaTableCacheEntry struct {
 	once  sync.Once
 	table ScyllaTable
 }
 
-var (
-	structFieldMetadataCache sync.Map
-	scyllaTableCache         sync.Map
-)
-
-func getOrBuildStructFieldMetadata(recordType reflect.Type) *structFieldMetadataCacheEntry {
-	if cachedEntry, cacheHit := structFieldMetadataCache.Load(recordType); cacheHit {
-		return cachedEntry.(*structFieldMetadataCacheEntry)
-	}
-
-	metadataByFieldName := map[string]columnInfo{}
-	for fieldIndex := 0; fieldIndex < recordType.NumField(); fieldIndex++ {
-		recordField := recordType.Field(fieldIndex)
-		if recordField.Name == "TableStruct" {
-			continue
-		}
-
-		unsafeField := xunsafe.FieldByName(recordType, recordField.Name)
-		columnType := GetColTypeByName(recordField.Type.String(), "")
-		if columnType.Type == 0 {
-			columnType = GetColTypeByID(9)
-		}
-
-		tagConfig := parseDBTagConfig(recordField.Tag.Get("db"))
-		columnType = applyCollectionTagOptions(recordType.Name(), recordField.Name, columnType, tagConfig)
-
-		metadataByFieldName[recordField.Name] = columnInfo{
-			colInfo: colInfo{
-				Name:      tagConfig.columnName,
-				FieldIdx:  fieldIndex,
-				FieldName: recordField.Name,
-				RefType:   recordField.Type,
-				Field:     unsafeField,
-			},
-			colType:                 columnType,
-			hasCollectionTagOptions: tagConfig.hasCollectionOptions(),
-		}
-	}
-
-	metadataEntry := &structFieldMetadataCacheEntry{
-		recordType:             recordType,
-		fieldMetadataByName:    metadataByFieldName,
-		cacheVersionFieldIndex: findCacheVersionFieldIndexInRecordType(recordType),
-	}
-
-	actualEntry, _ := structFieldMetadataCache.LoadOrStore(recordType, metadataEntry)
-	return actualEntry.(*structFieldMetadataCacheEntry)
-}
+var scyllaTableCache sync.Map
 
 func getOrCompileScyllaTable[T TableInterface[T]](schemaStruct *T) ScyllaTable {
 	cacheKey := reflect.TypeOf(schemaStruct).Elem().PkgPath() + "." + reflect.TypeOf(schemaStruct).Elem().Name()
@@ -84,6 +31,6 @@ func getOrCompileScyllaTable[T TableInterface[T]](schemaStruct *T) ScyllaTable {
 
 // resetORMTableCachesForTesting clears ORM metadata caches for deterministic benchmarks/tests.
 func resetORMTableCachesForTesting() {
-	structFieldMetadataCache = sync.Map{}
+	db.ResetMetadataCacheForTesting()
 	scyllaTableCache = sync.Map{}
 }

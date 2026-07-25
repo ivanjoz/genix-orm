@@ -307,7 +307,7 @@ func makePrimaryKeyRecordKey(ptr unsafe.Pointer, scyllaTable ScyllaTable) string
 		parts = append(parts, fmt.Sprintf("%s=%v", partKey.GetName(), scyllaTable.GetPartValue(ptr)))
 	}
 	keyValues := scyllaTable.GetKeyValues(ptr)
-	for keyIndex, keyColumn := range scyllaTable.keys {
+	for keyIndex, keyColumn := range scyllaTable.Keys {
 		parts = append(parts, fmt.Sprintf("%s=%v", keyColumn.GetName(), keyValues[keyIndex]))
 	}
 	return strings.Join(parts, "|")
@@ -316,7 +316,7 @@ func makePrimaryKeyRecordKey(ptr unsafe.Pointer, scyllaTable ScyllaTable) string
 func recordMatchesPostFilter(ptr unsafe.Pointer, statements []ColumnStatement, scyllaTable ScyllaTable) bool {
 	// Final in-memory filtering guarantees exact semantics after overfetch (e.g. packed indexes with DecimalSize truncation).
 	for _, statement := range statements {
-		column := scyllaTable.columnsMap[statement.Col]
+		column := scyllaTable.ColumnsMap[statement.Col]
 		if column == nil {
 			return false
 		}
@@ -534,8 +534,7 @@ func scanSelectQueryRows[E any](
 	queryNoticeTime time.Time,
 ) error {
 	usePostFilter := len(postFilterStatements) > 0
-	
-	
+
 	doScan := func() error {
 		if ShouldLog() {
 			// Log the executable statement with compact projection output to keep noisy SELECTs readable.
@@ -558,14 +557,14 @@ func scanSelectQueryRows[E any](
 			}
 			return err
 		}
-		
+
 		rowsScaned := 0
 		rowsFinal := 0
 
 		scanner := iter.Scanner()
 		for scanner.Next() {
 			rowsScaned++
-			
+
 			rowValues := rd.Values
 			if err := scanner.Scan(rowValues...); err != nil {
 				fmt.Println("Error on scan::", err)
@@ -576,29 +575,29 @@ func scanSelectQueryRows[E any](
 			recordPtr := xunsafe.AsPointer(record)
 			// shouldLog := ShouldLogFull()
 
-			/* 
-			if shouldLog {
-				fmt.Printf("\n--- Scanning record %d ---\n", atomic.LoadUint32(&LogCount)+1)
-			}
+			/*
+				if shouldLog {
+					fmt.Printf("\n--- Scanning record %d ---\n", atomic.LoadUint32(&LogCount)+1)
+				}
 			*/
 
 			// Map each scanned DB column into the destination struct using precomputed column metadata.
 			for columnIndex, scanColumn := range scanColumns {
 				columnName := scanColumn.ColumnName
-				column := scyllaTable.columnsMap[columnName]
+				column := scyllaTable.ColumnsMap[columnName]
 				value := rowValues[columnIndex]
-				/* 
-				if shouldLog {
-					valueText := "nil"
-					if value != nil {
-						valueText = fmt.Sprintf("%v", reflect.Indirect(reflect.ValueOf(value)).Interface())
+				/*
+					if shouldLog {
+						valueText := "nil"
+						if value != nil {
+							valueText = fmt.Sprintf("%v", reflect.Indirect(reflect.ValueOf(value)).Interface())
+						}
+						offset := uintptr(0)
+						if column.GetInfo().Field != nil {
+							offset = column.GetInfo().Field.Offset
+						}
+						fmt.Printf("Col: %-20s (Field: %-20s) | Offset: %-4d | DB Value: %s\n", columnName, column.GetInfo().FieldName, offset, valueText)
 					}
-					offset := uintptr(0)
-					if column.GetInfo().Field != nil {
-						offset = column.GetInfo().Field.Offset
-					}
-					fmt.Printf("Col: %-20s (Field: %-20s) | Offset: %-4d | DB Value: %s\n", columnName, column.GetInfo().FieldName, offset, valueText)
-				}
 				*/
 				if value == nil {
 					continue
@@ -616,11 +615,11 @@ func scanSelectQueryRows[E any](
 				}
 				column.SetValue(recordPtr, value)
 			}
-			/* 
-			if shouldLog {
-				recordJSON, _ := json.MarshalIndent(record, "", "  ")
-				fmt.Printf("Resulting Struct: %s\n", string(recordJSON))
-			}
+			/*
+				if shouldLog {
+					recordJSON, _ := json.MarshalIndent(record, "", "  ")
+					fmt.Printf("Resulting Struct: %s\n", string(recordJSON))
+				}
 			*/
 
 			// Post-filter keeps exact semantics when indexed query planning intentionally overfetches.
@@ -637,8 +636,8 @@ func scanSelectQueryRows[E any](
 			*refRecords = append(*refRecords, *record)
 		}
 
-		fmt.Printf(`Table %v | Rows Scanned %v | Final %v`+"\n",scyllaTable.name, rowsScaned, rowsFinal)
-		
+		fmt.Printf(`Table %v | Rows Scanned %v | Final %v`+"\n", scyllaTable.Name, rowsScaned, rowsFinal)
+
 		return nil
 	}
 
@@ -872,10 +871,10 @@ func selectExec[E any](
 	scanHandler func(record *E) bool,
 	selectStartTime time.Time,
 ) error {
-	if len(scyllaTable.keyspace) == 0 {
-		scyllaTable.keyspace = connParams.Keyspace
+	if len(scyllaTable.Namespace) == 0 {
+		scyllaTable.Namespace = connParams.Keyspace
 	}
-	if len(scyllaTable.keyspace) == 0 {
+	if len(scyllaTable.Namespace) == 0 {
 		return errors.New("no se ha especificado un keyspace")
 	}
 

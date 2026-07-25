@@ -2,20 +2,21 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"reflect"
 	"strings"
 	"unsafe"
 )
 
-func exportToCSV(scyllaTable *ScyllaTable, partValue int32) (CSVResult, error) {
+func exportToCSV(scyllaTable *ScyllaTable, partValue int32) (db.CSVResult, error) {
 
 	columnsOrder := map[string]int{}
 
-	for _, col := range scyllaTable.keys {
+	for _, col := range scyllaTable.Keys {
 		columnsOrder[col.GetName()] = len(columnsOrder) + 1
 	}
 
-	for _, col := range scyllaTable.columns {
+	for _, col := range scyllaTable.Columns {
 		pk := scyllaTable.GetPartKey()
 		if pk != nil && !pk.IsNil() && pk.GetInfo().Idx == col.GetInfo().Idx {
 			continue
@@ -30,10 +31,10 @@ func exportToCSV(scyllaTable *ScyllaTable, partValue int32) (CSVResult, error) {
 
 	columnsNames := make([]string, len(columnsOrder))
 	columnsNamesWType := make([]string, len(columnsOrder))
-	csv := CSVResult{}
+	csv := db.CSVResult{}
 
 	for name, i := range columnsOrder {
-		col := scyllaTable.columnsMap[name]
+		col := scyllaTable.ColumnsMap[name]
 		columnsNames[i-1] = name
 		columnsNamesWType[i-1] = fmt.Sprintf("%v:%v", name, col.GetType().Type)
 	}
@@ -48,7 +49,7 @@ func exportToCSV(scyllaTable *ScyllaTable, partValue int32) (CSVResult, error) {
 
 	csv.Content = append(csv.Content, '\n')
 
-	fmt.Println("Table:", scyllaTable.name, "| Cols:", strings.Join(columnsNames, ", "))
+	fmt.Println("Table:", scyllaTable.Name, "| Cols:", strings.Join(columnsNames, ", "))
 
 	whereClause := ""
 	pk := scyllaTable.GetPartKey()
@@ -116,7 +117,7 @@ func CsvToRecords[T any](
 	parseColumns := func() {
 		for _, colname := range columnNames {
 			name := strings.Split(colname, ":")[0]
-			columns = append(columns, scyllaTable.columnsMap[name])
+			columns = append(columns, scyllaTable.ColumnsMap[name])
 		}
 	}
 
@@ -158,8 +159,8 @@ func CsvToRecords[T any](
 			colIdx++
 
 			if b == '\n' {
-				if scyllaTable.partKey != nil {
-					scyllaTable.partKey.SetValue(unsafe.Pointer(&currentRecord), partValue)
+				if scyllaTable.PartKey != nil {
+					scyllaTable.PartKey.SetValue(unsafe.Pointer(&currentRecord), partValue)
 				}
 				parsedRecords = append(parsedRecords, currentRecord)
 				currentRecord = *new(T)

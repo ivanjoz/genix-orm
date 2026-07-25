@@ -9,21 +9,16 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/ivanjoz/genix-orm/scylla/text_search"
-
 	"github.com/gocql/gocql"
+	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/scylla/text_search"
 	"github.com/viant/xunsafe"
 )
 
-type ScyllaController[T TableBaseInterface[E, T], E TableSchemaInterface[E]] struct {
+type ScyllaController[T db.RecordWithExecutor[E, T, Exec[E, T]], E TableSchemaInterface[E]] struct {
 	TableName string
 	Table     ScyllaTable
 	Schema    TableSchema
-}
-
-type CSVResult struct {
-	Content   []byte
-	RowsCount int32
 }
 
 type virtualColumnsRecalcUpdate[T any] struct {
@@ -31,27 +26,12 @@ type virtualColumnsRecalcUpdate[T any] struct {
 	changedVirtualColumns []IColInfo
 }
 
-type ScyllaControllerInterface interface {
-	GetTable() ScyllaTable
-	GetTableName() string
-	GetRecords(partValue, limit int32, lastKey any) []any
-	GetRecordsGob(partValue, limit int32, lastKey any) ([]byte, error)
-	RestoreCSVRecords(partValue int32, content *[]byte) error
-	GetRecordsCSV(partValue int32) (CSVResult, error)
-	ReloadRecords(partValue int32) error
-	RecalcVirtualColumns(partValue int32) error
-	RecalcGroupIndexHashes(partValue int32) error
-	ResetCounter(partValue any) error
-	DeleteViewsAndIndexes() error
-	FlushTextSearchIndex(partValue int32) error
-}
-
-func (e *ScyllaController[T, E]) GetTable() ScyllaTable {
+func (e *ScyllaController[T, E]) GetTable() db.Table {
 	return e.Table
 }
 
 func (e *ScyllaController[T, E]) GetTableName() string {
-	return e.Table.name
+	return e.Table.Name
 }
 
 func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any) []any {
@@ -65,14 +45,14 @@ func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any)
 	}
 
 	// Add lastKey filter if provided (for pagination)
-	if lastKey != nil && len(e.Table.keys) > 0 {
-		query.SetWhere(e.Table.keys[0].GetName(), ">=", lastKey)
+	if lastKey != nil && len(e.Table.Keys) > 0 {
+		query.SetWhere(e.Table.Keys[0].GetName(), ">=", lastKey)
 	}
 
 	// Execute the query
-	fmt.Println("Obteniendo registros de::", e.Table.name)
+	fmt.Println("Obteniendo registros de::", e.Table.Name)
 	if err := query.Exec(); err != nil {
-		fmt.Println("Error al consultar", e.Table.name, ":", err)
+		fmt.Println("Error al consultar", e.Table.Name, ":", err)
 		return nil
 	}
 	fmt.Println("reqgistros obtenidos (1)::", len(records))
@@ -85,7 +65,7 @@ func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any)
 	return recordsAny
 }
 
-func (e *ScyllaController[T, E]) GetRecordsCSV(partValue int32) (CSVResult, error) {
+func (e *ScyllaController[T, E]) GetRecordsCSV(partValue int32) (db.CSVResult, error) {
 	scyllaTable := &e.Table
 	return exportToCSV(scyllaTable, partValue)
 }
@@ -100,7 +80,7 @@ func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
 	}
 
 	if err := query.Exec(); err != nil {
-		fmt.Println("Error al consultar", e.Table.name, ":", err)
+		fmt.Println("Error al consultar", e.Table.Name, ":", err)
 		return err
 	}
 
@@ -114,10 +94,10 @@ func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
 }
 
 func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
-	scyllaTable := getOrCompileScyllaTable(initStructTable[E, T](new(E)))
+	scyllaTable := getOrCompileScyllaTable(db.InitStructTable[E, T](new(E)))
 	virtualColumns := []IColInfo{}
-	selectedColumns := make([]IColInfo, 0, len(scyllaTable.columns))
-	for _, column := range scyllaTable.columns {
+	selectedColumns := make([]IColInfo, 0, len(scyllaTable.Columns))
+	for _, column := range scyllaTable.Columns {
 		if column == nil || column.IsNil() {
 			continue
 		}
@@ -151,11 +131,11 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 		queryStr = fmt.Sprintf("%v WHERE %v = %v", queryStr, partitionColumn.GetName(), partValue)
 	}
 
-	fmt.Printf("RecalcVirtualColumns | table=%s | query=%s\n", scyllaTable.name, queryStr)
+	fmt.Printf("RecalcVirtualColumns | table=%s | query=%s\n", scyllaTable.Name, queryStr)
 	queryIterator := getScyllaConnection().Query(queryStr).Iter()
 	rowData, err := queryIterator.RowData()
 	if err != nil {
-		return Err("RecalcVirtualColumns RowData failed for table", scyllaTable.name, ":", err)
+		return Err("RecalcVirtualColumns RowData failed for table", scyllaTable.Name, ":", err)
 	}
 
 	updatesToApply := []virtualColumnsRecalcUpdate[T]{}
@@ -165,7 +145,7 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 	scanner := queryIterator.Scanner()
 	for scanner.Next() {
 		if err := scanner.Scan(rowData.Values...); err != nil {
-			return Err("RecalcVirtualColumns scan failed for table", scyllaTable.name, ":", err)
+			return Err("RecalcVirtualColumns scan failed for table", scyllaTable.Name, ":", err)
 		}
 		rowsScanned++
 
@@ -203,15 +183,15 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 	}
 
 	if err := queryIterator.Close(); err != nil {
-		return Err("RecalcVirtualColumns query close failed for table", scyllaTable.name, ":", err)
+		return Err("RecalcVirtualColumns query close failed for table", scyllaTable.Name, ":", err)
 	}
 
 	if len(updatesToApply) == 0 {
-		fmt.Printf("RecalcVirtualColumns | table=%s | rows_scanned=%d | rows_updated=0\n", scyllaTable.name, rowsScanned)
+		fmt.Printf("RecalcVirtualColumns | table=%s | rows_scanned=%d | rows_updated=0\n", scyllaTable.Name, rowsScanned)
 		return nil
 	}
 
-	whereColumns := scyllaTable.keys
+	whereColumns := scyllaTable.Keys
 	if partitionColumn != nil && !partitionColumn.IsNil() {
 		whereColumns = append([]IColInfo{partitionColumn}, whereColumns...)
 	}
@@ -254,10 +234,10 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 		}
 
 		fmt.Printf("RecalcVirtualColumns | table=%s | chunk=%d/%d | rows_in_chunk=%d\n",
-			scyllaTable.name, chunkIndex+1, totalChunks, len(chunk))
+			scyllaTable.Name, chunkIndex+1, totalChunks, len(chunk))
 
 		if err := session.ExecuteBatch(batch); err != nil {
-			return Err("RecalcVirtualColumns update failed for table", scyllaTable.name, "chunk", chunkIndex+1, "of", totalChunks, ":", err)
+			return Err("RecalcVirtualColumns update failed for table", scyllaTable.Name, "chunk", chunkIndex+1, "of", totalChunks, ":", err)
 		}
 	}
 
@@ -268,26 +248,26 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 	slices.Sort(virtualColumnNames)
 	for _, virtualColumnName := range virtualColumnNames {
 		fmt.Printf("RecalcVirtualColumns | table=%s | virtual_column=%s | rows_saved=%d\n",
-			scyllaTable.name, virtualColumnName, updatedRowsByVirtualColumn[virtualColumnName])
+			scyllaTable.Name, virtualColumnName, updatedRowsByVirtualColumn[virtualColumnName])
 	}
 
 	fmt.Printf("RecalcVirtualColumns | table=%s | rows_scanned=%d | rows_updated=%d\n",
-		scyllaTable.name, rowsScanned, len(updatesToApply))
+		scyllaTable.Name, rowsScanned, len(updatesToApply))
 	return nil
 }
 
 func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
-	scyllaTable := getOrCompileScyllaTable(initStructTable[E, T](new(E)))
+	scyllaTable := getOrCompileScyllaTable(db.InitStructTable[E, T](new(E)))
 	if scyllaTable.indexUpdatedTable == nil || len(scyllaTable.indexGroups) == 0 {
 		return nil
 	}
 
 	partitionColumn := scyllaTable.GetPartKey()
 	if partitionColumn == nil || partitionColumn.IsNil() {
-		return Err("RecalcGroupIndexHashes requires a partition column for table:", scyllaTable.name)
+		return Err("RecalcGroupIndexHashes requires a partition column for table:", scyllaTable.Name)
 	}
 	if partValue <= 0 {
-		return Err("RecalcGroupIndexHashes requires a partition value > 0 for table:", scyllaTable.name)
+		return Err("RecalcGroupIndexHashes requires a partition value > 0 for table:", scyllaTable.Name)
 	}
 
 	selectedColumns := []IColInfo{}
@@ -304,8 +284,8 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 	}
 
 	appendSelectedColumn(partitionColumn)
-	if scyllaTable.updateCounterCol != nil {
-		appendSelectedColumn(scyllaTable.updateCounterCol)
+	if scyllaTable.UpdateCounterCol != nil {
+		appendSelectedColumn(scyllaTable.UpdateCounterCol)
 	}
 	for _, indexGroup := range scyllaTable.indexGroups {
 		if !shouldPersistIndexUpdatedGroup(indexGroup) {
@@ -329,11 +309,11 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 	}
 
 	deleteStatement := fmt.Sprintf("DELETE FROM %v.%v WHERE partition_id = ?",
-		scyllaTable.keyspace,
+		scyllaTable.Namespace,
 		scyllaTable.indexUpdatedTable.name,
 	)
 	if err := QueryExec(deleteStatement, partValue); err != nil {
-		return Err("RecalcGroupIndexHashes delete failed for table", scyllaTable.name, ":", err)
+		return Err("RecalcGroupIndexHashes delete failed for table", scyllaTable.Name, ":", err)
 	}
 
 	queryStr := fmt.Sprintf(
@@ -343,12 +323,12 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 		partitionColumn.GetName(),
 		partValue,
 	)
-	fmt.Printf("RecalcGroupIndexHashes | table=%s | query=%s\n", scyllaTable.name, queryStr)
+	fmt.Printf("RecalcGroupIndexHashes | table=%s | query=%s\n", scyllaTable.Name, queryStr)
 
 	queryIterator := getScyllaConnection().Query(queryStr).Iter()
 	rowData, err := queryIterator.RowData()
 	if err != nil {
-		return Err("RecalcGroupIndexHashes RowData failed for table", scyllaTable.name, ":", err)
+		return Err("RecalcGroupIndexHashes RowData failed for table", scyllaTable.Name, ":", err)
 	}
 
 	rowsScanned := 0
@@ -357,7 +337,7 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 	scanner := queryIterator.Scanner()
 	for scanner.Next() {
 		if err := scanner.Scan(rowData.Values...); err != nil {
-			return Err("RecalcGroupIndexHashes scan failed for table", scyllaTable.name, ":", err)
+			return Err("RecalcGroupIndexHashes scan failed for table", scyllaTable.Name, ":", err)
 		}
 		rowsScanned++
 
@@ -381,21 +361,21 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 	}
 
 	if err := queryIterator.Close(); err != nil {
-		return Err("RecalcGroupIndexHashes query close failed for table", scyllaTable.name, ":", err)
+		return Err("RecalcGroupIndexHashes query close failed for table", scyllaTable.Name, ":", err)
 	}
 
 	if len(rowsToPersist) == 0 {
 		fmt.Printf("RecalcGroupIndexHashes | table=%s | partition=%d | rows_scanned=%d | rows_persisted=0\n",
-			scyllaTable.name, partValue, rowsScanned)
+			scyllaTable.Name, partValue, rowsScanned)
 		return nil
 	}
 
-	if err := persistIndexUpdatedRows(scyllaTable.keyspace, scyllaTable.indexUpdatedTable.name, rowsToPersist); err != nil {
-		return Err("RecalcGroupIndexHashes persist failed for table", scyllaTable.name, ":", err)
+	if err := persistIndexUpdatedRows(scyllaTable.Namespace, scyllaTable.indexUpdatedTable.name, rowsToPersist); err != nil {
+		return Err("RecalcGroupIndexHashes persist failed for table", scyllaTable.Name, ":", err)
 	}
 
 	fmt.Printf("RecalcGroupIndexHashes | table=%s | partition=%d | rows_scanned=%d | rows_persisted=%d\n",
-		scyllaTable.name, partValue, rowsScanned, len(rowsToPersist))
+		scyllaTable.Name, partValue, rowsScanned, len(rowsToPersist))
 	return nil
 }
 
@@ -459,23 +439,23 @@ func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 	if partitionColumn == nil || partitionColumn.IsNil() {
 		return nil
 	}
-	if !scyllaTable.useSequences || scyllaTable.autoincrementCol == nil {
+	if !scyllaTable.UseSequences || scyllaTable.AutoincrementCol == nil {
 		return nil
 	}
-	if len(scyllaTable.keys) == 0 {
-		return Err("ResetCounter requires at least one key column for table:", scyllaTable.name)
+	if len(scyllaTable.Keys) == 0 {
+		return Err("ResetCounter requires at least one key column for table:", scyllaTable.Name)
 	}
 	if partValue == nil {
-		return Err("ResetCounter requires a non-nil partition value for table:", scyllaTable.name)
+		return Err("ResetCounter requires a non-nil partition value for table:", scyllaTable.Name)
 	}
 
 	// Read max persisted key in the target partition to align sequence with current data.
-	keyColumn := scyllaTable.keys[0]
+	keyColumn := scyllaTable.Keys[0]
 	// Use column metadata to validate the key once, then reuse the shared numeric converter.
 	switch keyColumn.GetType().Type {
 	case 2, 3, 4, 5:
 	default:
-		return Err("ResetCounter only supports numeric key types. table:", scyllaTable.name, "key:", keyColumn.GetName())
+		return Err("ResetCounter only supports numeric key types. table:", scyllaTable.Name, "key:", keyColumn.GetName())
 	}
 
 	maxValueQuery := fmt.Sprintf(
@@ -487,25 +467,25 @@ func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 	queryIterator := getScyllaConnection().Query(maxValueQuery, partValue).Iter()
 	rowData, err := queryIterator.RowData()
 	if err != nil {
-		return Err("ResetCounter max-value query failed for table", scyllaTable.name, ":", err)
+		return Err("ResetCounter max-value query failed for table", scyllaTable.Name, ":", err)
 	}
 
 	maxKeyValue := int64(0)
 	rowScanner := queryIterator.Scanner()
 	if rowScanner.Next() {
 		if err := rowScanner.Scan(rowData.Values...); err != nil {
-			return Err("ResetCounter max-value query failed for table", scyllaTable.name, ":", err)
+			return Err("ResetCounter max-value query failed for table", scyllaTable.Name, ":", err)
 		}
 		if len(rowData.Values) > 0 && rowData.Values[0] != nil {
-			maxKeyValue = reflectToInt64(rowData.Values[0])
+			maxKeyValue = db.ToInt64(rowData.Values[0])
 		}
 	}
 	if err := queryIterator.Close(); err != nil {
-		return Err("ResetCounter max-value query failed for table", scyllaTable.name, ":", err)
+		return Err("ResetCounter max-value query failed for table", scyllaTable.Name, ":", err)
 	}
 
 	// Counter naming must match the insert path (x{partition}_{table}_{autoincrementPart}).
-	counterName := fmt.Sprintf("x%v_%v_%v", partValue, scyllaTable.name, 0)
+	counterName := fmt.Sprintf("x%v_%v_%v", partValue, scyllaTable.Name, 0)
 	currentCounterValue, err := getSequenceCurrentValue(counterName)
 	if err != nil {
 		return Err("ResetCounter sequence read failed for", counterName, ":", err)
@@ -517,13 +497,13 @@ func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 		return nil
 	}
 
-	updateStatement := fmt.Sprintf("UPDATE %v.sequences SET current_value = current_value + ? WHERE name = ?", scyllaTable.keyspace)
+	updateStatement := fmt.Sprintf("UPDATE %v.sequences SET current_value = current_value + ? WHERE name = ?", scyllaTable.Namespace)
 	if err := getScyllaConnection().Query(updateStatement, delta, counterName).Exec(); err != nil {
 		return Err("ResetCounter sequence update failed for", counterName, ":", err)
 	}
 
 	fmt.Printf("ResetCounter | table=%s | partition=%v | counter=%s | previous=%d | maxKey=%d | delta=%d\n",
-		scyllaTable.name, partValue, counterName, currentCounterValue, maxKeyValue, delta)
+		scyllaTable.Name, partValue, counterName, currentCounterValue, maxKeyValue, delta)
 
 	return nil
 }
@@ -540,11 +520,11 @@ func (e *ScyllaController[T, E]) FlushTextSearchIndex(partValue int32) error {
 	}
 	ctx := context.Background()
 	for _, statusGroup := range []int8{0, 1} {
-		if err := text_search.FlushBucket(ctx, scyllaTable.name, partValue, statusGroup); err != nil {
-			return Err("FlushTextSearchIndex failed for table", scyllaTable.name, "partition", partValue, "group", statusGroup, ":", err)
+		if err := text_search.FlushBucket(ctx, scyllaTable.Name, partValue, statusGroup); err != nil {
+			return Err("FlushTextSearchIndex failed for table", scyllaTable.Name, "partition", partValue, "group", statusGroup, ":", err)
 		}
 	}
-	fmt.Printf("FlushTextSearchIndex | table=%s | partition=%d | groups=[0 1] flushed\n", scyllaTable.name, partValue)
+	fmt.Printf("FlushTextSearchIndex | table=%s | partition=%d | groups=[0 1] flushed\n", scyllaTable.Name, partValue)
 	return nil
 }
 
@@ -558,24 +538,24 @@ func (e *ScyllaController[T, E]) DeleteViewsAndIndexes() error {
 	viewNamesSeen := map[string]bool{}
 	viewsQuery := fmt.Sprintf(
 		"SELECT keyspace_name, view_name, base_table_name FROM system_schema.views WHERE keyspace_name = '%s'",
-		scyllaTable.keyspace,
+		scyllaTable.Namespace,
 	)
 	viewIterator := session.Query(viewsQuery).Iter()
 	var liveView ScyllaView
 	for viewIterator.Scan(&liveView.Keyspace, &liveView.Name, &liveView.BaseTable) {
-		if liveView.BaseTable != scyllaTable.name || viewNamesSeen[liveView.Name] {
+		if liveView.BaseTable != scyllaTable.Name || viewNamesSeen[liveView.Name] {
 			continue
 		}
 		viewNamesSeen[liveView.Name] = true
 		liveMaterializedViewNames = append(liveMaterializedViewNames, liveView.Name)
 	}
 	if err := viewIterator.Close(); err != nil {
-		return Err("DeleteViewsAndIndexes failed reading views catalog for table", scyllaTable.name, ":", err)
+		return Err("DeleteViewsAndIndexes failed reading views catalog for table", scyllaTable.Name, ":", err)
 	}
 
 	indexQuery := fmt.Sprintf(
 		"SELECT keyspace_name, table_name, index_name, kind FROM system_schema.indexes WHERE keyspace_name = '%s'",
-		scyllaTable.keyspace,
+		scyllaTable.Namespace,
 	)
 	indexIterator := session.Query(indexQuery).Iter()
 	liveIndexesByTable := map[string][]string{}
@@ -592,24 +572,24 @@ func (e *ScyllaController[T, E]) DeleteViewsAndIndexes() error {
 		liveIndexesByTable[liveIndex.Table] = append(liveIndexesByTable[liveIndex.Table], liveIndex.Name)
 	}
 	if err := indexIterator.Close(); err != nil {
-		return Err("DeleteViewsAndIndexes failed reading indexes catalog for table", scyllaTable.name, ":", err)
+		return Err("DeleteViewsAndIndexes failed reading indexes catalog for table", scyllaTable.Name, ":", err)
 	}
 
 	// Drop live base-table indexes directly from the catalog instead of trusting only the current ORM metadata.
-	for _, indexName := range liveIndexesByTable[scyllaTable.name] {
-		dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.keyspace, indexName)
+	for _, indexName := range liveIndexesByTable[scyllaTable.Name] {
+		dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.Namespace, indexName)
 		fmt.Println("DeleteViewsAndIndexes |", dropIndexStatement)
 		if err := QueryExec(dropIndexStatement); err != nil {
-			return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for table", scyllaTable.name, ":", err)
+			return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for table", scyllaTable.Name, ":", err)
 		}
 	}
 
 	// Drop all live MVs that still depend on the base table so DROP TABLE is no longer blocked by stale dependencies.
 	for _, viewName := range liveMaterializedViewNames {
-		dropViewStatement := fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %v.%v", scyllaTable.keyspace, viewName)
+		dropViewStatement := fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %v.%v", scyllaTable.Namespace, viewName)
 		fmt.Println("DeleteViewsAndIndexes |", dropViewStatement)
 		if err := QueryExec(dropViewStatement); err != nil {
-			return Err("DeleteViewsAndIndexes failed dropping live materialized view", viewName, "for table", scyllaTable.name, ":", err)
+			return Err("DeleteViewsAndIndexes failed dropping live materialized view", viewName, "for table", scyllaTable.Name, ":", err)
 		}
 	}
 
@@ -620,17 +600,17 @@ func (e *ScyllaController[T, E]) DeleteViewsAndIndexes() error {
 		}
 
 		for _, indexName := range liveIndexesByTable[view.name] {
-			dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.keyspace, indexName)
+			dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.Namespace, indexName)
 			fmt.Println("DeleteViewsAndIndexes |", dropIndexStatement)
 			if err := QueryExec(dropIndexStatement); err != nil {
 				return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for view table", view.name, ":", err)
 			}
 		}
 
-		dropViewTableStatement := fmt.Sprintf("DROP TABLE IF EXISTS %v.%v", scyllaTable.keyspace, view.name)
+		dropViewTableStatement := fmt.Sprintf("DROP TABLE IF EXISTS %v.%v", scyllaTable.Namespace, view.name)
 		fmt.Println("DeleteViewsAndIndexes |", dropViewTableStatement)
 		if err := QueryExec(dropViewTableStatement); err != nil {
-			return Err("DeleteViewsAndIndexes failed dropping view table", view.name, "for table", scyllaTable.name, ":", err)
+			return Err("DeleteViewsAndIndexes failed dropping view table", view.name, "for table", scyllaTable.Name, ":", err)
 		}
 	}
 
@@ -720,7 +700,7 @@ var cacheCodePrev int32
 var scyllaColumnsSaved []ScyllaColumns
 var scyllaIndexesSaved []ScyllaIndexes
 
-func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
+func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 	var scyllaColumns []ScyllaColumns
 	var scyllaIndexes []ScyllaIndexes
 	isFetched := false
@@ -795,10 +775,18 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 	}
 
 	for _, controller := range controllers {
-		table := controller.GetTable()
+		// Deploy emits CQL, so it needs this driver's full metadata (views, packed
+		// indexes, the index-updated table). A table compiled by another driver has
+		// nothing to deploy here.
+		table, isScyllaTable := controller.GetTable().(ScyllaTable)
+		if !isScyllaTable {
+			fmt.Printf("DeployScylla: %q was not compiled by the scylla driver, skipping\n",
+				controller.GetTableName())
+			continue
+		}
 		tableName := table.GetFullName()
 		originColumns := tableColumnsMap[tableName]
-		fmt.Println("Struct Type:", controller.GetTableName(),"| Columns:", len(originColumns))
+		fmt.Println("Struct Type:", controller.GetTableName(), "| Columns:", len(originColumns))
 
 		// Si no existe la tabla entonces la crea...
 		if len(originColumns) == 0 {
@@ -806,12 +794,12 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 			Logx(2, fmt.Sprintf(`Creando tabla "%v"...`+"\n", tableName))
 
 			columnsTypes := []string{}
-			for _, e := range table.columns {
-				columnsTypes = append(columnsTypes, e.GetName()+" "+e.GetType().ColType)
+			for _, e := range table.Columns {
+				columnsTypes = append(columnsTypes, e.GetName()+" "+e.GetType().DBType)
 			}
 
 			keys := []string{}
-			for _, key := range table.keys {
+			for _, key := range table.Keys {
 				keys = append(keys, key.GetName())
 			}
 
@@ -844,15 +832,15 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 		}
 
 		columnsSchemaMap := map[string]IColInfo{}
-		for name, col := range table.columnsMap {
+		for name, col := range table.ColumnsMap {
 			columnsSchemaMap[name] = col
 		}
 		columnsNoMapeadas := map[string]string{}
 
 		for _, originColumn := range originColumns {
 			if column, ok := columnsSchemaMap[originColumn.Name]; ok {
-				if column.GetType().ColType != originColumn.Type {
-					Logx(5, fmt.Sprintf(`La columna "%v" está definida con type "%v", pero en el Struct está con "%v" equivalente a "%v"`+"\n", originColumn.Name, originColumn.Type, column.GetType().FieldType, column.GetType().ColType))
+				if column.GetType().DBType != originColumn.Type {
+					Logx(5, fmt.Sprintf(`La columna "%v" está definida con type "%v", pero en el Struct está con "%v" equivalente a "%v"`+"\n", originColumn.Name, originColumn.Type, column.GetType().FieldType, column.GetType().DBType))
 				}
 				delete(columnsSchemaMap, originColumn.Name)
 			} else {
@@ -868,7 +856,7 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 			// Revisa las columnas que deben crearse en BD
 			for _, column := range columnsSchemaMap {
 				Logx(5, fmt.Sprintf(`La columna "%v" con struct type "%v" no existe en la BD de origen.`+"\n", column.GetName(), column.GetType().FieldType))
-				query := fmt.Sprintf(`ALTER TABLE %v ADD %v %v`, tableName, column.GetName(), column.GetType().ColType)
+				query := fmt.Sprintf(`ALTER TABLE %v ADD %v %v`, tableName, column.GetName(), column.GetType().DBType)
 				fmt.Printf(`Ejecutando agregar columna "%v"...`+"\n", query)
 
 				if err := QueryExec(query); err != nil {
@@ -882,11 +870,11 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 		tableIndexes := tableIndexesMap[tableName]
 
 		if table.indexUpdatedTable != nil {
-			indexUpdatedTableName := fmt.Sprintf("%v.%v", table.keyspace, table.indexUpdatedTable.name)
+			indexUpdatedTableName := fmt.Sprintf("%v.%v", table.Namespace, table.indexUpdatedTable.name)
 			if _, exists := tableColumnsMap[indexUpdatedTableName]; !exists {
 				Logx(5, fmt.Sprintf(`No se encontró la tabla de index updates "%v". Creando...`+"\n", indexUpdatedTableName))
 
-				createScript := getIndexUpdatedTableCreateScript(table.keyspace, table.indexUpdatedTable)
+				createScript := getIndexUpdatedTableCreateScript(table.Namespace, table.indexUpdatedTable)
 				fmt.Println(createScript)
 				if err := QueryExec(createScript); err != nil {
 					fmt.Println(err)
@@ -894,10 +882,10 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 				}
 
 				tableColumnsMap[indexUpdatedTableName] = []ScyllaColumns{
-					{Name: "partition_id", Type: "int", Keyspace: table.keyspace, Table: table.indexUpdatedTable.name},
-					{Name: "index_id", Type: "smallint", Keyspace: table.keyspace, Table: table.indexUpdatedTable.name},
-					{Name: "index_hash", Type: "int", Keyspace: table.keyspace, Table: table.indexUpdatedTable.name},
-					{Name: "update_counter", Type: "int", Keyspace: table.keyspace, Table: table.indexUpdatedTable.name},
+					{Name: "partition_id", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "index_id", Type: "smallint", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "index_hash", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "update_counter", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
 				}
 				Logx(2, fmt.Sprintf(`Index update table created "%v"`+"\n", table.indexUpdatedTable.name))
 			}
@@ -925,10 +913,10 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 
 		// Revisa si posee views, en su defecto las crea
 		for _, view := range table.views {
-			name := table.keyspace + "." + view.name
+			name := table.Namespace + "." + view.name
 			if _, ok := tableColumnsMap[name]; ok {
 			} else {
-				Logx(5, fmt.Sprintf(`No se encontró la view "%v" en la tabla "%v". Preparando creación...`+"\n", view.name, table.name))
+				Logx(5, fmt.Sprintf(`No se encontró la view "%v" en la tabla "%v". Preparando creación...`+"\n", view.name, table.Name))
 
 				createScript := view.getCreateScript()
 				fmt.Println(createScript)
@@ -940,7 +928,7 @@ func DeployScylla(cacheCode int32, controllers ...ScyllaControllerInterface) {
 				Logx(2, fmt.Sprintf(`View created "%v"`+"\n", view.name))
 			}
 
-			viewTableName := table.keyspace + "." + view.name
+			viewTableName := table.Namespace + "." + view.name
 			if view.Type == 9 {
 				maintenanceIndexName := getViewTableMaintenanceIndexName(view)
 				viewTableIndexes := tableIndexesMap[viewTableName]

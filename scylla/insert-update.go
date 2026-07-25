@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"reflect"
 	"slices"
 	"strings"
@@ -124,7 +125,7 @@ func fetchManagedCounterValues[T TableBaseInterface[E, T], E TableSchemaInterfac
 		counterValueByPartition: map[int64]any{},
 		counterNameByPartition:  map[int64]string{},
 	}
-	if len(*records) == 0 || scyllaTable.updateCounterCol == nil {
+	if len(*records) == 0 || scyllaTable.UpdateCounterCol == nil {
 		return prefetchedValues, nil
 	}
 
@@ -140,13 +141,13 @@ func fetchManagedCounterValues[T TableBaseInterface[E, T], E TableSchemaInterfac
 	}
 
 	for partitionValue := range partitionValuesToFetch {
-		counterName := fmt.Sprintf("x%v_%v_updated", partitionValue, scyllaTable.name)
-		nextCounterValue, err := getWriteCounterValue(scyllaTable.keyspace, counterName, 1)
+		counterName := fmt.Sprintf("x%v_%v_updated", partitionValue, scyllaTable.Name)
+		nextCounterValue, err := getWriteCounterValue(scyllaTable.Namespace, counterName, 1)
 		if err != nil {
 			return prefetchedManagedCounterValues{}, fmt.Errorf("write update counter %s: %w", counterName, err)
 		}
 		prefetchedValues.counterNameByPartition[partitionValue] = counterName
-		prefetchedValues.counterValueByPartition[partitionValue] = coerceManagedIntegerValue(scyllaTable.updateCounterCol, nextCounterValue)
+		prefetchedValues.counterValueByPartition[partitionValue] = coerceManagedIntegerValue(scyllaTable.UpdateCounterCol, nextCounterValue)
 	}
 
 	return prefetchedValues, nil
@@ -155,7 +156,7 @@ func fetchManagedCounterValues[T TableBaseInterface[E, T], E TableSchemaInterfac
 func applyPrefetchedManagedCounterValues[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	records *[]T, scyllaTable ScyllaTable, managedValues *managedWriteValues, prefetchedValues prefetchedManagedCounterValues,
 ) {
-	if scyllaTable.updateCounterCol == nil {
+	if scyllaTable.UpdateCounterCol == nil {
 		return
 	}
 
@@ -169,13 +170,13 @@ func applyPrefetchedManagedCounterValues[T TableBaseInterface[E, T], E TableSche
 
 		counterValue := prefetchedValues.counterValueByPartition[partitionValue]
 		managedValues.updateCounterValues[recordIndex] = counterValue
-		scyllaTable.updateCounterCol.SetValue(recordPointer, counterValue)
+		scyllaTable.UpdateCounterCol.SetValue(recordPointer, counterValue)
 	}
 
 	if DebugFull {
 		for partitionValue, counterName := range prefetchedValues.counterNameByPartition {
 			fmt.Printf("Write update counter assigned: table=%s partition=%d column=%s counter=%s records=%d\n",
-				scyllaTable.name, partitionValue, scyllaTable.updateCounterCol.GetName(), counterName, len(*records))
+				scyllaTable.Name, partitionValue, scyllaTable.UpdateCounterCol.GetName(), counterName, len(*records))
 		}
 	}
 }
@@ -196,20 +197,20 @@ func applyWriteManagedColumnsWithPrefetchedCounters[T TableBaseInterface[E, T], 
 	for recordIndex := range *records {
 		recordPointer := xunsafe.AsPointer(&(*records)[recordIndex])
 
-		if isInsert && scyllaTable.createdCol != nil {
-			createdValue := resolveManagedTimestampValue(scyllaTable.createdCol, recordPointer, currentWriteTime)
+		if isInsert && scyllaTable.CreatedCol != nil {
+			createdValue := resolveManagedTimestampValue(scyllaTable.CreatedCol, recordPointer, currentWriteTime)
 			managedValues.createdValues[recordIndex] = createdValue
-			scyllaTable.createdCol.SetValue(recordPointer, createdValue)
+			scyllaTable.CreatedCol.SetValue(recordPointer, createdValue)
 		}
 
-		if scyllaTable.updatedCol != nil {
-			updatedValue := resolveManagedTimestampValue(scyllaTable.updatedCol, recordPointer, currentWriteTime)
+		if scyllaTable.UpdatedCol != nil {
+			updatedValue := resolveManagedTimestampValue(scyllaTable.UpdatedCol, recordPointer, currentWriteTime)
 			managedValues.updatedValues[recordIndex] = updatedValue
-			scyllaTable.updatedCol.SetValue(recordPointer, updatedValue)
+			scyllaTable.UpdatedCol.SetValue(recordPointer, updatedValue)
 		}
 	}
 
-	if scyllaTable.updateCounterCol != nil {
+	if scyllaTable.UpdateCounterCol != nil {
 		valuesToApply := prefetchedManagedCounterValues{}
 		if prefetchedValues == nil {
 			fetchedValues, err := fetchManagedCounterValues(records, scyllaTable)
@@ -236,7 +237,7 @@ func fetchAutoincrementCounterStarts[T TableBaseInterface[E, T], E TableSchemaIn
 	records *[]T, scyllaTable ScyllaTable,
 ) (map[string]int64, error) {
 	counterStartByGroup := map[string]int64{}
-	if scyllaTable.autoincrementCol == nil {
+	if scyllaTable.AutoincrementCol == nil {
 		return counterStartByGroup, nil
 	}
 
@@ -253,8 +254,8 @@ func fetchAutoincrementCounterStarts[T TableBaseInterface[E, T], E TableSchemaIn
 		}
 
 		autoPartVal := int64(0)
-		if scyllaTable.autoincrementPart != nil {
-			autoPartVal = convertToInt64(scyllaTable.autoincrementPart.GetRawValue(ptr))
+		if scyllaTable.AutoincrementPart != nil {
+			autoPartVal = convertToInt64(scyllaTable.AutoincrementPart.GetRawValue(ptr))
 		}
 
 		key := fmt.Sprintf("%d|%v", partitionValue, autoPartVal)
@@ -266,7 +267,7 @@ func fetchAutoincrementCounterStarts[T TableBaseInterface[E, T], E TableSchemaIn
 		recordsNeedingAutoincrement := 0
 		for _, rec := range group {
 			ptr := xunsafe.AsPointer(rec)
-			rawAutoincrementValue := scyllaTable.autoincrementCol.GetRawValue(ptr)
+			rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr)
 			if convertToInt64(rawAutoincrementValue) <= 0 {
 				recordsNeedingAutoincrement++
 			}
@@ -275,7 +276,7 @@ func fetchAutoincrementCounterStarts[T TableBaseInterface[E, T], E TableSchemaIn
 			continue
 		}
 
-		counterName := fmt.Sprintf("x%v_%v_%v", partValues[0], scyllaTable.name, partValues[1])
+		counterName := fmt.Sprintf("x%v_%v_%v", partValues[0], scyllaTable.Name, partValues[1])
 		keyspace := strings.Split(scyllaTable.GetFullName(), ".")[0]
 		counterStartValue, err := GetCounter(keyspace, counterName, recordsNeedingAutoincrement)
 		if err != nil {
@@ -307,8 +308,8 @@ func handlePreInsert[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 
 		// Get autoincrement part value (0 if not defined)
 		autoPartVal := int64(0)
-		if scyllaTable.autoincrementPart != nil {
-			autoPartVal = convertToInt64(scyllaTable.autoincrementPart.GetRawValue(ptr))
+		if scyllaTable.AutoincrementPart != nil {
+			autoPartVal = convertToInt64(scyllaTable.AutoincrementPart.GetRawValue(ptr))
 		}
 
 		// Group key is concatenation of partition value + autoincrementPart value
@@ -325,8 +326,8 @@ func handlePreInsert[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 		for _, rec := range group {
 			ptr := xunsafe.AsPointer(rec)
 			autoincrementColumnValue := int64(0)
-			if scyllaTable.autoincrementCol != nil {
-				rawAutoincrementValue := scyllaTable.autoincrementCol.GetRawValue(ptr)
+			if scyllaTable.AutoincrementCol != nil {
+				rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr)
 				autoincrementColumnValue = convertToInt64(rawAutoincrementValue)
 			}
 
@@ -343,19 +344,19 @@ func handlePreInsert[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 			var currentAutoVal int64
 
 			// Only apply autoincrement when this record was marked as needing it (<= 0 rule).
-			if scyllaTable.autoincrementCol != nil && recordNeedsAutoincrement[rec] {
+			if scyllaTable.AutoincrementCol != nil && recordNeedsAutoincrement[rec] {
 				currentAutoVal = counterVal
 				counterVal++
 
-				colInfo := scyllaTable.autoincrementCol.(*columnInfo)
-				if colInfo.autoincrementRandSize > 0 {
-					suffix := GetRandomInt64(colInfo.autoincrementRandSize)
-					currentAutoVal = currentAutoVal*Pow10Int64(int64(colInfo.autoincrementRandSize)) + suffix
+				colInfo := scyllaTable.AutoincrementCol.(*columnInfo)
+				if colInfo.AutoincrementRandDigits > 0 {
+					suffix := GetRandomInt64(colInfo.AutoincrementRandDigits)
+					currentAutoVal = currentAutoVal*Pow10Int64(int64(colInfo.AutoincrementRandDigits)) + suffix
 				}
 
 				// If not packing, set directly
 				if len(scyllaTable.keyIntPacking) == 0 {
-					scyllaTable.autoincrementCol.SetValue(ptr, currentAutoVal)
+					scyllaTable.AutoincrementCol.SetValue(ptr, currentAutoVal)
 				}
 			}
 
@@ -367,14 +368,14 @@ func handlePreInsert[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 						continue
 					}
 					var val int64
-					if col == scyllaTable.autoincrementCol {
+					if col == scyllaTable.AutoincrementCol {
 						val = currentAutoVal
 					} else {
 						val = convertToInt64(col.GetRawValue(ptr))
 					}
 
 					colPackingInfo := col.(*columnInfo)
-					decSize := int64(colPackingInfo.decimalSize)
+					decSize := int64(colPackingInfo.DecimalDigits)
 					// If it's the last one and size is 0, it takes all remaining space
 					if i == len(scyllaTable.keyIntPacking)-1 && decSize == 0 {
 						decSize = remainingDigits
@@ -389,7 +390,7 @@ func handlePreInsert[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 					packedValue += val * shift
 				}
 				// Set into the only key
-				scyllaTable.keys[0].SetValue(ptr, packedValue)
+				scyllaTable.Keys[0].SetValue(ptr, packedValue)
 			}
 		}
 	}
@@ -409,7 +410,7 @@ type PreparedStatement struct {
 // production batch path would emit for each record. Intended for tests and debugging — the
 // production path builds the same shape directly into a gocql.Batch via appendInsertQueriesToBatch.
 func MakeInsertStatement[T TableBaseInterface[E, T], E TableSchemaInterface[E]](records *[]T, columnsToExclude ...Coln) []PreparedStatement {
-	refTable := initStructTable[E, T](new(E))
+	refTable := db.InitStructTable[E, T](new(E))
 	scyllaTable := getOrCompileScyllaTable(refTable)
 	managedValues, err := applyWriteManagedColumns(records, scyllaTable, true)
 	if err != nil {
@@ -438,7 +439,7 @@ func MakeInsertStatement[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 			var value any
 			if managedValue, found := managedValues.getValueForColumn(i, col, true); found {
 				value = managedValue
-			} else if slices.Contains(scyllaTable.keysIdx, col.GetInfo().Idx) {
+			} else if slices.Contains(scyllaTable.KeysIdx, col.GetInfo().Idx) {
 				value = col.GetStatementValue(ptr)
 			} else {
 				value = getNormalizedWriteValue(col, ptr)
@@ -448,10 +449,6 @@ func MakeInsertStatement[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 		entries = append(entries, PreparedStatement{Stmt: stmt, Args: args})
 	}
 	return entries
-}
-
-func Table[T TableBaseInterface[E, T], E TableSchemaInterface[E]]() *E {
-	return initStructTable[E, T](new(E))
 }
 
 func normalizeEmptyStringWriteValue(value any) any {
@@ -481,7 +478,7 @@ func getNormalizedWriteValue(column IColInfo, ptr unsafe.Pointer) any {
 
 func collectInsertColumns(scyllaTable *ScyllaTable, columnsToExclude []Coln) []IColInfo {
 	if len(columnsToExclude) == 0 {
-		return scyllaTable.columns
+		return scyllaTable.Columns
 	}
 
 	columnNamesToExclude := []string{}
@@ -490,7 +487,7 @@ func collectInsertColumns(scyllaTable *ScyllaTable, columnsToExclude []Coln) []I
 	}
 
 	columnsToInsert := []IColInfo{}
-	for _, column := range scyllaTable.columns {
+	for _, column := range scyllaTable.Columns {
 		mustIncludeManagedColumn := column.GetName() == managedCreatedColumnName ||
 			column.GetName() == managedUpdatedColumnName ||
 			column.GetName() == managedUpdateCounterColumnName
@@ -520,7 +517,7 @@ func makeInsertBatch[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	queryStrInsert := fmt.Sprintf(`INSERT INTO %v (%v) VALUES (%v)`,
 		scyllaTable.GetFullName(), strings.Join(columnsNames, ", "), strings.Join(columnPlaceholders, ", "))
 
-	appendInsertQueriesToBatch(batch, queryStrInsert, records, columns, scyllaTable.keysIdx, managedValues)
+	appendInsertQueriesToBatch(batch, queryStrInsert, records, columns, scyllaTable.KeysIdx, managedValues)
 	return batch
 }
 
@@ -551,7 +548,7 @@ func appendInsertQueriesToBatch[T TableBaseInterface[E, T], E TableSchemaInterfa
 
 func collectAllWritableColumns(scyllaTable *ScyllaTable) []IColInfo {
 	affectedColumns := []IColInfo{}
-	for _, column := range scyllaTable.columns {
+	for _, column := range scyllaTable.Columns {
 		if column.GetInfo().IsVirtual {
 			continue
 		}
@@ -574,22 +571,22 @@ func collectAffectedColumnsForInsert(scyllaTable *ScyllaTable, columnsToExclude 
 func collectAffectedColumnsForInclude(scyllaTable *ScyllaTable, columnsToInclude []Coln) []IColInfo {
 	affectedColumns := []IColInfo{}
 	for _, columnToInclude := range columnsToInclude {
-		column := scyllaTable.columnsMap[columnToInclude.GetName()]
+		column := scyllaTable.ColumnsMap[columnToInclude.GetName()]
 		if column == nil || column.IsNil() || column.GetInfo().IsVirtual {
 			continue
 		}
 		affectedColumns = append(affectedColumns, column)
 	}
-	if scyllaTable.updatedCol != nil {
+	if scyllaTable.UpdatedCol != nil {
 		updatedAlreadyIncluded := false
 		for _, affectedColumn := range affectedColumns {
-			if affectedColumn.GetName() == scyllaTable.updatedCol.GetName() {
+			if affectedColumn.GetName() == scyllaTable.UpdatedCol.GetName() {
 				updatedAlreadyIncluded = true
 				break
 			}
 		}
 		if !updatedAlreadyIncluded {
-			affectedColumns = append(affectedColumns, scyllaTable.updatedCol)
+			affectedColumns = append(affectedColumns, scyllaTable.UpdatedCol)
 		}
 	}
 	return affectedColumns
@@ -602,8 +599,8 @@ func collectAffectedColumnsForExclude(scyllaTable *ScyllaTable, columnsToExclude
 	}
 
 	affectedColumns := []IColInfo{}
-	for _, column := range scyllaTable.columns {
-		mustIncludeUpdated := scyllaTable.updatedCol != nil && column.GetName() == scyllaTable.updatedCol.GetName()
+	for _, column := range scyllaTable.Columns {
+		mustIncludeUpdated := scyllaTable.UpdatedCol != nil && column.GetName() == scyllaTable.UpdatedCol.GetName()
 		if column.GetInfo().IsVirtual || (!mustIncludeUpdated && excludedColumnNames[column.GetName()]) {
 			continue
 		}
@@ -877,7 +874,7 @@ func executeInsertUpdateBatch[T TableBaseInterface[E, T], E TableSchemaInterface
 		panic("No se incluyeron columnas a actualizar.")
 	}
 
-	refTable := initStructTable[E, T](new(E))
+	refTable := db.InitStructTable[E, T](new(E))
 	scyllaTable := getOrCompileScyllaTable(refTable)
 
 	runSelfParseIfDefined(recordsForInsert)
@@ -888,7 +885,7 @@ func executeInsertUpdateBatch[T TableBaseInterface[E, T], E TableSchemaInterface
 	autoincrementCounterStarts := map[string]int64{}
 	var fetchGroup errgroup.Group
 
-	if scyllaTable.updateCounterCol != nil {
+	if scyllaTable.UpdateCounterCol != nil {
 		fetchGroup.Go(func() error {
 			values, err := fetchManagedCounterValues(&combinedRecords, scyllaTable)
 			if err != nil {
@@ -898,7 +895,7 @@ func executeInsertUpdateBatch[T TableBaseInterface[E, T], E TableSchemaInterface
 			return nil
 		})
 	}
-	if scyllaTable.autoincrementCol != nil && len(*recordsForInsert) > 0 {
+	if scyllaTable.AutoincrementCol != nil && len(*recordsForInsert) > 0 {
 		fetchGroup.Go(func() error {
 			values, err := fetchAutoincrementCounterStarts(recordsForInsert, scyllaTable)
 			if err != nil {
@@ -948,7 +945,7 @@ func executeInsertUpdateBatch[T TableBaseInterface[E, T], E TableSchemaInterface
 			end := min(start+maxInsertBatchRows, len(*recordsForInsert))
 			chunk := (*recordsForInsert)[start:end]
 			queryBatch := session.NewBatch(gocql.UnloggedBatch)
-			appendInsertQueriesToBatch(queryBatch, insertQueryStatement, &chunk, insertColumns, scyllaTable.keysIdx, managedInsertValues.slice(start, end))
+			appendInsertQueriesToBatch(queryBatch, insertQueryStatement, &chunk, insertColumns, scyllaTable.KeysIdx, managedInsertValues.slice(start, end))
 			if DebugFull {
 				fmt.Printf("InsertUpdate insert batch write: table=%s rows=%d statements=%d chunk=%d-%d total=%d\n",
 					scyllaTable.GetFullName(), len(chunk), len(queryBatch.Entries), start, end, len(*recordsForInsert))
@@ -1103,48 +1100,48 @@ func InsertUpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	records *[]T, columnsToInclude []Coln, columnsToExclude []Coln, onlyVirtual bool,
 ) (ScyllaTable, []IColInfo) {
-	refTable := initStructTable[E, T](new(E))
+	refTable := db.InitStructTable[E, T](new(E))
 	scyllaTable := getOrCompileScyllaTable(refTable)
 	columnsToUpdate := []IColInfo{}
 
 	if len(columnsToInclude) > 0 {
-		updatedAlreadyIncluded := scyllaTable.updatedCol == nil
-		updateCounterAlreadyIncluded := scyllaTable.updateCounterCol == nil
+		updatedAlreadyIncluded := scyllaTable.UpdatedCol == nil
+		updateCounterAlreadyIncluded := scyllaTable.UpdateCounterCol == nil
 		for _, col_ := range columnsToInclude {
-			col := scyllaTable.columnsMap[col_.GetName()]
+			col := scyllaTable.ColumnsMap[col_.GetName()]
 			if col == nil {
 				Print(col)
 				panic("No se encontró la columna (update):" + col_.GetName())
 			}
-			if slices.Contains(scyllaTable.keysIdx, col.GetInfo().Idx) {
-				msg := fmt.Sprintf(`Table "%v": The column "%v" can't be updated because is part of primary key.`, scyllaTable.name, col.GetName())
+			if slices.Contains(scyllaTable.KeysIdx, col.GetInfo().Idx) {
+				msg := fmt.Sprintf(`Table "%v": The column "%v" can't be updated because is part of primary key.`, scyllaTable.Name, col.GetName())
 				panic(msg)
 			}
 			columnsToUpdate = append(columnsToUpdate, col)
-			if scyllaTable.updatedCol != nil && col.GetName() == scyllaTable.updatedCol.GetName() {
+			if scyllaTable.UpdatedCol != nil && col.GetName() == scyllaTable.UpdatedCol.GetName() {
 				updatedAlreadyIncluded = true
 			}
-			if scyllaTable.updateCounterCol != nil && col.GetName() == scyllaTable.updateCounterCol.GetName() {
+			if scyllaTable.UpdateCounterCol != nil && col.GetName() == scyllaTable.UpdateCounterCol.GetName() {
 				updateCounterAlreadyIncluded = true
 			}
 		}
 		if !updatedAlreadyIncluded {
-			columnsToUpdate = append(columnsToUpdate, scyllaTable.updatedCol)
+			columnsToUpdate = append(columnsToUpdate, scyllaTable.UpdatedCol)
 		}
 		if !updateCounterAlreadyIncluded {
 			// The managed update counter must always persist, even when callers provide an explicit include list.
-			columnsToUpdate = append(columnsToUpdate, scyllaTable.updateCounterCol)
+			columnsToUpdate = append(columnsToUpdate, scyllaTable.UpdateCounterCol)
 		}
 	} else {
 		columnsToExcludeNames := []string{}
 		for _, c := range columnsToExclude {
 			columnsToExcludeNames = append(columnsToExcludeNames, c.GetName())
 		}
-		for _, col := range scyllaTable.columns {
+		for _, col := range scyllaTable.Columns {
 			isExcluded := slices.Contains(columnsToExcludeNames, col.GetName())
-			mustIncludeManagedColumn := (scyllaTable.updatedCol != nil && col.GetName() == scyllaTable.updatedCol.GetName()) ||
-				(scyllaTable.updateCounterCol != nil && col.GetName() == scyllaTable.updateCounterCol.GetName())
-			if !col.GetInfo().IsVirtual && (mustIncludeManagedColumn || !isExcluded) && !slices.Contains(scyllaTable.keysIdx, col.GetInfo().Idx) {
+			mustIncludeManagedColumn := (scyllaTable.UpdatedCol != nil && col.GetName() == scyllaTable.UpdatedCol.GetName()) ||
+				(scyllaTable.UpdateCounterCol != nil && col.GetName() == scyllaTable.UpdateCounterCol.GetName())
+			if !col.GetInfo().IsVirtual && (mustIncludeManagedColumn || !isExcluded) && !slices.Contains(scyllaTable.KeysIdx, col.GetInfo().Idx) {
 				columnsToUpdate = append(columnsToUpdate, col)
 			}
 		}
@@ -1154,7 +1151,7 @@ func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInter
 	for _, col := range columnsToUpdate {
 		columnsIdx = append(columnsIdx, col.GetInfo().Idx)
 	}
-	columnsIncluded := slices.Concat(scyllaTable.keysIdx, columnsIdx)
+	columnsIncluded := slices.Concat(scyllaTable.KeysIdx, columnsIdx)
 	pk := scyllaTable.GetPartKey()
 	if pk != nil && !pk.IsNil() {
 		columnsIncluded = append(columnsIncluded, pk.GetInfo().Idx)
@@ -1189,10 +1186,10 @@ func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInter
 
 				includedColsNames := []string{}
 				for _, idx := range notIncludedCols {
-					includedColsNames = append(includedColsNames, scyllaTable.columnsIdxMap[idx].GetName())
+					includedColsNames = append(includedColsNames, scyllaTable.ColumnsIdxMap[idx].GetName())
 				}
 
-				msg := fmt.Sprintf(`Table "%v": A composit index/view requires the columns %v be updated together. Not Included: %v`, scyllaTable.name, strings.Join(colnames, ", "), strings.Join(includedColsNames, ", "))
+				msg := fmt.Sprintf(`Table "%v": A composit index/view requires the columns %v be updated together. Not Included: %v`, scyllaTable.Name, strings.Join(colnames, ", "), strings.Join(includedColsNames, ", "))
 				panic(msg)
 			} else if len(includedCols) > 0 {
 				columnsToUpdate = append(columnsToUpdate, indexViews.column)
@@ -1221,7 +1218,7 @@ func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInter
 
 		if len(includedCols) > 0 && len(notIncludedCols) > 0 {
 			panic(fmt.Sprintf(`Table "%v": CompositeBucketing index "%v" requires updating all source columns together. Included: %v | Missing: %v`,
-				scyllaTable.name,
+				scyllaTable.Name,
 				compositeBucketIndex.name,
 				strings.Join(includedCols, ", "),
 				strings.Join(notIncludedCols, ", "),
@@ -1267,7 +1264,7 @@ func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInter
 
 				if len(missingValuesInStruct) > 0 {
 					panic(fmt.Sprintf(`Table "%v": IndexGroup "%v" needs struct values for omitted source columns. Included in update: %v | Missing in struct: %v`,
-						scyllaTable.name,
+						scyllaTable.Name,
 						indexGroup.name,
 						strings.Join(includedSourceColumns, ", "),
 						strings.Join(missingValuesInStruct, ", "),
@@ -1298,7 +1295,7 @@ func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInter
 }
 
 func collectUpdateWhereColumns(scyllaTable ScyllaTable) []IColInfo {
-	columnsWhere := scyllaTable.keys
+	columnsWhere := scyllaTable.Keys
 	if partitionKey := scyllaTable.GetPartKey(); partitionKey != nil && !partitionKey.IsNil() {
 		columnsWhere = append([]IColInfo{partitionKey}, columnsWhere...)
 	}

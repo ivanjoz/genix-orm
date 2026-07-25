@@ -23,33 +23,33 @@ func resolveIndexPartitionColumn(dbTable *ScyllaTable, viewCfg Index) IColInfo {
 	if partitionColumnName == "" {
 		return nil
 	}
-	column := dbTable.columnsMap[partitionColumnName]
+	column := dbTable.ColumnsMap[partitionColumnName]
 	if column == nil || column.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": Partition column "%v" was not found`, dbTable.name, partitionColumnName))
+		panic(fmt.Sprintf(`Table "%v": Partition column "%v" was not found`, dbTable.Name, partitionColumnName))
 	}
 	if column.GetInfo().IsVirtual || column.GetType().IsComplexType || column.GetType().IsSlice {
-		panic(fmt.Sprintf(`Table "%v": Partition column "%v" cannot be virtual, a slice or a struct`, dbTable.name, column.GetName()))
+		panic(fmt.Sprintf(`Table "%v": Partition column "%v" cannot be virtual, a slice or a struct`, dbTable.Name, column.GetName()))
 	}
 	return column
 }
 
 func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	if indexPartitionColumnName(viewCfg) != "" {
-		panic(fmt.Sprintf(`Table "%v": ViewTables always keep the base partition; remove Partition`, dbTable.name))
+		panic(fmt.Sprintf(`Table "%v": ViewTables always keep the base partition; remove Partition`, dbTable.Name))
 	}
 	if viewCfg.UseHash {
-		panic(fmt.Sprintf(`Table "%v": ViewTables does not support UseHash`, dbTable.name))
+		panic(fmt.Sprintf(`Table "%v": ViewTables does not support UseHash`, dbTable.Name))
 	}
 	if len(viewCfg.Keys) == 0 {
-		panic(fmt.Sprintf(`Table "%v": ViewTables entry must declare at least one key column`, dbTable.name))
+		panic(fmt.Sprintf(`Table "%v": ViewTables entry must declare at least one key column`, dbTable.Name))
 	}
-	if len(dbTable.keys) != 1 {
-		panic(fmt.Sprintf(`Table "%v": ViewTables currently requires exactly one base key column for ID maintenance`, dbTable.name))
+	if len(dbTable.Keys) != 1 {
+		panic(fmt.Sprintf(`Table "%v": ViewTables currently requires exactly one base key column for ID maintenance`, dbTable.Name))
 	}
 
 	partKey := dbTable.GetPartKey()
 	if partKey == nil || partKey.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": ViewTables requires a partition column`, dbTable.name))
+		panic(fmt.Sprintf(`Table "%v": ViewTables requires a partition column`, dbTable.Name))
 	}
 
 	declaredColumns := []IColInfo{}
@@ -63,15 +63,15 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	sliceKeyCount := 0
 
 	for _, declaredColumn := range viewCfg.Keys {
-		column := dbTable.columnsMap[declaredColumn.GetInfo().Name]
+		column := dbTable.ColumnsMap[declaredColumn.GetInfo().Name]
 		if column == nil || column.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": ViewTables column "%v" was not found`, dbTable.name, declaredColumn.GetInfo().Name))
+			panic(fmt.Sprintf(`Table "%v": ViewTables column "%v" was not found`, dbTable.Name, declaredColumn.GetInfo().Name))
 		}
 		if column.GetType().IsComplexType {
-			panic(fmt.Sprintf(`Table "%v": ViewTables column "%v" cannot be a complex type`, dbTable.name, column.GetName()))
+			panic(fmt.Sprintf(`Table "%v": ViewTables column "%v" cannot be a complex type`, dbTable.Name, column.GetName()))
 		}
-		if column.GetInfo().Name == dbTable.keys[0].GetName() {
-			panic(fmt.Sprintf(`Table "%v": ViewTables key "%v" must not repeat the base ID column`, dbTable.name, column.GetName()))
+		if column.GetInfo().Name == dbTable.Keys[0].GetName() {
+			panic(fmt.Sprintf(`Table "%v": ViewTables key "%v" must not repeat the base ID column`, dbTable.Name, column.GetName()))
 		}
 
 		useSliceElement := column.GetType().IsSlice
@@ -90,15 +90,15 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	}
 
 	if sliceKeyCount > 1 {
-		panic(fmt.Sprintf(`Table "%v": ViewTables currently supports only one slice-backed key column`, dbTable.name))
+		panic(fmt.Sprintf(`Table "%v": ViewTables currently supports only one slice-backed key column`, dbTable.Name))
 	}
 
-	idColumn := dbTable.keys[0]
+	idColumn := dbTable.Keys[0]
 	physicalColumns = appendUniqueViewTableColumn(physicalColumns, makeViewTableColumn(idColumn, false))
 
 	projectedColumns := []IColInfo{}
 	if len(viewCfg.Cols) == 0 {
-		for _, baseColumn := range dbTable.columnsMap {
+		for _, baseColumn := range dbTable.ColumnsMap {
 			if baseColumn.GetInfo().IsVirtual {
 				continue
 			}
@@ -109,12 +109,12 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		}
 	} else {
 		for _, declaredProjectedColumn := range viewCfg.Cols {
-			projectedColumn := dbTable.columnsMap[declaredProjectedColumn.GetInfo().Name]
+			projectedColumn := dbTable.ColumnsMap[declaredProjectedColumn.GetInfo().Name]
 			if projectedColumn == nil || projectedColumn.IsNil() {
-				panic(fmt.Sprintf(`Table "%v": ViewTables projected column "%v" wasn't found`, dbTable.name, declaredProjectedColumn.GetInfo().Name))
+				panic(fmt.Sprintf(`Table "%v": ViewTables projected column "%v" wasn't found`, dbTable.Name, declaredProjectedColumn.GetInfo().Name))
 			}
 			if projectedColumn.GetInfo().IsVirtual {
-				panic(fmt.Sprintf(`Table "%v": ViewTables projected column "%v" cannot be virtual`, dbTable.name, projectedColumn.GetName()))
+				panic(fmt.Sprintf(`Table "%v": ViewTables projected column "%v" cannot be virtual`, dbTable.Name, projectedColumn.GetName()))
 			}
 			if projectedColumn.GetName() == fanoutColumnName {
 				continue
@@ -129,7 +129,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	}
 
 	viewColumns := append([]string{partKey.GetName()}, keyColumnNames...)
-	viewName := fmt.Sprintf(`%v__%v_view`, dbTable.name, strings.Join(keyColumnNames, "_"))
+	viewName := fmt.Sprintf(`%v__%v_view`, dbTable.Name, strings.Join(keyColumnNames, "_"))
 	view := &viewInfo{
 		Type:                9,
 		name:                viewName,
@@ -223,7 +223,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		for _, column := range viewPtr.tableColumns {
 			columnDefinitions = append(columnDefinitions, fmt.Sprintf("%v %v",
 				getViewTableColumnName(column),
-				getViewTableColumnType(column.SourceColumn, column.UsesSliceElement).ColType,
+				getViewTableColumnType(column.SourceColumn, column.UsesSliceElement).DBType,
 			))
 		}
 
@@ -234,7 +234,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 			PRIMARY KEY ((%v), %v)
 		)
 		%v;`,
-			dbTable.keyspace,
+			dbTable.Namespace,
 			viewPtr.name,
 			strings.Join(columnDefinitions, ", "),
 			partKey.GetName(),
@@ -277,7 +277,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	for _, declaredColumn := range viewCfg.Keys {
 		columnConfig := declaredColumn.GetInfo()
 		viewColumnsConfig = append(viewColumnsConfig, columnConfig)
-		if columnConfig.decimalSize > 0 || columnConfig.useInt32Packing {
+		if columnConfig.DecimalDigits > 0 || columnConfig.UseInt32Packing {
 			packedViewHintFound = true
 		}
 	}
@@ -297,7 +297,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	}
 
 	for _, colInfo := range viewCfg.Keys {
-		column := dbTable.columnsMap[colInfo.GetInfo().Name]
+		column := dbTable.ColumnsMap[colInfo.GetInfo().Name]
 		if column.GetType().IsComplexType {
 			panic("No puede usar un struct como columna de una view.")
 		}
@@ -320,7 +320,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			partColName := viewPartCol.GetName()
 			if isRangeView && slices.Contains(colNames, partColName) {
 				panic(fmt.Sprintf(`Table "%v": the Partition column "%v" cannot also be a packed view key`,
-					dbTable.name, partColName))
+					dbTable.Name, partColName))
 			}
 			clusteringColNames := make([]string, 0, len(colNames))
 			for _, colName := range colNames {
@@ -338,24 +338,24 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 
 	view := &viewInfo{
 		Type:          6,
-		name:          fmt.Sprintf(`%v__%v_view`, dbTable.name, colNamesJoined),
+		name:          fmt.Sprintf(`%v__%v_view`, dbTable.Name, colNamesJoined),
 		columns:       colNames,
 		columnsNoPart: colNamesNoPart,
 	}
 
 	if len(columns) > 1 {
 		view.column = &columnInfo{
-			colInfo: colInfo{
+			ColInfo: colInfo{
 				IsVirtual: true,
-				Idx:       dbTable._maxColIdx,
+				Idx:       dbTable.MaxColIdx,
 			},
-			colType: colType{
-				FieldType: "int32", ColType: "int",
+			ColType: colType{
+				FieldType: "int32", DBType: "int",
 			},
 		}
 		view.column.GetInfo().Name = fmt.Sprintf(`zz_%v`, colNamesJoined)
-		dbTable._maxColIdx++
-		dbTable.columnsMap[view.column.GetName()] = view.column
+		dbTable.MaxColIdx++
+		dbTable.ColumnsMap[view.column.GetName()] = view.column
 	}
 
 	if isSingleDeclaredSimpleView {
@@ -378,29 +378,29 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	} else if isRangeView {
 		view.Type = 8
 		view.column.GetType().FieldType = "int64"
-		view.column.GetType().ColType = "bigint"
+		view.column.GetType().DBType = "bigint"
 
 		if len(columns) < 2 {
-			panic(fmt.Sprintf(`The view "%v" in "%v" requires at least 2 columns for DecimalSize() packed range views`, view.name, dbTable.name))
+			panic(fmt.Sprintf(`The view "%v" in "%v" requires at least 2 columns for DecimalSize() packed range views`, view.name, dbTable.Name))
 		}
-		if viewColumnsConfig[0].decimalSize > 0 {
-			panic(fmt.Sprintf(`The view "%v" in "%v" cannot set DecimalSize() on the first column; it is inferred from the remaining columns`, view.name, dbTable.name))
+		if viewColumnsConfig[0].DecimalDigits > 0 {
+			panic(fmt.Sprintf(`The view "%v" in "%v" cannot set DecimalSize() on the first column; it is inferred from the remaining columns`, view.name, dbTable.Name))
 		}
 
-		isInt32PackedView := viewColumnsConfig[0].useInt32Packing
+		isInt32PackedView := viewColumnsConfig[0].UseInt32Packing
 		if isInt32PackedView {
 			view.column.GetType().FieldType = "int32"
-			view.column.GetType().ColType = "int"
+			view.column.GetType().DBType = "int"
 		}
 
 		radixSlotsByColumn := make([]int8, 0, len(viewColumnsConfig)-1)
 		for columnIndex := 1; columnIndex < len(viewColumnsConfig); columnIndex++ {
-			decimalSize := viewColumnsConfig[columnIndex].decimalSize
-			if decimalSize <= 0 {
+			DecimalDigits := viewColumnsConfig[columnIndex].DecimalDigits
+			if DecimalDigits <= 0 {
 				panic(fmt.Sprintf(`The view "%v" in "%v" must set DecimalSize() on column "%v" (only the first column can be inferred)`,
-					view.name, dbTable.name, columns[columnIndex].GetName()))
+					view.name, dbTable.Name, columns[columnIndex].GetName()))
 			}
-			radixSlotsByColumn = append(radixSlotsByColumn, decimalSize)
+			radixSlotsByColumn = append(radixSlotsByColumn, DecimalDigits)
 		}
 
 		radixes := append(radixSlotsByColumn, 0)
@@ -412,7 +412,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		}
 		slices.Reverse(radixes)
 		if radixes[0] > 17 {
-			panic(fmt.Sprintf(`For view "%v" in "%v" the max radix must not be greater than 17.`, view.name, dbTable.name))
+			panic(fmt.Sprintf(`For view "%v" in "%v" the max radix must not be greater than 17.`, view.name, dbTable.Name))
 		}
 
 		totalDigitsForPackedView := int64(19)
@@ -421,12 +421,12 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		}
 		slotDigitsPerColumn := make([]int64, 0, len(viewColumnsConfig))
 		sumTrailingDigits := int64(0)
-		for _, decimalSize := range radixSlotsByColumn {
-			sumTrailingDigits += int64(decimalSize)
+		for _, DecimalDigits := range radixSlotsByColumn {
+			sumTrailingDigits += int64(DecimalDigits)
 		}
 		slotDigitsPerColumn = append(slotDigitsPerColumn, totalDigitsForPackedView-sumTrailingDigits)
-		for _, decimalSize := range radixSlotsByColumn {
-			slotDigitsPerColumn = append(slotDigitsPerColumn, int64(decimalSize))
+		for _, DecimalDigits := range radixSlotsByColumn {
+			slotDigitsPerColumn = append(slotDigitsPerColumn, int64(DecimalDigits))
 		}
 		view.packedSourceColumns = append([]IColInfo{}, columns...)
 		view.packedSlotDigitsPerColumn = append([]int64{}, slotDigitsPerColumn...)
@@ -435,7 +435,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		for _, col := range columns {
 			if col.GetType().IsSlice || !slices.Contains(supportedTypes, col.GetType().FieldType) {
 				panic(fmt.Sprintf(`For view "%v" in "%v" need the column %v need to be a int type for the radix value be computed.`,
-					view.name, dbTable.name, col.GetName()))
+					view.name, dbTable.Name, col.GetName()))
 			}
 		}
 
@@ -456,7 +456,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 
 		viewCols := columns
 		useInt32Output := isInt32PackedView
-		view.column.(*columnInfo).getValue = func(ptr unsafe.Pointer) any {
+		view.column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
 			values := []int64{}
 			for _, col := range viewCols {
 				values = append(values, convertToInt64(col.GetValue(ptr)))
@@ -608,7 +608,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		viewCols := columns
 		view.Operators = []string{"=", "IN"}
 		view.Type = 7
-		view.column.(*columnInfo).getValue = func(ptr unsafe.Pointer) any {
+		view.column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
 			values := []any{}
 			for _, e := range viewCols {
 				values = append(values, e.GetValue(ptr))
@@ -682,21 +682,21 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	projectedColumnsConfig := viewCfg.Cols
 	projectedColumns := []IColInfo{}
 	for _, declaredProjectedColumn := range projectedColumnsConfig {
-		projectedColumn := dbTable.columnsMap[declaredProjectedColumn.GetInfo().Name]
+		projectedColumn := dbTable.ColumnsMap[declaredProjectedColumn.GetInfo().Name]
 		if projectedColumn == nil || projectedColumn.IsNil() {
 			panic(fmt.Sprintf(`The projected column "%v" for view "%v" in "%v" wasn't found.`,
-				declaredProjectedColumn.GetInfo().Name, view.name, dbTable.name))
+				declaredProjectedColumn.GetInfo().Name, view.name, dbTable.Name))
 		}
 		if projectedColumn.GetInfo().IsVirtual {
 			panic(fmt.Sprintf(`The projected column "%v" for view "%v" in "%v" cannot be virtual.`,
-				projectedColumn.GetName(), view.name, dbTable.name))
+				projectedColumn.GetName(), view.name, dbTable.Name))
 		}
 		projectedColumns = appendUniqueColumn(projectedColumns, projectedColumn)
 	}
 
 	selectableColumns := []IColInfo{}
 	if len(projectedColumns) == 0 {
-		for _, baseColumn := range dbTable.columnsMap {
+		for _, baseColumn := range dbTable.ColumnsMap {
 			if baseColumn.GetInfo().IsVirtual {
 				continue
 			}
@@ -711,7 +711,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 				selectableColumns = appendUniqueColumn(selectableColumns, declaredViewColumn)
 			}
 		}
-		for _, keyColumn := range dbTable.keys {
+		for _, keyColumn := range dbTable.Keys {
 			selectableColumns = appendUniqueColumn(selectableColumns, keyColumn)
 		}
 		if view.column != nil && !view.column.IsNil() && !view.column.GetInfo().IsVirtual {
@@ -740,7 +740,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			// The base partition becomes a clustering column of the relocated view.
 			whereCols = appendUniqueColumn(whereCols, basePartCol)
 		}
-		for _, keyColumn := range dbTable.keys {
+		for _, keyColumn := range dbTable.Keys {
 			whereCols = appendUniqueColumn(whereCols, keyColumn)
 		}
 		if wherePartCol != nil {
@@ -761,7 +761,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 
 		whereColumnsNotNull := []string{}
 		if wherePartCol != nil {
-			if wherePartCol.GetType().ColType == "text" {
+			if wherePartCol.GetType().DBType == "text" {
 				whereColumnsNotNull = append(whereColumnsNotNull, wherePartCol.GetName()+" IS NOT NULL")
 			} else {
 				// whereColumnsNotNull = append(whereColumnsNotNull, wherePartCol.GetName()+" > 0")
@@ -769,7 +769,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			}
 		}
 		for _, col := range whereCols {
-			if col.GetType().ColType == "text" {
+			if col.GetType().DBType == "text" {
 				whereColumnsNotNull = append(whereColumnsNotNull, col.GetName()+" IS NOT NULL")
 			} else {
 				// whereColumnsNotNull = append(whereColumnsNotNull, col.GetName()+" > 0")
@@ -805,7 +805,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			WHERE %v
 			PRIMARY KEY (%v)
 			%v;`,
-			dbTable.keyspace, viewPtr.name, selectClause, dbTable.GetFullName(),
+			dbTable.Namespace, viewPtr.name, selectClause, dbTable.GetFullName(),
 			strings.Join(whereColumnsNotNull, " AND "), primaryKey, makeStatementWith)
 	}
 

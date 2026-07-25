@@ -83,7 +83,7 @@ type weekIndexGroupSchema struct {
 
 func (e updateCounterSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Keyspace:  "test_keyspace",
+		Namespace: "test_keyspace",
 		Name:      "update_counter_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -92,7 +92,7 @@ func (e updateCounterSchema) GetSchema() TableSchema {
 
 func (e updateCounterDisabledSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Keyspace:             "test_keyspace",
+		Namespace:            "test_keyspace",
 		Name:                 "update_counter_records_disabled",
 		Partition:            e.CompanyID,
 		Keys:                 Cols(e.ID),
@@ -102,7 +102,7 @@ func (e updateCounterDisabledSchema) GetSchema() TableSchema {
 
 func (e indexGroupSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Keyspace:  "test_keyspace",
+		Namespace: "test_keyspace",
 		Name:      "index_group_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -121,7 +121,7 @@ func (e indexGroupSchema) GetSchema() TableSchema {
 
 func (e weekIndexGroupSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Keyspace:  "test_keyspace",
+		Namespace: "test_keyspace",
 		Name:      "week_index_group_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -138,7 +138,7 @@ func TestMakeScyllaTableAddsManagedAuditColumns(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterRecord, updateCounterSchema]()
 
 	for _, columnName := range []string{"created", "updated", "update_counter"} {
-		if scyllaTable.columnsMap[columnName] == nil {
+		if scyllaTable.ColumnsMap[columnName] == nil {
 			t.Fatalf("expected managed column %q to exist in table metadata", columnName)
 		}
 	}
@@ -147,13 +147,13 @@ func TestMakeScyllaTableAddsManagedAuditColumns(t *testing.T) {
 func TestMakeScyllaTableSkipsManagedUpdateCounterWhenDisabled(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterDisabledRecord, updateCounterDisabledSchema]()
 
-	if scyllaTable.columnsMap["created"] == nil || scyllaTable.columnsMap["updated"] == nil {
+	if scyllaTable.ColumnsMap["created"] == nil || scyllaTable.ColumnsMap["updated"] == nil {
 		t.Fatalf("expected created and updated managed columns to remain enabled")
 	}
-	if scyllaTable.columnsMap["update_counter"] != nil {
+	if scyllaTable.ColumnsMap["update_counter"] != nil {
 		t.Fatalf("expected update_counter managed column to be disabled")
 	}
-	if scyllaTable.updateCounterCol != nil {
+	if scyllaTable.UpdateCounterCol != nil {
 		t.Fatalf("expected updateCounterCol runtime metadata to be nil when disabled")
 	}
 }
@@ -226,7 +226,7 @@ func TestMakeUpdateStatementsAlwaysPersistsManagedUpdatedColumns(t *testing.T) {
 	records := []updateCounterRecord{
 		{CompanyID: 7, ID: 1, Nombre: "nuevo"},
 	}
-	table := Table[updateCounterRecord, updateCounterSchema]()
+	table := TableOf[updateCounterRecord, updateCounterSchema]()
 
 	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
@@ -317,7 +317,7 @@ func TestMakeUpdateStatementsAllowsIndexGroupUpdateWhenOmittedValuesExistInStruc
 	records := []indexGroupRecord{
 		{CompanyID: 7, ID: 1, Date: 18754, ClientID: 5, ProductIDs: []int32{11, 17}},
 	}
-	table := Table[indexGroupRecord, indexGroupSchema]()
+	table := TableOf[indexGroupRecord, indexGroupSchema]()
 
 	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
@@ -355,7 +355,7 @@ func TestMakeUpdateStatementsRejectsIndexGroupUpdateWhenOmittedValuesMissingInSt
 	records := []indexGroupRecord{
 		{CompanyID: 7, ID: 1, Date: 0, ClientID: 5, ProductIDs: nil},
 	}
-	table := Table[indexGroupRecord, indexGroupSchema]()
+	table := TableOf[indexGroupRecord, indexGroupSchema]()
 
 	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime

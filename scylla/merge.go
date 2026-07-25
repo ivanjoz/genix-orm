@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 
 	"github.com/viant/xunsafe"
 )
@@ -42,7 +43,7 @@ func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchema
 
 	partitionColumn := scyllaTable.GetPartKey()
 	keyColumn := scyllaTable.GetKeys()[0]
-	queryTable := initStructTable[E, T](new(E))
+	queryTable := db.InitStructTable[E, T](new(E))
 	groupsByPartition := map[string]*bulkLookupGroup{}
 
 	for recordIndex := range *records {
@@ -101,8 +102,8 @@ func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchema
 		}
 
 		queryInfo := &TableInfo{
-			refSlice:   &queryResult,
-			statements: statements,
+			RefSlice:   &queryResult,
+			Statements: statements,
 		}
 
 		if err := execQuery[E, T](queryTable, queryInfo, nil); err != nil {
@@ -164,7 +165,7 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 		return nil
 	}
 
-	queryTable := initStructTable[E, T](new(E))
+	queryTable := db.InitStructTable[E, T](new(E))
 	scyllaTable := getOrCompileScyllaTable(queryTable)
 	if len(scyllaTable.GetKeys()) != 1 {
 		return Err(`merge requires exactly one key column in schema`)
@@ -191,7 +192,7 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 				// We already hold the previous record, so decide here whether the searchable
 				// content actually changed and let the write path skip unchanged re-indexes.
 				if textSearchInfo != nil && !textSearchRecordChanged(textSearchInfo, previousRecord, currentRecord) {
-					recordID := convertToInt64(scyllaTable.keys[0].GetRawValue(currentRecordPointer))
+					recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(currentRecordPointer))
 					skipTextSearchRecordsIDs = append(skipTextSearchRecordsIDs, recordID)
 				}
 			}
@@ -209,12 +210,12 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 
 	// Combine inserts and updates into a single batch so the merge issues one Scylla round-trip,
 	// one managed-counter prefetch, one cache-version bump, and one text-search sync.
-	fmt.Println("Merge | records to Insert:", len(recordsToInsert), "Update:", len(recordsToUpdate),"| Text skip:", len(skipTextSearchRecordsIDs))
-	
+	fmt.Println("Merge | records to Insert:", len(recordsToInsert), "Update:", len(recordsToUpdate), "| Text skip:", len(skipTextSearchRecordsIDs))
+
 	if err := executeInsertUpdateBatch(insertUpdateBatchParams[T, E]{
 		recordsForInsert:         &recordsToInsert,
 		recordsForUpdate:         &recordsToUpdate,
-		columnsToUpdate:            columnsToExcludeUpdate,
+		columnsToUpdate:          columnsToExcludeUpdate,
 		skipTextSearchRecordsIDs: skipTextSearchRecordsIDs,
 	}); err != nil {
 		return err

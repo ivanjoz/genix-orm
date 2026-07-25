@@ -9,10 +9,10 @@ func TestQueryIndexGroupStoresCachedGroupsInTableInfo(t *testing.T) {
 	query.IncludeCachedGroup(101, 33)
 
 	tableInfo := any(query).(interface{ GetTableInfo() *TableInfo }).GetTableInfo()
-	if !tableInfo.useIndexGroupSelect {
+	if !tableInfo.UseIndexGroupSelect {
 		t.Fatal("expected QueryIndexGroup to enable grouped execution")
 	}
-	if cachedCounter := tableInfo.cachedIndexGroups[101]; cachedCounter != 33 {
+	if cachedCounter := tableInfo.CachedIndexGroups[101]; cachedCounter != 33 {
 		t.Fatalf("expected cached group counter 33, got %d", cachedCounter)
 	}
 }
@@ -20,7 +20,7 @@ func TestQueryIndexGroupStoresCachedGroupsInTableInfo(t *testing.T) {
 func TestBuildIndexGroupSelectPlanAllowsSingleColumnRawGroup(t *testing.T) {
 	scyllaTable := MakeScyllaTable[indexGroupRecord, indexGroupSchema]()
 	tableInfo := &TableInfo{
-		statements: []ColumnStatement{
+		Statements: []ColumnStatement{
 			{Col: "empresa_id", Operator: "=", Value: int32(7)},
 			{Col: "date", Operator: "BETWEEN", From: []ColumnStatement{{Col: "date", Value: int16(18754)}}, To: []ColumnStatement{{Col: "date", Value: int16(18756)}}},
 		},

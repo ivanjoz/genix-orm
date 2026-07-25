@@ -9,14 +9,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type RecordGroup[T any] struct {
-	IndexID          int16   `json:"ig"`
-	GroupHash        int32   `json:"id"`
-	IndexGroupValues []int64 `json:"igVal"`
-	Records          []T     `json:"records"`
-	UpdateCounter    int32   `json:"upc"`
-}
-
 type queryIndexGroupHash struct {
 	hashValue        int32
 	indexGroupValues []int64
@@ -38,30 +30,30 @@ type indexGroupFetchState struct {
 var loadIndexGroupFreshnessRows = loadIndexGroupFreshnessRowsFromScylla
 
 func execIndexGroupQuery[T TableSchemaInterface[T], E any](schemaStruct *T, tableInfo *TableInfo) error {
-	if len(tableInfo.columnsInclude) > 0 || len(tableInfo.columnsExclude) > 0 {
+	if len(tableInfo.ColumnsInclude) > 0 || len(tableInfo.ColumnsExclude) > 0 {
 		return fmt.Errorf("QueryIndexGroup does not support Select() or Exclude() yet")
 	}
-	if len(tableInfo.groupByColumns) > 0 {
+	if len(tableInfo.GroupByColumns) > 0 {
 		return fmt.Errorf("QueryIndexGroup does not support GroupBy()")
 	}
-	if tableInfo.orderBy != "" {
+	if tableInfo.OrderBy != "" {
 		return fmt.Errorf("QueryIndexGroup does not support OrderDesc() yet")
 	}
-	if tableInfo.limit > 0 {
+	if tableInfo.Limit > 0 {
 		return fmt.Errorf("QueryIndexGroup does not support Limit() yet")
 	}
-	if tableInfo.allowFilter {
+	if tableInfo.AllowFilter {
 		return fmt.Errorf("QueryIndexGroup does not support AllowFilter()")
 	}
 
-	refGroups := tableInfo.refSlice.(*[]RecordGroup[E])
+	refGroups := tableInfo.RefSlice.(*[]RecordGroup[E])
 	*refGroups = (*refGroups)[:0]
 
 	scyllaTable := getOrCompileScyllaTable(schemaStruct)
-	if len(scyllaTable.keyspace) == 0 {
-		scyllaTable.keyspace = connParams.Keyspace
+	if len(scyllaTable.Namespace) == 0 {
+		scyllaTable.Namespace = connParams.Keyspace
 	}
-	if len(scyllaTable.keyspace) == 0 {
+	if len(scyllaTable.Namespace) == 0 {
 		return fmt.Errorf("no se ha especificado un keyspace")
 	}
 
@@ -76,10 +68,10 @@ func execIndexGroupQuery[T TableSchemaInterface[T], E any](schemaStruct *T, tabl
 		return err
 	}
 
-	fetchStates, cachedStates := splitIndexGroupFetches(queryPlan.hashGroups, serverFreshnessByHash, tableInfo.cachedIndexGroups)
+	fetchStates, cachedStates := splitIndexGroupFetches(queryPlan.hashGroups, serverFreshnessByHash, tableInfo.CachedIndexGroups)
 	if len(fetchStates) == 0 && len(cachedStates) == 0 {
 		fmt.Printf("QueryIndexGroup skipped all groups: table=%s partition=%d hashes=%d\n",
-			scyllaTable.name, queryPlan.partitionValue, len(hashValues))
+			scyllaTable.Name, queryPlan.partitionValue, len(hashValues))
 		return nil
 	}
 
@@ -115,7 +107,7 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 	statements := collectSelectStatements(tableInfo)
 	partitionColumn := scyllaTable.GetPartKey()
 	if partitionColumn == nil || partitionColumn.IsNil() {
-		return nil, fmt.Errorf(`QueryIndexGroup requires a partition column on table "%v"`, scyllaTable.name)
+		return nil, fmt.Errorf(`QueryIndexGroup requires a partition column on table "%v"`, scyllaTable.Name)
 	}
 
 	statementByColumn := map[string][]ColumnStatement{}
@@ -148,7 +140,7 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 	}
 
 	if bestIndexGroup == nil {
-		return nil, fmt.Errorf(`QueryIndexGroup did not find a compatible UseIndexGroup for table "%v"`, scyllaTable.name)
+		return nil, fmt.Errorf(`QueryIndexGroup did not find a compatible UseIndexGroup for table "%v"`, scyllaTable.Name)
 	}
 
 	hashGroups, err := buildQueryIndexGroupHashes(*bestIndexGroup, statements)
@@ -160,7 +152,7 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 	}
 
 	fmt.Printf("QueryIndexGroup plan selected: table=%s group=%s candidate_hashes=%d\n",
-		scyllaTable.name, bestIndexGroup.name, len(hashGroups))
+		scyllaTable.Name, bestIndexGroup.name, len(hashGroups))
 
 	return &indexGroupSelectPlan{
 		partitionValue: convertToInt32(partitionStatements[0].Value),
@@ -332,7 +324,7 @@ func loadIndexGroupFreshnessRowsFromScylla(
 		return map[int32]int32{}, nil
 	}
 	if scyllaTable.indexUpdatedTable == nil {
-		return nil, fmt.Errorf(`QueryIndexGroup requires "__index_updated" metadata for table "%v"`, scyllaTable.name)
+		return nil, fmt.Errorf(`QueryIndexGroup requires "__index_updated" metadata for table "%v"`, scyllaTable.Name)
 	}
 
 	freshnessByHash := map[int32]int32{}
@@ -359,13 +351,13 @@ func loadIndexGroupFreshnessRowsFromScylla(
 
 		queryStr := fmt.Sprintf(
 			`SELECT index_hash, update_counter FROM %v.%v WHERE partition_id = ? AND index_id = ? AND index_hash IN (%v)`,
-			scyllaTable.keyspace,
+			scyllaTable.Namespace,
 			scyllaTable.indexUpdatedTable.name,
 			strings.Join(placeholders, ", "),
 		)
 
 		fmt.Printf("QueryIndexGroup freshness probe: table=%s partition=%d index_id=%d hashes=%d\n",
-			scyllaTable.name, partitionValue, indexGroup.indexID, len(hashChunk))
+			scyllaTable.Name, partitionValue, indexGroup.indexID, len(hashChunk))
 
 		iter := getScyllaConnection().Query(queryStr, queryValues...).Iter()
 		var hashValue int32
@@ -494,7 +486,7 @@ func buildIndexGroupFetchQuery(
 		}
 		rewrittenStatements, canRewrite := buildKeyIntPackingStatements(keyStatements, scyllaTable)
 		if !canRewrite || len(rewrittenStatements) == 0 {
-			panic(fmt.Sprintf(`QueryIndexGroup: TypeInheritFromKey fetch could not rewrite keys for table "%v"`, scyllaTable.name))
+			panic(fmt.Sprintf(`QueryIndexGroup: TypeInheritFromKey fetch could not rewrite keys for table "%v"`, scyllaTable.Name))
 		}
 		keyPredicate := rewrittenStatements[0]
 		keyColumnName := keyPredicate.Col
@@ -522,8 +514,8 @@ func buildIndexGroupFetchQuery(
 	queryStr := fmt.Sprintf(
 		"SELECT %v FROM %v.%v WHERE %v",
 		strings.Join(selectExpressions, ", "),
-		scyllaTable.keyspace,
-		scyllaTable.name,
+		scyllaTable.Namespace,
+		scyllaTable.Name,
 		strings.Join(whereStatements, " AND "),
 	)
 	return queryStr, queryValues

@@ -2,52 +2,12 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"strings"
 )
 
-type dbTagConfig struct {
-	columnName string
-	isFrozen   bool
-	isTypeList bool
-	isTypeSet  bool
-}
-
-func parseDBTagConfig(dbTagRaw string) dbTagConfig {
-	tagConfig := dbTagConfig{}
-	if dbTagRaw == "" {
-		return tagConfig
-	}
-
-	tagParts := strings.Split(dbTagRaw, ",")
-	tagConfig.columnName = strings.TrimSpace(tagParts[0])
-
-	// Normalize option flags so callers can check options in a case-insensitive way.
-	for optionIndex := 1; optionIndex < len(tagParts); optionIndex++ {
-		tagOption := strings.ToLower(strings.TrimSpace(tagParts[optionIndex]))
-		if tagOption == "" {
-			continue
-		}
-
-		// Keep collection tags as strongly typed booleans to avoid magic-string checks.
-		switch tagOption {
-		case "frozen":
-			tagConfig.isFrozen = true
-		case "list":
-			tagConfig.isTypeList = true
-		case "set":
-			tagConfig.isTypeSet = true
-		}
-	}
-
-	return tagConfig
-}
-
-func (tagConfig dbTagConfig) hasCollectionOptions() bool {
-	return tagConfig.isTypeList || tagConfig.isTypeSet || tagConfig.isFrozen
-}
-
-func applyCollectionTagOptions(recordTypeName string, recordFieldName string, inferredColType colType, tagConfig dbTagConfig) colType {
-	if !tagConfig.hasCollectionOptions() {
+func applyCollectionTagOptions(recordTypeName string, recordFieldName string, inferredColType colType, tagConfig db.DBTag) colType {
+	if !tagConfig.HasCollectionOptions() {
 		return inferredColType
 	}
 
@@ -57,25 +17,25 @@ func applyCollectionTagOptions(recordTypeName string, recordFieldName string, in
 	}
 
 	// Reject ambiguous collection kind options so tag behavior is explicit and deterministic.
-	if tagConfig.isTypeList && tagConfig.isTypeSet {
+	if tagConfig.IsList && tagConfig.IsSet {
 		panic(fmt.Sprintf(`Record "%v": field "%v" cannot declare both "list" and "set" db options.`,
 			recordTypeName, recordFieldName))
 	}
 
-	innerCollectionType := unwrapFrozenCollectionType(inferredColType.ColType)
-	if tagConfig.isTypeSet {
+	innerCollectionType := unwrapFrozenCollectionType(inferredColType.DBType)
+	if tagConfig.IsSet {
 		innerCollectionType = swapCollectionKind(innerCollectionType, "set")
 	} else {
 		innerCollectionType = swapCollectionKind(innerCollectionType, "list")
 	}
 
-	if tagConfig.isFrozen {
-		inferredColType.ColType = "frozen<" + innerCollectionType + ">"
+	if tagConfig.IsFrozen {
+		inferredColType.DBType = "frozen<" + innerCollectionType + ">"
 		return inferredColType
 	}
 
 	collectionColType := innerCollectionType
-	inferredColType.ColType = collectionColType
+	inferredColType.DBType = collectionColType
 	return inferredColType
 }
 

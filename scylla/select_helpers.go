@@ -94,10 +94,10 @@ func (e *selectPlanCache) Store(hash uint64, plan *SelectStatement) {
 
 func collectSelectStatements(tableInfo *TableInfo) []ColumnStatement {
 	// Keep statement extraction centralized so compile and bind share the exact same logical input order.
-	statements := make([]ColumnStatement, 0, len(tableInfo.statements)+1)
-	statements = append(statements, tableInfo.statements...)
-	if len(tableInfo.between.From) > 0 {
-		statements = append(statements, tableInfo.between)
+	statements := make([]ColumnStatement, 0, len(tableInfo.Statements)+1)
+	statements = append(statements, tableInfo.Statements...)
+	if len(tableInfo.Between.From) > 0 {
+		statements = append(statements, tableInfo.Between)
 	}
 	return statements
 }
@@ -119,8 +119,8 @@ func buildSelectProjection(tableInfo *TableInfo, scyllaTable ScyllaTable) ([]str
 	scanColumns := []selectScanColumn{}
 	selectExpressions := []string{}
 
-	if len(tableInfo.columnsInclude) > 0 {
-		for _, col := range tableInfo.columnsInclude {
+	if len(tableInfo.ColumnsInclude) > 0 {
+		for _, col := range tableInfo.ColumnsInclude {
 			columnNames = append(columnNames, col.GetName())
 		}
 		scanColumns = buildDefaultScanColumns(columnNames)
@@ -128,19 +128,19 @@ func buildSelectProjection(tableInfo *TableInfo, scyllaTable ScyllaTable) ([]str
 		return columnNames, scanColumns, selectExpressions
 	}
 
-	if len(tableInfo.columnsExclude) > 0 {
-		excludedColumns := make([]string, 0, len(tableInfo.columnsExclude))
-		for _, col := range tableInfo.columnsExclude {
+	if len(tableInfo.ColumnsExclude) > 0 {
+		excludedColumns := make([]string, 0, len(tableInfo.ColumnsExclude))
+		for _, col := range tableInfo.ColumnsExclude {
 			excludedColumns = append(excludedColumns, col.GetName())
 		}
-		for _, col := range scyllaTable.columns {
+		for _, col := range scyllaTable.Columns {
 			if slices.Contains(excludedColumns, col.GetName()) || !shouldAutoSelectColumn(col) {
 				continue
 			}
 			columnNames = append(columnNames, col.GetName())
 		}
 	} else {
-		for _, col := range scyllaTable.columns {
+		for _, col := range scyllaTable.Columns {
 			if !shouldAutoSelectColumn(col) {
 				continue
 			}
@@ -163,18 +163,18 @@ func computeSelectShapeHash(tableInfo *TableInfo, scyllaTable ScyllaTable) uint6
 		_, _ = hashBuilder.Write([]byte{0})
 	}
 
-	writeText(scyllaTable.name)
+	writeText(scyllaTable.Name)
 	columnNames, _, _ := buildSelectProjection(tableInfo, scyllaTable)
 	writeText("projection:resolved")
 	for _, columnName := range columnNames {
 		writeText(columnName)
 	}
 
-	if len(tableInfo.groupByColumns) > 0 {
+	if len(tableInfo.GroupByColumns) > 0 {
 		writeText("group-by")
-		for _, col := range tableInfo.groupByColumns {
+		for _, col := range tableInfo.GroupByColumns {
 			writeText(col.GetName())
-			writeText(col.aggregateFn)
+			writeText(col.AggregateFn)
 		}
 	}
 
@@ -192,9 +192,9 @@ func computeSelectShapeHash(tableInfo *TableInfo, scyllaTable ScyllaTable) uint6
 		}
 	}
 
-	writeText(tableInfo.orderBy)
-	writeText(fmt.Sprintf("limit:%d", tableInfo.limit))
-	if tableInfo.allowFilter {
+	writeText(tableInfo.OrderBy)
+	writeText(fmt.Sprintf("limit:%d", tableInfo.Limit))
+	if tableInfo.AllowFilter {
 		writeText("allow-filter")
 	}
 
@@ -395,7 +395,7 @@ func canRewriteKeyConcatenated(statements []ColumnStatement, scyllaTable ScyllaT
 
 func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable ScyllaTable) ([]ColumnStatement, bool) {
 	// Convert equality/range prefixes on smart concatenated keys into one physical PK predicate plus residual filters.
-	keyCol := scyllaTable.keys[0]
+	keyCol := scyllaTable.Keys[0]
 	hasKeyColQuery := false
 	for _, st := range statements {
 		if st.Col == keyCol.GetName() {
@@ -503,7 +503,7 @@ func canRewriteKeyIntPacking(statements []ColumnStatement, scyllaTable ScyllaTab
 
 func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable ScyllaTable) ([]ColumnStatement, bool) {
 	// Convert equality/range prefixes on packed numeric keys into one physical PK predicate plus residual filters.
-	keyCol := scyllaTable.keys[0]
+	keyCol := scyllaTable.Keys[0]
 	hasKeyColQuery := false
 	for _, st := range statements {
 		if st.Col == keyCol.GetName() {
@@ -561,11 +561,11 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 
 		for columnIndex, column := range scyllaTable.keyIntPacking {
 			columnInfo := column.(*columnInfo)
-			decimalSize := int64(columnInfo.decimalSize)
-			if columnIndex == len(scyllaTable.keyIntPacking)-1 && decimalSize == 0 {
-				decimalSize = remainingDigits
+			DecimalDigits := int64(columnInfo.DecimalDigits)
+			if columnIndex == len(scyllaTable.keyIntPacking)-1 && DecimalDigits == 0 {
+				DecimalDigits = remainingDigits
 			}
-			remainingDigits -= decimalSize
+			remainingDigits -= DecimalDigits
 
 			if columnIndex < len(values) {
 				packedValue += convertToInt64(values[columnIndex]) * Pow10Int64(remainingDigits)
@@ -585,7 +585,7 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 			}
 
 			fromValue := packedValue
-			toValue := packedValue + Pow10Int64(remainingDigits+decimalSize)
+			toValue := packedValue + Pow10Int64(remainingDigits+DecimalDigits)
 			isEquality := columnIndex == len(scyllaTable.keyIntPacking)
 			return fromValue, toValue, isEquality
 		}
@@ -623,7 +623,7 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 	statements := collectSelectStatements(tableInfo)
 	selectShapeHash := computeSelectShapeHash(tableInfo, scyllaTable)
 
-	if len(tableInfo.groupByColumns) > 0 {
+	if len(tableInfo.GroupByColumns) > 0 {
 		groupByPlan, err := buildNativeGroupByPlan(tableInfo, statements, scyllaTable)
 		if err != nil {
 			return nil, err
@@ -632,7 +632,7 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 			return nil, fmt.Errorf("group by select shape did not produce a native plan")
 		}
 
-		sourceTableName := scyllaTable.name
+		sourceTableName := scyllaTable.Name
 		if groupByPlan.ViewTableName != "" {
 			sourceTableName = groupByPlan.ViewTableName
 		}
@@ -644,37 +644,37 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 
 		compiledStatement := &SelectStatement{
 			hash:                  selectShapeHash,
-			queryTemplate:         makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.keyspace, sourceTableName),
+			queryTemplate:         makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.Namespace, sourceTableName),
 			scanColumns:           slices.Clone(groupByPlan.ScanColumns),
 			route:                 selectRouteNativeGroupBy,
-			orderBy:               tableInfo.orderBy,
+			orderBy:               tableInfo.OrderBy,
 			orderColumnName:       orderColumnName,
-			limit:                 tableInfo.limit,
-			allowFilter:           tableInfo.allowFilter,
+			limit:                 tableInfo.Limit,
+			allowFilter:           tableInfo.AllowFilter,
 			groupByColumns:        slices.Clone(groupByPlan.GroupByColumns),
 			assignCacheVersions:   false,
 			requiresDeduplication: false,
 		}
 
 		fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=false dedup=false\n",
-			scyllaTable.name, compiledStatement.hash, compiledStatement.route, sourceTableName)
+			scyllaTable.Name, compiledStatement.hash, compiledStatement.route, sourceTableName)
 		return compiledStatement, nil
 	}
 
 	columnNames, scanColumns, selectExpressions := buildSelectProjection(tableInfo, scyllaTable)
-	viewTableName := scyllaTable.name
+	viewTableName := scyllaTable.Name
 	orderColumnName := ""
-	if len(scyllaTable.keys) > 0 {
-		orderColumnName = scyllaTable.keys[0].GetName()
+	if len(scyllaTable.Keys) > 0 {
+		orderColumnName = scyllaTable.Keys[0].GetName()
 	}
 
 	compiledStatement := &SelectStatement{
 		hash:                computeSelectShapeHash(tableInfo, scyllaTable),
 		scanColumns:         slices.Clone(scanColumns),
-		orderBy:             tableInfo.orderBy,
+		orderBy:             tableInfo.OrderBy,
 		orderColumnName:     orderColumnName,
-		limit:               tableInfo.limit,
-		allowFilter:         tableInfo.allowFilter,
+		limit:               tableInfo.Limit,
+		allowFilter:         tableInfo.AllowFilter,
 		route:               selectRouteAllStatements,
 		assignCacheVersions: true,
 	}
@@ -682,9 +682,9 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 	if compositePlan := tryBuildCompositeBucketPlan(statements, scyllaTable); compositePlan != nil {
 		compiledStatement.route = selectRouteCompositeBucket
 		compiledStatement.requiresDeduplication = true
-		compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.keyspace, viewTableName)
+		compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.Namespace, viewTableName)
 		fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=true dedup=true\n",
-			scyllaTable.name, compiledStatement.hash, compiledStatement.route, viewTableName)
+			scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName)
 		return compiledStatement, nil
 	}
 
@@ -754,10 +754,10 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 		}
 	}
 
-	compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.keyspace, viewTableName)
+	compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.Namespace, viewTableName)
 
 	fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=%v dedup=%v\n",
-		scyllaTable.name, compiledStatement.hash, compiledStatement.route, viewTableName,
+		scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName,
 		len(compiledStatement.postFilterStatementIndexes) > 0, compiledStatement.requiresDeduplication)
 
 	return compiledStatement, nil
@@ -808,11 +808,11 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 			return nil, fmt.Errorf("group by select shape no longer matches the cached route")
 		}
 
-		sourceTableName := scyllaTable.name
+		sourceTableName := scyllaTable.Name
 		if groupByPlan.ViewTableName != "" {
 			sourceTableName = groupByPlan.ViewTableName
 		}
-		queryTemplate = makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.keyspace, sourceTableName)
+		queryTemplate = makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.Namespace, sourceTableName)
 		scanColumns = slices.Clone(groupByPlan.ScanColumns)
 		groupByColumns = slices.Clone(groupByPlan.GroupByColumns)
 		remainingStatements = nil

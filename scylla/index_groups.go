@@ -7,14 +7,9 @@ import (
 	"unsafe"
 
 	"github.com/gocql/gocql"
+	"github.com/ivanjoz/genix-orm/db"
 	"github.com/viant/xunsafe"
 )
-
-type GroupIndexCache struct {
-	IndexID       int16
-	GroupHash     int32
-	UpdateCounter int32
-}
 
 type indexUpdatedRow struct {
 	partitionID   int32
@@ -270,12 +265,12 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 			name:    indexCfg.Keys[0].GetName(),
 			indexID: indexID,
 			sourceColumns: []indexGroupSourceColumn{{
-				column:      dbTable.columnsMap[indexCfg.Keys[0].GetName()],
-				storeAsWeek: indexCfg.Keys[0].GetInfo().storeAsWeek,
+				column:      dbTable.ColumnsMap[indexCfg.Keys[0].GetName()],
+				storeAsWeek: indexCfg.Keys[0].GetInfo().StoreAsWeek,
 			}},
 		})
 		if dbTable.indexUpdatedTable == nil {
-			dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.name + "__index_updated"}
+			dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
 		}
 		return
 	}
@@ -285,54 +280,54 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 	usesCollectionValues := false
 	hasStoreAsWeekColumn := false
 	for _, key := range indexCfg.Keys {
-		baseColumn := dbTable.columnsMap[key.GetName()]
+		baseColumn := dbTable.ColumnsMap[key.GetName()]
 		if baseColumn == nil || baseColumn.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": IndexGroup column "%v" was not found`, dbTable.name, key.GetName()))
+			panic(fmt.Sprintf(`Table "%v": IndexGroup column "%v" was not found`, dbTable.Name, key.GetName()))
 		}
 		rawSourceColumn := indexGroupSourceColumn{
 			column:      baseColumn,
-			storeAsWeek: key.GetInfo().storeAsWeek,
+			storeAsWeek: key.GetInfo().StoreAsWeek,
 		}
 		rawSourceColumns = append(rawSourceColumns, rawSourceColumn)
 		weekSourceColumns = append(weekSourceColumns, indexGroupSourceColumn{
 			column:      baseColumn,
-			storeAsWeek: key.GetInfo().storeAsWeek,
-			weekOnly:    key.GetInfo().storeAsWeek,
+			storeAsWeek: key.GetInfo().StoreAsWeek,
+			weekOnly:    key.GetInfo().StoreAsWeek,
 		})
 		if baseColumn.GetType().IsSlice {
 			usesCollectionValues = true
 		}
-		if key.GetInfo().storeAsWeek {
+		if key.GetInfo().StoreAsWeek {
 			hasStoreAsWeekColumn = true
 		}
 	}
 
 	registerCompiledIndexGroup := func(sourceColumns []indexGroupSourceColumn, weekOnly bool) {
 		virtualColumnName := makeIndexGroupVirtualColumnName(sourceColumnNames, usesCollectionValues, weekOnly)
-		if _, exists := dbTable.columnsMap[virtualColumnName]; exists {
-			panic(fmt.Sprintf(`Table "%v": generated IndexGroup column already exists: %v`, dbTable.name, virtualColumnName))
+		if _, exists := dbTable.ColumnsMap[virtualColumnName]; exists {
+			panic(fmt.Sprintf(`Table "%v": generated IndexGroup column already exists: %v`, dbTable.Name, virtualColumnName))
 		}
 
 		virtualColumn := &columnInfo{
-			colInfo: colInfo{
+			ColInfo: colInfo{
 				Name:      virtualColumnName,
 				FieldName: virtualColumnName,
 				IsVirtual: true,
-				Idx:       dbTable._maxColIdx,
+				Idx:       dbTable.MaxColIdx,
 			},
-			colType: GetColTypeByName("int32", ""),
+			ColType: db.GetColTypeByName("int32"),
 		}
 		if usesCollectionValues {
-			virtualColumn.colType = colType{
+			virtualColumn.ColType = colType{
 				Type:      13,
 				FieldType: "[]int32",
-				ColType:   "set<int>",
+				DBType:    "set<int>",
 				IsSlice:   true,
 			}
 		}
 
 		sourceColumnsLocal := slices.Clone(sourceColumns)
-		virtualColumn.getRawValue = func(ptr unsafe.Pointer) any {
+		virtualColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
 			hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
 			if usesCollectionValues {
 				return hashes
@@ -342,7 +337,7 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 			}
 			return hashes[0]
 		}
-		virtualColumn.getStatementValue = func(ptr unsafe.Pointer) any {
+		virtualColumn.GetStatementValueFn = func(ptr unsafe.Pointer) any {
 			hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
 			if usesCollectionValues {
 				return hashes
@@ -352,10 +347,10 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 			}
 			return hashes[0]
 		}
-		virtualColumn.getValue = func(ptr unsafe.Pointer) any {
+		virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
 			hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
 			if usesCollectionValues {
-				return makeSignedIntCollectionLiteral(virtualColumn.ColType, hashes)
+				return makeSignedIntCollectionLiteral(virtualColumn.DBType, hashes)
 			}
 			if len(hashes) == 0 {
 				return int32(0)
@@ -363,12 +358,12 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 			return hashes[0]
 		}
 
-		dbTable._maxColIdx++
-		dbTable.columnsMap[virtualColumn.GetName()] = virtualColumn
+		dbTable.MaxColIdx++
+		dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
 
 		index := &viewInfo{
 			Type:               3,
-			name:               fmt.Sprintf(`%v__%v_index_0`, dbTable.name, virtualColumnName),
+			name:               fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumnName),
 			idx:                *idxCount,
 			column:             virtualColumn,
 			columns:            slices.Clone(sourceColumnNames),
@@ -443,40 +438,40 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 	}
 
 	if dbTable.indexUpdatedTable == nil {
-		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.name + "__index_updated"}
+		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
 	}
 }
 
 func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, indexID int16, sourceColumnNames []string) {
 	if len(dbTable.keyIntPacking) == 0 {
-		panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey requires KeyIntPacking on the table`, dbTable.name))
+		panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey requires KeyIntPacking on the table`, dbTable.Name))
 	}
 	if len(indexCfg.Keys) > len(dbTable.keyIntPacking) {
 		panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey index has %d keys but KeyIntPacking only declares %d columns`,
-			dbTable.name, len(indexCfg.Keys), len(dbTable.keyIntPacking)))
+			dbTable.Name, len(indexCfg.Keys), len(dbTable.keyIntPacking)))
 	}
 	for columnIndex, key := range indexCfg.Keys {
 		packedColumnName := dbTable.keyIntPacking[columnIndex].GetName()
 		if key.GetName() != packedColumnName {
 			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey keys must be a prefix of KeyIntPacking. Position %d expected "%v" but got "%v"`,
-				dbTable.name, columnIndex, packedColumnName, key.GetName()))
+				dbTable.Name, columnIndex, packedColumnName, key.GetName()))
 		}
-		if key.GetInfo().storeAsWeek {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey does not support storeAsWeek on "%v"`, dbTable.name, key.GetName()))
+		if key.GetInfo().StoreAsWeek {
+			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey does not support storeAsWeek on "%v"`, dbTable.Name, key.GetName()))
 		}
-		baseColumn := dbTable.columnsMap[key.GetName()]
+		baseColumn := dbTable.ColumnsMap[key.GetName()]
 		if baseColumn == nil || baseColumn.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey column "%v" was not found`, dbTable.name, key.GetName()))
+			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey column "%v" was not found`, dbTable.Name, key.GetName()))
 		}
 		if baseColumn.GetType().IsSlice {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey does not support slice column "%v"`, dbTable.name, key.GetName()))
+			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey does not support slice column "%v"`, dbTable.Name, key.GetName()))
 		}
 	}
 
 	sourceColumns := make([]indexGroupSourceColumn, 0, len(indexCfg.Keys))
 	for _, key := range indexCfg.Keys {
 		sourceColumns = append(sourceColumns, indexGroupSourceColumn{
-			column: dbTable.columnsMap[key.GetName()],
+			column: dbTable.ColumnsMap[key.GetName()],
 		})
 	}
 
@@ -488,7 +483,7 @@ func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, inde
 	})
 
 	if dbTable.indexUpdatedTable == nil {
-		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.name + "__index_updated"}
+		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
 	}
 }
 
@@ -515,7 +510,7 @@ func syncIndexGroupsAfterWrite[T TableBaseInterface[E, T], E TableSchemaInterfac
 		return nil
 	}
 
-	keyspace := scyllaTable.keyspace
+	keyspace := scyllaTable.Namespace
 	tableName := scyllaTable.indexUpdatedTable.name
 	rowsSnapshot := append([]indexUpdatedRow(nil), rowsToPersist...)
 	if !persistIndexUpdatedRowsAsync {

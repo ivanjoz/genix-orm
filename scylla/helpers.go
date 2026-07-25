@@ -8,7 +8,6 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 	"reflect"
-	"regexp"
 	"strings"
 	"unsafe"
 
@@ -18,8 +17,8 @@ import (
 )
 
 var (
-	DebugFull              bool
-	DebugNormal 					 bool
+	DebugFull   bool
+	DebugNormal bool
 )
 
 // SetDebugLogging maps a verbosity level to the DB debug flags. Level
@@ -334,136 +333,8 @@ func reflectToSliceValue(value any) []any {
 	return values
 }
 
-var (
-	matchFirstCap  = regexp.MustCompile("(.)([A-Z][a-z]+)")
-	matchAllCap    = regexp.MustCompile("([a-z0-9])([A-Z])")
-	matchUnderline = regexp.MustCompile("_([a-z0-9])_")
-)
-
-func toSnakeCase(str string) string {
-	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
-	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
-	res := strings.ToLower(snake)
-
-	for matchUnderline.MatchString(res) {
-		res = matchUnderline.ReplaceAllString(res, "_$1")
-	}
-
-	return res
-}
-
 func Print(Struct any) {
 	pretty.Println(Struct)
-}
-
-func MakeKeyConcat(values ...any) string {
-	valuesStrings := []string{}
-	for _, va := range values {
-		str := ""
-		if v, ok := va.(string); ok {
-			str = v
-		} else if v, ok := va.(int32); ok {
-			if v > 0 {
-				str = EncodeToBase62(int64(v))
-			}
-		} else if v, ok := va.(int64); ok {
-			if v > 0 {
-				str = EncodeToBase62(int64(v))
-			}
-		} else if v, ok := va.(int); ok {
-			if v > 0 {
-				str = EncodeToBase62(int64(v))
-			}
-		} else if v, ok := va.(int16); ok {
-			if v > 0 {
-				str = EncodeToBase62(int64(v))
-			}
-		} else {
-			str = fmt.Sprintf("%v", v)
-		}
-		valuesStrings = append(valuesStrings, str)
-	}
-	return strings.TrimRight(strings.Join(valuesStrings, "_"), "_")
-}
-
-type KeyParser struct {
-	Key        string
-	keySplited []string
-}
-
-func (e *KeyParser) GetNumber(index int) int64 {
-	if len(e.keySplited) == 0 {
-		e.keySplited = strings.Split(e.Key, "_")
-	}
-
-	if len(e.keySplited) > index {
-		return DecodeFromBase62(e.keySplited[index])
-	} else {
-		return 0
-	}
-}
-
-func (e *KeyParser) GetString(index int) string {
-	if len(e.keySplited) == 0 {
-		e.keySplited = strings.Split(e.Key, "_")
-	}
-
-	if len(e.keySplited) > index {
-		return e.keySplited[index]
-	} else {
-		return ""
-	}
-}
-
-// characters used for conversion
-const base32Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-// Encode encodes an int64 to a base62 encoded string.
-func EncodeToBase62(number int64) string {
-	return encodeToBase62(uint64(number))
-}
-
-// Decode decodes a base62 encoded string to an int64.
-func DecodeFromBase62(token string) int64 {
-	return int64(decodeFromBase62(token))
-}
-
-// EncodeUint64 encodes a uint64 to a base62 encoded string.
-func encodeToBase62(number uint64) string {
-	if number == 0 {
-		return string(base32Alphabet[0])
-	}
-
-	chars := make([]byte, 0)
-
-	length := uint64(len(base32Alphabet))
-
-	for number > 0 {
-		result := number / length
-		remainder := number % length
-		chars = append(chars, base32Alphabet[remainder])
-		number = result
-	}
-
-	for i, j := 0, len(chars)-1; i < j; i, j = i+1, j-1 {
-		chars[i], chars[j] = chars[j], chars[i]
-	}
-
-	return string(chars)
-}
-
-// DecodeUint64 decodes a base62 encoded string to an uint64.
-func decodeFromBase62(token string) uint64 {
-	// Decode incrementally to avoid float math and repeated exponentiation.
-	number := uint64(0)
-	baseLength := uint64(len(base32Alphabet))
-
-	for currentIndex := 0; currentIndex < len(token); currentIndex++ {
-		digitValue := uint64(strings.IndexByte(base32Alphabet, token[currentIndex]))
-		number = number*baseLength + digitValue
-	}
-
-	return number
 }
 
 func GetRandomInt64(digits int8) int64 {

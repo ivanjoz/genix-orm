@@ -9,63 +9,29 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/ivanjoz/colbin"
-
+	"github.com/ivanjoz/genix-orm/db"
 	"github.com/viant/xunsafe"
 )
 
-type colType struct {
-	Type          int8
-	FieldType     string
-	ColType       string
-	IsSlice       bool
-	IsPointer     bool
-	IsComplexType bool
+// cqlTypeNames names each ORM type ID in Cassandra's type system. It is installed
+// as db.DBTypeResolver at Register time, which is what lets the shared type table
+// in db stay free of CQL syntax. Slices default to set semantics; record-level db
+// tags can override to list/set/frozen variants.
+var cqlTypeNames = map[int8]string{
+	1: "text", 2: "bigint", 3: "int", 4: "smallint", 5: "tinyint",
+	6: "float", 7: "double", 8: "boolean", 9: "blob",
+	11: "set<text>", 12: "set<bigint>", 13: "set<int>", 14: "set<smallint>",
+	15: "set<tinyint>", 16: "set<float>", 17: "set<double>",
+	21: "text", 22: "bigint", 23: "int", 24: "smallint", 25: "tinyint",
+	26: "float", 27: "double",
+	31: "set<text>", 32: "set<bigint>", 33: "set<int>", 34: "set<smallint>",
+	35: "set<tinyint>", 36: "set<float>", 37: "set<double>",
 }
 
-// It must me no "int", is int32 or int64
-var colTypes = []colType{
-	{1, "string", "text", false, false, false},
-	{2, "int64", "bigint", false, false, false},
-	{3, "int32", "int", false, false, false},
-	{4, "int16", "smallint", false, false, false},
-	{5, "int8", "tinyint", false, false, false},
-	{6, "float32", "float", false, false, false},
-	{7, "float64", "double", false, false, false},
-	{8, "bool", "boolean", false, false, false},
-	{9, "[]byte", "blob", false, false, true},
-	// Slice defaults use set semantics; record-level db tags can override to list/set/frozen variants.
-	{11, "[]string", "set<text>", true, false, false},
-	{12, "[]int64", "set<bigint>", true, false, false},
-	{13, "[]int32", "set<int>", true, false, false},
-	{14, "[]int16", "set<smallint>", true, false, false},
-	{15, "[]int8", "set<tinyint>", true, false, false},
-	{16, "[]float32", "set<float>", true, false, false},
-	{17, "[]float64", "set<double>", true, false, false},
-	{21, "*string", "text", false, true, false},
-	{22, "*int64", "bigint", false, true, false},
-	{23, "*int32", "int", false, true, false},
-	{24, "*int16", "smallint", false, true, false},
-	{25, "*int8", "tinyint", false, true, false},
-	{26, "*float32", "float", false, true, false},
-	{27, "*float64", "double", false, true, false},
-	{31, "*[]string", "set<text>", true, true, false},
-	{32, "*[]int64", "set<bigint>", true, true, false},
-	{33, "*[]int32", "set<int>", true, true, false},
-	{34, "*[]int16", "set<smallint>", true, true, false},
-	{35, "*[]int8", "set<tinyint>", true, true, false},
-	{36, "*[]float32", "set<float>", true, true, false},
-	{37, "*[]float64", "set<double>", true, true, false},
-}
-
-var colTypesMap = map[int8]colType{}
-var colTypesFieldMap = map[string]colType{}
-var colTypesDBMap = map[string]colType{}
-var initColTypesOnce sync.Once
 var assignFallbackCountByType [64]uint64
 var assignFallbackLoggedByType [64]uint32
 
@@ -73,16 +39,12 @@ type number1 interface {
 	int | int32 | int8 | uint8 | int16 | uint16 | int64 | float32 | float64
 }
 
-func setField[T any](f *xunsafe.Field, ptr unsafe.Pointer, val T) {
-	*(*T)(f.Pointer(ptr)) = val
-}
-
 func setReflectIntSlice[T number1, E number1](f *xunsafe.Field, ptr unsafe.Pointer, vl *[]E) {
 	newSlice := make([]T, len(*vl))
 	for i, v := range *vl {
 		newSlice[i] = T(v)
 	}
-	setField(f, ptr, newSlice)
+	db.SetField(f, ptr, newSlice)
 }
 
 func setReflectIntSlicePointer[T number1, E number1](f *xunsafe.Field, ptr unsafe.Pointer, vl *[]E) {
@@ -90,34 +52,12 @@ func setReflectIntSlicePointer[T number1, E number1](f *xunsafe.Field, ptr unsaf
 	for i, v := range *vl {
 		newSlice[i] = T(v)
 	}
-	setField(f, ptr, &newSlice)
+	db.SetField(f, ptr, &newSlice)
 }
 
 func printError(valType string, v any) {
 	fmt.Printf("Error: El valor %v no fue mapeado = %v | %T\n", valType, v, v)
 	panic("!")
-}
-
-func GetColTypeByID(typeID int8) colType {
-	initColTypesOnce.Do(func() {
-		for _, ct := range colTypes {
-			colTypesMap[ct.Type] = ct
-			colTypesFieldMap[ct.FieldType] = ct
-			colTypesFieldMap["*"+ct.FieldType] = ct
-			colTypesDBMap[ct.ColType] = ct
-		}
-	})
-	return colTypesMap[typeID]
-}
-
-func GetColTypeByName(fieldName string, dbName string) colType {
-	GetColTypeByID(0)
-	if fieldName != "" {
-		return colTypesFieldMap[fieldName]
-	} else if dbName != "" {
-		return colTypesDBMap[dbName]
-	}
-	return colType{}
 }
 
 // Number constraint to cover all numeric types requested
@@ -156,60 +96,6 @@ func makeNumericSlice[T Number](slice []T) []byte {
 }
 
 // Helper to convert any integer constraint to int64 for strconv
-func reflectToInt64(v any) int64 {
-	switch t := v.(type) {
-	case int:
-		return int64(t)
-	case *int:
-		return int64(*t)
-	case int64:
-		return t
-	case *int64:
-		return *t
-	case int32:
-		return int64(t)
-	case *int32:
-		return int64(*t)
-	case int16:
-		return int64(t)
-	case *int16:
-		return int64(*t)
-	case int8:
-		return int64(t)
-	case *int8:
-		return int64(*t)
-	}
-	return 0
-}
-
-func reflectToFloat64(v any) float64 {
-	switch t := v.(type) {
-	case float64:
-		return t
-	case *float64:
-		return *t
-	case float32:
-		return float64(t)
-	case *float32:
-		return float64(*t)
-	}
-	return 0
-}
-
-func reflectToFloat32(v any) float32 {
-	switch t := v.(type) {
-	case float32:
-		return t
-	case *float32:
-		return *t
-	case float64:
-		return float32(t)
-	case *float64:
-		return float32(*t)
-	}
-	return 0
-}
-
 func supportsUnsignedBlobEncoding(targetType reflect.Type) bool {
 	if targetType == nil {
 		return false
@@ -619,7 +505,7 @@ func trySetNumberSlice[T number1](f *xunsafe.Field, ptr unsafe.Pointer, colType 
 	case *[]float32:
 		setReflectIntSlice[T](f, ptr, vl)
 	default:
-		printError(GetColTypeByID(colType).FieldType, value)
+		printError(db.GetColTypeByID(colType).FieldType, value)
 	}
 }
 
@@ -654,7 +540,7 @@ func trySetNumberSlicePointer[T number1](f *xunsafe.Field, ptr unsafe.Pointer, c
 	case *[]float32:
 		setReflectIntSlicePointer[T](f, ptr, vl)
 	default:
-		printError(GetColTypeByID(colType).FieldType, value)
+		printError(db.GetColTypeByID(colType).FieldType, value)
 	}
 }
 
@@ -668,7 +554,7 @@ func incrementAssignFallbackStats(colType int8) {
 	atomic.AddUint64(&assignFallbackCountByType[colType], 1)
 	// Log only first hit per type to keep diagnostics visible without flooding logs.
 	if ShouldLogFull() && atomic.CompareAndSwapUint32(&assignFallbackLoggedByType[colType], 0, 1) {
-		fmt.Printf("assingValue fallback engaged for colType=%d (%s)\n", colType, GetColTypeByID(colType).FieldType)
+		fmt.Printf("assingValue fallback engaged for colType=%d (%s)\n", colType, db.GetColTypeByID(colType).FieldType)
 	}
 }
 
@@ -705,61 +591,61 @@ func assignScalarFallback(f *xunsafe.Field, ptr unsafe.Pointer, colType int8, va
 		} else if vl, ok := value.(*string); ok {
 			f.SetString(ptr, *vl)
 		} else {
-			printError(GetColTypeByID(colType).FieldType, value)
+			printError(db.GetColTypeByID(colType).FieldType, value)
 		}
 	case 2: // int64
-		f.SetInt64(ptr, reflectToInt64(value))
+		f.SetInt64(ptr, db.ToInt64(value))
 	case 3: // int32
-		f.SetInt32(ptr, int32(reflectToInt64(value)))
+		f.SetInt32(ptr, int32(db.ToInt64(value)))
 	case 4: // int16
-		f.SetInt16(ptr, int16(reflectToInt64(value)))
+		f.SetInt16(ptr, int16(db.ToInt64(value)))
 	case 5: // int8
-		f.SetInt8(ptr, int8(reflectToInt64(value)))
+		f.SetInt8(ptr, int8(db.ToInt64(value)))
 	case 6: // float32
-		f.SetFloat32(ptr, reflectToFloat32(value))
+		f.SetFloat32(ptr, db.ToFloat32(value))
 	case 7: // float64
-		f.SetFloat64(ptr, reflectToFloat64(value))
+		f.SetFloat64(ptr, db.ToFloat64(value))
 	case 8: // bool
 		if vl, ok := value.(bool); ok {
 			f.SetBool(ptr, vl)
 		} else if vl, ok := value.(*bool); ok {
 			f.SetBool(ptr, *vl)
 		} else {
-			printError(GetColTypeByID(colType).FieldType, value)
+			printError(db.GetColTypeByID(colType).FieldType, value)
 		}
 	case 10: // int
-		f.SetInt(ptr, int(reflectToInt64(value)))
+		f.SetInt(ptr, int(db.ToInt64(value)))
 	case 21: // *string
 		if vl, ok := value.(string); ok {
 			f.Set(ptr, &vl)
 		} else if vl, ok := value.(*string); ok {
 			f.Set(ptr, vl)
 		} else {
-			printError(GetColTypeByID(colType).FieldType, value)
+			printError(db.GetColTypeByID(colType).FieldType, value)
 		}
 	case 22: // *int64
-		val := reflectToInt64(value)
+		val := db.ToInt64(value)
 		f.Set(ptr, &val)
 	case 23: // *int32
-		val := int32(reflectToInt64(value))
+		val := int32(db.ToInt64(value))
 		f.Set(ptr, &val)
 	case 24: // *int16
-		val := int16(reflectToInt64(value))
+		val := int16(db.ToInt64(value))
 		f.Set(ptr, &val)
 	case 25: // *int8
-		val := int8(reflectToInt64(value))
+		val := int8(db.ToInt64(value))
 		f.Set(ptr, &val)
 	case 26: // *float32
-		val := reflectToFloat32(value)
+		val := db.ToFloat32(value)
 		f.Set(ptr, &val)
 	case 27: // *float64
-		val := reflectToFloat64(value)
+		val := db.ToFloat64(value)
 		f.Set(ptr, &val)
 	case 28: // *int
-		val := int(reflectToInt64(value))
+		val := int(db.ToInt64(value))
 		f.Set(ptr, &val)
 	default:
-		printError(GetColTypeByID(colType).FieldType, value)
+		printError(db.GetColTypeByID(colType).FieldType, value)
 	}
 }
 
@@ -778,7 +664,7 @@ func assingValue(f *xunsafe.Field, ptr unsafe.Pointer, colType int8, value any) 
 		} else if vl, ok := value.(*[]byte); ok {
 			f.Set(ptr, *vl)
 		} else {
-			printError(GetColTypeByID(colType).FieldType, value)
+			printError(db.GetColTypeByID(colType).FieldType, value)
 		}
 	case 11: // []string
 		// Clone slices on assignment to avoid sharing mutable backing arrays with caller buffers.
@@ -787,7 +673,7 @@ func assingValue(f *xunsafe.Field, ptr unsafe.Pointer, colType int8, value any) 
 		} else if vl, ok := value.(*[]string); ok {
 			f.Set(ptr, slices.Clone(*vl))
 		} else {
-			printError(GetColTypeByID(colType).FieldType, value)
+			printError(db.GetColTypeByID(colType).FieldType, value)
 		}
 	case 12: // []int64
 		// Numeric slice helpers keep support for multiple incoming numeric widths in fallback mode.
@@ -811,7 +697,7 @@ func assingValue(f *xunsafe.Field, ptr unsafe.Pointer, colType int8, value any) 
 			val := slices.Clone(*vl)
 			f.Set(ptr, &val)
 		} else {
-			printError(GetColTypeByID(colType).FieldType, value)
+			printError(db.GetColTypeByID(colType).FieldType, value)
 		}
 	case 32: // *[]int64
 		trySetNumberSlicePointer[int64](f, ptr, colType, value)
