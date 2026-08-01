@@ -86,7 +86,7 @@ type Executor[TableT any, RecordT any] interface {
     InsertUpdateExclude(records *[]RecordT, isInsert func(*RecordT) bool, columnsToExcludeUpdate []Coln, columnsToExcludeInsert ...Coln) error
     Merge(records *[]RecordT, columnsToExcludeUpdate []Coln, onUpdate func(previous, current *RecordT) bool, onInsert func(*RecordT)) error
 
-    QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDCacheVersion) error
+    QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error
     SearchTextIDs(partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
     SearchText(refSlice *[]RecordT, partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
 
@@ -126,7 +126,7 @@ them in its `init()`:
 ```go
 var (
     GetAutoincrementID      func(key string, recordsSize int) (int64, error)
-    QueryCachedGenericByIDs func(tableName string, cachedIDs []IDCacheVersion) ([]GenericRecord, error)
+    QueryCachedGenericByIDs func(tableName string, cachedIDs []IDUpdatedVersion) ([]GenericRecord, error)
     SetDebugLogging         func(level int)
 )
 ```
@@ -225,7 +225,7 @@ Two, both keyed by type and both immutable once built.
 
 **Record metadata** (`db/metacache.go`) — per record struct: one `ColumnInfo` per
 field with its resolved type, `db` tag, offset and accessors, plus the
-cache-version field path. Built once, then copied into per-query column handles so
+column metadata. Built once, then copied into per-query column handles so
 cache entries are never mutated.
 
 **Compiled table** (`scylla/table_cache.go`) — per table struct, behind a
@@ -259,7 +259,7 @@ type Table interface {
 `db.TableCore` implements it and holds the metadata that means the same thing
 everywhere: `Name`, `Namespace`, `Keys`, `PartKey`, `Columns`, `ColumnsMap`,
 `ColumnsIdxMap`, `KeysIdx`, the managed columns (`CreatedCol`, `UpdatedCol`,
-`UpdateCounterCol`), sequence/autoincrement metadata, cache-version metadata, and
+`UpdatedVersionCol`), sequence/autoincrement metadata, by-IDs slot metadata, and
 `MaxColIdx`.
 
 A driver embeds it and adds its own. `scylla.ScyllaTable` adds views, indexes,

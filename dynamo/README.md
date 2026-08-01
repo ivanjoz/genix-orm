@@ -302,7 +302,7 @@ path and the record body avoid it.
 
 ## What was intentionally dropped from genix
 
-Materialized/hash/radix views, `int64` packing, index groups, cache-version
+Materialized/hash/radix views, `int64` packing, index groups, by-IDs slot versions
 hooks, and CQL deploy/homologation. DynamoDB's fixed physical schema and string
 keys make most of that unnecessary — so this is, as expected, a much smaller
 ORM. (Cached metadata, precompiled `xunsafe` accessors, autoincrement sequences

@@ -27,6 +27,7 @@ type partitionedRangeViewSchema struct {
 
 func (e partitionedRangeViewSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10018,
 		Name:      "partitioned_range_records",
 		Partition: e.GroupID,
 		Keys:      Cols(e.ID),
@@ -96,6 +97,7 @@ type relocatedPartitionViewSchema struct {
 
 func (e relocatedPartitionViewSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10019,
 		Name:      "relocated_partition_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -265,7 +267,6 @@ func TestBuildBoundSelectPlanSplitsLargeInQueriesWithDefaultLimit(t *testing.T) 
 		"SELECT id FROM genix.sale_order %v",
 		nil,
 		false,
-		false,
 		[]boundWhereClause{{Clause: "company_id = ?", Values: []any{1}}},
 		[]ColumnStatement{{Col: "id", Operator: "IN", Values: inValues}},
 		nil,
@@ -297,7 +298,6 @@ func TestBuildBoundSelectPlanSplitsCartesianInQueriesByEnvLimit(t *testing.T) {
 	boundPlan := buildBoundSelectPlan(
 		"SELECT id FROM genix.sale_order %v",
 		nil,
-		false,
 		false,
 		[]boundWhereClause{{Clause: "company_id = ?", Values: []any{1}}},
 		[]ColumnStatement{
@@ -352,8 +352,8 @@ func TestCompiledSelectStatementSkipsWriteOnlyManagedColumns(t *testing.T) {
 	if strings.Contains(compiledStatement.queryTemplate, managedUpdatedColumnName) {
 		t.Fatalf("did not expect %q in query template: %s", managedUpdatedColumnName, compiledStatement.queryTemplate)
 	}
-	if strings.Contains(compiledStatement.queryTemplate, managedUpdateCounterColumnName) {
-		t.Fatalf("did not expect %q in query template: %s", managedUpdateCounterColumnName, compiledStatement.queryTemplate)
+	if strings.Contains(compiledStatement.queryTemplate, managedUpdatedVersionColumnName) {
+		t.Fatalf("did not expect %q in query template: %s", managedUpdatedVersionColumnName, compiledStatement.queryTemplate)
 	}
 	if !strings.Contains(compiledStatement.queryTemplate, "FROM genix_test.sequences") {
 		t.Fatalf("unexpected query template: %s", compiledStatement.queryTemplate)

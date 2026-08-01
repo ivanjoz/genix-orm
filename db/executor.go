@@ -37,7 +37,7 @@ type Executor[TableT any, RecordT any] interface {
 		onUpdate func(previous, current *RecordT) bool, onInsert func(record *RecordT)) error
 	// QueryCachedIDs resolves records by ID, skipping any whose client cache version
 	// still matches the server.
-	QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDCacheVersion) error
+	QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error
 	// SearchTextIDs returns matching record IDs ranked by weight.
 	SearchTextIDs(partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
 	// SearchText fills refSlice with the matching records and returns their weights.

@@ -71,7 +71,7 @@ func (Exec[TableT, RecordT]) Merge(
 	return Merge[RecordT, TableT](records, columnsToExcludeUpdate, onUpdate, onInsert)
 }
 
-func (Exec[TableT, RecordT]) QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDCacheVersion) error {
+func (Exec[TableT, RecordT]) QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error {
 	return QueryCachedIDs[RecordT, TableT](refSlice, cachedIDs)
 }
 

@@ -14,7 +14,7 @@ func TestToSnakeCase(t *testing.T) {
 		"DetailProductIDs":       "detail_product_ids",
 		"PaisCiudadID":           "pais_ciudad_id",
 		"WarehouseProductStatus": "warehouse_product_status",
-		"CacheVersion":           "cache_version",
+		"UpdatedVersion":         "updated_version",
 		"S1":                     "s1",
 		"N1":                     "n1",
 		"A":                      "a",

@@ -24,7 +24,13 @@ type ScyllaTable struct {
 	keyIntPacking       []IColInfo
 	// packedIndexes stores metadata for packed indexes declared in schema (local and global).
 	packedIndexes []*packedIndexInfo
-	capabilities  []QueryCapability
+	// fixedValueRanges holds the schema's FixedValues per column name, which is what lets a
+	// TypeDelta view size each key's digit slot without a .DecimalSize() decorator.
+	fixedValueRanges map[string]columnValueRange
+	// maxDeltaVersionValue is the widest "updated_version" the delta view's trailing slot can hold.
+	// Zero means the table declares no delta view and nothing needs checking.
+	maxDeltaVersionValue int64
+	capabilities     []QueryCapability
 	// Composite bucket metadata is used to materialize virtual hash sets and plan range+contains reads.
 	compositeBucketIndexes []compositeBucketIndex
 	indexGroups            []indexGroupInfo
@@ -150,6 +156,9 @@ type IncrementTable struct {
 
 func (e IncrementTable) GetSchema() TableSchema {
 	return TableSchema{
+		// The ORM's own tables claim IDs from the top of the range so application tables can number
+		// themselves from 1 upwards without ever colliding.
+		ID:             MaxTableID,
 		Name:           "sequences",
 		Keys:           Cols(e.Name),
 		SequenceColumn: &e.CurrentValue,
@@ -213,22 +222,3 @@ type SeqValue struct {
 	SeqPart int64 `db:"seq_part"`
 }
 
-/* CacheVersion Table */
-type CacheVersion struct {
-	TableStruct[CacheVersionTable, CacheVersion]
-	PackedID     int64
-	CachedValues []byte
-}
-
-type CacheVersionTable struct {
-	TableStruct[CacheVersionTable, CacheVersion]
-	PackedID     Col[CacheVersionTable, int64]
-	CachedValues Col[CacheVersionTable, []byte]
-}
-
-func (e CacheVersionTable) GetSchema() TableSchema {
-	return TableSchema{
-		Name: "cache_version",
-		Keys: Cols(e.PackedID),
-	}
-}

@@ -9,34 +9,36 @@ import (
 // accessors are exercised for int16/int32/int64 and for the auto-resolved status column.
 type genericLabelRecord struct {
 	TableStruct[genericLabelSchema, genericLabelRecord]
-	CompanyID    int32  `db:"company_id"`
-	ID           int32  `db:"id"`
-	Name         string `db:"name"`
-	SKU          string `db:"sku"`
-	City         string `db:"city"`
-	Price        int64  `db:"price"`
-	BrandID      int16  `db:"brand_id"`
-	Status       int8   `db:"status"`
-	CacheVersion uint8  `json:"ccv,omitempty"`
+	CompanyID      int32  `db:"company_id"`
+	ID             int32  `db:"id"`
+	Name           string `db:"name"`
+	SKU            string `db:"sku"`
+	City           string `db:"city"`
+	Price          int64  `db:"price"`
+	BrandID        int16  `db:"brand_id"`
+	Status         int8   `db:"status"`
+	UpdatedVersion int32  `json:"upv,omitempty"`
 }
 
 type genericLabelSchema struct {
 	TableStruct[genericLabelSchema, genericLabelRecord]
-	CompanyID Col[genericLabelSchema, int32]
-	ID        Col[genericLabelSchema, int32]
-	Name      Col[genericLabelSchema, string]
-	SKU       Col[genericLabelSchema, string]
-	City      Col[genericLabelSchema, string]
-	Price     Col[genericLabelSchema, int64]
-	BrandID   Col[genericLabelSchema, int16]
-	Status    Col[genericLabelSchema, int8]
+	CompanyID      Col[genericLabelSchema, int32]
+	ID             Col[genericLabelSchema, int32]
+	Name           Col[genericLabelSchema, string]
+	SKU            Col[genericLabelSchema, string]
+	City           Col[genericLabelSchema, string]
+	Price          Col[genericLabelSchema, int64]
+	BrandID        Col[genericLabelSchema, int16]
+	Status         Col[genericLabelSchema, int8]
+	UpdatedVersion Col[genericLabelSchema, int32]
 }
 
 func (e genericLabelSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Name:             "generic_label",
-		Partition:        e.CompanyID,
-		SaveCacheVersion: true,
+		ID:                 10000,
+		Name:               "generic_label",
+		Partition:          e.CompanyID,
+		SaveUpdatedVersion: true,
 		GenericRecord: GenericRecordSchema{
 			Name: e.Name, S1: e.SKU, S2: e.City, N1: e.Price, N2: e.BrandID,
 		},
@@ -44,49 +46,52 @@ func (e genericLabelSchema) GetSchema() TableSchema {
 	}
 }
 
-// Table with SaveCacheVersion but no GenericRecord: must stay unexposed.
+// Table with SaveUpdatedVersion but no GenericRecord: must stay unexposed.
 type genericOptedOutRecord struct {
 	TableStruct[genericOptedOutSchema, genericOptedOutRecord]
-	CompanyID    int32  `db:"company_id"`
-	ID           int32  `db:"id"`
-	Name         string `db:"name"`
-	CacheVersion uint8  `json:"ccv,omitempty"`
+	CompanyID      int32  `db:"company_id"`
+	ID             int32  `db:"id"`
+	Name           string `db:"name"`
+	UpdatedVersion int32  `json:"upv,omitempty"`
 }
 
 type genericOptedOutSchema struct {
 	TableStruct[genericOptedOutSchema, genericOptedOutRecord]
-	CompanyID Col[genericOptedOutSchema, int32]
-	ID        Col[genericOptedOutSchema, int32]
-	Name      Col[genericOptedOutSchema, string]
+	CompanyID      Col[genericOptedOutSchema, int32]
+	ID             Col[genericOptedOutSchema, int32]
+	Name           Col[genericOptedOutSchema, string]
+	UpdatedVersion Col[genericOptedOutSchema, int32]
 }
 
 func (e genericOptedOutSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Name:             "generic_opted_out",
-		Partition:        e.CompanyID,
-		SaveCacheVersion: true,
-		Keys:             Cols(e.ID.Autoincrement(0)),
+		ID:                 10001,
+		Name:               "generic_opted_out",
+		Partition:          e.CompanyID,
+		SaveUpdatedVersion: true,
+		Keys:               Cols(e.ID.Autoincrement(0)),
 	}
 }
 
-// GenericRecord without SaveCacheVersion must panic: ccv is what makes the read incremental.
-type genericNoCacheVersionRecord struct {
-	TableStruct[genericNoCacheVersionSchema, genericNoCacheVersionRecord]
+// GenericRecord without SaveUpdatedVersion must panic: the slot version is what makes the read incremental.
+type genericNoSlotVersionRecord struct {
+	TableStruct[genericNoSlotVersionSchema, genericNoSlotVersionRecord]
 	CompanyID int32  `db:"company_id"`
 	ID        int32  `db:"id"`
 	Name      string `db:"name"`
 }
 
-type genericNoCacheVersionSchema struct {
-	TableStruct[genericNoCacheVersionSchema, genericNoCacheVersionRecord]
-	CompanyID Col[genericNoCacheVersionSchema, int32]
-	ID        Col[genericNoCacheVersionSchema, int32]
-	Name      Col[genericNoCacheVersionSchema, string]
+type genericNoSlotVersionSchema struct {
+	TableStruct[genericNoSlotVersionSchema, genericNoSlotVersionRecord]
+	CompanyID Col[genericNoSlotVersionSchema, int32]
+	ID        Col[genericNoSlotVersionSchema, int32]
+	Name      Col[genericNoSlotVersionSchema, string]
 }
 
-func (e genericNoCacheVersionSchema) GetSchema() TableSchema {
+func (e genericNoSlotVersionSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Name:          "generic_no_cache_version",
+		ID:            10002,
+		Name:          "generic_no_slot_version",
 		Partition:     e.CompanyID,
 		GenericRecord: GenericRecordSchema{Name: e.Name},
 		Keys:          Cols(e.ID.Autoincrement(0)),
@@ -96,26 +101,28 @@ func (e genericNoCacheVersionSchema) GetSchema() TableSchema {
 // A non-string column in a string slot must panic rather than mis-scan at runtime.
 type genericBadNameRecord struct {
 	TableStruct[genericBadNameSchema, genericBadNameRecord]
-	CompanyID    int32 `db:"company_id"`
-	ID           int32 `db:"id"`
-	Amount       int32 `db:"amount"`
-	CacheVersion uint8 `json:"ccv,omitempty"`
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	Amount         int32 `db:"amount"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
 }
 
 type genericBadNameSchema struct {
 	TableStruct[genericBadNameSchema, genericBadNameRecord]
-	CompanyID Col[genericBadNameSchema, int32]
-	ID        Col[genericBadNameSchema, int32]
-	Amount    Col[genericBadNameSchema, int32]
+	CompanyID      Col[genericBadNameSchema, int32]
+	ID             Col[genericBadNameSchema, int32]
+	Amount         Col[genericBadNameSchema, int32]
+	UpdatedVersion Col[genericBadNameSchema, int32]
 }
 
 func (e genericBadNameSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Name:             "generic_bad_name",
-		Partition:        e.CompanyID,
-		SaveCacheVersion: true,
-		GenericRecord:    GenericRecordSchema{Name: e.Amount},
-		Keys:             Cols(e.ID.Autoincrement(0)),
+		ID:                 10003,
+		Name:               "generic_bad_name",
+		Partition:          e.CompanyID,
+		SaveUpdatedVersion: true,
+		GenericRecord:      GenericRecordSchema{Name: e.Amount},
+		Keys:               Cols(e.ID.Autoincrement(0)),
 	}
 }
 
@@ -199,14 +206,14 @@ func TestGenericRecordPlanAbsentWhenNotDeclared(t *testing.T) {
 }
 
 func TestQueryCachedGenericByIDsRejectsUnregisteredAndOptedOutTables(t *testing.T) {
-	if _, err := QueryCachedGenericByIDs("table_that_does_not_exist", []IDCacheVersion{{ID: 1}}); err == nil {
+	if _, err := QueryCachedGenericByIDs("table_that_does_not_exist", []IDUpdatedVersion{{ID: 1}}); err == nil {
 		t.Fatal("expected an error for a table name that was never registered")
 	}
 
 	RegisterTableFactory("generic_opted_out", func() db.Table {
 		return MakeScyllaTable[genericOptedOutRecord, genericOptedOutSchema]()
 	})
-	if _, err := QueryCachedGenericByIDs("generic_opted_out", []IDCacheVersion{{ID: 1}}); err == nil {
+	if _, err := QueryCachedGenericByIDs("generic_opted_out", []IDUpdatedVersion{{ID: 1}}); err == nil {
 		t.Fatal("expected an error for a registered table that did not declare GenericRecord")
 	}
 }
@@ -226,9 +233,9 @@ func TestGenericRecordSchemaValidationPanics(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "GenericRecord without SaveCacheVersion",
-			makeTable:  func() { MakeScyllaTable[genericNoCacheVersionRecord, genericNoCacheVersionSchema]() },
-			wantReason: "requires SaveCacheVersion enabled",
+			name:       "GenericRecord without SaveUpdatedVersion",
+			makeTable:  func() { MakeScyllaTable[genericNoSlotVersionRecord, genericNoSlotVersionSchema]() },
+			wantReason: "requires SaveUpdatedVersion enabled",
 		},
 		{
 			name:       "non-string column in the Name slot",

@@ -72,7 +72,7 @@ func Merge[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInt
 }
 
 func QueryCachedIDs[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
-	refSlice *[]RecordT, cachedIDs []IDCacheVersion,
+	refSlice *[]RecordT, cachedIDs []IDUpdatedVersion,
 ) error {
 	return executorFor[RecordT, TableT, D]().QueryCachedIDs(refSlice, cachedIDs)
 }
@@ -102,7 +102,7 @@ var (
 	GetAutoincrementID func(key string, recordsSize int) (int64, error)
 	// QueryCachedGenericByIDs resolves IDs to the flat GenericRecord shape for any table
 	// that opted in through TableSchema.GenericRecord.
-	QueryCachedGenericByIDs func(tableName string, cachedIDs []IDCacheVersion) ([]GenericRecord, error)
+	QueryCachedGenericByIDs func(tableName string, cachedIDs []IDUpdatedVersion) ([]GenericRecord, error)
 	// SetDebugLogging raises the ORM's log verbosity: 0 off, 1 statements, 2 full.
 	SetDebugLogging func(level int)
 )

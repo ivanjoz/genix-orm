@@ -29,6 +29,7 @@ type groupedMovementSchema struct {
 
 func (e groupedMovementSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10004,
 		Name:      "grouped_movements",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -59,6 +60,7 @@ type fullViewSchema struct {
 
 func (e fullViewSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10005,
 		Name:      "full_view_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -93,6 +95,7 @@ type hashIndexedFullViewSchema struct {
 
 func (e hashIndexedFullViewSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10006,
 		Name:      "hash_indexed_full_view_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -122,6 +125,7 @@ type int32PackedViewSchema struct {
 
 func (e int32PackedViewSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10007,
 		Name:      "int32_packed_view_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),

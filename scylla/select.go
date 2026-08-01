@@ -900,11 +900,5 @@ func selectExec[E any](
 		return err
 	}
 
-	if boundPlan.AssignCacheVersions {
-		if err := assignCacheVersionsAfterSelect(recordsGetted, scyllaTable); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }

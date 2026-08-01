@@ -493,7 +493,7 @@ func syncIndexGroupsAfterWrite[T TableBaseInterface[E, T], E TableSchemaInterfac
 	if len(*records) == 0 || len(scyllaTable.indexGroups) == 0 || scyllaTable.indexUpdatedTable == nil {
 		return nil
 	}
-	if len(managedValues.updateCounterValues) == 0 {
+	if len(managedValues.updatedVersionValues) == 0 {
 		return nil
 	}
 
@@ -502,7 +502,7 @@ func syncIndexGroupsAfterWrite[T TableBaseInterface[E, T], E TableSchemaInterfac
 	for recordIndex := range *records {
 		recordPointer := xunsafe.AsPointer(&(*records)[recordIndex])
 		partitionValue := int32(scyllaTable.GetPartValue(recordPointer))
-		updateCounterValue := convertToInt64(managedValues.updateCounterValues[recordIndex])
+		updateCounterValue := convertToInt64(managedValues.updatedVersionValues[recordIndex])
 		appendIndexUpdatedRowsForRecord(recordPointer, scyllaTable, partitionValue, updateCounterValue, rowsByPartitionAndHash, &rowsToPersist)
 	}
 

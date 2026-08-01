@@ -15,7 +15,7 @@ This separation keeps setup overhead low while preserving the fluent API.
 
 ### 1.1 Main Types
 
-- **`ScyllaTable`** (`main.go`): table runtime descriptor (keys, partition, columns, maps, views/indexes, capabilities, cache-version metadata).
+- **`ScyllaTable`** (`main.go`): table runtime descriptor (keys, partition, columns, maps, views/indexes, capabilities, by-IDs slot metadata).
 - **`columnInfo` / `colInfo`** (`reflect_accessors.go`): column runtime metadata + getter/setter function pointers.
 - **`TableInfo`** (`main.go`): mutable query builder state.
 - **`ColumnStatement`** (`main.go`): normalized predicate unit used by planner and query execution.
@@ -32,7 +32,7 @@ Cached items include:
 - field name/index/type
 - `xunsafe.Field` pointer for direct memory access
 - inferred ORM type (`colType`)
-- cache-version response field index
+- managed `updated_version` column
 
 This avoids rebuilding reflection metadata for each call to `initStructTable`.
 
@@ -198,6 +198,7 @@ Inference rules:
 - `Type: TypeGlobalIndex`: global secondary index
 - `Cols != nil`: materialized view payload declaration
 - `Type: TypeViewTable`: derived table with write-side maintenance
+- `Type: TypeDelta`: packed range view with an implicit trailing `updated_version` key
 - `UseIndexGroup: true`: write-maintained hash group metadata
 
 ### 8.2 Packed Indexes
@@ -214,6 +215,24 @@ Rules:
 
 - **Hash views**: equality/IN routing via computed hash columns.
 - **Range (radix) views**: multi-column range routing via radix-weighted composite values.
+
+A range view's packed key is prefix-searchable, so it serves its full key and every leading subset:
+equality/IN on `columns[0..i-1]` plus equality or a range on `columns[i]` is one contiguous span of
+the packed column. Absent trailing columns therefore count as range columns, not as an equality on
+zero. A filter *behind* an unconstrained column cannot be expressed as one span, so
+`getStatementPrepared` returns nil and the planner falls back rather than dropping the predicate.
+
+Capability priorities reflect selectivity, not just prefix length: the full key keeps the view's own
+tier, while a partial prefix sits above the bare-partition plan (100) and below a local index
+equality (120) — a narrow index beats a broad prefix scan, and picking the view instead would leave
+the narrow predicate as an unservable leftover filter.
+
+`TypeDelta` is a range view whose digit layout is resolved from `TableSchema.FixedValues` instead of
+per-column `DecimalSize()` hints, with the managed `updated` column appended as the trailing key.
+`compileSchemaDeltaView` computes the maximum packed value from the declared ranges and picks `int`
+or `bigint` from it; the leading slot's magnitude is what decides the fit. A full-width scan's
+exclusive upper bound is capped at one past that maximum, which keeps it inside the packed column
+(a 10-digit layout would otherwise emit 10^10 for an `int`) and tightens the range.
 
 ### 8.4 Composite Bucketing
 
@@ -263,18 +282,36 @@ Update path enforces dependency integrity:
 
 ---
 
-## 11. Cache-Version Integration
+## 11. By-IDs Slot Versions (`cache_updated_version`)
 
-Cache-version support is precomputed during table build.
+`SaveUpdatedVersion` opts a table into the by-IDs cache. Records are bucketed into 256 slots by
+`uint8(record_id)`, and one row per (table+partition, slot) holds the version of the last write that
+touched it. Metadata is precomputed during table build (`configureSlotVersionFields`).
 
-Stored runtime metadata includes:
-- cache-version response field index
-- partition column used for group key
-- key column used for group/version mapping
+Stored runtime metadata:
+- managed `updated_version` column
+- partition column and key column used to derive the slot key
+
+Storage:
+
+```
+cache_updated_version(partition_table_id int, id_slot tinyint, updated_version smallint,
+                      PRIMARY KEY (partition_table_id, id_slot))
+```
+
+- `partition_table_id` packs the tenant (18 bits) and `TableSchema.ID` (14 bits) into one int.
+- `updated_version` is the write sequence truncated to int16. Slot versions are only compared for
+  equality, so wrap-around aliasing (1 in 65536) is accepted for a much smaller row. `0` is reserved
+  to mean "unknown" and is never stored.
 
 Read/write flow:
-- write operations increment version groups after successful commit
-- select paths ensure required ID/partition columns are available for version assignment
+- **Write**: one blind `UPDATE` per touched slot, batched. Nothing is read first — the version is
+  already on the record, assigned by the same counter call that hands out autoincrement IDs.
+- **Read**: one query returns a tenant's whole slot partition (≤256 tiny rows, kept hot by
+  `rows_per_partition: ALL`). Requested IDs whose client version equals their slot version are never
+  read from the base table.
+- Returned records have their `updated_version` overwritten with the **slot** version. Ordinary
+  selects do not touch it, so a delta read still carries each record's own write version.
 
 ---
 
@@ -286,6 +323,15 @@ Capabilities:
 - add missing table columns
 - create/manage indexes and materialized views
 - generate required `IS NOT NULL` clauses for view key parts
+
+`DeployScylla` also calls `EnsureInternalTables()` before homologating anything. The ORM's own
+tables — `sequences` and `cache_updated_version` — are raw CQL, not declared `TableSchema`s, so the
+homologation pass cannot discover them: it only inspects the controllers it was handed. Without that
+call a standalone deploy would produce a keyspace with every application table and no counters,
+and the first write would fail. All the statements are `IF NOT EXISTS`, so it is free to re-run.
+
+Homologation never drops anything. A table that stops being declared — like the old `cache_version`
+— stays in the keyspace until it is dropped by hand.
 
 ---
 

@@ -41,7 +41,6 @@ type BoundSelectPlan struct {
 	Statements            []BoundSelectStatement
 	ScanColumns           []selectScanColumn
 	RequiresDeduplication bool
-	AssignCacheVersions   bool
 }
 
 // SelectStatement caches one compiled select shape so repeated queries skip capability matching and source selection.
@@ -57,7 +56,6 @@ type SelectStatement struct {
 	remainingStatementIndexes  []int
 	postFilterStatementIndexes []int
 	requiresDeduplication      bool
-	assignCacheVersions        bool
 	orderBy                    string
 	orderColumnName            string
 	limit                      int32
@@ -148,7 +146,6 @@ func buildSelectProjection(tableInfo *TableInfo, scyllaTable ScyllaTable) ([]str
 		}
 	}
 
-	columnNames = ensureCacheVersionColumnsForSelect(columnNames, scyllaTable)
 	scanColumns = buildDefaultScanColumns(columnNames)
 	selectExpressions = append(selectExpressions, columnNames...)
 	return columnNames, scanColumns, selectExpressions
@@ -317,7 +314,6 @@ func buildBoundSelectPlan(
 	queryTemplate string,
 	scanColumns []selectScanColumn,
 	requiresDeduplication bool,
-	assignCacheVersions bool,
 	whereStatements []boundWhereClause,
 	remainingStatements []ColumnStatement,
 	postFilterStatements []ColumnStatement,
@@ -374,7 +370,6 @@ func buildBoundSelectPlan(
 		Statements:            boundStatements,
 		ScanColumns:           slices.Clone(scanColumns),
 		RequiresDeduplication: requiresDeduplication,
-		AssignCacheVersions:   assignCacheVersions,
 	}
 }
 
@@ -652,7 +647,6 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 			limit:                 tableInfo.Limit,
 			allowFilter:           tableInfo.AllowFilter,
 			groupByColumns:        slices.Clone(groupByPlan.GroupByColumns),
-			assignCacheVersions:   false,
 			requiresDeduplication: false,
 		}
 
@@ -676,7 +670,6 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 		limit:               tableInfo.Limit,
 		allowFilter:         tableInfo.AllowFilter,
 		route:               selectRouteAllStatements,
-		assignCacheVersions: true,
 	}
 
 	if compositePlan := tryBuildCompositeBucketPlan(statements, scyllaTable); compositePlan != nil {
@@ -779,6 +772,11 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 		selectedStatements := pickStatementsByIndexes(statements, e.selectedStatementIndexes)
 		remainingStatements = pickStatementsByIndexes(statements, e.remainingStatementIndexes)
 		whereStatements = e.sourceView.getStatementPrepared(selectedStatements...)
+		if len(whereStatements) == 0 {
+			// A view that cannot bind the predicates would otherwise yield zero bound statements,
+			// which reads as an empty result set instead of a planning failure.
+			return nil, fmt.Errorf(`view "%v" cannot serve this query's predicates`, e.sourceView.name)
+		}
 	case selectRouteKeyConcatenated:
 		rewrittenStatements, canRewrite := buildKeyConcatenatedStatements(statements, scyllaTable)
 		if !canRewrite {
@@ -826,7 +824,6 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 		queryTemplate,
 		scanColumns,
 		e.requiresDeduplication,
-		e.assignCacheVersions,
 		whereStatements,
 		remainingStatements,
 		postFilterStatements,

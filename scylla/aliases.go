@@ -12,10 +12,11 @@ type (
 	TableInfo       = db.TableInfo
 	TableSchema     = db.TableSchema
 	Index           = db.Index
+	FixedValues     = db.FixedValues
 
 	GenericRecordSchema = db.GenericRecordSchema
 	GenericRecord       = db.GenericRecord
-	IDCacheVersion      = db.IDCacheVersion
+	IDUpdatedVersion    = db.IDUpdatedVersion
 
 	Table     = db.Table
 	CSVResult = db.CSVResult
@@ -48,11 +49,17 @@ type RecordOf[TableT TableSchemaInterface[TableT], RecordT TableBaseInterface[Ta
 }
 
 const (
+	// Bounds of the packed by-IDs cache key, re-exported so the driver's own packing code reads
+	// against the same declaration the schema layer validates with.
+	MaxTableID          = db.MaxTableID
+	MaxCachePartitionID = db.MaxCachePartitionID
+
 	TypeGlobalIndex    = db.TypeGlobalIndex
 	TypeLocalIndex     = db.TypeLocalIndex
 	TypeInheritFromKey = db.TypeInheritFromKey
 	TypeView           = db.TypeView
 	TypeViewTable      = db.TypeViewTable
+	TypeDelta          = db.TypeDelta
 )
 
 // Cols returns columns as the slice required by schema declarations.

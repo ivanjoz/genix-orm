@@ -158,10 +158,14 @@ func (e ProductTable) GetSchema() db.TableSchema {
         Name:      "products",
         Partition: e.EmpresaID,
         Keys:      db.Cols(e.ID.Autoincrement(0)),
+        // Declared value ranges let a TypeDelta index size its packed digit slots.
+        FixedValues: []db.FixedValues{
+            {Col: e.Status, Values: []int64{0, 1}},
+        },
         Indexes: []db.Index{
-            // The first index key takes no .DecimalSize(): its width is inferred
-            // from the columns after it.
-            {Type: db.TypeView, Keys: db.Cols(e.Status, e.Updated.DecimalSize(10))},
+            // TypeDelta appends the managed "updated" column implicitly and serves both halves
+            // of a delta-cache sync. Keys[0] is the column query.Delta() filters on.
+            {Type: db.TypeDelta, Keys: db.Cols(e.Status)},
             {Type: db.TypeLocalIndex, Keys: db.Cols(e.Nombre)},
         },
     }

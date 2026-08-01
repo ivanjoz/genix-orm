@@ -16,11 +16,10 @@ import (
 // per query, which is how one record type can be read from two databases at once.
 type TableStruct[D Executor[T, E], T TableSchemaInterface[T], E TableBaseInterface[T, E]] struct {
 	// exec is nil until a query picks a driver; nil means "use D".
-	exec                   Executor[T, E]
-	schemaStruct           *T
-	tableInfo              *TableInfo
-	baseStructType         reflect.Type
-	cacheVersionFieldIndex []int
+	exec           Executor[T, E]
+	schemaStruct   *T
+	tableInfo      *TableInfo
+	baseStructType reflect.Type
 	// field just for encoding purposes
 	I__ bool `gob:"-" json:"-"`
 }
@@ -99,16 +98,6 @@ func (e *TableStruct[D, T, E]) setBaseStructType(baseType reflect.Type) {
 	e.baseStructType = baseType
 }
 
-func (e *TableStruct[D, T, E]) setCacheVersionFieldIndex(fieldIndex []int) {
-	e.cacheVersionFieldIndex = fieldIndex
-}
-
-// CacheVersionFieldIndex is the record field path of the cache-version column, or
-// nil when the record declares none. Drivers read it to stamp versions after a read.
-func (e *TableStruct[D, T, E]) CacheVersionFieldIndex() []int {
-	return e.cacheVersionFieldIndex
-}
-
 // BaseStructType is the record struct type this table was compiled against.
 func (e *TableStruct[D, T, E]) BaseStructType() reflect.Type {
 	return e.baseStructType
@@ -122,6 +111,113 @@ func (e TableStruct[D, T, E]) GetSchema() TableSchema {
 func (e *TableStruct[D, T, E]) SetWhere(colname string, operator string, value any) {
 	cs := ColumnStatement{Col: colname, Operator: operator, Value: value}
 	e.tableInfo.Statements = append(e.tableInfo.Statements, cs)
+}
+
+// SetWhereIn adds an IN predicate. It exists next to SetWhere because ColumnStatement carries IN
+// operands in Values rather than in Value.
+func (e *TableStruct[D, T, E]) SetWhereIn(colname string, values []any) {
+	e.tableInfo.Statements = append(e.tableInfo.Statements,
+		ColumnStatement{Col: colname, Operator: "IN", Values: values})
+}
+
+// Delta constrains a read to the delta-cache shape backed by the table's TypeDelta index.
+//
+// updatedSince is the client's watermark: the highest "updated_version" it has already received.
+// Greater than zero asks for everything written after it, fanned out over every declared value of
+// the index's leading key so the client also sees rows flipped to an inactive value and can evict
+// them. Zero is a first sync and keeps only syncFilterValues.
+//
+// The filtered column is not named here: it is the first key of the first TypeDelta index the
+// schema declares — a Status column in the common case, but any low-cardinality column will do.
+// Pass no value to constrain nothing but the watermark.
+func (e *TableStruct[D, T, E]) Delta(updatedSince int32, syncFilterValues ...int64) *T {
+	schema := (*e.schemaStruct).GetSchema()
+
+	deltaIndexes := []Index{}
+	for _, index := range schema.Indexes {
+		if index.Type == TypeDelta {
+			deltaIndexes = append(deltaIndexes, index)
+		}
+	}
+	if len(deltaIndexes) == 0 {
+		panic(fmt.Sprintf(`Table "%v": Delta() requires a delta index. Declare {Type: db.TypeDelta, Keys: db.Cols(…)}.`,
+			schema.Name))
+	}
+
+	if len(syncFilterValues) > 0 {
+		syncFilterColumn := resolveDeltaSyncFilterColumn(schema, deltaIndexes)
+
+		filterValues := make([]any, 0, len(syncFilterValues))
+		if updatedSince > 0 {
+			// A delta sync must carry every value of the filter column, or rows that moved to an
+			// inactive one would never reach the client that still caches them.
+			for _, declaredValue := range declaredValuesOfColumn(schema, syncFilterColumn) {
+				filterValues = append(filterValues, declaredValue)
+			}
+		} else {
+			for _, requestedValue := range syncFilterValues {
+				filterValues = append(filterValues, requestedValue)
+			}
+		}
+
+		if len(filterValues) == 1 {
+			e.SetWhere(syncFilterColumn, "=", filterValues[0])
+		} else {
+			e.SetWhereIn(syncFilterColumn, filterValues)
+		}
+	}
+
+	// The watermark predicate is always emitted, even at zero: a packed delta view is only reachable
+	// through a range on its trailing key, so without it the planner falls into exact-equality
+	// matching. The bound is expressed as ">= W+1" rather than "> W" because the packed view builds
+	// its lower bound from the statement value and ignores the operator; versions start at 1, so a
+	// first sync still reads the whole slot.
+	e.SetWhere(ColumnNameUpdatedVersion, ">=", updatedSince+1)
+	return e.schemaStruct
+}
+
+// resolveDeltaSyncFilterColumn returns the column Delta() filters on: the first key of the first
+// declared TypeDelta index. Several delta indexes are fine as long as they agree on that key,
+// since otherwise the inference would silently pick one and route to the wrong view.
+func resolveDeltaSyncFilterColumn(schema TableSchema, deltaIndexes []Index) string {
+	if len(deltaIndexes[0].Keys) == 0 {
+		panic(fmt.Sprintf(`Table "%v": Delta() was given filter values, but its delta index declares no key to filter on.`,
+			schema.Name))
+	}
+	syncFilterColumn := deltaIndexes[0].Keys[0].GetInfo().Name
+
+	for _, deltaIndex := range deltaIndexes[1:] {
+		if len(deltaIndex.Keys) == 0 || deltaIndex.Keys[0].GetInfo().Name != syncFilterColumn {
+			panic(fmt.Sprintf(`Table "%v": Delta() cannot infer a filter column because the delta indexes disagree on their first key ("%v" vs "%v").`,
+				schema.Name, syncFilterColumn, deltaIndex.Keys[0].GetInfo().Name))
+		}
+	}
+	return syncFilterColumn
+}
+
+// declaredValuesOfColumn enumerates a column's FixedValues, expanding a Min/Max range when no
+// explicit list was given.
+func declaredValuesOfColumn(schema TableSchema, columnName string) []int64 {
+	for _, fixedValues := range schema.FixedValues {
+		if fixedValues.Col == nil || fixedValues.Col.GetInfo().Name != columnName {
+			continue
+		}
+		if len(fixedValues.Values) > 0 {
+			return fixedValues.Values
+		}
+		minValue, maxValue, isDeclared := fixedValues.Bounds()
+		if !isDeclared {
+			break
+		}
+		values := make([]int64, 0, maxValue-minValue+1)
+		for value := minValue; value <= maxValue; value++ {
+			values = append(values, value)
+		}
+		return values
+	}
+
+	panic(fmt.Sprintf(`Table "%v": Delta() needs a FixedValues entry for "%v" to fan a delta sync out over its every value.`,
+		schema.Name, columnName))
 }
 
 func (e *TableStruct[D, T, E]) SetTableInfo(t *TableInfo) {
@@ -238,7 +334,6 @@ func MakeSchema[T TableBaseInterface[E, T], E TableSchemaInterface[E]]() TableSc
 
 type tableStructCacheMetaSetter interface {
 	setBaseStructType(reflect.Type)
-	setCacheVersionFieldIndex([]int)
 }
 
 // getCollectionFrozenDefaultForTableField reports whether the declaring handle
@@ -334,7 +429,6 @@ func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
 
 	if tableStructMeta, ok := any(schemaStruct).(tableStructCacheMetaSetter); ok {
 		tableStructMeta.setBaseStructType(recordMetadata.recordType)
-		tableStructMeta.setCacheVersionFieldIndex(append([]int(nil), recordMetadata.cacheVersionFieldIndex...))
 	}
 	return schemaStruct
 }

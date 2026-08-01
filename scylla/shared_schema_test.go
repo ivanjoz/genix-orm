@@ -31,6 +31,7 @@ type sharedSchemaTable struct {
 
 func (e sharedSchemaTable) GetSchema() db.TableSchema {
 	return db.TableSchema{
+		ID:        10024,
 		Name:      "shared_schema_probe",
 		Partition: e.EmpresaID,
 		Keys:      db.Cols(e.ID.Autoincrement(0)),

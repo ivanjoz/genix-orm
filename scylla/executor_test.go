@@ -53,7 +53,7 @@ func (f *fakeExec[TableT, RecordT]) Merge(
 ) error {
 	return nil
 }
-func (f *fakeExec[TableT, RecordT]) QueryCachedIDs(_ *[]RecordT, _ []IDCacheVersion) error {
+func (f *fakeExec[TableT, RecordT]) QueryCachedIDs(_ *[]RecordT, _ []IDUpdatedVersion) error {
 	return nil
 }
 func (f *fakeExec[TableT, RecordT]) SearchTextIDs(_ int32, _ string, _ int8, _ int) ([]db.IDWeight, error) {

@@ -246,7 +246,10 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	dbTable.views[view.name] = view
 }
 
-func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
+// compileSchemaView builds the materialized view backing one TypeView declaration. slotPlan is nil
+// for a plain TypeView, whose packed digit layout is derived from .DecimalSize() hints here; a
+// TypeDelta declaration resolves its layout from FixedValues up front and passes it in.
+func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotPlan) {
 	appendUniqueColumn := func(target []IColInfo, column IColInfo) []IColInfo {
 		if column == nil || column.IsNil() {
 			return target
@@ -282,7 +285,8 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		}
 	}
 
-	isRangeView := len(viewCfg.Keys) > 1 && packedViewHintFound
+	// A resolved slot plan already establishes the view as packed, so no per-column hint is needed.
+	isRangeView := len(viewCfg.Keys) > 1 && (packedViewHintFound || slotPlan != nil)
 
 	// Views keep the base table partition unless the schema declares another column.
 	basePartCol := dbTable.GetPartKey()
@@ -383,50 +387,65 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		if len(columns) < 2 {
 			panic(fmt.Sprintf(`The view "%v" in "%v" requires at least 2 columns for DecimalSize() packed range views`, view.name, dbTable.Name))
 		}
-		if viewColumnsConfig[0].DecimalDigits > 0 {
-			panic(fmt.Sprintf(`The view "%v" in "%v" cannot set DecimalSize() on the first column; it is inferred from the remaining columns`, view.name, dbTable.Name))
+
+		isInt32PackedView := false
+		slotDigitsPerColumn := make([]int64, 0, len(viewColumnsConfig))
+
+		if slotPlan != nil {
+			// TypeDelta resolved every slot from FixedValues, so the DecimalSize() rules below do not
+			// apply: the leading column carries a real width instead of absorbing a digit remainder.
+			if len(slotPlan.slotDigitsPerColumn) != len(columns) {
+				panic(fmt.Sprintf(`The view "%v" in "%v" got %v slot widths for %v columns`,
+					view.name, dbTable.Name, len(slotPlan.slotDigitsPerColumn), len(columns)))
+			}
+			isInt32PackedView = slotPlan.useInt32
+			slotDigitsPerColumn = append(slotDigitsPerColumn, slotPlan.slotDigitsPerColumn...)
+		} else {
+			if viewColumnsConfig[0].DecimalDigits > 0 {
+				panic(fmt.Sprintf(`The view "%v" in "%v" cannot set DecimalSize() on the first column; it is inferred from the remaining columns`, view.name, dbTable.Name))
+			}
+
+			isInt32PackedView = viewColumnsConfig[0].UseInt32Packing
+
+			radixSlotsByColumn := make([]int8, 0, len(viewColumnsConfig)-1)
+			for columnIndex := 1; columnIndex < len(viewColumnsConfig); columnIndex++ {
+				DecimalDigits := viewColumnsConfig[columnIndex].DecimalDigits
+				if DecimalDigits <= 0 {
+					panic(fmt.Sprintf(`The view "%v" in "%v" must set DecimalSize() on column "%v" (only the first column can be inferred)`,
+						view.name, dbTable.Name, columns[columnIndex].GetName()))
+				}
+				radixSlotsByColumn = append(radixSlotsByColumn, DecimalDigits)
+			}
+
+			radixes := append(radixSlotsByColumn, 0)
+			slices.Reverse(radixes)
+			sum := int8(0)
+			for i, v := range radixes {
+				radixes[i] = v + sum
+				sum += v
+			}
+			slices.Reverse(radixes)
+			if radixes[0] > 17 {
+				panic(fmt.Sprintf(`For view "%v" in "%v" the max radix must not be greater than 17.`, view.name, dbTable.Name))
+			}
+
+			totalDigitsForPackedView := int64(19)
+			if isInt32PackedView {
+				totalDigitsForPackedView = 9
+			}
+			sumTrailingDigits := int64(0)
+			for _, DecimalDigits := range radixSlotsByColumn {
+				sumTrailingDigits += int64(DecimalDigits)
+			}
+			slotDigitsPerColumn = append(slotDigitsPerColumn, totalDigitsForPackedView-sumTrailingDigits)
+			for _, DecimalDigits := range radixSlotsByColumn {
+				slotDigitsPerColumn = append(slotDigitsPerColumn, int64(DecimalDigits))
+			}
 		}
 
-		isInt32PackedView := viewColumnsConfig[0].UseInt32Packing
 		if isInt32PackedView {
 			view.column.GetType().FieldType = "int32"
 			view.column.GetType().DBType = "int"
-		}
-
-		radixSlotsByColumn := make([]int8, 0, len(viewColumnsConfig)-1)
-		for columnIndex := 1; columnIndex < len(viewColumnsConfig); columnIndex++ {
-			DecimalDigits := viewColumnsConfig[columnIndex].DecimalDigits
-			if DecimalDigits <= 0 {
-				panic(fmt.Sprintf(`The view "%v" in "%v" must set DecimalSize() on column "%v" (only the first column can be inferred)`,
-					view.name, dbTable.Name, columns[columnIndex].GetName()))
-			}
-			radixSlotsByColumn = append(radixSlotsByColumn, DecimalDigits)
-		}
-
-		radixes := append(radixSlotsByColumn, 0)
-		slices.Reverse(radixes)
-		sum := int8(0)
-		for i, v := range radixes {
-			radixes[i] = v + sum
-			sum += v
-		}
-		slices.Reverse(radixes)
-		if radixes[0] > 17 {
-			panic(fmt.Sprintf(`For view "%v" in "%v" the max radix must not be greater than 17.`, view.name, dbTable.Name))
-		}
-
-		totalDigitsForPackedView := int64(19)
-		if isInt32PackedView {
-			totalDigitsForPackedView = 9
-		}
-		slotDigitsPerColumn := make([]int64, 0, len(viewColumnsConfig))
-		sumTrailingDigits := int64(0)
-		for _, DecimalDigits := range radixSlotsByColumn {
-			sumTrailingDigits += int64(DecimalDigits)
-		}
-		slotDigitsPerColumn = append(slotDigitsPerColumn, totalDigitsForPackedView-sumTrailingDigits)
-		for _, DecimalDigits := range radixSlotsByColumn {
-			slotDigitsPerColumn = append(slotDigitsPerColumn, int64(DecimalDigits))
 		}
 		view.packedSourceColumns = append([]IColInfo{}, columns...)
 		view.packedSlotDigitsPerColumn = append([]int64{}, slotDigitsPerColumn...)
@@ -443,6 +462,21 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			return computePackedInt64ValueNonNegative(values, slotDigitsPerColumn)
 		}
 
+		// A scan that spans a whole slot width computes an exclusive upper bound one past the end of
+		// that slot, which can land outside what the packed column physically holds — 10^10 for an
+		// int, or a wrapped negative once Pow10Int64 passes 18 digits. Cap it at one past the highest
+		// value this layout can actually produce; that is both in range and tighter.
+		packedValueCeiling := Pow10Int64(min(sumSlotDigits(slotDigitsPerColumn, 0), 18)) - 1
+		if slotPlan != nil {
+			packedValueCeiling = slotPlan.maxPackedValue
+		}
+		clampPackedUpperBound := func(upperBound int64) int64 {
+			if upperBound <= 0 || upperBound > packedValueCeiling {
+				return packedValueCeiling + 1
+			}
+			return upperBound
+		}
+
 		slotDigitsCopy := append([]int64{}, slotDigitsPerColumn...)
 		viewColsCopy := append([]IColInfo{}, columns...)
 		view.decomposeVirtualValue = func(rawValue any) []any {
@@ -456,12 +490,23 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 
 		viewCols := columns
 		useInt32Output := isInt32PackedView
+		// A slot plan sizes the packed column from declared FixedValues, so a row written outside
+		// those ranges would overflow the key and silently corrupt the view. Fail loudly instead.
+		maxPackedValue := int64(0)
+		if slotPlan != nil {
+			maxPackedValue = slotPlan.maxPackedValue
+		}
+		viewNameForGuard, tableNameForGuard := view.name, dbTable.Name
 		view.column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
 			values := []int64{}
 			for _, col := range viewCols {
 				values = append(values, convertToInt64(col.GetValue(ptr)))
 			}
 			sumValue := makeValue(values)
+			if maxPackedValue > 0 && sumValue > maxPackedValue {
+				panic(fmt.Sprintf(`Table "%v": view "%v" packed to %v, past the %v its declared FixedValues allow. Column values: %v`,
+					tableNameForGuard, viewNameForGuard, sumValue, maxPackedValue, values))
+			}
 			if useInt32Output {
 				return any(int32(sumValue))
 			}
@@ -494,22 +539,25 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 				partStatement = statementsMap[viewPartColPtr.GetName()].from
 			}
 
+			// A packed key is prefix-searchable: the leading columns pinned by equality/IN select a
+			// contiguous block, and everything from the first unconstrained or range-filtered column
+			// onwards spans that block's full width. Absent columns therefore count as range columns,
+			// not as an equality on zero — that distinction is what lets one packed view answer
+			// "Status = 1" as well as the full key.
 			getValuesGroups := func() ([][]int64, []IColInfo) {
 				valuesGroups := [][]int64{}
 				rangeColumns := []IColInfo{}
 				for _, col := range viewCols {
-					stRange, ok := statementsMap[col.GetName()]
-					if !ok || stRange.from == nil {
-						stRange = statementRangeGroup{from: &ColumnStatement{Value: int64(0)}}
-					}
-					st := stRange.from
-					if viewPartColPtr != nil && st.Col == viewPartColPtr.GetName() {
+					if viewPartColPtr != nil && col.GetName() == viewPartColPtr.GetName() {
 						continue
 					}
-					if len(rangeColumns) > 0 || slices.Contains(rangeOperators, st.Operator) {
+					stRange, hasStatement := statementsMap[col.GetName()]
+					isUnconstrained := !hasStatement || stRange.from == nil
+					if len(rangeColumns) > 0 || isUnconstrained || slices.Contains(rangeOperators, stRange.from.Operator) {
 						rangeColumns = append(rangeColumns, col)
 						continue
 					}
+					st := stRange.from
 
 					valuesToAdd := []int64{}
 					if len(st.Values) > 0 {
@@ -537,11 +585,37 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 				return valuesGroups, rangeColumns
 			}
 
+			// Only the first range column can carry a bound; a filter on anything after it cannot be
+			// expressed as one packed range and must not be silently dropped. Returning nil tells the
+			// planner this view cannot serve the query.
+			hasUnservableGap := func(rangeColumns []IColInfo) bool {
+				for _, col := range rangeColumns[1:] {
+					if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
+						fmt.Printf("Packed view rejected: view=%s cannot bind a filter on \"%s\" behind an unconstrained column\n",
+							viewPtr.name, col.GetName())
+						return true
+					}
+				}
+				return false
+			}
+
 			whereStatements := []boundWhereClause{}
+			valuesGroups, rangeColumns := getValuesGroups()
+			if len(rangeColumns) > 1 && hasUnservableGap(rangeColumns) {
+				return nil
+			}
+
 			if useBeetween {
 				valuesFrom, valuesTo := []int64{}, []int64{}
 				for _, col := range viewCols {
-					srg := statementsMap[col.GetName()]
+					srg, hasStatement := statementsMap[col.GetName()]
+					// An unconstrained column spans its whole slot, so it floors on the low bound and
+					// tops out on the high one.
+					if !hasStatement || srg.from == nil {
+						valuesFrom = append(valuesFrom, 0)
+						valuesTo = append(valuesTo, Pow10Int64(slotDigitsPerColumn[len(valuesTo)])-1)
+						continue
+					}
 					valuesFrom = append(valuesFrom, convertToInt64(srg.from.Value))
 					if srg.betweenTo != nil {
 						valuesTo = append(valuesTo, convertToInt64(srg.betweenTo.Value))
@@ -551,7 +625,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 				}
 				whereStatement := boundWhereClause{
 					Clause: fmt.Sprintf("%v >= ? AND %v < ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
-					Values: []any{makeValue(valuesFrom), makeValue(valuesTo) + 1},
+					Values: []any{makeValue(valuesFrom), clampPackedUpperBound(makeValue(valuesTo) + 1)},
 				}
 				if partStatement != nil {
 					whereStatement = boundWhereClause{
@@ -560,26 +634,32 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 					}
 				}
 				return []boundWhereClause{whereStatement}
-			} else if len(statements) > 0 && slices.Contains(rangeOperators, statements[len(statements)-1].Operator) {
-				valuesGroups, rangeColumns := getValuesGroups()
+			} else if len(rangeColumns) > 0 {
+				if len(valuesGroups) == 0 {
+					// Nothing is pinned by equality, so the scan starts at the packed column's floor.
+					valuesGroups = [][]int64{{}}
+				}
 				for _, prefixValues := range valuesGroups {
 					valuesFrom := slices.Clone(prefixValues)
 					prefixFloorValues := slices.Clone(prefixValues)
 
 					for _, col := range rangeColumns {
-						st := statementsMap[col.GetName()]
-						valuesFrom = append(valuesFrom, convertToInt64(st.from.Value))
+						// Only the first range column can carry a lower bound; the rest span their slot.
+						rangeFrom := int64(0)
+						if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
+							rangeFrom = convertToInt64(stRange.from.Value)
+						}
+						valuesFrom = append(valuesFrom, rangeFrom)
 						prefixFloorValues = append(prefixFloorValues, 0)
 					}
 
-					upperBound := makeValue(prefixFloorValues) + Pow10Int64(sumSlotDigits(slotDigitsPerColumn, len(prefixValues)))
+					upperBound := clampPackedUpperBound(makeValue(prefixFloorValues) + Pow10Int64(sumSlotDigits(slotDigitsPerColumn, len(prefixValues))))
 					whereStatements = append(whereStatements, boundWhereClause{
 						Clause: fmt.Sprintf("%v >= ? AND %v < ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
 						Values: []any{makeValue(valuesFrom), upperBound},
 					})
 				}
 			} else {
-				valuesGroups, _ := getValuesGroups()
 				hashValues := make([]any, 0, len(valuesGroups))
 				placeholders := make([]string, 0, len(valuesGroups))
 				for _, values := range valuesGroups {

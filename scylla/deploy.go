@@ -284,8 +284,8 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 	}
 
 	appendSelectedColumn(partitionColumn)
-	if scyllaTable.UpdateCounterCol != nil {
-		appendSelectedColumn(scyllaTable.UpdateCounterCol)
+	if scyllaTable.UpdatedVersionCol != nil {
+		appendSelectedColumn(scyllaTable.UpdatedVersionCol)
 	}
 	for _, indexGroup := range scyllaTable.indexGroups {
 		if !shouldPersistIndexUpdatedGroup(indexGroup) {
@@ -347,7 +347,7 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 
 		for valueIndex, selectedColumn := range selectedColumns {
 			rawValue := dereferenceScyllaValue(rowData.Values[valueIndex])
-			if selectedColumn.GetName() == managedUpdateCounterColumnName {
+			if selectedColumn.GetName() == managedUpdatedVersionColumnName {
 				updateCounterValue = convertToInt64(rawValue)
 				continue
 			}
@@ -701,6 +701,13 @@ var scyllaColumnsSaved []ScyllaColumns
 var scyllaIndexesSaved []ScyllaIndexes
 
 func DeployScylla(cacheCode int32, controllers ...db.Controller) {
+	// The ORM's own tables are raw CQL, so the homologation pass below can never discover them —
+	// it only sees the controllers it was handed. Creating them here is what makes a standalone
+	// deploy ("fn-homologate") produce a usable keyspace, not just one with the app tables in it.
+	if err := EnsureInternalTables(); err != nil {
+		panic("Error al crear las tablas internas del ORM: " + err.Error())
+	}
+
 	var scyllaColumns []ScyllaColumns
 	var scyllaIndexes []ScyllaIndexes
 	isFetched := false

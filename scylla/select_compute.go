@@ -410,7 +410,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 		// Just partition
 		caps = append(caps, QueryCapability{
 			Signature: fmt.Sprintf("%v|=", pk.GetName()),
-			Priority:  10,
+			Priority:  100,
 			IsKey:     true,
 		})
 
@@ -421,13 +421,13 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			// Equality
 			caps = append(caps, QueryCapability{
 				Signature: currentSig + fmt.Sprintf("|%v|=", colName),
-				Priority:  20 + i*2,
+				Priority:  200 + i*20,
 				IsKey:     true,
 			})
 			// Range (only supported on clustering keys)
 			caps = append(caps, QueryCapability{
 				Signature: currentSig + fmt.Sprintf("|%v|~", colName),
-				Priority:  15 + i*2,
+				Priority:  150 + i*20,
 				IsKey:     true,
 			})
 			currentSig += fmt.Sprintf("|%v|=", colName)
@@ -445,13 +445,13 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			caps = append(caps, QueryCapability{
 				Signature: fmt.Sprintf("%v|=|%v|%v", pkName, colName, colOp),
 				Source:    idx,
-				Priority:  12,
+				Priority:  120,
 			})
 			// Range
 			caps = append(caps, QueryCapability{
 				Signature: fmt.Sprintf("%v|=|%v|~", pkName, colName),
 				Source:    idx,
-				Priority:  11,
+				Priority:  110,
 			})
 		} else if idx.Type == 1 { // Global Index
 			colName := idx.column.GetName()
@@ -460,7 +460,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			caps = append(caps, QueryCapability{
 				Signature: fmt.Sprintf("%v|%v", colName, colOp),
 				Source:    idx,
-				Priority:  10,
+				Priority:  100,
 			})
 		}
 	}
@@ -497,12 +497,12 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				caps = append(caps, QueryCapability{
 					Signature: sigPrefix + fmt.Sprintf("%v|=", colName),
 					Source:    source,
-					Priority:  14,
+					Priority:  140,
 				})
 				caps = append(caps, QueryCapability{
 					Signature: sigPrefix + fmt.Sprintf("%v|~", colName),
 					Source:    source,
-					Priority:  13,
+					Priority:  130,
 				})
 				continue
 			}
@@ -520,16 +520,16 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					signaturePrefix += "|"
 				}
 
-				priorityBase := 20
+				priorityBase := 200
 				if isLocal {
 					// Local packed indexes are typically more selective when partition is provided.
-					priorityBase = 26
+					priorityBase = 260
 				}
 
 				caps = append(caps, QueryCapability{
 					Signature: signaturePrefix + colName + "|=",
 					Source:    source,
-					Priority:  priorityBase + len(packedIndex.sourceColumnNames)*2,
+					Priority:  priorityBase + len(packedIndex.sourceColumnNames)*20,
 				})
 				// Global secondary indexes are not reliable for range scans; Scylla can demand ALLOW FILTERING.
 				// We only advertise "~" for local packed indexes (partition-scoped index table supports range on packed col).
@@ -537,7 +537,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					caps = append(caps, QueryCapability{
 						Signature: signaturePrefix + colName + "|~",
 						Source:    source,
-						Priority:  priorityBase - 2 + len(packedIndex.sourceColumnNames)*2,
+						Priority:  priorityBase - 20 + len(packedIndex.sourceColumnNames)*20,
 					})
 				}
 			}
@@ -564,7 +564,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			caps = append(caps, QueryCapability{
 				Signature: sigBase,
 				Source:    view,
-				Priority:  30 + len(view.columns)*2,
+				Priority:  300 + len(view.columns)*20,
 			})
 
 			// Index groups support BETWEEN on each non-slice source column by
@@ -586,7 +586,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				caps = append(caps, QueryCapability{
 					Signature: strings.Join(rangeSigParts, "|"),
 					Source:    view,
-					Priority:  28 + len(view.columns)*2, // slightly lower than full equality
+					Priority:  280 + len(view.columns)*20, // slightly lower than full equality
 				})
 			}
 		} else if view.Type == 6 { // Simple View
@@ -597,9 +597,9 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				}
 				currentSig += col + "|="
 
-				priority := 10
+				priority := 100
 				if i > 0 {
-					priority = 25 + (i-1)*2
+					priority = 250 + (i-1)*20
 				}
 
 				// Prefix equality
@@ -614,7 +614,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					caps = append(caps, QueryCapability{
 						Signature: currentSig[:len(currentSig)-1] + "~",
 						Source:    view,
-						Priority:  priority - 5,
+						Priority:  priority - 50,
 					})
 				}
 			}
@@ -628,9 +628,9 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				operatorToken := capabilityDefaultOpForColumn(dbTable.ColumnsMap[col])
 				currentSig += col + "|" + operatorToken
 
-				priority := 10
+				priority := 100
 				if i > 0 {
-					priority = 25 + (i-1)*2
+					priority = 250 + (i-1)*20
 				}
 
 				caps = append(caps, QueryCapability{
@@ -643,35 +643,51 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					caps = append(caps, QueryCapability{
 						Signature: currentSig[:len(currentSig)-1] + "~",
 						Source:    view,
-						Priority:  priority - 5,
+						Priority:  priority - 50,
 					})
 				}
 			}
 		} else if view.Type == 8 { // Range/Radix
-			// Radix views always have equality on prefix, range on last.
-			// They also usually keep part.
+			// A packed base-10 key is prefix-searchable: equality on columns[0..i-1] plus equality or
+			// a range on columns[i] is one contiguous range over the packed column. So the view serves
+			// its full key and every shorter prefix of it.
+			//
+			// Only the full key gets the view's own tier. A partial prefix sits above the
+			// bare-partition plan (100) but below a local index equality (120), because a narrow index
+			// is more selective than a broad prefix scan — without that gap the planner would prefer
+			// this view and leave the narrow predicate as an unservable leftover filter.
 			cols := []string{}
 			for i, col := range view.columns {
-				if i < len(view.columns)-1 {
+				if i == 0 {
+					// The partition alone is served better by the base table.
 					cols = append(cols, col+"|=")
-				} else {
-					// Last one can be = or ~
-					sigPrefix := strings.Join(cols, "|")
-					if sigPrefix != "" {
-						sigPrefix += "|"
-					}
-
-					caps = append(caps, QueryCapability{
-						Signature: sigPrefix + col + "|=",
-						Source:    view,
-						Priority:  36 + len(view.columns)*2,
-					})
-					caps = append(caps, QueryCapability{
-						Signature: sigPrefix + col + "|~",
-						Source:    view,
-						Priority:  35 + len(view.columns)*2,
-					})
+					continue
 				}
+
+				sigPrefix := strings.Join(cols, "|")
+				if sigPrefix != "" {
+					sigPrefix += "|"
+				}
+
+				equalityPriority := 360 + len(view.columns)*20
+				if i < len(view.columns)-1 {
+					// Longer prefixes still outrank shorter ones; the cap keeps very wide keys inside
+					// the band, where the more-columns tie-break in MatchQueryCapability takes over.
+					equalityPriority = min(101+i*2, 108)
+				}
+
+				caps = append(caps, QueryCapability{
+					Signature: sigPrefix + col + "|=",
+					Source:    view,
+					Priority:  equalityPriority,
+				})
+				caps = append(caps, QueryCapability{
+					Signature: sigPrefix + col + "|~",
+					Source:    view,
+					Priority:  equalityPriority - 1,
+				})
+
+				cols = append(cols, col+"|=")
 			}
 		}
 	}
@@ -692,14 +708,14 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				// Equality
 				caps = append(caps, QueryCapability{
 					Signature: currentSig + fmt.Sprintf("|%v|=", colName),
-					Priority:  40 + i*2,
+					Priority:  400 + i*20,
 					IsKey:     true,
 				})
 
 				// Range
 				caps = append(caps, QueryCapability{
 					Signature: currentSig + fmt.Sprintf("|%v|~", colName),
-					Priority:  35 + i*2,
+					Priority:  350 + i*20,
 					IsKey:     true,
 				})
 
@@ -726,14 +742,14 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				// Equality
 				caps = append(caps, QueryCapability{
 					Signature: currentSig + fmt.Sprintf("|%v|=", colName),
-					Priority:  25 + i*2,
+					Priority:  250 + i*20,
 					IsKey:     true, // It's handled by PK smart logic
 				})
 
 				// Range on this column
 				caps = append(caps, QueryCapability{
 					Signature: currentSig + fmt.Sprintf("|%v|~", colName),
-					Priority:  20 + i*2,
+					Priority:  200 + i*20,
 					IsKey:     true,
 				})
 

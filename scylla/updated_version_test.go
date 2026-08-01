@@ -83,6 +83,7 @@ type weekIndexGroupSchema struct {
 
 func (e updateCounterSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10020,
 		Namespace: "test_keyspace",
 		Name:      "update_counter_records",
 		Partition: e.CompanyID,
@@ -92,16 +93,18 @@ func (e updateCounterSchema) GetSchema() TableSchema {
 
 func (e updateCounterDisabledSchema) GetSchema() TableSchema {
 	return TableSchema{
-		Namespace:            "test_keyspace",
-		Name:                 "update_counter_records_disabled",
-		Partition:            e.CompanyID,
-		Keys:                 Cols(e.ID),
-		DisableUpdateCounter: true,
+		ID:                    10021,
+		Namespace:             "test_keyspace",
+		Name:                  "update_counter_records_disabled",
+		Partition:             e.CompanyID,
+		Keys:                  Cols(e.ID),
+		DisableUpdatedVersion: true,
 	}
 }
 
 func (e indexGroupSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10022,
 		Namespace: "test_keyspace",
 		Name:      "index_group_records",
 		Partition: e.CompanyID,
@@ -121,6 +124,7 @@ func (e indexGroupSchema) GetSchema() TableSchema {
 
 func (e weekIndexGroupSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10023,
 		Namespace: "test_keyspace",
 		Name:      "week_index_group_records",
 		Partition: e.CompanyID,
@@ -137,7 +141,7 @@ func (e weekIndexGroupSchema) GetSchema() TableSchema {
 func TestMakeScyllaTableAddsManagedAuditColumns(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterRecord, updateCounterSchema]()
 
-	for _, columnName := range []string{"created", "updated", "update_counter"} {
+	for _, columnName := range []string{"created", "updated", "updated_version"} {
 		if scyllaTable.ColumnsMap[columnName] == nil {
 			t.Fatalf("expected managed column %q to exist in table metadata", columnName)
 		}
@@ -150,10 +154,10 @@ func TestMakeScyllaTableSkipsManagedUpdateCounterWhenDisabled(t *testing.T) {
 	if scyllaTable.ColumnsMap["created"] == nil || scyllaTable.ColumnsMap["updated"] == nil {
 		t.Fatalf("expected created and updated managed columns to remain enabled")
 	}
-	if scyllaTable.ColumnsMap["update_counter"] != nil {
-		t.Fatalf("expected update_counter managed column to be disabled")
+	if scyllaTable.ColumnsMap["updated_version"] != nil {
+		t.Fatalf("expected updated_version managed column to be disabled")
 	}
-	if scyllaTable.UpdateCounterCol != nil {
+	if scyllaTable.UpdatedVersionCol != nil {
 		t.Fatalf("expected updateCounterCol runtime metadata to be nil when disabled")
 	}
 }
@@ -217,8 +221,8 @@ func TestApplyWriteManagedColumnsUsesPartitionScopedUpdatedCounter(t *testing.T)
 			t.Fatalf("expected managed updated 77, got %v at index %d", managedValues.updatedValues[recordIndex], recordIndex)
 		}
 	}
-	if managedValues.updateCounterValues[0] != int32(41) || managedValues.updateCounterValues[1] != int32(41) || managedValues.updateCounterValues[2] != int32(52) {
-		t.Fatalf("unexpected managed update counters: %v", managedValues.updateCounterValues)
+	if managedValues.updatedVersionValues[0] != int32(41) || managedValues.updatedVersionValues[1] != int32(41) || managedValues.updatedVersionValues[2] != int32(52) {
+		t.Fatalf("unexpected managed update counters: %v", managedValues.updatedVersionValues)
 	}
 }
 
@@ -246,7 +250,7 @@ func TestMakeUpdateStatementsAlwaysPersistsManagedUpdatedColumns(t *testing.T) {
 	}
 	preparedStatement := preparedStatements[0]
 
-	for _, expectedSetClause := range []string{"nombre = ?", "updated = ?", "update_counter = ?"} {
+	for _, expectedSetClause := range []string{"nombre = ?", "updated = ?", "updated_version = ?"} {
 		if !strings.Contains(preparedStatement.Stmt, expectedSetClause) {
 			t.Fatalf("expected SET clause %q in statement: %s", expectedSetClause, preparedStatement.Stmt)
 		}
@@ -283,7 +287,7 @@ func TestMakeInsertStatementIncludesManagedAuditColumnsWithoutStructFields(t *te
 	}
 	preparedStatement := insertStatements[0]
 
-	for _, expectedColumn := range []string{"created", "updated", "update_counter"} {
+	for _, expectedColumn := range []string{"created", "updated", "updated_version"} {
 		if !strings.Contains(preparedStatement.Stmt, expectedColumn) {
 			t.Fatalf("expected managed column %q in insert statement: %s", expectedColumn, preparedStatement.Stmt)
 		}
@@ -408,7 +412,7 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 	}
 
 	managedValues := managedWriteValues{
-		updateCounterValues: []any{int32(41)},
+		updatedVersionValues: []any{int32(41)},
 	}
 
 	if err := syncIndexGroupsAfterWrite(&records, &scyllaTable, managedValues); err != nil {
@@ -544,8 +548,8 @@ func TestBuildSelectProjectionSkipsWriteOnlyManagedColumns(t *testing.T) {
 	if slices.Contains(columnNames, managedUpdatedColumnName) {
 		t.Fatalf("did not expect %q in default projection: %v", managedUpdatedColumnName, columnNames)
 	}
-	if slices.Contains(columnNames, managedUpdateCounterColumnName) {
-		t.Fatalf("did not expect %q in default projection: %v", managedUpdateCounterColumnName, columnNames)
+	if slices.Contains(columnNames, managedUpdatedVersionColumnName) {
+		t.Fatalf("did not expect %q in default projection: %v", managedUpdatedVersionColumnName, columnNames)
 	}
 	if !slices.Contains(columnNames, "name") || !slices.Contains(columnNames, "current_value") {
 		t.Fatalf("expected real sequence columns in projection, got %v", columnNames)

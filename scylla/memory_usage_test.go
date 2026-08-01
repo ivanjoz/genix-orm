@@ -51,6 +51,7 @@ type simpleSchema struct {
 
 func (e simpleSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10014,
 		Name:      "simple_table",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -98,6 +99,7 @@ type mediumSchema struct {
 
 func (e mediumSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10015,
 		Name:      "medium_table",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -175,6 +177,7 @@ type complexSchema struct {
 
 func (e complexSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:        10016,
 		Name:      "complex_table",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
@@ -292,6 +295,7 @@ type veryComplexSchema struct {
 
 func (e veryComplexSchema) GetSchema() TableSchema {
 	return TableSchema{
+		ID:              10017,
 		Name:            "very_complex_table",
 		Partition:       e.CompanyID,
 		Keys:            Cols(e.ID),

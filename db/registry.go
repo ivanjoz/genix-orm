@@ -15,6 +15,32 @@ var (
 	tableFactoriesMutex  sync.RWMutex
 )
 
+// Table IDs are hand-assigned and packed into the by-IDs cache key, so two tables sharing one ID
+// would silently share their cached slot versions. Drivers claim the ID while compiling a table,
+// which is the first moment both the ID and the name are known.
+var (
+	tableNamesByID   = map[int16]string{}
+	tableNamesByIDMu sync.Mutex
+)
+
+// ClaimTableID validates a table's declared ID and reserves it for that table. Recompiling the
+// same table is a no-op; a different table claiming the same ID panics.
+func ClaimTableID(tableID int16, tableName string) {
+	if tableID <= 0 || tableID > MaxTableID {
+		panic(fmt.Sprintf(`Table "%v": TableSchema.ID must be between 1 and %v. Found: %v`,
+			tableName, MaxTableID, tableID))
+	}
+
+	tableNamesByIDMu.Lock()
+	defer tableNamesByIDMu.Unlock()
+
+	if claimedBy, isClaimed := tableNamesByID[tableID]; isClaimed && claimedBy != tableName {
+		panic(fmt.Sprintf(`TableSchema.ID %v is declared by two tables: "%v" and "%v".`,
+			tableID, claimedBy, tableName))
+	}
+	tableNamesByID[tableID] = tableName
+}
+
 // RegisterTableFactory records how to compile one table by name.
 func RegisterTableFactory(tableName string, makeTable func() Table) {
 	tableFactoriesMutex.Lock()

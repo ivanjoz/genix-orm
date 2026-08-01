@@ -1,7 +1,6 @@
 package db
 
 import (
-	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
@@ -14,9 +13,8 @@ import (
 // on any query. Building it once per type is what keeps InitStructTable cheap
 // enough to call on every query.
 type structFieldMetadataCacheEntry struct {
-	recordType             reflect.Type
-	fieldMetadataByName    map[string]ColumnInfo
-	cacheVersionFieldIndex []int
+	recordType          reflect.Type
+	fieldMetadataByName map[string]ColumnInfo
 }
 
 var structFieldMetadataCache sync.Map
@@ -59,9 +57,8 @@ func getOrBuildStructFieldMetadata(recordType reflect.Type) *structFieldMetadata
 	}
 
 	metadataEntry := &structFieldMetadataCacheEntry{
-		recordType:             recordType,
-		fieldMetadataByName:    metadataByFieldName,
-		cacheVersionFieldIndex: findCacheVersionFieldIndex(recordType),
+		recordType:          recordType,
+		fieldMetadataByName: metadataByFieldName,
 	}
 
 	actualEntry, _ := structFieldMetadataCache.LoadOrStore(recordType, metadataEntry)
@@ -72,39 +69,6 @@ func getOrBuildStructFieldMetadata(recordType reflect.Type) *structFieldMetadata
 // tests measure a cold build.
 func ResetMetadataCacheForTesting() {
 	structFieldMetadataCache = sync.Map{}
-}
-
-// findCacheVersionFieldIndex locates the record's cache-version field, recognised
-// either by the name CacheVersion or by the "ccv" json tag the frontend cache
-// contract requires.
-func findCacheVersionFieldIndex(recordType reflect.Type) []int {
-	if recordType.Kind() == reflect.Pointer {
-		recordType = recordType.Elem()
-	}
-	if recordType.Kind() != reflect.Struct {
-		return nil
-	}
-
-	for i := 0; i < recordType.NumField(); i++ {
-		field := recordType.Field(i)
-		if field.Name != "CacheVersion" && jsonTagName(field) != "ccv" {
-			continue
-		}
-		if field.Type.Kind() != reflect.Uint8 {
-			panic(fmt.Sprintf(`Record "%v": cache-version field "%v" must be uint8.`, recordType.Name(), field.Name))
-		}
-		return field.Index
-	}
-
-	return nil
-}
-
-func jsonTagName(field reflect.StructField) string {
-	jsonTag := field.Tag.Get("json")
-	if jsonTag == "" {
-		return ""
-	}
-	return strings.TrimSpace(strings.Split(jsonTag, ",")[0])
 }
 
 // DBTag is the parsed `db:"..."` tag of a record field: the column name plus the

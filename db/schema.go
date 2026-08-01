@@ -35,6 +35,12 @@ const (
 	TypeInheritFromKey int8 = 4
 	TypeView           int8 = 6
 	TypeViewTable      int8 = 9
+	// TypeDelta is a TypeView packed range view with the table's "updated_version" column appended
+	// as its last key, so one index serves both halves of a delta-cache sync. The digit width of
+	// every declared key comes from its FixedValues instead of a .DecimalSize() decorator, and the
+	// packed column is int32 whenever the resulting maximum fits. Keys[0] is also the column Delta()
+	// filters on; see TableStruct.Delta for the query side.
+	TypeDelta int8 = 10
 )
 
 // IndexTypeNames labels index kinds for logs and deploy output.
@@ -45,7 +51,26 @@ var IndexTypeNames = map[int8]string{
 	TypeInheritFromKey: "Inherit From Key",
 	TypeView:           "View",
 	TypeViewTable:      "View Table",
+	TypeDelta:          "Delta View",
 }
+
+// ColumnNameUpdated is the column the ORM maintains as every record's last-write timestamp. It is
+// resolved by name rather than declared, so the query side and the drivers share one spelling.
+const ColumnNameUpdated = "updated"
+
+// ColumnNameUpdatedVersion is the column the ORM maintains as every record's write sequence number:
+// one value per write call per partition, taken from the same counter that hands out autoincrement
+// IDs. Unlike a timestamp it is strictly increasing and never collides, which is what lets a delta
+// sync ask for "> my watermark" and lets the by-IDs cache compare slot versions for equality.
+const ColumnNameUpdatedVersion = "updated_version"
+
+// MaxTableID is the largest value TableSchema.ID can hold: it occupies the low 14 bits of the
+// packed partition_table_id key of cache_updated_version.
+const MaxTableID = int16(1<<14 - 1)
+
+// MaxCachePartitionID is the largest partition value the same packed key can carry, in its high
+// 18 bits.
+const MaxCachePartitionID = int32(1<<18 - 1)
 
 type Index struct {
 	Type int8
@@ -62,11 +87,50 @@ type Index struct {
 	UseIndexGroup bool
 }
 
+// FixedValues pins down the set of values a column can hold. Declaring it lets the schema
+// compiler size the column's digit slot inside a packed key (see TypeDelta) and lets Delta()
+// enumerate every value of a sync-filter column, neither of which is derivable from the Go type.
+type FixedValues struct {
+	Col          Coln
+	Values       []int64
+	ValuesString []string // Not used, meaby in the future
+	Min          int64
+	Max          int64
+}
+
+// Bounds returns the inclusive range this declaration pins down, preferring an explicit Values
+// list over Min/Max. The third result is false when neither was declared, leaving the column's
+// width unknown to whatever wanted to size a packed slot from it.
+func (f FixedValues) Bounds() (int64, int64, bool) {
+	if len(f.Values) > 0 {
+		minValue, maxValue := f.Values[0], f.Values[0]
+		for _, value := range f.Values[1:] {
+			if value < minValue {
+				minValue = value
+			}
+			if value > maxValue {
+				maxValue = value
+			}
+		}
+		return minValue, maxValue, true
+	}
+	// A Max of zero cannot describe a useful range, so it reads as "not declared" rather than
+	// as a column pinned to the single value 0.
+	if f.Max > 0 {
+		return f.Min, f.Max, true
+	}
+	return 0, 0, false
+}
+
 // TableSchema is the single, driver-independent declaration of a table. Each
 // driver reads the subset it can honour and fails loudly at compile time on the
 // rest, so a table never silently loses a key or an index under a driver that
 // cannot express it.
 type TableSchema struct {
+	// ID is the table's stable, hand-assigned identity, unique across the whole project and never
+	// derived from the name. It is packed into cache_updated_version's partition key, so changing
+	// it silently repoints a table's cached slot versions. Range: 1..MaxTableID.
+	ID int16
 	// Namespace is the logical grouping a table lives in — a keyspace on Scylla.
 	Namespace         string
 	Name              string
@@ -81,16 +145,20 @@ type TableSchema struct {
 	KeyConcatenated   []Coln
 	KeyIntPacking     []Coln
 	AutoincrementPart Coln
-	SaveCacheVersion  bool
+	// SaveUpdatedVersion opts the table into the by-IDs cache: writes bump the record's slot in
+	// cache_updated_version, and QueryCachedIDs skips reading rows whose slot did not move.
+	SaveUpdatedVersion bool
 	// GenericRecord maps this table's columns onto the flat shape returned by
 	// QueryCachedGenericByIDs, so a single endpoint can resolve labels for any table by name.
-	GenericRecord        GenericRecordSchema
-	UseUpdateCounter     Coln
-	DisableUpdateCounter bool
+	GenericRecord GenericRecordSchema
+	// DisableUpdatedVersion turns off the managed "updated_version" column for tables that are
+	// never synced incrementally, saving one counter read per write.
+	DisableUpdatedVersion bool
 	// UseListAsDefault makes slice columns map to an ordered collection instead of a
 	// set when no explicit ",list" / ",set" db tag is set. Per-field tags still
 	// override this default.
 	UseListAsDefault bool
+	FixedValues      []FixedValues
 }
 
 // GenericRecordSchema declares which columns fill the generic by-IDs shape. Name is required; the
@@ -109,25 +177,30 @@ func (schema GenericRecordSchema) IsEmpty() bool {
 }
 
 // GenericRecord is the flat, table-agnostic row returned to the client. Short json tags keep the
-// payload small, which is the whole point of this endpoint. ID keeps its capitalised name and ccv/ss
+// payload small, which is the whole point of this endpoint. ID keeps its capitalised name and upv/ss
 // are required by the frontend by-ID cache contract (IMinimalRecord).
 type GenericRecord struct {
-	ID           int64  `json:"ID"`
-	Name         string `json:"nm,omitempty"`
-	S1           string `json:"s1,omitempty"`
-	S2           string `json:"s2,omitempty"`
-	N1           int64  `json:"n1,omitempty"`
-	N2           int64  `json:"n2,omitempty"`
-	Status       int8   `json:"ss,omitempty"`
-	CacheVersion uint8  `json:"ccv,omitempty"`
+	ID     int64  `json:"ID"`
+	Name   string `json:"nm,omitempty"`
+	S1     string `json:"s1,omitempty"`
+	S2     string `json:"s2,omitempty"`
+	N1     int64  `json:"n1,omitempty"`
+	N2     int64  `json:"n2,omitempty"`
+	Status int8   `json:"ss,omitempty"`
+	// UpdatedVersion carries the record's *slot* version here, not its own write version: by-IDs
+	// reads are the one path where "upv" means "the version this record was validated against".
+	UpdatedVersion uint16 `json:"upv,omitempty"`
 }
 
-// IDCacheVersion is one entry of a client's by-ID cache: which record it holds
-// and which version of it, so the server can reply with only what changed.
-type IDCacheVersion struct {
-	ID           int64
-	PartitionID  int32
-	CacheVersion uint8
+// IDUpdatedVersion is one entry of a client's by-ID cache: which record it holds
+// and which slot version it was last validated against, so the server can reply
+// with only what changed.
+type IDUpdatedVersion struct {
+	ID          int64
+	PartitionID int32
+	// UpdatedVersion is 0 when the client holds no version yet, which never matches a stored slot
+	// version and therefore always forces a read.
+	UpdatedVersion uint16
 }
 
 // RecordGroup is a set of records sharing one index-group hash, plus the counter
