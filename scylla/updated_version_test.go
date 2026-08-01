@@ -19,18 +19,22 @@ func containsAny(values []any, needle any) bool {
 	return false
 }
 
+// Declaring UpdatedVersion is what opts a table into the managed write sequence when it has
+// neither a TypeDelta index nor SaveUpdatedVersion.
 type updateCounterRecord struct {
 	TableStruct[updateCounterSchema, updateCounterRecord]
-	CompanyID int32  `db:"empresa_id"`
-	ID        int64  `db:"id"`
-	Nombre    string `db:"nombre"`
+	CompanyID      int32  `db:"empresa_id"`
+	ID             int64  `db:"id"`
+	Nombre         string `db:"nombre"`
+	UpdatedVersion int32  `json:"upv,omitempty"`
 }
 
 type updateCounterSchema struct {
 	TableStruct[updateCounterSchema, updateCounterRecord]
-	CompanyID Col[updateCounterSchema, int32]
-	ID        Col[updateCounterSchema, int64]
-	Nombre    Col[updateCounterSchema, string]
+	CompanyID      Col[updateCounterSchema, int32]
+	ID             Col[updateCounterSchema, int64]
+	Nombre         Col[updateCounterSchema, string]
+	UpdatedVersion Col[updateCounterSchema, int32]
 }
 
 type updateCounterDisabledRecord struct {
@@ -93,12 +97,11 @@ func (e updateCounterSchema) GetSchema() TableSchema {
 
 func (e updateCounterDisabledSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:                    10021,
-		Namespace:             "test_keyspace",
-		Name:                  "update_counter_records_disabled",
-		Partition:             e.CompanyID,
-		Keys:                  Cols(e.ID),
-		DisableUpdatedVersion: true,
+		ID:        10021,
+		Namespace: "test_keyspace",
+		Name:      "update_counter_records_disabled",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
 	}
 }
 
@@ -148,7 +151,9 @@ func TestMakeScyllaTableAddsManagedAuditColumns(t *testing.T) {
 	}
 }
 
-func TestMakeScyllaTableSkipsManagedUpdateCounterWhenDisabled(t *testing.T) {
+// A table with no reader for the write sequence — no TypeDelta index, no SaveUpdatedVersion and no
+// declared field — keeps neither the column nor its per-write counter read.
+func TestMakeScyllaTableSkipsManagedUpdateCounterWithoutAConsumer(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterDisabledRecord, updateCounterDisabledSchema]()
 
 	if scyllaTable.ColumnsMap["created"] == nil || scyllaTable.ColumnsMap["updated"] == nil {

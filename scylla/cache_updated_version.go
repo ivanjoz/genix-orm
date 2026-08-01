@@ -65,7 +65,7 @@ func configureSlotVersionFields(scyllaTable *ScyllaTable) {
 	}
 
 	if scyllaTable.UpdatedVersionCol == nil || scyllaTable.UpdatedVersionCol.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": SaveUpdatedVersion requires the managed "%v" column; remove DisableUpdatedVersion.`,
+		panic(fmt.Sprintf(`Table "%v": SaveUpdatedVersion requires the managed "%v" column; declare UpdatedVersion in the record and table structs.`,
 			scyllaTable.Name, managedUpdatedVersionColumnName))
 	}
 

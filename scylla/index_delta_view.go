@@ -16,6 +16,12 @@ const deltaVersionDigitsInt32 = 8
 // extra digits are paid for either way, so they are spent on sequence headroom.
 const deltaVersionDigitsInt64 = 10
 
+// deltaVersionDigitsElastic is the slot the version gets when one key was left undeclared and
+// absorbs the digit remainder. It sits between the two fixed widths on purpose: the layout is
+// already a bigint, and splitting the 18-digit budget as 9 for the sequence and 9 for everything
+// else keeps both sides usefully wide without either starving the other.
+const deltaVersionDigitsElastic = 9
+
 // maxPackedInt64Digits is the widest packed key an int64 column can hold without risking overflow
 // on the upper bound arithmetic in getStatementPrepared.
 const maxPackedInt64Digits = 18
@@ -87,20 +93,42 @@ func resolveFixedValueRanges(dbTable *ScyllaTable, declaredFixedValues []FixedVa
 // the declared keys plus the table's "updated_version" column, with every digit slot resolved up
 // front.
 func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
-	if len(indexCfg.Keys) == 0 {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta entries must declare at least one key column`, dbTable.Name))
-	}
-
 	versionColumn := dbTable.UpdatedVersionCol
 	if versionColumn == nil || versionColumn.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires the managed "%v" column; remove DisableUpdatedVersion`,
+		panic(fmt.Sprintf(`Table "%v": TypeDelta requires the managed "%v" column; declare UpdatedVersion in the record and table structs`,
 			dbTable.Name, managedUpdatedVersionColumnName))
+	}
+
+	versionKeyColumn := func(decimalDigits int8) deltaKeyColumn {
+		versionKey := deltaKeyColumn{}
+		versionKey.info.Name = versionColumn.GetName()
+		versionKey.info.DecimalDigits = decimalDigits
+		return versionKey
+	}
+
+	// With no declared keys there is nothing to pack: the view degenerates to a plain one on
+	// "updated_version" within the partition, which is all a sync that filters nothing but its
+	// watermark needs. No packing also means no digit slot, so writes keep the column's full int32
+	// range instead of a trimmed budget. Delta() must then be called with no filter values —
+	// resolveDeltaSyncFilterColumn rejects the alternative.
+	if len(indexCfg.Keys) == 0 {
+		watermarkOnlyCfg := indexCfg
+		watermarkOnlyCfg.Type = TypeView
+		watermarkOnlyCfg.Keys = []Coln{versionKeyColumn(0)}
+
+		fmt.Printf("Delta view registered: table=%s keys=[%s] watermarkOnly=true\n",
+			dbTable.Name, versionColumn.GetName())
+
+		compileSchemaView(dbTable, watermarkOnlyCfg, nil)
+		return
 	}
 
 	declaredKeyNames := make([]string, 0, len(indexCfg.Keys))
 	declaredKeyDigits := make([]int64, 0, len(indexCfg.Keys))
 	declaredKeyMaxValues := make([]int64, 0, len(indexCfg.Keys))
 	forcesInt32 := false
+	// elasticKeyIndex is the one key, if any, whose width is left for planDeltaSlots to derive.
+	elasticKeyIndex := -1
 
 	for _, declaredKey := range indexCfg.Keys {
 		keyConfig := declaredKey.GetInfo()
@@ -124,17 +152,24 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 		}
 
 		// An explicit DecimalSize() stays available as the escape hatch; otherwise the slot width
-		// comes from the declared value range, which is the whole point of TypeDelta.
+		// comes from the declared value range, which is the whole point of TypeDelta. A key with
+		// neither is elastic: it absorbs whatever digits the rest of the layout leaves over, which is
+		// how a column with no natural ceiling (an autoincrement id) can still be a delta key.
 		keyDigits := int64(keyConfig.DecimalDigits)
 		keyMaxValue := Pow10Int64(keyDigits) - 1
 		if keyDigits <= 0 {
-			valueRange, isDeclared := dbTable.fixedValueRanges[column.GetName()]
-			if !isDeclared {
-				panic(fmt.Sprintf(`Table "%v": TypeDelta key "%v" needs a FixedValues entry (or an explicit DecimalSize) so its digit slot can be sized`,
-					dbTable.Name, column.GetName()))
+			if valueRange, isDeclared := dbTable.fixedValueRanges[column.GetName()]; isDeclared {
+				keyMaxValue = valueRange.maxValue
+				keyDigits = countBase10DigitsNonNegative(keyMaxValue)
+			} else {
+				// Two elastic keys would have no unambiguous split of the remainder.
+				if elasticKeyIndex >= 0 {
+					panic(fmt.Sprintf(`Table "%v": TypeDelta keys "%v" and "%v" both lack a FixedValues entry and a DecimalSize; only one key can absorb the digit remainder`,
+						dbTable.Name, declaredKeyNames[elasticKeyIndex], column.GetName()))
+				}
+				elasticKeyIndex = len(declaredKeyNames)
+				keyDigits, keyMaxValue = 0, 0
 			}
-			keyMaxValue = valueRange.maxValue
-			keyDigits = countBase10DigitsNonNegative(keyMaxValue)
 		}
 
 		declaredKeyNames = append(declaredKeyNames, column.GetName())
@@ -142,13 +177,12 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 		declaredKeyMaxValues = append(declaredKeyMaxValues, keyMaxValue)
 	}
 
-	plan := planDeltaSlots(dbTable.Name, declaredKeyDigits, declaredKeyMaxValues, forcesInt32)
+	plan := planDeltaSlots(dbTable.Name, declaredKeyNames, declaredKeyDigits, declaredKeyMaxValues,
+		forcesInt32, elasticKeyIndex)
 
 	// The implicit key carries only a name and its digit width; the view compiler resolves the rest
 	// against the base table.
-	versionKey := deltaKeyColumn{}
-	versionKey.info.Name = versionColumn.GetName()
-	versionKey.info.DecimalDigits = int8(plan.slotDigitsPerColumn[len(plan.slotDigitsPerColumn)-1])
+	versionKey := versionKeyColumn(int8(plan.slotDigitsPerColumn[len(plan.slotDigitsPerColumn)-1]))
 
 	// Writes must refuse to pack a version wider than its slot: the packer trims from the right, so
 	// an overrun would silently bucket versions in groups of ten and break the delta watermark.
@@ -166,7 +200,8 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 		dbTable.Name, strings.Join(declaredKeyNames, ","), versionColumn.GetName(),
 		plan.slotDigitsPerColumn, packedColumnTypeName, plan.maxPackedValue)
 
-	if !plan.useInt32 {
+	// An elastic key always spills to a bigint, so no key order could have fit an int32.
+	if !plan.useInt32 && elasticKeyIndex < 0 {
 		logDeltaInt32KeyOrderHint(dbTable.Name, declaredKeyNames, declaredKeyDigits, declaredKeyMaxValues)
 	}
 
@@ -176,7 +211,13 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 // planDeltaSlots settles the digit layout and storage width of a delta packed column. The declared
 // keys keep the widths they were resolved with; only the trailing "updated_version" slot flexes,
 // widening once the budget has already spilled past int32.
-func planDeltaSlots(tableName string, declaredKeyDigits, declaredKeyMaxValues []int64, forcesInt32 bool) deltaSlotPlan {
+//
+// An elastic key (elasticKeyIndex >= 0) inverts that: the version slot is pinned to
+// deltaVersionDigitsElastic and the elastic key takes every digit the others leave, which always
+// means a bigint.
+func planDeltaSlots(tableName string, declaredKeyNames []string, declaredKeyDigits,
+	declaredKeyMaxValues []int64, forcesInt32 bool, elasticKeyIndex int) deltaSlotPlan {
+
 	planForVersionDigits := func(versionDigits int64) deltaSlotPlan {
 		slotDigits := append(slices.Clone(declaredKeyDigits), versionDigits)
 		componentMaxValues := append(slices.Clone(declaredKeyMaxValues), Pow10Int64(versionDigits)-1)
@@ -194,6 +235,28 @@ func planDeltaSlots(tableName string, declaredKeyDigits, declaredKeyMaxValues []
 			slotDigitsPerColumn: slotDigits,
 			maxPackedValue:      computePackedInt64ValueNonNegative(componentMaxValues, slotDigits),
 		}
+	}
+
+	if elasticKeyIndex >= 0 {
+		if forcesInt32 {
+			panic(fmt.Sprintf(`Table "%v": TypeDelta cannot pack into an int32 while key "%v" has no declared range. Drop .Int32(), or give "%v" a FixedValues entry or a DecimalSize.`,
+				tableName, declaredKeyNames[elasticKeyIndex], declaredKeyNames[elasticKeyIndex]))
+		}
+
+		remainingDigits := int64(maxPackedInt64Digits - deltaVersionDigitsElastic)
+		for keyIndex, digits := range declaredKeyDigits {
+			if keyIndex != elasticKeyIndex {
+				remainingDigits -= digits
+			}
+		}
+		if remainingDigits < 1 {
+			panic(fmt.Sprintf(`Table "%v": TypeDelta leaves no digits for key "%v": the other keys and the %v-digit version slot already fill the %v an int64 packed key allows. Narrow a FixedValues range.`,
+				tableName, declaredKeyNames[elasticKeyIndex], deltaVersionDigitsElastic, maxPackedInt64Digits))
+		}
+
+		declaredKeyDigits[elasticKeyIndex] = remainingDigits
+		declaredKeyMaxValues[elasticKeyIndex] = Pow10Int64(remainingDigits) - 1
+		return planForVersionDigits(deltaVersionDigitsElastic)
 	}
 
 	plan := planForVersionDigits(deltaVersionDigitsInt32)

@@ -96,9 +96,10 @@ func ensureManagedIntColumn(dbTable *ScyllaTable, columnName string) IColInfo {
 	return managedColumn
 }
 
-// needsReadableUpdatedVersion reports whether the client has to see each record's write sequence
-// number: either to compare slot versions on a by-IDs read, or to carry a delta watermark.
-func needsReadableUpdatedVersion(schema TableSchema) bool {
+// consumesUpdatedVersion reports whether the table has a reader for the write sequence number: a
+// delta index watermarks on it, and the by-IDs cache compares slot versions with it. A table struct
+// that declares the column counts too, so declaring the field is never silently ignored.
+func consumesUpdatedVersion(dbTable *ScyllaTable, schema TableSchema) bool {
 	if schema.SaveUpdatedVersion {
 		return true
 	}
@@ -107,26 +108,29 @@ func needsReadableUpdatedVersion(schema TableSchema) bool {
 			return true
 		}
 	}
-	return false
+	_, isDeclaredByTableStruct := dbTable.ColumnsMap[managedUpdatedVersionColumnName]
+	return isDeclaredByTableStruct
 }
 
 func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
 	dbTable.CreatedCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
 	dbTable.UpdatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
 
-	// A column already in ColumnsMap was declared by the table struct, so it is backed by a record
-	// field and reaches the client. Anything ensureManagedIntColumn creates is DB-only.
-	_, isDeclaredByTableStruct := dbTable.ColumnsMap[managedUpdatedVersionColumnName]
-
-	if !schema.DisableUpdatedVersion {
-		dbTable.UpdatedVersionCol = ensureManagedIntColumn(dbTable, managedUpdatedVersionColumnName)
+	// The version costs a counter read per write, so a table that has no reader for it keeps neither
+	// the column nor that cost.
+	if !consumesUpdatedVersion(dbTable, schema) {
+		return
 	}
 
-	if needsReadableUpdatedVersion(schema) && !isDeclaredByTableStruct {
+	// A column already in ColumnsMap was declared by the table struct, so it is backed by a record
+	// field and reaches the client — which is required, since the client sends it back as a watermark.
+	if _, isDeclaredByTableStruct := dbTable.ColumnsMap[managedUpdatedVersionColumnName]; !isDeclaredByTableStruct {
 		panic(fmt.Sprintf(`Table "%v": SaveUpdatedVersion and TypeDelta need the version to reach the client. `+
 			`Declare the field "UpdatedVersion int32" with the json tag "upv,omitempty" in the record struct, `+
 			`and "UpdatedVersion db.Col[...]" in the table struct.`, dbTable.Name))
 	}
+
+	dbTable.UpdatedVersionCol = ensureManagedIntColumn(dbTable, managedUpdatedVersionColumnName)
 }
 
 func flattenCompositeInt64Values(rawValue any) []int64 {
@@ -437,7 +441,9 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 
 	// Compile schema indexes in one pass to keep the public API and compiler flow simple.
 	for _, indexCfg := range schema.Indexes {
-		if len(indexCfg.Keys) == 0 {
+		// TypeDelta is the one kind that means something with no keys: it appends "updated_version"
+		// itself, so a keyless entry declares a watermark-only sync.
+		if len(indexCfg.Keys) == 0 && resolveSchemaIndexType(indexCfg) != TypeDelta {
 			panic(fmt.Sprintf(`Table "%v": Indexes entry must not be empty`, dbTable.Name))
 		}
 		if indexCfg.Type == TypeInheritFromKey && !indexCfg.UseIndexGroup {

@@ -62,6 +62,10 @@ const ColumnNameUpdated = "updated"
 // one value per write call per partition, taken from the same counter that hands out autoincrement
 // IDs. Unlike a timestamp it is strictly increasing and never collides, which is what lets a delta
 // sync ask for "> my watermark" and lets the by-IDs cache compare slot versions for equality.
+//
+// It costs one counter read per write, so it is maintained only for tables that consume it: those
+// declaring a TypeDelta index or SaveUpdatedVersion. Both require the record and table structs to
+// declare the field, since the value has to reach the client to be sent back as a watermark.
 const ColumnNameUpdatedVersion = "updated_version"
 
 // MaxTableID is the largest value TableSchema.ID can hold: it occupies the low 14 bits of the
@@ -151,9 +155,6 @@ type TableSchema struct {
 	// GenericRecord maps this table's columns onto the flat shape returned by
 	// QueryCachedGenericByIDs, so a single endpoint can resolve labels for any table by name.
 	GenericRecord GenericRecordSchema
-	// DisableUpdatedVersion turns off the managed "updated_version" column for tables that are
-	// never synced incrementally, saving one counter read per write.
-	DisableUpdatedVersion bool
 	// UseListAsDefault makes slice columns map to an ordered collection instead of a
 	// set when no explicit ",list" / ",set" db tag is set. Per-field tags still
 	// override this default.

@@ -187,47 +187,209 @@ func TestDeltaViewMatchesEquivalentDecoratedTypeView(t *testing.T) {
 	}
 }
 
-// Missing FixedValues leaves the digit slot unsizeable.
-type deltaUnsizedRecord struct {
-	TableStruct[deltaUnsizedSchema, deltaUnsizedRecord]
+// A key with no FixedValues and no DecimalSize absorbs the digit remainder instead of being
+// rejected: the layout goes bigint and the version slot pins to deltaVersionDigitsElastic.
+type deltaElasticRecord struct {
+	TableStruct[deltaElasticSchema, deltaElasticRecord]
 	CompanyID      int32 `db:"company_id"`
 	ID             int32 `db:"id"`
-	Type           int8  `db:"type"`
+	Status         int8  `db:"status"`
+	ListID         int32 `db:"list_id"`
 	UpdatedVersion int32 `json:"upv,omitempty"`
 }
 
-type deltaUnsizedSchema struct {
-	TableStruct[deltaUnsizedSchema, deltaUnsizedRecord]
-	CompanyID      Col[deltaUnsizedSchema, int32]
-	ID             Col[deltaUnsizedSchema, int32]
-	Type           Col[deltaUnsizedSchema, int8]
-	UpdatedVersion Col[deltaUnsizedSchema, int32]
+type deltaElasticSchema struct {
+	TableStruct[deltaElasticSchema, deltaElasticRecord]
+	CompanyID      Col[deltaElasticSchema, int32]
+	ID             Col[deltaElasticSchema, int32]
+	Status         Col[deltaElasticSchema, int8]
+	ListID         Col[deltaElasticSchema, int32]
+	UpdatedVersion Col[deltaElasticSchema, int32]
 }
 
-func (e deltaUnsizedSchema) GetSchema() TableSchema {
+func (e deltaElasticSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:        10011,
-		Name:      "delta_unsized_records",
-		Partition: e.CompanyID,
-		Keys:      Cols(e.ID),
-		Indexes:   []Index{{Type: TypeDelta, Keys: Cols(e.Type)}},
+		ID:          10011,
+		Name:        "delta_elastic_records",
+		Partition:   e.CompanyID,
+		Keys:        Cols(e.ID),
+		FixedValues: []FixedValues{{Col: e.Status, Values: []int64{0, 1}}},
+		// ListID has no declared ceiling, so it takes every digit the others leave over.
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(e.Status, e.ListID)}},
 	}
 }
 
-func TestDeltaViewRejectsKeyWithoutDeclaredRange(t *testing.T) {
+func TestDeltaViewLetsAnUndeclaredKeyAbsorbTheDigitRemainder(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaElasticRecord, deltaElasticSchema]()
+	view := deltaPackedView(t, scyllaTable)
+
+	if view.column.GetType().DBType != "bigint" {
+		t.Fatalf("expected a bigint packed column for an elastic layout, got %v", view.column.GetType().DBType)
+	}
+	// 1 digit for the declared Status, 9 for the version, and the remaining 8 of the 18-digit
+	// int64 budget for ListID.
+	expectedSlots := []int64{1, 8, 9}
+	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	}
+	if scyllaTable.maxDeltaVersionValue != 999_999_999 {
+		t.Fatalf("expected the 9-digit version ceiling, got %v", scyllaTable.maxDeltaVersionValue)
+	}
+}
+
+// A single elastic key as Keys[0]: the whole remainder is its own, and the watermark is the only
+// thing a Delta() read can constrain.
+type deltaElasticLeadRecord struct {
+	TableStruct[deltaElasticLeadSchema, deltaElasticLeadRecord]
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	ListID         int32 `db:"list_id"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
+}
+
+type deltaElasticLeadSchema struct {
+	TableStruct[deltaElasticLeadSchema, deltaElasticLeadRecord]
+	CompanyID      Col[deltaElasticLeadSchema, int32]
+	ID             Col[deltaElasticLeadSchema, int32]
+	ListID         Col[deltaElasticLeadSchema, int32]
+	UpdatedVersion Col[deltaElasticLeadSchema, int32]
+}
+
+func (e deltaElasticLeadSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10026,
+		Name:      "delta_elastic_lead_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes:   []Index{{Type: TypeDelta, Keys: Cols(e.ListID)}},
+	}
+}
+
+func TestDeltaViewSizesALoneElasticKey(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaElasticLeadRecord, deltaElasticLeadSchema]()
+	view := deltaPackedView(t, scyllaTable)
+
+	// Nothing else claims a slot, so ListID takes 9 of the 18 digits and the version takes 9.
+	expectedSlots := []int64{9, 9}
+	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	}
+}
+
+// No declared keys at all: a sync that filters nothing but its watermark.
+type deltaWatermarkOnlyRecord struct {
+	TableStruct[deltaWatermarkOnlySchema, deltaWatermarkOnlyRecord]
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
+}
+
+type deltaWatermarkOnlySchema struct {
+	TableStruct[deltaWatermarkOnlySchema, deltaWatermarkOnlyRecord]
+	CompanyID      Col[deltaWatermarkOnlySchema, int32]
+	ID             Col[deltaWatermarkOnlySchema, int32]
+	UpdatedVersion Col[deltaWatermarkOnlySchema, int32]
+}
+
+func (e deltaWatermarkOnlySchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10027,
+		Name:      "delta_watermark_only_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes:   []Index{{Type: TypeDelta}},
+	}
+}
+
+func TestDeltaViewWithNoKeysIsAPlainUpdatedVersionView(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaWatermarkOnlyRecord, deltaWatermarkOnlySchema]()
+
+	// Nothing to pack, so this must be a plain view keyed on updated_version — not a Type 8 packed
+	// range view.
+	var watermarkView *viewInfo
+	for _, view := range scyllaTable.views {
+		if slices.Equal(view.columnsNoPart, []string{"updated_version"}) {
+			watermarkView = view
+		}
+		if view.Type == 8 {
+			t.Fatalf("expected no packed range view, got %v", view.name)
+		}
+	}
+	if watermarkView == nil {
+		t.Fatal("expected a view keyed on updated_version")
+	}
+	// No digit slot means no trimming, so writes keep the column's full range.
+	if scyllaTable.maxDeltaVersionValue != 0 {
+		t.Fatalf("expected no version ceiling for an unpacked delta view, got %v", scyllaTable.maxDeltaVersionValue)
+	}
+}
+
+func TestDeltaWithFilterValuesRejectsAKeylessDeltaIndex(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
-			t.Fatal("expected a panic naming the key that has no declared range")
+			t.Fatal("expected Delta() to panic when given filter values with no key to filter on")
 		}
-		if !strings.Contains(fmt.Sprint(recovered), `"type"`) {
-			t.Fatalf("expected the panic to name the column, got: %v", recovered)
+		if !strings.Contains(fmt.Sprint(recovered), "unpinned") {
+			t.Fatalf("expected the panic to explain the missing key, got: %v", recovered)
 		}
 	}()
 
-	MakeScyllaTable[deltaUnsizedRecord, deltaUnsizedSchema]()
+	records := []deltaWatermarkOnlyRecord{}
+	Query[deltaWatermarkOnlyRecord, deltaWatermarkOnlySchema](&records).Delta(100, 1)
+}
+
+// Two undeclared keys leave no unambiguous way to split the remainder.
+type deltaTwoElasticRecord struct {
+	TableStruct[deltaTwoElasticSchema, deltaTwoElasticRecord]
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	ListID         int32 `db:"list_id"`
+	GroupID        int32 `db:"group_id"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
+}
+
+type deltaTwoElasticSchema struct {
+	TableStruct[deltaTwoElasticSchema, deltaTwoElasticRecord]
+	CompanyID      Col[deltaTwoElasticSchema, int32]
+	ID             Col[deltaTwoElasticSchema, int32]
+	ListID         Col[deltaTwoElasticSchema, int32]
+	GroupID        Col[deltaTwoElasticSchema, int32]
+	UpdatedVersion Col[deltaTwoElasticSchema, int32]
+}
+
+func (e deltaTwoElasticSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10025,
+		Name:      "delta_two_elastic_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes:   []Index{{Type: TypeDelta, Keys: Cols(e.ListID, e.GroupID)}},
+	}
+}
+
+func TestDeltaViewRejectsTwoKeysWithoutDeclaredRange(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("expected a panic naming both keys that have no declared range")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), `"group_id"`) {
+			t.Fatalf("expected the panic to name the second elastic column, got: %v", recovered)
+		}
+	}()
+
+	MakeScyllaTable[deltaTwoElasticRecord, deltaTwoElasticSchema]()
 }
 
 // A forced .Int32() on a budget that cannot fit must fail rather than silently overflow.
@@ -341,30 +503,31 @@ func TestDeltaSyncFansOutOverEveryDeclaredValue(t *testing.T) {
 	}
 }
 
-func TestDeltaComposesWhenFollowedByAnotherPredicate(t *testing.T) {
+// Delta() reads the predicates already on the query to choose its index, so calling it before the
+// key columns are pinned cannot resolve — and must say so rather than route to the wrong view.
+func TestDeltaRejectsBeingCalledBeforeTheKeyColumnsArePinned(t *testing.T) {
 	resetORMTableCachesForTesting()
 
-	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
-	scyllaTable.Namespace = "genix_test"
-	view := deltaPackedView(t, scyllaTable)
+	MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("expected Delta() to panic when no index leaves exactly one key unpinned")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "unpinned") {
+			t.Fatalf("expected the panic to explain the unpinned keys, got: %v", recovered)
+		}
+	}()
 
 	records := []deltaViewRecord{}
 	query := Query[deltaViewRecord, deltaViewSchema](&records)
 	query.CompanyID.Equals(7)
+	// "type" is still open, so both keys of the only delta index are unpinned.
 	query.Delta(0, 1)
-	// Delta() is no longer required to be the last predicate in the chain.
-	query.Type.Equals(int8(2))
-
-	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
-	if len(whereStatements) != 1 {
-		t.Fatalf("expected a single range clause, got %d", len(whereStatements))
-	}
-	if !strings.Contains(whereStatements[0].Clause, ">=") {
-		t.Fatalf("expected a range clause regardless of predicate order, got %q", whereStatements[0].Clause)
-	}
 }
 
-// The sync-filter column is inferred from Keys[0], never looked up by name.
+// The sync-filter column is the key the query left unpinned, never looked up by name.
 type deltaInferredRecord struct {
 	TableStruct[deltaInferredSchema, deltaInferredRecord]
 	CompanyID      int32 `db:"company_id"`
@@ -397,7 +560,7 @@ func (e deltaInferredSchema) GetSchema() TableSchema {
 	}
 }
 
-func TestDeltaInfersFilterColumnFromLeadingKey(t *testing.T) {
+func TestDeltaInfersFilterColumnFromTheUnpinnedKey(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	MakeScyllaTable[deltaInferredRecord, deltaInferredSchema]()
@@ -405,6 +568,8 @@ func TestDeltaInfersFilterColumnFromLeadingKey(t *testing.T) {
 	records := []deltaInferredRecord{}
 	query := Query[deltaInferredRecord, deltaInferredSchema](&records)
 	query.CompanyID.Equals(7)
+	// Pinning "type" leaves "channel" as the only open key, so that is what Delta() filters.
+	query.Type.Equals(int8(2))
 	query.Delta(0, 1)
 
 	filteredColumns := []string{}
@@ -416,6 +581,114 @@ func TestDeltaInfersFilterColumnFromLeadingKey(t *testing.T) {
 	}
 	if slices.Contains(filteredColumns, "status") {
 		t.Fatalf("expected no name-based status lookup, got %v", filteredColumns)
+	}
+}
+
+// Two delta indexes for two read shapes, as warehouse_product_stock declares them.
+type deltaMultiShapeRecord struct {
+	TableStruct[deltaMultiShapeSchema, deltaMultiShapeRecord]
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	WarehouseID    int32 `db:"warehouse_id"`
+	Status         int8  `db:"status"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
+}
+
+type deltaMultiShapeSchema struct {
+	TableStruct[deltaMultiShapeSchema, deltaMultiShapeRecord]
+	CompanyID      Col[deltaMultiShapeSchema, int32]
+	ID             Col[deltaMultiShapeSchema, int32]
+	WarehouseID    Col[deltaMultiShapeSchema, int32]
+	Status         Col[deltaMultiShapeSchema, int8]
+	UpdatedVersion Col[deltaMultiShapeSchema, int32]
+}
+
+func (e deltaMultiShapeSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:          10028,
+		Name:        "delta_multi_shape_records",
+		Partition:   e.CompanyID,
+		Keys:        Cols(e.ID),
+		FixedValues: []FixedValues{{Col: e.Status, Values: []int64{0, 1}}},
+		Indexes: []Index{
+			{Type: TypeDelta, Keys: Cols(e.WarehouseID.DecimalSize(5), e.Status)},
+			{Type: TypeDelta, Keys: Cols(e.Status)},
+		},
+	}
+}
+
+func deltaFilteredColumns(query *deltaMultiShapeSchema) []string {
+	filteredColumns := []string{}
+	for _, statement := range query.GetTableInfo().Statements {
+		filteredColumns = append(filteredColumns, statement.Col)
+	}
+	return filteredColumns
+}
+
+func TestDeltaPicksTheWiderIndexWhenTheQueryPinsItsKey(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	MakeScyllaTable[deltaMultiShapeRecord, deltaMultiShapeSchema]()
+
+	records := []deltaMultiShapeRecord{}
+	query := Query[deltaMultiShapeRecord, deltaMultiShapeSchema](&records)
+	query.CompanyID.Equals(7)
+	// warehouse_id pinned → the [warehouse_id, status] index fits, leaving status as the filter.
+	query.WarehouseID.Equals(int32(42))
+	query.Delta(0, 1)
+
+	filteredColumns := deltaFilteredColumns(query)
+	for _, expectedColumn := range []string{"warehouse_id", "status", "updated_version"} {
+		if !slices.Contains(filteredColumns, expectedColumn) {
+			t.Fatalf("expected %q to be constrained, got %v", expectedColumn, filteredColumns)
+		}
+	}
+}
+
+func TestDeltaFallsBackToTheNarrowIndexWhenItsKeyIsOpen(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	MakeScyllaTable[deltaMultiShapeRecord, deltaMultiShapeSchema]()
+
+	records := []deltaMultiShapeRecord{}
+	query := Query[deltaMultiShapeRecord, deltaMultiShapeSchema](&records)
+	query.CompanyID.Equals(7)
+	// warehouse_id left open → only the [status] index fits, and nothing constrains warehouse_id.
+	query.Delta(0, 1)
+
+	filteredColumns := deltaFilteredColumns(query)
+	if slices.Contains(filteredColumns, "warehouse_id") {
+		t.Fatalf("expected no warehouse_id predicate, got %v", filteredColumns)
+	}
+	if !slices.Contains(filteredColumns, "status") {
+		t.Fatalf("expected status to be the sync filter, got %v", filteredColumns)
+	}
+}
+
+// A delta index is an abstraction over a packed TypeView, so a hand-written query that pins the key
+// and ranges on updated_version must reach it without going through Delta(). That is what lets a
+// handler scan a specific status bucket — for an eviction list, say — instead of the fan-out.
+func TestDeltaViewServesAPlainQueryWithoutDelta(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaMultiShapeRecord, deltaMultiShapeSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	records := []deltaMultiShapeRecord{}
+	query := Query[deltaMultiShapeRecord, deltaMultiShapeSchema](&records)
+	query.CompanyID.Equals(7)
+	query.Status.Equals(int8(0))
+	query.UpdatedVersion.GreaterEqual(int32(100))
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if compiledStatement.sourceView == nil {
+		t.Fatal("expected a delta view to serve the plain query, got a base-table read")
+	}
+	if !strings.Contains(compiledStatement.sourceView.name, "status_updated_version") {
+		t.Fatalf("expected the [status, updated_version] delta view, got %v", compiledStatement.sourceView.name)
 	}
 }
 
@@ -468,9 +741,10 @@ func TestDeltaRequiresFixedValuesForItsFilterColumn(t *testing.T) {
 		}
 	}()
 
-	records := []deltaUnsizedRecord{}
-	// A delta sync must enumerate the filter column, which needs a declared range.
-	Query[deltaUnsizedRecord, deltaUnsizedSchema](&records).Delta(100, 1)
+	records := []deltaElasticLeadRecord{}
+	// A delta sync must enumerate the filter column, which needs a declared range. An elastic
+	// leading key compiles fine, but only Delta() with no filter values can use it.
+	Query[deltaElasticLeadRecord, deltaElasticLeadSchema](&records).Delta(100, 1)
 }
 
 // ─── Prefix routing ────────────────────────────────────────────────────────────
