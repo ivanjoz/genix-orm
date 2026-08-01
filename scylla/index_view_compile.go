@@ -365,17 +365,10 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 	if isSingleDeclaredSimpleView {
 		view.column = declaredColumns[0]
 		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
-			// Simple MVs keep their source columns, so predicates bind without key rewriting.
-			sourceClauses := buildRemainingWhereClauses(statements)
-			combinedClause := boundWhereClause{}
-			for _, sourceClause := range sourceClauses {
-				if combinedClause.Clause != "" {
-					combinedClause.Clause += " AND "
-				}
-				combinedClause.Clause += sourceClause.Clause
-				combinedClause.Values = append(combinedClause.Values, sourceClause.Values...)
-			}
-			return []boundWhereClause{combinedClause}
+			// Simple MVs keep their source columns, so predicates bind without key rewriting
+			// and the generic batcher applies as-is: an IN on the view's clustering key is
+			// split into several queries rather than one the node would reject.
+			return buildRemainingWhereClauseBatches(statements)
 		}
 	} else if len(columns) == 1 {
 		view.column = columns[0]
@@ -661,15 +654,11 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 				}
 			} else {
 				hashValues := make([]any, 0, len(valuesGroups))
-				placeholders := make([]string, 0, len(valuesGroups))
 				for _, values := range valuesGroups {
 					hashValues = append(hashValues, makeValue(values))
-					placeholders = append(placeholders, "?")
 				}
-				whereStatements = append(whereStatements, boundWhereClause{
-					Clause: fmt.Sprintf("%v IN (%v)", viewPtr.column.GetName(), strings.Join(placeholders, ", ")),
-					Values: hashValues,
-				})
+				whereStatements = append(whereStatements,
+					buildChunkedInWhereClauses(viewPtr.column.GetName(), hashValues)...)
 			}
 
 			if partStatement != nil {
@@ -727,35 +716,22 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 				hashValues = append(hashValues, HashInt(values...))
 			}
 
-			statement := boundWhereClause{}
-			if len(hashValues) == 1 {
-				statement = boundWhereClause{
-					Clause: fmt.Sprintf("%v = ?", viewPtr.column.GetName()),
-					Values: []any{hashValues[0]},
-				}
-			} else {
-				placeholders := make([]string, 0, len(hashValues))
-				for range hashValues {
-					placeholders = append(placeholders, "?")
-				}
-				statement = boundWhereClause{
-					Clause: fmt.Sprintf("%v IN (%v)", viewPtr.column.GetName(), strings.Join(placeholders, ", ")),
-					Values: hashValues,
-				}
-			}
+			whereStatements := buildChunkedInWhereClauses(viewPtr.column.GetName(), hashValues)
 
 			if viewPartColPtr != nil {
 				for _, st := range statements {
 					if st.Col == viewPartColPtr.GetName() {
-						statement = boundWhereClause{
-							Clause: fmt.Sprintf("%v = ? AND %v", st.Col, statement.Clause),
-							Values: append([]any{st.Value}, statement.Values...),
+						for i, whereStatement := range whereStatements {
+							whereStatements[i] = boundWhereClause{
+								Clause: fmt.Sprintf("%v = ? AND %v", st.Col, whereStatement.Clause),
+								Values: append([]any{st.Value}, whereStatement.Values...),
+							}
 						}
 						break
 					}
 				}
 			}
-			return []boundWhereClause{statement}
+			return whereStatements
 		}
 	}
 

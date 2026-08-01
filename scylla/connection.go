@@ -25,6 +25,11 @@ type ConnParams struct {
 	QueryTimeout int64 //Seconds
 	WriteTimeout int64 //Seconds
 	Keyspace     string
+	// MaxClusteringKey mirrors the node's max_clustering_key_restrictions_per_query.
+	// The ORM splits a wider IN fanout into that many values per query instead of
+	// letting the server reject the statement. 0 falls back to the MAX_CLUSTERING_KEY
+	// environment variable, then to 100 (Scylla's own default).
+	MaxClusteringKey int
 }
 
 func SetScyllaConnection(params ConnParams) {

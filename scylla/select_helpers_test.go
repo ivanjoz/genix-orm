@@ -81,6 +81,87 @@ func TestSingleColumnPartitionedViewRoutesRangeQueryToView(t *testing.T) {
 	}
 }
 
+func TestSingleColumnPartitionedViewSplitsLargeInQuery(t *testing.T) {
+	// A wide IN on a simple MV's clustering key must batch, or Scylla rejects the
+	// statement with max-clustering-key-restrictions-per-query.
+	resetORMTableCachesForTesting()
+	t.Setenv("MAX_CLUSTERING_KEY", "")
+
+	scyllaTable := MakeScyllaTable[partitionedRangeViewRecord, partitionedRangeViewSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	updatedValues := make([]int32, 0, 250)
+	for updatedValue := int32(1); updatedValue <= 250; updatedValue++ {
+		updatedValues = append(updatedValues, updatedValue)
+	}
+
+	records := []partitionedRangeViewRecord{}
+	query := Query[partitionedRangeViewRecord, partitionedRangeViewSchema](&records)
+	query.Select(query.ID, query.Payload, query.Updated)
+	query.GroupID.Equals(1)
+	query.Updated.In(updatedValues...)
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if compiledStatement.route != selectRouteViewStatements {
+		t.Fatalf("expected a view-backed route, got %d", compiledStatement.route)
+	}
+
+	boundPlan, err := compiledStatement.Compute(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected bind error: %v", err)
+	}
+	if len(boundPlan.Statements) != 3 {
+		t.Fatalf("expected 250 values split into 3 batches, got %d", len(boundPlan.Statements))
+	}
+
+	boundValuesSeen := []any{}
+	for _, boundStatement := range boundPlan.Statements {
+		if !strings.Contains(boundStatement.QueryStr, " WHERE group_id = ? AND updated IN (?") {
+			t.Fatalf("expected the partition equality to stay ahead of the batched IN, got %q", boundStatement.QueryStr)
+		}
+		// The partition value leads every batch, so the IN values follow it.
+		if placeholderCount := strings.Count(boundStatement.QueryStr, "?") - 1; placeholderCount > 100 {
+			t.Fatalf("expected at most 100 IN placeholders per batch, got %d", placeholderCount)
+		}
+		boundValuesSeen = append(boundValuesSeen, boundStatement.QueryValues[1:]...)
+	}
+
+	if len(boundValuesSeen) != len(updatedValues) {
+		t.Fatalf("expected every value to survive batching, got %d of %d", len(boundValuesSeen), len(updatedValues))
+	}
+	for valueIndex, updatedValue := range updatedValues {
+		if boundValuesSeen[valueIndex] != any(updatedValue) {
+			t.Fatalf("expected value %v at position %d, got %v", updatedValue, valueIndex, boundValuesSeen[valueIndex])
+		}
+	}
+}
+
+func TestConnParamsMaxClusteringKeyOverridesEnvironment(t *testing.T) {
+	// The project passes its node's limit through ConnParams, which must win over the env fallback.
+	previousConnParams := connParams
+	t.Cleanup(func() { connParams = previousConnParams })
+
+	t.Setenv("MAX_CLUSTERING_KEY", "7")
+	connParams.MaxClusteringKey = 0
+	if maxClusteringKeys := getMaxClusteringKeyRestrictionsPerQuery(); maxClusteringKeys != 7 {
+		t.Fatalf("expected the environment fallback of 7, got %d", maxClusteringKeys)
+	}
+
+	connParams.MaxClusteringKey = 40
+	if maxClusteringKeys := getMaxClusteringKeyRestrictionsPerQuery(); maxClusteringKeys != 40 {
+		t.Fatalf("expected the ConnParams value of 40, got %d", maxClusteringKeys)
+	}
+
+	t.Setenv("MAX_CLUSTERING_KEY", "")
+	connParams.MaxClusteringKey = 0
+	if maxClusteringKeys := getMaxClusteringKeyRestrictionsPerQuery(); maxClusteringKeys != 100 {
+		t.Fatalf("expected the default of 100, got %d", maxClusteringKeys)
+	}
+}
+
 type relocatedPartitionViewRecord struct {
 	TableStruct[relocatedPartitionViewSchema, relocatedPartitionViewRecord]
 	CompanyID int32  `db:"company_id"`

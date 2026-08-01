@@ -215,6 +215,12 @@ func makeSelectQueryTemplate(selectExpressions []string, keyspace, sourceTableNa
 
 func getMaxClusteringKeyRestrictionsPerQuery() int {
 	// Keep the Scylla clustering-key fanout limit configurable while staying safe by default.
+	// The connection params win so each project can pass its own node setting through
+	// ConnParams; the environment variable stays as the fallback for tools and tests.
+	if connParams.MaxClusteringKey > 0 {
+		return connParams.MaxClusteringKey
+	}
+
 	rawMaxClusteringKeys := strings.TrimSpace(os.Getenv("MAX_CLUSTERING_KEY"))
 	if rawMaxClusteringKeys == "" {
 		return 100
@@ -242,6 +248,45 @@ func chunkStatementInValues(values []any, chunkSize int) [][]any {
 		valueChunks = append(valueChunks, slices.Clone(values[startIndex:endIndex]))
 	}
 	return valueChunks
+}
+
+// buildChunkedInWhereClauses turns one IN list into as many clauses as the node's
+// clustering-key restriction ceiling requires. Views bind their predicates directly
+// into a clause string, so they cannot go through buildRemainingWhereClauseBatches
+// and need the split here instead.
+func buildChunkedInWhereClauses(columnName string, inValues []any) []boundWhereClause {
+	if len(inValues) == 0 {
+		return nil
+	}
+
+	valueChunks := chunkStatementInValues(inValues, getMaxClusteringKeyRestrictionsPerQuery())
+	whereClauses := make([]boundWhereClause, 0, len(valueChunks))
+
+	for _, valueChunk := range valueChunks {
+		if len(valueChunk) == 1 {
+			whereClauses = append(whereClauses, boundWhereClause{
+				Clause: fmt.Sprintf("%v = ?", columnName),
+				Values: valueChunk,
+			})
+			continue
+		}
+
+		placeholders := make([]string, len(valueChunk))
+		for placeholderIndex := range placeholders {
+			placeholders[placeholderIndex] = "?"
+		}
+		whereClauses = append(whereClauses, boundWhereClause{
+			Clause: fmt.Sprintf("%v IN (%v)", columnName, strings.Join(placeholders, ", ")),
+			Values: valueChunk,
+		})
+	}
+
+	if len(whereClauses) > 1 {
+		fmt.Printf("View batching IN query: column=%s values=%d batches=%d\n",
+			columnName, len(inValues), len(whereClauses))
+	}
+
+	return whereClauses
 }
 
 func buildRemainingWhereClauseBatches(remainingStatements []ColumnStatement) []boundWhereClause {
