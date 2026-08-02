@@ -30,6 +30,33 @@ const maxPackedInt64Digits = 18
 type columnValueRange struct {
 	minValue int64
 	maxValue int64
+	// declaredValues enumerates every value the column may hold. It is what lets the select planner
+	// fan a query out over an unconstrained key column instead of falling back to a table scan. It
+	// stays nil for a range too wide to be worth enumerating, which is exactly the case where the
+	// fan-out would cost more than it saves.
+	declaredValues []int64
+}
+
+// maxEnumerableFixedValues caps how wide a Min/Max declaration may be before its values stop being
+// enumerated. It sits above the planner's own fan-out ceiling so a range that just misses the cut
+// is still visible to any future caller that can afford a wider fan-out.
+const maxEnumerableFixedValues = 32
+
+// enumerateFixedValues lists every value a FixedValues entry pins down, preferring the explicit
+// list over the Min/Max span. A span wider than maxEnumerableFixedValues yields nil: the column is
+// still range-bounded for digit sizing, just not enumerable.
+func enumerateFixedValues(declared FixedValues, minValue, maxValue int64) []int64 {
+	if len(declared.Values) > 0 {
+		return slices.Clone(declared.Values)
+	}
+	if maxValue-minValue+1 > maxEnumerableFixedValues {
+		return nil
+	}
+	values := make([]int64, 0, maxValue-minValue+1)
+	for value := minValue; value <= maxValue; value++ {
+		values = append(values, value)
+	}
+	return values
 }
 
 // deltaSlotPlan is the resolved digit layout of a TypeDelta packed column. It is handed to
@@ -84,7 +111,11 @@ func resolveFixedValueRanges(dbTable *ScyllaTable, declaredFixedValues []FixedVa
 				dbTable.Name, columnName, maxValue, minValue))
 		}
 
-		valueRanges[columnName] = columnValueRange{minValue: minValue, maxValue: maxValue}
+		valueRanges[columnName] = columnValueRange{
+			minValue:       minValue,
+			maxValue:       maxValue,
+			declaredValues: enumerateFixedValues(declared, minValue, maxValue),
+		}
 	}
 	return valueRanges
 }

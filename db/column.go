@@ -68,11 +68,6 @@ func (q Col[T, E]) Autoincrement(randSufixSize int8) Col[T, E] {
 	return q
 }
 
-func (q Col[T, E]) StoreAsWeek() Col[T, E] {
-	q.info.StoreAsWeek = true
-	return q
-}
-
 func (q Col[T, E]) GetName() string {
 	return q.info.Name
 }

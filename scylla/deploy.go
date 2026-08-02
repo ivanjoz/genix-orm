@@ -288,9 +288,6 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 		appendSelectedColumn(scyllaTable.UpdatedVersionCol)
 	}
 	for _, indexGroup := range scyllaTable.indexGroups {
-		if !shouldPersistIndexUpdatedGroup(indexGroup) {
-			continue
-		}
 		for _, sourceColumn := range indexGroup.sourceColumns {
 			appendSelectedColumn(sourceColumn.column)
 		}

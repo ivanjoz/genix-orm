@@ -602,6 +602,13 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 	for _, e := range dbTable.views {
 		dbTable.indexViews = append(dbTable.indexViews, e)
 	}
+	// Both sources above are maps, so their iteration order changes every process. Capability
+	// matching breaks priority ties by first-seen, which would make a query plan differ between
+	// runs whenever two sources advertise the same signature at the same priority. Sorting by name
+	// pins the tie-break to something stable.
+	slices.SortFunc(dbTable.indexViews, func(leftView, rightView *viewInfo) int {
+		return strings.Compare(leftView.name, rightView.name)
+	})
 
 	for _, idxview := range dbTable.indexViews {
 		for _, colname := range idxview.columns {

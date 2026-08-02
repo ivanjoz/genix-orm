@@ -55,6 +55,10 @@ type SelectStatement struct {
 	selectedStatementIndexes   []int
 	remainingStatementIndexes  []int
 	postFilterStatementIndexes []int
+	// fixedValueFanoutStatements are the schema-derived IN predicates that filled a gap in the
+	// chosen source's key prefix. They depend only on the schema, so bind-time appends them after
+	// the query's own statements exactly as compile-time did and every cached index stays valid.
+	fixedValueFanoutStatements []ColumnStatement
 	requiresDeduplication      bool
 	orderBy                    string
 	orderColumnName            string
@@ -659,6 +663,164 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 	return rewrittenStatements, true
 }
 
+// maxFixedValueFanoutPerColumn is the widest declared value set the planner will enumerate to fill
+// a gap in an index key prefix.
+const maxFixedValueFanoutPerColumn = 8
+
+// maxFixedValueFanoutQueries caps the product of the enumerated sets, which is how many parallel
+// queries the fan-out costs. It matches the concurrency limit executeBoundSelectQueries runs under,
+// so a fanned-out read never queues against itself.
+const maxFixedValueFanoutQueries = 8
+
+// narrowInt64ToColumnWidth returns value as the column's own Go integer type. The synthesized
+// values come from the schema as int64, but they end up bound straight into CQL and, on hash views,
+// fed to HashInt — which writes each width differently, so an int64 1 would not match the int8 1
+// the row was written with.
+func narrowInt64ToColumnWidth(value int64, column IColInfo) any {
+	switch column.GetType().FieldType {
+	case "int8":
+		return int8(value)
+	case "int16":
+		return int16(value)
+	case "int32":
+		return int32(value)
+	case "int":
+		return int(value)
+	}
+	return value
+}
+
+// buildFixedValueFanoutStatements synthesizes an IN predicate for every unconstrained column whose
+// FixedValues enumerate a small, closed set.
+//
+// An index whose key prefix has a gap at such a column is still reachable: enumerating the column
+// is logically identical to leaving it open, and each resulting value group is one contiguous range
+// over the key. Without this the planner drops to a base-table read that Scylla rejects unless the
+// caller allows filtering — a query pinning only the trailing half of a delta view's keys being the
+// motivating case.
+func buildFixedValueFanoutStatements(statements []ColumnStatement, scyllaTable ScyllaTable) []ColumnStatement {
+	if len(scyllaTable.fixedValueRanges) == 0 {
+		return nil
+	}
+
+	constrainedColumns := map[string]bool{}
+	for _, statement := range statements {
+		constrainedColumns[statement.Col] = true
+		for _, betweenStatement := range statement.From {
+			constrainedColumns[betweenStatement.Col] = true
+		}
+	}
+
+	fanoutStatements := []ColumnStatement{}
+	plannedQueryCount := 1
+	// Walking the table's columns rather than the fixedValueRanges map keeps the synthesized order
+	// stable, which the statement indexes cached on SelectStatement depend on.
+	for _, column := range scyllaTable.Columns {
+		columnName := column.GetName()
+		if constrainedColumns[columnName] {
+			continue
+		}
+		valueRange, isDeclared := scyllaTable.fixedValueRanges[columnName]
+		if !isDeclared || len(valueRange.declaredValues) == 0 ||
+			len(valueRange.declaredValues) > maxFixedValueFanoutPerColumn ||
+			plannedQueryCount*len(valueRange.declaredValues) > maxFixedValueFanoutQueries {
+			continue
+		}
+		plannedQueryCount *= len(valueRange.declaredValues)
+
+		fanoutValues := make([]any, 0, len(valueRange.declaredValues))
+		for _, declaredValue := range valueRange.declaredValues {
+			fanoutValues = append(fanoutValues, narrowInt64ToColumnWidth(declaredValue, column))
+		}
+		fanoutStatements = append(fanoutStatements, ColumnStatement{
+			Col: columnName, Operator: "IN", Values: fanoutValues,
+		})
+	}
+
+	return fanoutStatements
+}
+
+// countSignatureCoveredQueryColumns counts how many of the query's own predicate columns a
+// capability constrains. Columns the fan-out synthesized are deliberately not counted: a signature
+// that only grew by them constrains nothing the caller asked for, so it buys no selectivity while
+// still costing one query per enumerated value.
+func countSignatureCoveredQueryColumns(capability *QueryCapability, statements []ColumnStatement) int {
+	if capability == nil {
+		return 0
+	}
+
+	signatureParts := strings.Split(capability.Signature, "|")
+	coveredColumns := make(map[string]bool, len(signatureParts)/2)
+	for partIndex := 0; partIndex < len(signatureParts); partIndex += 2 {
+		coveredColumns[signatureParts[partIndex]] = true
+	}
+
+	coveredCount := 0
+	for _, statement := range statements {
+		if coveredColumns[statement.Col] {
+			coveredCount++
+		}
+	}
+	return coveredCount
+}
+
+// applyFixedValueFanout retries capability matching with the synthesized predicates and keeps them
+// only when they let an index bind strictly more of the query's own predicates. It returns the
+// capability to compile against and the predicates that must be appended to the statement list.
+func applyFixedValueFanout(statements []ColumnStatement, baseCapability *QueryCapability,
+	scyllaTable ScyllaTable) (*QueryCapability, []ColumnStatement) {
+
+	candidateStatements := buildFixedValueFanoutStatements(statements, scyllaTable)
+	if len(candidateStatements) == 0 {
+		return baseCapability, nil
+	}
+
+	fannedCapability := MatchQueryCapability(append(slices.Clone(statements), candidateStatements...),
+		scyllaTable.capabilities)
+	// A base-key capability is excluded outright: the key rewrite paths read equality and range
+	// predicates only, so a synthesized IN would survive as a plain filter.
+	if fannedCapability == nil || fannedCapability.Source == nil {
+		return baseCapability, nil
+	}
+	// Coverage, not capability priority, is what decides this. Priority ranks a longer packed-key
+	// prefix above a shorter one, but both are one contiguous range over the same column — reaching
+	// the longer one by enumerating a gap costs several queries and returns the very same rows. The
+	// fan-out only pays for itself when it rescues a predicate that would otherwise be left as a
+	// filter Scylla refuses to run.
+	if countSignatureCoveredQueryColumns(fannedCapability, statements) <=
+		countSignatureCoveredQueryColumns(baseCapability, statements) {
+		return baseCapability, nil
+	}
+
+	// A synthesized predicate the chosen source cannot bind would land in remainingStatements as
+	// the very filter this is meant to avoid, so only the bindable ones are kept.
+	fanoutStatements := []ColumnStatement{}
+	fanoutColumnNames := []string{}
+	for _, candidateStatement := range candidateStatements {
+		if slices.Contains(fannedCapability.Source.columns, candidateStatement.Col) {
+			fanoutStatements = append(fanoutStatements, candidateStatement)
+			fanoutColumnNames = append(fanoutColumnNames, candidateStatement.Col)
+		}
+	}
+	if len(fanoutStatements) == 0 {
+		return baseCapability, nil
+	}
+
+	fanoutQueryCount := 1
+	for _, fanoutStatement := range fanoutStatements {
+		fanoutQueryCount *= len(fanoutStatement.Values)
+	}
+	baseSignature := "none"
+	if baseCapability != nil {
+		baseSignature = baseCapability.Signature
+	}
+	fmt.Printf("FixedValues fanout applied: table=%s columns=%v queries=%d signature=%s (was %s, covering %d of %d predicates)\n",
+		scyllaTable.Name, fanoutColumnNames, fanoutQueryCount, fannedCapability.Signature, baseSignature,
+		countSignatureCoveredQueryColumns(baseCapability, statements), len(statements))
+
+	return fannedCapability, fanoutStatements
+}
+
 func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*SelectStatement, error) {
 	statements := collectSelectStatements(tableInfo)
 	selectShapeHash := computeSelectShapeHash(tableInfo, scyllaTable)
@@ -708,13 +870,13 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 	}
 
 	compiledStatement := &SelectStatement{
-		hash:                computeSelectShapeHash(tableInfo, scyllaTable),
-		scanColumns:         slices.Clone(scanColumns),
-		orderBy:             tableInfo.OrderBy,
-		orderColumnName:     orderColumnName,
-		limit:               tableInfo.Limit,
-		allowFilter:         tableInfo.AllowFilter,
-		route:               selectRouteAllStatements,
+		hash:            computeSelectShapeHash(tableInfo, scyllaTable),
+		scanColumns:     slices.Clone(scanColumns),
+		orderBy:         tableInfo.OrderBy,
+		orderColumnName: orderColumnName,
+		limit:           tableInfo.Limit,
+		allowFilter:     tableInfo.AllowFilter,
+		route:           selectRouteAllStatements,
 	}
 
 	if compositePlan := tryBuildCompositeBucketPlan(statements, scyllaTable); compositePlan != nil {
@@ -727,6 +889,14 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 	}
 
 	bestCapability := MatchQueryCapability(statements, scyllaTable.capabilities)
+	bestCapability, fanoutStatements := applyFixedValueFanout(statements, bestCapability, scyllaTable)
+	if len(fanoutStatements) > 0 {
+		// The fan-out predicates take part in planning from here on, so they must sit in the
+		// statement list the cached indexes are computed against.
+		statements = append(slices.Clone(statements), fanoutStatements...)
+		compiledStatement.fixedValueFanoutStatements = fanoutStatements
+	}
+
 	if bestCapability != nil {
 		if bestCapability.Source != nil {
 			selectedView := bestCapability.Source
@@ -804,6 +974,9 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable) (*BoundSelectPlan, error) {
 	// Bind current values into the cached query shape without rerunning planner selection in selectExec.
 	statements := collectSelectStatements(tableInfo)
+	if len(e.fixedValueFanoutStatements) > 0 {
+		statements = append(statements, e.fixedValueFanoutStatements...)
+	}
 	whereStatements := []boundWhereClause{{}}
 	remainingStatements := statements
 	postFilterStatements := pickStatementsByIndexes(statements, e.postFilterStatementIndexes)

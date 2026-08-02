@@ -30,7 +30,7 @@ type ScyllaTable struct {
 	// maxDeltaVersionValue is the widest "updated_version" the delta view's trailing slot can hold.
 	// Zero means the table declares no delta view and nothing needs checking.
 	maxDeltaVersionValue int64
-	capabilities     []QueryCapability
+	capabilities         []QueryCapability
 	// Composite bucket metadata is used to materialize virtual hash sets and plan range+contains reads.
 	compositeBucketIndexes []compositeBucketIndex
 	indexGroups            []indexGroupInfo
@@ -79,9 +79,7 @@ type textSearchIndexProvider interface {
 }
 
 type indexGroupSourceColumn struct {
-	column      IColInfo
-	storeAsWeek bool
-	weekOnly    bool
+	column IColInfo
 }
 
 type viewInfo struct {
@@ -221,4 +219,3 @@ type SeqValue struct {
 	ID      int64 `db:"id"`
 	SeqPart int64 `db:"seq_part"`
 }
-

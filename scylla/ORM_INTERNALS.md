@@ -181,7 +181,36 @@ Each signature ties a predicate pattern to a source:
 2. scoring candidates by specificity,
 3. preferring exact/high-selectivity paths.
 
+Equal-priority candidates are broken by first-seen order, so `indexViews` is sorted by name once at
+compile time. Both of its sources are maps, and Go randomizes map iteration — without the sort, two
+sources advertising the same signature at the same priority would make the chosen plan differ
+between processes.
+
 This is the primary mechanism used to avoid accidental `ALLOW FILTERING` queries.
+
+### 7.3 FixedValues Fan-Out
+
+A signature only matches when the query constrains every column it names, so a query that skips a
+*leading* key of an index cannot reach it — `company_id = ? AND type = ?` misses a view keyed
+`[company_id, status, type, updated_version]` and falls back to a table scan.
+
+When the skipped column declares `FixedValues`, the gap can be closed by enumeration:
+`status IN (0,1) AND type = 1` is logically identical to the original predicate and *is* a valid key
+prefix. `buildFixedValueFanoutStatements` synthesizes that `IN` for every unconstrained column whose
+declared set is small enough, and matching is retried with it. Each resulting value group becomes one
+contiguous key range, and the ranges execute concurrently through the existing bound-statement
+fan-out (§13).
+
+Two caps bound the cost: at most 8 values per column, and at most 8 queries across the product of all
+enumerated columns. A `Min`/`Max` span wider than 32 is never enumerated at all.
+
+The fan-out is kept only when it lets the source bind **strictly more of the query's own
+predicates** — not when it merely reaches a higher-priority capability. Capability priority ranks a
+longer packed-key prefix above a shorter one, but both resolve to one contiguous range over the same
+packed column, so enumerating a gap to reach the longer prefix would cost several queries and return
+the very same rows. The synthesized predicates are stored on the compiled `SelectStatement`; being
+schema constants, bind time re-appends them in the same position and every cached statement index
+stays valid.
 
 ---
 
@@ -200,6 +229,15 @@ Inference rules:
 - `Type: TypeViewTable`: derived table with write-side maintenance
 - `Type: TypeDelta`: packed range view with an implicit trailing `updated_version` key
 - `UseIndexGroup: true`: write-maintained hash group metadata
+
+An index group compiles to exactly one virtual hash column per declaration (`zz_ig_` for scalars,
+`zz_igs_` for collections). There was once a second, week-coded variant per declaration
+(`zz_iwk_` / `zz_iwks_`, opted into with `Col.StoreAsWeek()`), meant to answer wide date ranges with
+one hash per week instead of one per day. It was never implemented on the read side: both
+`scoreIndexGroupCandidate` and `resolveIndexGroupQueryValues` refused it. `ComputeCapabilities`
+missed that exclusion, so it advertised range signatures identical to the raw variant's and the
+planner could route to a view that failed at bind time. `StoreAsWeek` and the week variant are gone;
+week-coded bucketing is a separate feature that lives in composite bucketing (§8.4, `Col.IsWeek()`).
 
 ### 8.2 Packed Indexes
 

@@ -961,3 +961,242 @@ func TestPackedViewRefusesFilterBehindUnconstrainedKey(t *testing.T) {
 		t.Fatalf("expected the view to refuse a gapped predicate set, got %+v", whereStatements)
 	}
 }
+
+// ─── FixedValues fan-out ───────────────────────────────────────────────────────
+
+// boundPackedRanges extracts the packed [from, to) bounds of every bound statement, dropping the
+// partition value each clause is prefixed with.
+func boundPackedRanges(t *testing.T, boundPlan *BoundSelectPlan) [][2]int64 {
+	t.Helper()
+	ranges := make([][2]int64, 0, len(boundPlan.Statements))
+	for _, boundStatement := range boundPlan.Statements {
+		if len(boundStatement.QueryValues) < 2 {
+			t.Fatalf("expected packed bounds in %q, got %v", boundStatement.QueryStr, boundStatement.QueryValues)
+		}
+		packedValues := boundStatement.QueryValues[len(boundStatement.QueryValues)-2:]
+		ranges = append(ranges, [2]int64{convertToInt64(packedValues[0]), convertToInt64(packedValues[1])})
+	}
+	slices.SortFunc(ranges, func(left, right [2]int64) int { return int(left[0] - right[0]) })
+	return ranges
+}
+
+// A query that pins Type but leaves the leading Status open cannot match the packed view's key
+// prefix on its own. Status declares only two values, so enumerating it is logically identical to
+// leaving it open and turns the gap into two contiguous key ranges — the alternative being a base
+// table read Scylla rejects without ALLOW FILTERING.
+func TestFixedValueFanoutFillsAGapInThePackedKeyPrefix(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	records := []deltaViewRecord{}
+	query := Query[deltaViewRecord, deltaViewSchema](&records)
+	query.CompanyID.Equals(7)
+	query.Type.Equals(int8(1))
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if compiledStatement.sourceView == nil {
+		t.Fatal("expected the packed delta view to serve the query, got a base-table read")
+	}
+	if len(compiledStatement.fixedValueFanoutStatements) != 1 ||
+		compiledStatement.fixedValueFanoutStatements[0].Col != "status" {
+		t.Fatalf("expected one synthesized status predicate, got %+v", compiledStatement.fixedValueFanoutStatements)
+	}
+	// The values must carry the column's own width: an int64 0 would bind wrong and hash wrong.
+	if _, isInt8 := compiledStatement.fixedValueFanoutStatements[0].Values[0].(int8); !isInt8 {
+		t.Fatalf("expected int8 fan-out values for an int8 column, got %T",
+			compiledStatement.fixedValueFanoutStatements[0].Values[0])
+	}
+
+	boundPlan, err := compiledStatement.Compute(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected bind error: %v", err)
+	}
+	// Slots are [1,1,8], so status s with type 1 spans [s*10^9 + 10^8, s*10^9 + 2*10^8).
+	expectedRanges := [][2]int64{{100_000_000, 200_000_000}, {1_100_000_000, 1_200_000_000}}
+	if !slices.Equal(boundPackedRanges(t, boundPlan), expectedRanges) {
+		t.Fatalf("expected packed ranges %v, got %v", expectedRanges, boundPackedRanges(t, boundPlan))
+	}
+}
+
+// A plan the query already reaches on its own must not be traded for a fanned-out one.
+func TestFixedValueFanoutNeverDisplacesTheKeyRoute(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	records := []deltaViewRecord{}
+	query := Query[deltaViewRecord, deltaViewSchema](&records)
+	query.CompanyID.Equals(7)
+	query.ID.Equals(int32(42))
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if len(compiledStatement.fixedValueFanoutStatements) > 0 {
+		t.Fatalf("expected no fan-out over a primary key read, got %+v", compiledStatement.fixedValueFanoutStatements)
+	}
+	if compiledStatement.sourceView != nil {
+		t.Fatalf("expected the base-key route, got view %v", compiledStatement.sourceView.name)
+	}
+}
+
+// Values listed one by one are three values, not the ten their span suggests.
+type deltaSparseValuesRecord struct {
+	TableStruct[deltaSparseValuesSchema, deltaSparseValuesRecord]
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	Status         int8  `db:"status"`
+	Type           int8  `db:"type"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
+}
+
+type deltaSparseValuesSchema struct {
+	TableStruct[deltaSparseValuesSchema, deltaSparseValuesRecord]
+	CompanyID      Col[deltaSparseValuesSchema, int32]
+	ID             Col[deltaSparseValuesSchema, int32]
+	Status         Col[deltaSparseValuesSchema, int8]
+	Type           Col[deltaSparseValuesSchema, int8]
+	UpdatedVersion Col[deltaSparseValuesSchema, int32]
+}
+
+func (e deltaSparseValuesSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10029,
+		Name:      "delta_sparse_values_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		FixedValues: []FixedValues{
+			{Col: e.Status, Values: []int64{0, 5, 9}},
+			{Col: e.Type, Min: 1, Max: 2},
+		},
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(e.Status, e.Type)}},
+	}
+}
+
+func TestFixedValueFanoutUsesTheDeclaredListNotItsSpan(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaSparseValuesRecord, deltaSparseValuesSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	records := []deltaSparseValuesRecord{}
+	query := Query[deltaSparseValuesRecord, deltaSparseValuesSchema](&records)
+	query.CompanyID.Equals(7)
+	query.Type.Equals(int8(1))
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	boundPlan, err := compiledStatement.Compute(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected bind error: %v", err)
+	}
+	// Three declared values, not the ten spanned by 0..9.
+	if len(boundPlan.Statements) != 3 {
+		t.Fatalf("expected 3 fanned-out queries, got %d", len(boundPlan.Statements))
+	}
+	// A status reaching 9 pushes the layout to a bigint, so the version slot widens to 10 digits.
+	expectedRanges := [][2]int64{{10_000_000_000, 20_000_000_000}, {510_000_000_000, 520_000_000_000},
+		{910_000_000_000, 920_000_000_000}}
+	if !slices.Equal(boundPackedRanges(t, boundPlan), expectedRanges) {
+		t.Fatalf("expected packed ranges %v, got %v", expectedRanges, boundPackedRanges(t, boundPlan))
+	}
+}
+
+// A column too wide to enumerate keeps its gap: fanning 501 values out would cost far more than the
+// scan it replaces.
+type deltaUnenumerableLeadRecord struct {
+	TableStruct[deltaUnenumerableLeadSchema, deltaUnenumerableLeadRecord]
+	CompanyID      int32 `db:"company_id"`
+	ID             int32 `db:"id"`
+	Kind           int16 `db:"kind"`
+	Status         int8  `db:"status"`
+	UpdatedVersion int32 `json:"upv,omitempty"`
+}
+
+type deltaUnenumerableLeadSchema struct {
+	TableStruct[deltaUnenumerableLeadSchema, deltaUnenumerableLeadRecord]
+	CompanyID      Col[deltaUnenumerableLeadSchema, int32]
+	ID             Col[deltaUnenumerableLeadSchema, int32]
+	Kind           Col[deltaUnenumerableLeadSchema, int16]
+	Status         Col[deltaUnenumerableLeadSchema, int8]
+	UpdatedVersion Col[deltaUnenumerableLeadSchema, int32]
+}
+
+func (e deltaUnenumerableLeadSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10030,
+		Name:      "delta_unenumerable_lead_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		FixedValues: []FixedValues{
+			{Col: e.Kind, Min: 0, Max: 500},
+			{Col: e.Status, Values: []int64{0, 1}},
+		},
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(e.Kind, e.Status)}},
+	}
+}
+
+func TestFixedValueFanoutSkipsAColumnTooWideToEnumerate(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaUnenumerableLeadRecord, deltaUnenumerableLeadSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	records := []deltaUnenumerableLeadRecord{}
+	query := Query[deltaUnenumerableLeadRecord, deltaUnenumerableLeadSchema](&records)
+	query.CompanyID.Equals(7)
+	query.Status.Equals(int8(1))
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if len(compiledStatement.fixedValueFanoutStatements) > 0 {
+		t.Fatalf("expected no fan-out over a 501-value column, got %+v",
+			compiledStatement.fixedValueFanoutStatements)
+	}
+	if compiledStatement.sourceView != nil {
+		t.Fatalf("expected the base-table route, got view %v", compiledStatement.sourceView.name)
+	}
+}
+
+// A shorter key prefix that already binds every predicate is one query over the same rows the
+// fanned-out longer prefix would return in several. Capability priority ranks the longer prefix
+// higher, so coverage of the caller's own predicates has to be what decides it.
+func TestFixedValueFanoutSkipsAPrefixThatAlreadyCoversTheQuery(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
+	scyllaTable.Namespace = "genix_test"
+
+	records := []deltaViewRecord{}
+	query := Query[deltaViewRecord, deltaViewSchema](&records)
+	query.CompanyID.Equals(7)
+	query.Status.Equals(int8(1))
+
+	compiledStatement, err := tryGetOrCompileSelectStatement(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if len(compiledStatement.fixedValueFanoutStatements) > 0 {
+		t.Fatalf("expected no fan-out when [status] already binds every predicate, got %+v",
+			compiledStatement.fixedValueFanoutStatements)
+	}
+
+	boundPlan, err := compiledStatement.Compute(query.GetTableInfo(), scyllaTable)
+	if err != nil {
+		t.Fatalf("unexpected bind error: %v", err)
+	}
+	if len(boundPlan.Statements) != 1 {
+		t.Fatalf("expected a single query over the [status] prefix, got %d", len(boundPlan.Statements))
+	}
+}

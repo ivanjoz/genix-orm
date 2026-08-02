@@ -166,11 +166,6 @@ func scoreIndexGroupCandidate(indexGroup indexGroupInfo, statementByColumn map[s
 	fanoutSize := 1
 
 	for _, sourceColumn := range indexGroup.sourceColumns {
-		if sourceColumn.weekOnly {
-			// TODO: Future version should probe date hashes first and only then decide whether week hashes help fetch records.
-			return 0, false
-		}
-
 		columnStatements := statementByColumn[sourceColumn.column.GetName()]
 		if len(columnStatements) != 1 {
 			return 0, false
@@ -220,7 +215,7 @@ func buildQueryIndexGroupHashes(indexGroup indexGroupInfo, statements []ColumnSt
 			return nil, err
 		}
 
-		columnValues, err := resolveIndexGroupQueryValues(sourceColumn, statement)
+		columnValues, err := resolveIndexGroupQueryValues(statement)
 		if err != nil {
 			return nil, err
 		}
@@ -279,24 +274,21 @@ func findIndexGroupStatement(columnName string, statements []ColumnStatement) (C
 	return ColumnStatement{}, fmt.Errorf(`QueryIndexGroup missing statement for column "%v"`, columnName)
 }
 
-func resolveIndexGroupQueryValues(sourceColumn indexGroupSourceColumn, statement ColumnStatement) ([]int64, error) {
+func resolveIndexGroupQueryValues(statement ColumnStatement) ([]int64, error) {
 	switch statement.Operator {
 	case "=":
-		return resolveIndexGroupValues(sourceColumn, statement.Value), nil
+		return flattenCompositeInt64Values(statement.Value), nil
 	case "CONTAINS":
-		return resolveIndexGroupValues(sourceColumn, statement.Value), nil
+		return flattenCompositeInt64Values(statement.Value), nil
 	case "IN":
 		columnValues := make([]int64, 0, len(statement.Values))
 		for _, rawValue := range statement.Values {
-			columnValues = append(columnValues, resolveIndexGroupValues(sourceColumn, rawValue)...)
+			columnValues = append(columnValues, flattenCompositeInt64Values(rawValue)...)
 		}
 		return columnValues, nil
 	case "BETWEEN":
 		if len(statement.From) == 0 || len(statement.To) == 0 {
 			return nil, fmt.Errorf(`QueryIndexGroup received an invalid BETWEEN for "%v"`, statement.Col)
-		}
-		if sourceColumn.weekOnly {
-			return nil, fmt.Errorf(`QueryIndexGroup TODO: week-only probing is not implemented for "%v"`, statement.Col)
 		}
 
 		fromValue := convertToInt64(statement.From[0].Value)
