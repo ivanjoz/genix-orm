@@ -69,22 +69,6 @@ type indexGroupSchema struct {
 	ProductIDs Col[indexGroupSchema, []int32]
 }
 
-type weekIndexGroupRecord struct {
-	TableStruct[weekIndexGroupSchema, weekIndexGroupRecord]
-	CompanyID int32 `db:"empresa_id"`
-	ID        int64 `db:"id"`
-	Date      int16 `db:"date"`
-	Status    int8  `db:"status"`
-}
-
-type weekIndexGroupSchema struct {
-	TableStruct[weekIndexGroupSchema, weekIndexGroupRecord]
-	CompanyID Col[weekIndexGroupSchema, int32]
-	ID        Col[weekIndexGroupSchema, int64]
-	Date      Col[weekIndexGroupSchema, int16]
-	Status    Col[weekIndexGroupSchema, int8]
-}
-
 func (e updateCounterSchema) GetSchema() TableSchema {
 	return TableSchema{
 		ID:        10020,
@@ -118,23 +102,7 @@ func (e indexGroupSchema) GetSchema() TableSchema {
 				UseIndexGroup: true,
 			},
 			{
-				Keys:          Cols(e.Date.StoreAsWeek(), e.ClientID, e.ProductIDs),
-				UseIndexGroup: true,
-			},
-		},
-	}
-}
-
-func (e weekIndexGroupSchema) GetSchema() TableSchema {
-	return TableSchema{
-		ID:        10023,
-		Namespace: "test_keyspace",
-		Name:      "week_index_group_records",
-		Partition: e.CompanyID,
-		Keys:      Cols(e.ID),
-		Indexes: []Index{
-			{
-				Keys:          Cols(e.Date.StoreAsWeek(), e.Status),
+				Keys:          Cols(e.Date, e.ClientID, e.ProductIDs),
 				UseIndexGroup: true,
 			},
 		},
@@ -350,10 +318,7 @@ func TestMakeUpdateStatementsAllowsIndexGroupUpdateWhenOmittedValuesExistInStruc
 		t.Fatalf("expected client_id SET clause in statement: %s", preparedStatement.Stmt)
 	}
 	if !strings.Contains(preparedStatement.Stmt, "zz_igs_date_client_id_product_ids = ?") {
-		t.Fatalf("expected raw+slice index-group virtual column SET in statement: %s", preparedStatement.Stmt)
-	}
-	if !strings.Contains(preparedStatement.Stmt, "zz_iwks_date_client_id_product_ids = ?") {
-		t.Fatalf("expected week+slice index-group virtual column SET in statement: %s", preparedStatement.Stmt)
+		t.Fatalf("expected the slice index-group virtual column SET in statement: %s", preparedStatement.Stmt)
 	}
 	if !containsAny(preparedStatement.Args, int32(5)) {
 		t.Fatalf("expected client_id bound value 5 in args %v", preparedStatement.Args)
@@ -399,12 +364,9 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 	}
 
 	originalPersistIndexUpdatedRows := persistIndexUpdatedRows
-	originalPersistIndexUpdatedRowsAsync := persistIndexUpdatedRowsAsync
 	t.Cleanup(func() {
 		persistIndexUpdatedRows = originalPersistIndexUpdatedRows
-		persistIndexUpdatedRowsAsync = originalPersistIndexUpdatedRowsAsync
 	})
-	persistIndexUpdatedRowsAsync = false
 
 	var persistedKeyspace string
 	var persistedTable string
@@ -433,9 +395,6 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 
 	expectedHashes := map[int32]struct{}{}
 	for _, indexGroup := range scyllaTable.indexGroups {
-		if !shouldPersistIndexUpdatedGroup(indexGroup) {
-			continue
-		}
 		for _, hashValue := range computeIndexGroupHashes(unsafe.Pointer(&records[0]), indexGroup.sourceColumns) {
 			expectedHashes[hashValue] = struct{}{}
 		}
@@ -463,24 +422,6 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 			t.Fatalf("duplicate index hash persisted: %+v", row)
 		}
 		seenHashes[row.indexHash] = struct{}{}
-	}
-}
-
-func TestShouldPersistIndexUpdatedGroupSkipsWeekOnlyHashes(t *testing.T) {
-	scyllaTable := MakeScyllaTable[weekIndexGroupRecord, weekIndexGroupSchema]()
-	if len(scyllaTable.indexGroups) != 2 {
-		t.Fatalf("expected raw and week variants, got %d", len(scyllaTable.indexGroups))
-	}
-
-	if !shouldPersistIndexUpdatedGroup(scyllaTable.indexGroups[0]) {
-		t.Fatal("expected raw index-group hashes to be persisted")
-	}
-	if shouldPersistIndexUpdatedGroup(scyllaTable.indexGroups[1]) {
-		t.Fatal("expected week-only index-group hashes to be excluded from __index_updated")
-	}
-	if scyllaTable.indexGroups[0].indexID != scyllaTable.indexGroups[1].indexID {
-		t.Fatalf("expected raw and week index groups to reuse the same index_id, got %d and %d",
-			scyllaTable.indexGroups[0].indexID, scyllaTable.indexGroups[1].indexID)
 	}
 }
 

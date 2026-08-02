@@ -47,15 +47,6 @@ func allocateIndexGroupID(scyllaTable *ScyllaTable, sourceColumnNames []string) 
 	}
 }
 
-func shouldPersistIndexUpdatedGroup(indexGroup indexGroupInfo) bool {
-	for _, sourceColumn := range indexGroup.sourceColumns {
-		if sourceColumn.weekOnly {
-			return false
-		}
-	}
-	return true
-}
-
 func appendIndexUpdatedRowsForRecord(
 	recordPointer unsafe.Pointer,
 	scyllaTable *ScyllaTable,
@@ -65,10 +56,6 @@ func appendIndexUpdatedRowsForRecord(
 	rowsToPersist *[]indexUpdatedRow,
 ) {
 	for _, indexGroup := range scyllaTable.indexGroups {
-		if !shouldPersistIndexUpdatedGroup(indexGroup) {
-			continue
-		}
-
 		hashValues := computeIndexGroupHashes(recordPointer, indexGroup.sourceColumns)
 		for _, hashValue := range hashValues {
 			dedupKey := fmt.Sprintf("%d|%d|%d", partitionValue, indexGroup.indexID, hashValue)
@@ -117,7 +104,6 @@ func getIndexUpdatedTableCreateScript(keyspace string, tableInfo *indexUpdatedTa
 }
 
 var persistIndexUpdatedRows = persistIndexUpdatedRowsBatch
-var persistIndexUpdatedRowsAsync = true
 
 func persistIndexUpdatedRowsBatch(keyspace string, tableName string, rows []indexUpdatedRow) error {
 	if len(rows) == 0 {
@@ -136,45 +122,19 @@ func persistIndexUpdatedRowsBatch(keyspace string, tableName string, rows []inde
 	return session.ExecuteBatch(batch)
 }
 
-func makeIndexGroupVirtualColumnName(sourceColumnNames []string, usesCollection bool, weekOnly bool) string {
+func makeIndexGroupVirtualColumnName(sourceColumnNames []string, usesCollection bool) string {
 	prefix := "zz_ig_"
 	if usesCollection {
 		prefix = "zz_igs_"
 	}
-	if weekOnly {
-		prefix = "zz_iwk_"
-		if usesCollection {
-			prefix = "zz_iwks_"
-		}
-	}
 	return prefix + strings.Join(sourceColumnNames, "_")
-}
-
-func resolveIndexGroupValues(sourceColumn indexGroupSourceColumn, rawValue any) []int64 {
-	values := flattenCompositeInt64Values(rawValue)
-	if len(values) == 0 {
-		return nil
-	}
-	if !sourceColumn.storeAsWeek {
-		return values
-	}
-
-	expandedValues := make([]int64, 0, len(values))
-	for _, value := range values {
-		if sourceColumn.weekOnly {
-			expandedValues = append(expandedValues, int64(makeWeekCodeFromUnixDay(int16(value))))
-		} else {
-			expandedValues = append(expandedValues, value)
-		}
-	}
-	return expandedValues
 }
 
 func computeIndexGroupHashes(ptr unsafe.Pointer, sourceColumns []indexGroupSourceColumn) []int32 {
 	combinations := [][]int64{{}}
 
 	for _, sourceColumn := range sourceColumns {
-		columnValues := resolveIndexGroupValues(sourceColumn, sourceColumn.column.GetRawValue(ptr))
+		columnValues := flattenCompositeInt64Values(sourceColumn.column.GetRawValue(ptr))
 		if len(columnValues) == 0 {
 			return nil
 		}
@@ -224,7 +184,7 @@ func buildIndexGroupHashValues(sourceColumns []indexGroupSourceColumn, statement
 
 		columnValues := make([]int64, 0, len(rawValues))
 		for _, rawValue := range rawValues {
-			columnValues = append(columnValues, resolveIndexGroupValues(sourceColumn, rawValue)...)
+			columnValues = append(columnValues, flattenCompositeInt64Values(rawValue)...)
 		}
 		if len(columnValues) == 0 {
 			return nil
@@ -265,8 +225,7 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 			name:    indexCfg.Keys[0].GetName(),
 			indexID: indexID,
 			sourceColumns: []indexGroupSourceColumn{{
-				column:      dbTable.ColumnsMap[indexCfg.Keys[0].GetName()],
-				storeAsWeek: indexCfg.Keys[0].GetInfo().StoreAsWeek,
+				column: dbTable.ColumnsMap[indexCfg.Keys[0].GetName()],
 			}},
 		})
 		if dbTable.indexUpdatedTable == nil {
@@ -275,167 +234,146 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 		return
 	}
 
-	rawSourceColumns := make([]indexGroupSourceColumn, 0, len(indexCfg.Keys))
-	weekSourceColumns := make([]indexGroupSourceColumn, 0, len(indexCfg.Keys))
+	sourceColumns := make([]indexGroupSourceColumn, 0, len(indexCfg.Keys))
 	usesCollectionValues := false
-	hasStoreAsWeekColumn := false
 	for _, key := range indexCfg.Keys {
 		baseColumn := dbTable.ColumnsMap[key.GetName()]
 		if baseColumn == nil || baseColumn.IsNil() {
 			panic(fmt.Sprintf(`Table "%v": IndexGroup column "%v" was not found`, dbTable.Name, key.GetName()))
 		}
-		rawSourceColumn := indexGroupSourceColumn{
-			column:      baseColumn,
-			storeAsWeek: key.GetInfo().StoreAsWeek,
-		}
-		rawSourceColumns = append(rawSourceColumns, rawSourceColumn)
-		weekSourceColumns = append(weekSourceColumns, indexGroupSourceColumn{
-			column:      baseColumn,
-			storeAsWeek: key.GetInfo().StoreAsWeek,
-			weekOnly:    key.GetInfo().StoreAsWeek,
-		})
+		sourceColumns = append(sourceColumns, indexGroupSourceColumn{column: baseColumn})
 		if baseColumn.GetType().IsSlice {
 			usesCollectionValues = true
 		}
-		if key.GetInfo().StoreAsWeek {
-			hasStoreAsWeekColumn = true
+	}
+
+	virtualColumnName := makeIndexGroupVirtualColumnName(sourceColumnNames, usesCollectionValues)
+	if _, exists := dbTable.ColumnsMap[virtualColumnName]; exists {
+		panic(fmt.Sprintf(`Table "%v": generated IndexGroup column already exists: %v`, dbTable.Name, virtualColumnName))
+	}
+
+	virtualColumn := &columnInfo{
+		ColInfo: colInfo{
+			Name:      virtualColumnName,
+			FieldName: virtualColumnName,
+			IsVirtual: true,
+			Idx:       dbTable.MaxColIdx,
+		},
+		ColType: db.GetColTypeByName("int32"),
+	}
+	if usesCollectionValues {
+		virtualColumn.ColType = colType{
+			Type:      13,
+			FieldType: "[]int32",
+			DBType:    "set<int>",
+			IsSlice:   true,
 		}
 	}
 
-	registerCompiledIndexGroup := func(sourceColumns []indexGroupSourceColumn, weekOnly bool) {
-		virtualColumnName := makeIndexGroupVirtualColumnName(sourceColumnNames, usesCollectionValues, weekOnly)
-		if _, exists := dbTable.ColumnsMap[virtualColumnName]; exists {
-			panic(fmt.Sprintf(`Table "%v": generated IndexGroup column already exists: %v`, dbTable.Name, virtualColumnName))
-		}
-
-		virtualColumn := &columnInfo{
-			ColInfo: colInfo{
-				Name:      virtualColumnName,
-				FieldName: virtualColumnName,
-				IsVirtual: true,
-				Idx:       dbTable.MaxColIdx,
-			},
-			ColType: db.GetColTypeByName("int32"),
-		}
+	sourceColumnsLocal := slices.Clone(sourceColumns)
+	virtualColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
+		hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
 		if usesCollectionValues {
-			virtualColumn.ColType = colType{
-				Type:      13,
-				FieldType: "[]int32",
-				DBType:    "set<int>",
-				IsSlice:   true,
-			}
+			return hashes
 		}
+		if len(hashes) == 0 {
+			return int32(0)
+		}
+		return hashes[0]
+	}
+	virtualColumn.GetStatementValueFn = func(ptr unsafe.Pointer) any {
+		hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
+		if usesCollectionValues {
+			return hashes
+		}
+		if len(hashes) == 0 {
+			return int32(0)
+		}
+		return hashes[0]
+	}
+	virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
+		hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
+		if usesCollectionValues {
+			return makeSignedIntCollectionLiteral(virtualColumn.DBType, hashes)
+		}
+		if len(hashes) == 0 {
+			return int32(0)
+		}
+		return hashes[0]
+	}
 
-		sourceColumnsLocal := slices.Clone(sourceColumns)
-		virtualColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
-			hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
-			if usesCollectionValues {
-				return hashes
-			}
-			if len(hashes) == 0 {
-				return int32(0)
-			}
-			return hashes[0]
-		}
-		virtualColumn.GetStatementValueFn = func(ptr unsafe.Pointer) any {
-			hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
-			if usesCollectionValues {
-				return hashes
-			}
-			if len(hashes) == 0 {
-				return int32(0)
-			}
-			return hashes[0]
-		}
-		virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
-			hashes := computeIndexGroupHashes(ptr, sourceColumnsLocal)
-			if usesCollectionValues {
-				return makeSignedIntCollectionLiteral(virtualColumn.DBType, hashes)
-			}
-			if len(hashes) == 0 {
-				return int32(0)
-			}
-			return hashes[0]
-		}
+	dbTable.MaxColIdx++
+	dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
 
-		dbTable.MaxColIdx++
-		dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
-
-		index := &viewInfo{
-			Type:               3,
-			name:               fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumnName),
-			idx:                *idxCount,
-			column:             virtualColumn,
-			columns:            slices.Clone(sourceColumnNames),
-			RequiresPostFilter: false,
+	index := &viewInfo{
+		Type:               3,
+		name:               fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumnName),
+		idx:                *idxCount,
+		column:             virtualColumn,
+		columns:            slices.Clone(sourceColumnNames),
+		RequiresPostFilter: false,
+	}
+	index.getCreateScript = func() string {
+		if usesCollectionValues {
+			return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, index.name, dbTable.GetFullName(), virtualColumnName)
 		}
-		index.getCreateScript = func() string {
-			if usesCollectionValues {
-				return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, index.name, dbTable.GetFullName(), virtualColumnName)
-			}
-			return fmt.Sprintf(`CREATE INDEX %v ON %v (%v)`, index.name, dbTable.GetFullName(), virtualColumnName)
-		}
+		return fmt.Sprintf(`CREATE INDEX %v ON %v (%v)`, index.name, dbTable.GetFullName(), virtualColumnName)
+	}
 
-		virtualColumnNameLocal := virtualColumnName
-		usesCollectionLocal := usesCollectionValues
-		index.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
-			// Build all hash input combinations using resolveIndexGroupQueryValues, which handles
-			// =, CONTAINS, IN, and BETWEEN (BETWEEN is expanded into one value per step in range).
-			valuesGroups := [][]int64{{}}
-			for _, sourceColumn := range sourceColumnsLocal {
-				st, err := findIndexGroupStatement(sourceColumn.column.GetName(), statements)
-				if err != nil {
-					return nil
-				}
-				columnValues, err := resolveIndexGroupQueryValues(sourceColumn, st)
-				if err != nil || len(columnValues) == 0 {
-					return nil
-				}
-				nextGroups := make([][]int64, 0, len(valuesGroups)*len(columnValues))
-				for _, vg := range valuesGroups {
-					for _, v := range columnValues {
-						nextGroups = append(nextGroups, append(append([]int64{}, vg...), v))
-					}
-				}
-				valuesGroups = nextGroups
+	virtualColumnNameLocal := virtualColumnName
+	usesCollectionLocal := usesCollectionValues
+	index.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
+		// Build all hash input combinations using resolveIndexGroupQueryValues, which handles
+		// =, CONTAINS, IN, and BETWEEN (BETWEEN is expanded into one value per step in range).
+		valuesGroups := [][]int64{{}}
+		for _, sourceColumn := range sourceColumnsLocal {
+			st, err := findIndexGroupStatement(sourceColumn.column.GetName(), statements)
+			if err != nil {
+				return nil
 			}
-
-			// Emit one WHERE clause per unique hash value.
-			// Collection columns (set<int>) require CONTAINS; scalar columns use =.
-			seen := map[int32]struct{}{}
-			clauses := make([]boundWhereClause, 0, len(valuesGroups))
+			columnValues, err := resolveIndexGroupQueryValues(st)
+			if err != nil || len(columnValues) == 0 {
+				return nil
+			}
+			nextGroups := make([][]int64, 0, len(valuesGroups)*len(columnValues))
 			for _, vg := range valuesGroups {
-				hashValue := HashInt64(vg...)
-				if _, exists := seen[hashValue]; exists {
-					continue
+				for _, v := range columnValues {
+					nextGroups = append(nextGroups, append(append([]int64{}, vg...), v))
 				}
-				seen[hashValue] = struct{}{}
-				clause := fmt.Sprintf("%v = ?", virtualColumnNameLocal)
-				if usesCollectionLocal {
-					clause = fmt.Sprintf("%v CONTAINS ?", virtualColumnNameLocal)
-				}
-				clauses = append(clauses, boundWhereClause{
-					Clause: clause,
-					Values: []any{hashValue},
-				})
 			}
-			return clauses
+			valuesGroups = nextGroups
 		}
-		*idxCount = *idxCount + 1
-		dbTable.indexes[index.name] = index
-		dbTable.indexGroups = append(dbTable.indexGroups, indexGroupInfo{
-			name:                 strings.Join(sourceColumnNames, "_"),
-			indexID:              indexID,
-			sourceColumns:        sourceColumns,
-			virtualColumn:        virtualColumn,
-			usesCollectionValues: usesCollectionValues,
-		})
-	}
 
-	registerCompiledIndexGroup(rawSourceColumns, false)
-	if hasStoreAsWeekColumn {
-		registerCompiledIndexGroup(weekSourceColumns, true)
+		// Emit one WHERE clause per unique hash value.
+		// Collection columns (set<int>) require CONTAINS; scalar columns use =.
+		seen := map[int32]struct{}{}
+		clauses := make([]boundWhereClause, 0, len(valuesGroups))
+		for _, vg := range valuesGroups {
+			hashValue := HashInt64(vg...)
+			if _, exists := seen[hashValue]; exists {
+				continue
+			}
+			seen[hashValue] = struct{}{}
+			clause := fmt.Sprintf("%v = ?", virtualColumnNameLocal)
+			if usesCollectionLocal {
+				clause = fmt.Sprintf("%v CONTAINS ?", virtualColumnNameLocal)
+			}
+			clauses = append(clauses, boundWhereClause{
+				Clause: clause,
+				Values: []any{hashValue},
+			})
+		}
+		return clauses
 	}
+	*idxCount = *idxCount + 1
+	dbTable.indexes[index.name] = index
+	dbTable.indexGroups = append(dbTable.indexGroups, indexGroupInfo{
+		name:                 strings.Join(sourceColumnNames, "_"),
+		indexID:              indexID,
+		sourceColumns:        sourceColumns,
+		virtualColumn:        virtualColumn,
+		usesCollectionValues: usesCollectionValues,
+	})
 
 	if dbTable.indexUpdatedTable == nil {
 		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
@@ -455,9 +393,6 @@ func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, inde
 		if key.GetName() != packedColumnName {
 			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey keys must be a prefix of KeyIntPacking. Position %d expected "%v" but got "%v"`,
 				dbTable.Name, columnIndex, packedColumnName, key.GetName()))
-		}
-		if key.GetInfo().StoreAsWeek {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey does not support storeAsWeek on "%v"`, dbTable.Name, key.GetName()))
 		}
 		baseColumn := dbTable.ColumnsMap[key.GetName()]
 		if baseColumn == nil || baseColumn.IsNil() {
@@ -510,17 +445,11 @@ func syncIndexGroupsAfterWrite[T TableBaseInterface[E, T], E TableSchemaInterfac
 		return nil
 	}
 
-	keyspace := scyllaTable.Namespace
-	tableName := scyllaTable.indexUpdatedTable.name
-	rowsSnapshot := append([]indexUpdatedRow(nil), rowsToPersist...)
-	if !persistIndexUpdatedRowsAsync {
-		return persistIndexUpdatedRows(keyspace, tableName, rowsSnapshot)
-	}
-	go func() {
-		if err := persistIndexUpdatedRows(keyspace, tableName, rowsSnapshot); err != nil {
-			fmt.Printf("Error persisting index-updated rows asynchronously: table=%s.%s err=%v\n", keyspace, tableName, err)
-		}
-	}()
-
-	return nil
+	// Persisted synchronously. These counters are the freshness marker the frontend delta cache
+	// reads (cc-gh / cc-upc), so losing one silently strands every client on stale data. A
+	// fire-and-forget goroutine cannot guarantee delivery: AWS Lambda freezes the execution
+	// environment the moment the handler returns, suspending the write until the environment is
+	// reused — or discarding it outright when the environment is recycled. The caller recovers the
+	// lost concurrency by running this alongside the other post-write syncs.
+	return persistIndexUpdatedRows(scyllaTable.Namespace, scyllaTable.indexUpdatedTable.name, rowsToPersist)
 }

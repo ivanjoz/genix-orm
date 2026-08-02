@@ -993,65 +993,97 @@ func executeInsertUpdateBatch[T TableBaseInterface[E, T], E TableSchemaInterface
 
 	combinedManagedValues := mergeManagedWriteValues(managedInsertValues, managedUpdateValues)
 	combinedRecords = slices.Concat(*recordsForInsert, *recordsForUpdate)
-	if err := syncIndexGroupsAfterWrite(&combinedRecords, &scyllaTable, combinedManagedValues); err != nil {
-		fmt.Println("Error syncing index groups after insert-update:", err)
-		return err
+
+	// The update-phase column set drives both the view sync and the text-search sync, so it is
+	// resolved once here instead of being recomputed inside each block.
+	updateAffectedColumns := []IColInfo{}
+	if len(*recordsForUpdate) > 0 {
+		if useIncludeUpdateColumns {
+			updateAffectedColumns = collectAffectedColumnsForInclude(&scyllaTable, columnsToUpdate)
+		} else {
+			updateAffectedColumns = collectAffectedColumnsForExclude(&scyllaTable, columnsToUpdate)
+		}
 	}
 
+	// The post-write syncs run in two parallel phases, separated by a barrier.
+	//
+	// Phase 1 writes the derived DATA (view tables, search index). Phase 2 writes the FRESHNESS
+	// MARKERS the delta cache reads to decide whether to refetch (__index_updated counters and
+	// cache_updated_version slots). The barrier is what makes the protocol safe: publishing a
+	// marker before the data it gates lets a client refetch a stale row and then record the new
+	// version, permanently missing the update.
+	//
+	// Within a phase the syncs target distinct tables and only ever read the record slices, so
+	// they are independent. Each sync KIND keeps its own insert/update phases sequential inside
+	// one goroutine — the view sync is a read-modify-write cycle over a shared view table and
+	// text-search upserts can land in the same bucket, so overlapping them with themselves would
+	// add a hazard for no gain.
+	var dataSyncGroup errgroup.Group
+
 	if scyllaTable.hasTableBackedViews {
-		if len(*recordsForInsert) > 0 {
-			insertAffectedColumns := collectAffectedColumnsForInsert(&scyllaTable, columnsToExcludeInsert)
-			if err := syncTableBackedViews(recordsForInsert, &scyllaTable, insertAffectedColumns); err != nil {
-				fmt.Println("Error syncing view tables after insert-update insert phase:", err)
-				return err
+		dataSyncGroup.Go(func() error {
+			if len(*recordsForInsert) > 0 {
+				insertAffectedColumns := collectAffectedColumnsForInsert(&scyllaTable, columnsToExcludeInsert)
+				if err := syncTableBackedViews(recordsForInsert, &scyllaTable, insertAffectedColumns); err != nil {
+					return fmt.Errorf("syncing view tables after insert phase: %w", err)
+				}
 			}
-		}
-		if len(*recordsForUpdate) > 0 {
-			updateAffectedColumns := []IColInfo{}
-			if useIncludeUpdateColumns {
-				updateAffectedColumns = collectAffectedColumnsForInclude(&scyllaTable, columnsToUpdate)
-			} else {
-				updateAffectedColumns = collectAffectedColumnsForExclude(&scyllaTable, columnsToUpdate)
+			if len(*recordsForUpdate) > 0 {
+				if err := syncTableBackedViews(recordsForUpdate, &scyllaTable, updateAffectedColumns); err != nil {
+					return fmt.Errorf("syncing view tables after update phase: %w", err)
+				}
 			}
-			if err := syncTableBackedViews(recordsForUpdate, &scyllaTable, updateAffectedColumns); err != nil {
-				fmt.Println("Error syncing view tables after insert-update update phase:", err)
-				return err
-			}
-		}
+			return nil
+		})
 	}
 
 	if scyllaTable.textSearchIndex != nil {
-		if len(*recordsForInsert) > 0 {
-			if err := syncTextSearchIndexAfterWrite(recordsForInsert, &scyllaTable, false, nil); err != nil {
-				fmt.Println("Error syncing text search index after insert phase:", err)
-				return err
-			}
-		}
-		if len(*recordsForUpdate) > 0 {
-			updateAffectedColumns := []IColInfo{}
-			if useIncludeUpdateColumns {
-				updateAffectedColumns = collectAffectedColumnsForInclude(&scyllaTable, columnsToUpdate)
-			} else {
-				updateAffectedColumns = collectAffectedColumnsForExclude(&scyllaTable, columnsToUpdate)
-			}
-			textChanged, statusChanged := textSearchAffectedColumns(&scyllaTable, updateAffectedColumns)
-			if textChanged {
-				if err := syncTextSearchIndexAfterWrite(recordsForUpdate, &scyllaTable, !statusChanged, skipTextSearchIDs); err != nil {
-					fmt.Println("Error syncing text search index after update phase:", err)
-					return err
-				}
-			} else if statusChanged {
-				if err := syncTextSearchStatusAfterWrite(recordsForUpdate, &scyllaTable); err != nil {
-					fmt.Println("Error syncing text search status after update phase:", err)
-					return err
+		dataSyncGroup.Go(func() error {
+			if len(*recordsForInsert) > 0 {
+				if err := syncTextSearchIndexAfterWrite(recordsForInsert, &scyllaTable, false, nil); err != nil {
+					return fmt.Errorf("syncing text search index after insert phase: %w", err)
 				}
 			}
-		}
+			if len(*recordsForUpdate) > 0 {
+				textChanged, statusChanged := textSearchAffectedColumns(&scyllaTable, updateAffectedColumns)
+				if textChanged {
+					if err := syncTextSearchIndexAfterWrite(recordsForUpdate, &scyllaTable, !statusChanged, skipTextSearchIDs); err != nil {
+						return fmt.Errorf("syncing text search index after update phase: %w", err)
+					}
+				} else if statusChanged {
+					if err := syncTextSearchStatusAfterWrite(recordsForUpdate, &scyllaTable); err != nil {
+						return fmt.Errorf("syncing text search status after update phase: %w", err)
+					}
+				}
+			}
+			return nil
+		})
 	}
 
+	if err := dataSyncGroup.Wait(); err != nil {
+		fmt.Println("Error syncing derived data after insert-update:", err)
+		return err
+	}
+
+	var markerSyncGroup errgroup.Group
+
+	markerSyncGroup.Go(func() error {
+		if err := syncIndexGroupsAfterWrite(&combinedRecords, &scyllaTable, combinedManagedValues); err != nil {
+			return fmt.Errorf("syncing index groups: %w", err)
+		}
+		return nil
+	})
+
 	// Combined insert/update writes bump each touched slot once for the merged mutation set.
-	if err := updateSlotVersionsAfterWrite(&combinedRecords, scyllaTable); err != nil {
-		fmt.Println("Error updating slot versions after insert-update:", err)
+	markerSyncGroup.Go(func() error {
+		if err := updateSlotVersionsAfterWrite(&combinedRecords, scyllaTable); err != nil {
+			return fmt.Errorf("updating slot versions: %w", err)
+		}
+		return nil
+	})
+
+	if err := markerSyncGroup.Wait(); err != nil {
+		fmt.Println("Error syncing cache markers after insert-update:", err)
 		return err
 	}
 
