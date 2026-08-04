@@ -51,14 +51,17 @@ func EnsureInternalTables() error {
 }
 
 // CreateKeyspaceIfNotExists ensures the configured keyspace exists in ScyllaDB,
-// creating it with SimpleStrategy / replication_factor=1 when missing.
+// creating it with NetworkTopologyStrategy / replication_factor=1 when missing.
+// NetworkTopologyStrategy is mandatory since Scylla 2026.x: tablets are enabled
+// by default for new keyspaces and reject SimpleStrategy. The bare
+// replication_factor (without naming a DC) applies the same RF to every DC.
 func CreateKeyspaceIfNotExists() error {
 	keyspace := connParams.Keyspace
 	if keyspace == "" {
 		return errors.New("CreateKeyspaceIfNotExists: no keyspace configured")
 	}
 	stmt := fmt.Sprintf(
-		"CREATE KEYSPACE IF NOT EXISTS %v WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+		"CREATE KEYSPACE IF NOT EXISTS %v WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}",
 		keyspace,
 	)
 	return QueryExec(stmt)
