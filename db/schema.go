@@ -149,6 +149,9 @@ type TableSchema struct {
 	KeyConcatenated   []Coln
 	KeyIntPacking     []Coln
 	AutoincrementPart Coln
+	// DisableDefaultColumns prevents the ORM from adding its DB-only "created" and "updated"
+	// timestamp columns. Explicitly declared columns with those names remain regular user columns.
+	DisableDefaultColumns bool
 	// SaveUpdatedVersion opts the table into the by-IDs cache: writes bump the record's slot in
 	// cache_updated_version, and QueryCachedIDs skips reading rows whose slot did not move.
 	SaveUpdatedVersion bool

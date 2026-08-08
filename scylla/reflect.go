@@ -113,8 +113,10 @@ func consumesUpdatedVersion(dbTable *ScyllaTable, schema TableSchema) bool {
 }
 
 func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
-	dbTable.CreatedCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
-	dbTable.UpdatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
+	if !schema.DisableDefaultColumns {
+		dbTable.CreatedCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
+		dbTable.UpdatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
+	}
 
 	// The version costs a counter read per write, so a table that has no reader for it keeps neither
 	// the column nor that cost.
@@ -305,7 +307,7 @@ func makeTable[T TableSchemaInterface[T]](structType *T) ScyllaTable {
 		}
 	}
 
-	// Every table keeps the same audit columns in Scylla, even when a struct hides them.
+	// Default audit columns are added unless the schema explicitly opts out.
 	bindManagedAuditColumns(&dbTable, schema)
 
 	// Resolve declared value ranges before any index compiles, since TypeDelta sizes its digit

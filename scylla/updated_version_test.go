@@ -81,11 +81,12 @@ func (e updateCounterSchema) GetSchema() TableSchema {
 
 func (e updateCounterDisabledSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:        10021,
-		Namespace: "test_keyspace",
-		Name:      "update_counter_records_disabled",
-		Partition: e.CompanyID,
-		Keys:      Cols(e.ID),
+		ID:                    10021,
+		Namespace:             "test_keyspace",
+		Name:                  "update_counter_records_disabled",
+		Partition:             e.CompanyID,
+		Keys:                  Cols(e.ID),
+		DisableDefaultColumns: true,
 	}
 }
 
@@ -119,19 +120,37 @@ func TestMakeScyllaTableAddsManagedAuditColumns(t *testing.T) {
 	}
 }
 
-// A table with no reader for the write sequence — no TypeDelta index, no SaveUpdatedVersion and no
-// declared field — keeps neither the column nor its per-write counter read.
-func TestMakeScyllaTableSkipsManagedUpdateCounterWithoutAConsumer(t *testing.T) {
+// A table can omit default audit columns and still avoids the update counter when no feature consumes it.
+func TestMakeScyllaTableDisablesDefaultColumnsAndUnusedUpdateCounter(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterDisabledRecord, updateCounterDisabledSchema]()
 
-	if scyllaTable.ColumnsMap["created"] == nil || scyllaTable.ColumnsMap["updated"] == nil {
-		t.Fatalf("expected created and updated managed columns to remain enabled")
+	for _, columnName := range []string{"created", "updated"} {
+		if scyllaTable.ColumnsMap[columnName] != nil {
+			t.Fatalf("expected default column %q to be disabled", columnName)
+		}
+	}
+	if scyllaTable.CreatedCol != nil || scyllaTable.UpdatedCol != nil {
+		t.Fatalf("expected default audit metadata to be disabled")
 	}
 	if scyllaTable.ColumnsMap["updated_version"] != nil {
 		t.Fatalf("expected updated_version managed column to be disabled")
 	}
 	if scyllaTable.UpdatedVersionCol != nil {
 		t.Fatalf("expected updateCounterCol runtime metadata to be nil when disabled")
+	}
+}
+
+func TestMakeInsertStatementSkipsDisabledDefaultColumns(t *testing.T) {
+	records := []updateCounterDisabledRecord{{CompanyID: 7, ID: 1, Nombre: "nuevo"}}
+
+	preparedStatements := MakeInsertStatement(&records)
+	if len(preparedStatements) != 1 {
+		t.Fatalf("expected one insert statement, got %d", len(preparedStatements))
+	}
+	for _, columnName := range []string{"created", "updated"} {
+		if strings.Contains(preparedStatements[0].Stmt, columnName) {
+			t.Fatalf("expected disabled default column %q to be absent: %s", columnName, preparedStatements[0].Stmt)
+		}
 	}
 }
 
