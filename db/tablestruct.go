@@ -121,6 +121,17 @@ func (e *TableStruct[D, T, E]) SetWhereIn(colname string, values []any) {
 		ColumnStatement{Col: colname, Operator: "IN", Values: values})
 }
 
+// SetBetween adds a BETWEEN predicate from runtime values, mirroring Col.Between for callers that
+// only know the column by name. Its bounds go in From/To, like every other BETWEEN.
+func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
+	e.tableInfo.Statements = append(e.tableInfo.Statements, ColumnStatement{
+		Col:      colname,
+		Operator: "BETWEEN",
+		From:     []ColumnStatement{{Col: colname, Value: from}},
+		To:       []ColumnStatement{{Col: colname, Value: to}},
+	})
+}
+
 // Delta constrains a read to the delta-cache shape backed by one of the table's TypeDelta indexes.
 //
 // updatedSince is the client's watermark: the highest "updated_version" it has already received.

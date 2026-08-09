@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -96,4 +97,61 @@ type Controller interface {
 	ResetCounter(partValue any) error
 	DeleteViewsAndIndexes() error
 	FlushTextSearchIndex(partValue int32) error
+
+	// The four below are the name-addressed data surface (see generic_access.go): the read and
+	// write a caller can drive knowing only the table's name. Records cross the boundary as the
+	// record struct's own JSON, so a row that was read can be edited and written straight back,
+	// and the write still runs through the ORM — keeping autoincrement keys, updated_version,
+	// virtual columns, views and the text index.
+
+	// DescribeTable publishes the schema in serializable form.
+	DescribeTable() TableDescription
+	// QueryRecordsJSON runs a read described only with strings, returning the records as a JSON
+	// array and how many came back.
+	QueryRecordsJSON(spec QuerySpec) (payload []byte, count int, err error)
+	// InsertRecordsJSON inserts a JSON array of records, returning how many were written.
+	InsertRecordsJSON(payload []byte, columnsToExclude []string) (int, error)
+	// UpdateRecordsJSON updates only columnsToInclude on every record of the JSON array.
+	UpdateRecordsJSON(payload []byte, columnsToInclude []string) (int, error)
+}
+
+// Controllers, unlike tables, cannot be compiled from metadata alone: one carries the record type
+// as a type parameter, so only the code that named that type can build it. This registry is how a
+// caller holding just a name reaches the full data surface, and it is populated by whoever owns
+// the table list (in genix, app/exec from MakeScyllaControllers).
+var (
+	controllerFactoriesByName = map[string]func() Controller{}
+	controllerFactoriesMutex  sync.RWMutex
+)
+
+// RegisterControllerFactory records how to build one table's controller by name.
+func RegisterControllerFactory(tableName string, makeController func() Controller) {
+	controllerFactoriesMutex.Lock()
+	defer controllerFactoriesMutex.Unlock()
+	controllerFactoriesByName[tableName] = makeController
+}
+
+// ResolveControllerByName returns the named table's controller.
+func ResolveControllerByName(tableName string) (Controller, error) {
+	controllerFactoriesMutex.RLock()
+	makeController, registered := controllerFactoriesByName[tableName]
+	controllerFactoriesMutex.RUnlock()
+
+	if !registered {
+		return nil, fmt.Errorf("la tabla %q no tiene un controller registrado", tableName)
+	}
+	return makeController(), nil
+}
+
+// RegisteredControllerNames lists every table reachable by name, sorted so the listing is stable.
+func RegisteredControllerNames() []string {
+	controllerFactoriesMutex.RLock()
+	defer controllerFactoriesMutex.RUnlock()
+
+	names := make([]string, 0, len(controllerFactoriesByName))
+	for tableName := range controllerFactoriesByName {
+		names = append(names, tableName)
+	}
+	sort.Strings(names)
+	return names
 }

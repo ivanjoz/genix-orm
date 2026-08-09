@@ -36,3 +36,14 @@ type TableQueryInterface[T any] interface {
 	AllowFilter() *T
 	Exec() error
 }
+
+// TableGenericQuery is the surface a read built entirely at runtime needs: every predicate and
+// projection addressed by column name instead of by a typed column handle. It sits apart from
+// TableQueryInterface so the narrower contract stays the one the driver's own admin paths assert.
+type TableGenericQuery[T any] interface {
+	TableQueryInterface[T]
+	SetWhereIn(string, []any)
+	SetBetween(string, any, any)
+	Select(...Coln) *T
+	OrderDesc() *T
+}
