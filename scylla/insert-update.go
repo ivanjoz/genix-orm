@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"time"
 	"unsafe"
 
 	"github.com/gocql/gocql"
@@ -32,7 +31,9 @@ type prefetchedManagedCounterValues struct {
 
 func currentManagedUnixTime() int32 {
 	// Keep DB-managed audit timestamps aligned with the project SUnixTime convention without importing core.
-	return int32((time.Now().Unix() - 1e9) / 2)
+	// db.Now() rather than time.Now() so a historical-clock override reaches the columns the ORM
+	// writes on its own: otherwise a backdated record would carry today's created/updated.
+	return int32((db.Now().Unix() - 1e9) / 2)
 }
 
 func (e managedWriteValues) slice(start int, end int) managedWriteValues {
