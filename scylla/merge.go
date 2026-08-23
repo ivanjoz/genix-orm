@@ -32,6 +32,9 @@ func isNonPositiveNumericValue(value any) bool {
 	case int64:
 		return typedValue <= 0
 	}
+	if plainValue, isNamed := db.NormalizeNamedNumeric(value); isNamed {
+		return isNonPositiveNumericValue(plainValue)
+	}
 	return false
 }
 

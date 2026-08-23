@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/fatih/color"
+	"github.com/ivanjoz/genix-orm/db"
 	"github.com/kr/pretty"
 	"github.com/viant/xunsafe"
 )
@@ -117,32 +118,45 @@ func HashInt(values ...any) int32 {
 	buf := new(bytes.Buffer)
 
 	for _, anyVal := range values {
-		switch val := anyVal.(type) {
-		case int:
-			binary.Write(buf, binary.LittleEndian, int64(val))
-		case int32:
-			binary.Write(buf, binary.LittleEndian, val)
-		case int64:
-			binary.Write(buf, binary.LittleEndian, val)
-		case int16:
-			binary.Write(buf, binary.LittleEndian, val)
-		case int8:
-			binary.Write(buf, binary.LittleEndian, val)
-		case float32:
-			binary.Write(buf, binary.LittleEndian, val)
-		case float64:
-			binary.Write(buf, binary.LittleEndian, val)
-		case string:
-			buf.WriteString(val)
-		default:
-			buf.WriteString(fmt.Sprintf("%v", val))
-		}
+		appendHashValue(buf, anyVal)
 		buf.WriteByte(0)
 	}
 
 	h := fnv.New32a()
 	h.Write(buf.Bytes())
 	return int32(h.Sum32())
+}
+
+// appendHashValue writes one value into the hash buffer. A named numeric type is
+// normalized to its underlying plain type and re-dispatched, so it hashes to the SAME
+// bytes as the plain type it wraps — retyping a column from int8 to a named int8 must not
+// silently invalidate every hash already persisted from it. Without this it would fall to
+// the %v branch and hash the decimal text instead of the binary value.
+func appendHashValue(buf *bytes.Buffer, anyVal any) {
+	switch val := anyVal.(type) {
+	case int:
+		binary.Write(buf, binary.LittleEndian, int64(val))
+	case int32:
+		binary.Write(buf, binary.LittleEndian, val)
+	case int64:
+		binary.Write(buf, binary.LittleEndian, val)
+	case int16:
+		binary.Write(buf, binary.LittleEndian, val)
+	case int8:
+		binary.Write(buf, binary.LittleEndian, val)
+	case float32:
+		binary.Write(buf, binary.LittleEndian, val)
+	case float64:
+		binary.Write(buf, binary.LittleEndian, val)
+	case string:
+		buf.WriteString(val)
+	default:
+		if plainValue, isNamed := db.NormalizeNamedNumeric(anyVal); isNamed {
+			appendHashValue(buf, plainValue)
+			return
+		}
+		buf.WriteString(fmt.Sprintf("%v", val))
+	}
 }
 
 func HashInt64(values ...int64) int32 {
@@ -239,6 +253,9 @@ func convertToInt64(val any) int64 {
 	case int64:
 		return v
 	default:
+		if plainValue, isNamed := db.NormalizeNamedNumeric(val); isNamed {
+			return convertToInt64(plainValue)
+		}
 		// The value is not an integer
 		fmt.Println("Error: Value is not an integer:", v)
 		return 0
@@ -259,6 +276,9 @@ func convertToInt32(val any) int32 {
 	case int64:
 		return int32(v)
 	default:
+		if plainValue, isNamed := db.NormalizeNamedNumeric(val); isNamed {
+			return convertToInt32(plainValue)
+		}
 		// The value is not an integer
 		fmt.Println("Error: Value is not an integer:", v)
 		return 0

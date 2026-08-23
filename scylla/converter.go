@@ -73,24 +73,34 @@ func makeNumericSlice[T Number](slice []T) []byte {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
-		// Since we need to call specific strconv functions,
-		// we switch on the type one more time inside the generic.
-		switch val := any(v).(type) {
-		case int:
-			dst = append(dst, Int64ToBase64Bytes(int64(val))...)
-		case int64:
-			dst = append(dst, Int64ToBase64Bytes(val)...)
-		case int32:
-			dst = append(dst, Int64ToBase64Bytes(int64(val))...)
-		case int16:
-			dst = append(dst, Int64ToBase64Bytes(int64(val))...)
-		case int8:
-			dst = append(dst, Int64ToBase64Bytes(int64(val))...)
-		case float64:
-			dst = strconv.AppendFloat(dst, val, 'f', -1, 64)
-		case float32:
-			dst = strconv.AppendFloat(dst, float64(val), 'f', -1, 32)
-		}
+		dst = appendNumericElement(dst, any(v))
+	}
+	return dst
+}
+
+// appendNumericElement encodes one slice element. Split out of makeNumericSlice because
+// the Number constraint is written with ~ (`~int8`), so a []CashMovementType satisfies it
+// — but `any(v).(type)` then sees the NAMED type and `case int8:` misses, appending
+// nothing and silently dropping the element. Normalizing re-dispatches it once.
+func appendNumericElement(dst []byte, value any) []byte {
+	switch val := value.(type) {
+	case int:
+		return append(dst, Int64ToBase64Bytes(int64(val))...)
+	case int64:
+		return append(dst, Int64ToBase64Bytes(val)...)
+	case int32:
+		return append(dst, Int64ToBase64Bytes(int64(val))...)
+	case int16:
+		return append(dst, Int64ToBase64Bytes(int64(val))...)
+	case int8:
+		return append(dst, Int64ToBase64Bytes(int64(val))...)
+	case float64:
+		return strconv.AppendFloat(dst, val, 'f', -1, 64)
+	case float32:
+		return strconv.AppendFloat(dst, float64(val), 'f', -1, 32)
+	}
+	if plainValue, isNamed := db.NormalizeNamedNumeric(value); isNamed {
+		return appendNumericElement(dst, plainValue)
 	}
 	return dst
 }
@@ -388,6 +398,12 @@ func valueToCSVBase64(val any) []byte {
 		}
 		return []byte{'0'}
 	default:
+		// A named numeric type reaches here and %v would encode its DECIMAL TEXT where
+		// every reader expects the base64 integer encoding — a corrupt value, not a
+		// missing one. Normalize and re-dispatch so it encodes like the type it wraps.
+		if plainValue, isNamed := db.NormalizeNamedNumeric(val); isNamed {
+			return valueToCSVBase64(plainValue)
+		}
 		return []byte(fmt.Sprintf("%v", v))
 	}
 }
