@@ -240,7 +240,7 @@ func fetchExistingViewTableDeleteRows(
 }
 
 // Non-generic: the chunk is only ever iterated and turned into an unsafe.Pointer, so the type
-// parameter stencilled all 131 lines once per table type. See BINARY_SIZE_PLAN.md §6.
+// parameter stencilled all 131 lines once per table type.
 func executeViewTableSyncChunk(
 	view *viewInfo, recordCount int, recordPointerAt func(int) unsafe.Pointer,
 	session *gocql.Session, scyllaTable *ScyllaTable,

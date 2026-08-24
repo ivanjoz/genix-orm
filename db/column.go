@@ -12,7 +12,7 @@ import (
 // colCore is the part of a column handle that does not depend on the type parameters. It is
 // embedded (not named) so every existing q.info / c.tableInfo reference keeps resolving, while the
 // method bodies that touch only these two fields can live here and be compiled exactly once
-// instead of once per (table, column-type) pair. See BINARY_SIZE_PLAN.md §6.
+// instead of once per (table, column-type) pair. See BINARY_SIZE_FINDINGS.md §6.
 type colCore struct {
 	info      ColumnInfo
 	tableInfo *TableInfo

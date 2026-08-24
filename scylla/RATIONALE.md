@@ -49,7 +49,7 @@ a shim that type-erases and calls one non-generic implementation. Applied to `ma
 `resetCounterForTable`, `deleteViewsAndIndexesForTable`, `recalcVirtualColumnsForTable` and
 `recalcGroupIndexHashesForTable`. The two recalc bodies keep `T` only as a `reflect.Type` used to
 allocate one record per scanned row. Toolchain also moved to Go 1.27. Result: 54,263,970 →
-50,790,560 bytes (−6.40%), genix-orm 20.5 MB → 17.3 MB. Full analysis in `BINARY_SIZE_PLAN.md`.
+50,790,560 bytes (−6.40%), genix-orm 20.5 MB → 17.3 MB. Full analysis in `BINARY_SIZE_FINDINGS.md`.
 
 **Rationale** — the alternative was dropping `T` from `Col[T, E]`, which is where the largest single
 concentration of duplication sits (`db/column.go`, 4.33 MB across 6,325 compiled functions). It was

@@ -1141,7 +1141,7 @@ func InsertUpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 
 // Non-generic on purpose: the body works on ScyllaTable and IColInfo, and reaches records only
 // through unsafe.Pointer. A type parameter here stencilled all ~190 lines once per table type.
-// See BINARY_SIZE_PLAN.md §6.
+//
 func resolveUpdateColumnsForWrite(
 	scyllaTable ScyllaTable, recordCount int, recordPointerAt func(int) unsafe.Pointer,
 	columnsToInclude []Coln, columnsToExclude []Coln, onlyVirtual bool,

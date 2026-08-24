@@ -95,7 +95,7 @@ func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
 }
 
 // RecalcVirtualColumns is a shim over a non-generic body; T survives only as a reflect.Type used
-// to allocate one record per scanned row. See BINARY_SIZE_PLAN.md §6.
+// to allocate one record per scanned row.
 func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 	return recalcVirtualColumnsForTable(
 		getOrCompileScyllaTable(db.InitStructTable[E, T](new(E))), reflect.TypeFor[T](), partValue)
@@ -442,7 +442,7 @@ func makeVirtualValueSignature(value any) string {
 }
 
 // ResetCounter is a shim: the body below is non-generic so it exists once instead of once per
-// table type. See BINARY_SIZE_PLAN.md §6.
+// table type.
 func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 	return resetCounterForTable(&e.Table, partValue)
 }

@@ -213,7 +213,7 @@ func computeCompositeHashSet(ptr unsafe.Pointer, sourceColumns []IColInfo, bucke
 // makeTable is deliberately NOT generic. It is 400+ lines that work purely through the schema
 // and reflection, so a type parameter here would stencil the whole body once per table type —
 // it cost ~850 KB of binary across 54 tables. The caller does the two lines of type-specific
-// work (GetSchema, reflect.ValueOf) and hands the results in. See BINARY_SIZE_PLAN.md §6.
+// work (GetSchema, reflect.ValueOf) and hands the results in.
 func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable {
 
 	if len(schema.Keys) == 0 {
