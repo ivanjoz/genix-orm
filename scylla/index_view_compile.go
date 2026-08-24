@@ -218,13 +218,20 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		}
 		return []boundWhereClause{combinedClause}
 	}
+	view.getExpectedColumns = func() []viewExpectedColumn {
+		expectedColumns := make([]viewExpectedColumn, 0, len(viewPtr.tableColumns))
+		for _, column := range viewPtr.tableColumns {
+			expectedColumns = append(expectedColumns, viewExpectedColumn{
+				name:   getViewTableColumnName(column),
+				dbType: getViewTableColumnType(column.SourceColumn, column.UsesSliceElement).DBType,
+			})
+		}
+		return expectedColumns
+	}
 	view.getCreateScript = func() string {
 		columnDefinitions := make([]string, 0, len(viewPtr.tableColumns))
-		for _, column := range viewPtr.tableColumns {
-			columnDefinitions = append(columnDefinitions, fmt.Sprintf("%v %v",
-				getViewTableColumnName(column),
-				getViewTableColumnType(column.SourceColumn, column.UsesSliceElement).DBType,
-			))
+		for _, column := range viewPtr.getExpectedColumns() {
+			columnDefinitions = append(columnDefinitions, fmt.Sprintf("%v %v", column.name, column.dbType))
 		}
 
 		primaryKeyColumns := append([]string{}, keyColumnNames...)
@@ -782,7 +789,9 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 	}
 
 	viewPtr := view
-	view.getCreateScript = func() string {
+	// The CREATE script and deploy's column-drift check must agree on what the view contains, so
+	// both read the layout from here instead of each deriving it.
+	resolveShape := func() materializedViewShape {
 		whereCols := []IColInfo{}
 		if viewPtr.Type == 6 && !viewPtr.column.GetInfo().IsVirtual {
 			for _, declaredViewColumn := range declaredColumns {
@@ -805,55 +814,52 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 			})
 		}
 
+		shape := materializedViewShape{}
+		if wherePartCol != nil {
+			shape.primaryKeyColumns = append(shape.primaryKeyColumns, wherePartCol)
+		}
+		shape.primaryKeyColumns = append(shape.primaryKeyColumns, whereCols...)
+
 		keyNames := []string{}
 		for _, col := range whereCols {
 			keyNames = append(keyNames, col.GetName())
 		}
 
-		primaryKey := strings.Join(keyNames, ",")
+		shape.primaryKeyClause = strings.Join(keyNames, ",")
 		if wherePartCol != nil {
-			primaryKey = fmt.Sprintf("(%v), %v", wherePartCol.GetName(), primaryKey)
+			shape.primaryKeyClause = fmt.Sprintf("(%v), %v", wherePartCol.GetName(), shape.primaryKeyClause)
 		}
 
-		whereColumnsNotNull := []string{}
-		if wherePartCol != nil {
-			if wherePartCol.GetType().DBType == "text" {
-				whereColumnsNotNull = append(whereColumnsNotNull, wherePartCol.GetName()+" IS NOT NULL")
-			} else {
-				// whereColumnsNotNull = append(whereColumnsNotNull, wherePartCol.GetName()+" > 0")
-				whereColumnsNotNull = append(whereColumnsNotNull, wherePartCol.GetName()+" IS NOT NULL")
-			}
-		}
-		for _, col := range whereCols {
-			if col.GetType().DBType == "text" {
-				whereColumnsNotNull = append(whereColumnsNotNull, col.GetName()+" IS NOT NULL")
-			} else {
-				// whereColumnsNotNull = append(whereColumnsNotNull, col.GetName()+" > 0")
-				whereColumnsNotNull = append(whereColumnsNotNull, col.GetName()+" IS NOT NULL")
-			}
+		for _, col := range shape.primaryKeyColumns {
+			shape.notNullClauses = append(shape.notNullClauses, col.GetName()+" IS NOT NULL")
 		}
 
-		selectClause := "*"
 		if len(projectedColumns) > 0 {
-			projectedColumnNames := make([]string, 0, len(projectedColumns))
-			for _, projectedColumn := range projectedColumns {
-				projectedColumnNames = append(projectedColumnNames, projectedColumn.GetName())
+			shape.selectColumns = slices.Clone(projectedColumns)
+			return shape
+		}
+		selectColumns := slices.Clone(selectableColumns)
+		for _, whereColumn := range whereCols {
+			if whereColumn != nil && !whereColumn.IsNil() && whereColumn.GetInfo().IsVirtual {
+				selectColumns = appendUniqueColumn(selectColumns, whereColumn)
 			}
-			selectClause = strings.Join(projectedColumnNames, ", ")
-		} else {
-			selectColumns := slices.Clone(selectableColumns)
-			for _, whereColumn := range whereCols {
-				if whereColumn != nil && !whereColumn.IsNil() && whereColumn.GetInfo().IsVirtual {
-					selectColumns = appendUniqueColumn(selectColumns, whereColumn)
-				}
-			}
-			selectColumns = orderColumnsBySchemaIndex(selectColumns)
+		}
+		shape.selectColumns = orderColumnsBySchemaIndex(selectColumns)
+		return shape
+	}
 
-			selectColumnNames := make([]string, 0, len(selectColumns))
-			for _, selectColumn := range selectColumns {
-				selectColumnNames = append(selectColumnNames, selectColumn.GetName())
-			}
-			selectClause = strings.Join(selectColumnNames, ", ")
+	view.getExpectedColumns = func() []viewExpectedColumn {
+		shape := resolveShape()
+		// A materialized view stores its selected columns plus its own primary key, and a projected
+		// view names only the projection in SELECT — so the key columns have to be added back here.
+		return makeViewExpectedColumns(append(slices.Clone(shape.selectColumns), shape.primaryKeyColumns...))
+	}
+
+	view.getCreateScript = func() string {
+		shape := resolveShape()
+		selectColumnNames := make([]string, 0, len(shape.selectColumns))
+		for _, selectColumn := range shape.selectColumns {
+			selectColumnNames = append(selectColumnNames, selectColumn.GetName())
 		}
 
 		return fmt.Sprintf(`CREATE MATERIALIZED VIEW %v.%v AS
@@ -861,9 +867,36 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 			WHERE %v
 			PRIMARY KEY (%v)
 			%v;`,
-			dbTable.Namespace, viewPtr.name, selectClause, dbTable.GetFullName(),
-			strings.Join(whereColumnsNotNull, " AND "), primaryKey, makeStatementWith)
+			dbTable.Namespace, viewPtr.name, strings.Join(selectColumnNames, ", "), dbTable.GetFullName(),
+			strings.Join(shape.notNullClauses, " AND "), shape.primaryKeyClause, makeStatementWith)
 	}
 
 	dbTable.views[view.name] = view
+}
+
+// materializedViewShape is the column layout of one compiled materialized view, derived once and
+// consumed both by the CREATE script and by the expected-column set deploy diffs against the DB.
+type materializedViewShape struct {
+	selectColumns     []IColInfo
+	primaryKeyColumns []IColInfo
+	primaryKeyClause  string
+	notNullClauses    []string
+}
+
+// makeViewExpectedColumns flattens columns to name/type pairs, dropping repeats: a projected view's
+// key column appears in both halves of the union.
+func makeViewExpectedColumns(columns []IColInfo) []viewExpectedColumn {
+	expectedColumns := make([]viewExpectedColumn, 0, len(columns))
+	namesSeen := map[string]bool{}
+	for _, column := range columns {
+		if column == nil || column.IsNil() || namesSeen[column.GetName()] {
+			continue
+		}
+		namesSeen[column.GetName()] = true
+		expectedColumns = append(expectedColumns, viewExpectedColumn{
+			name:   column.GetName(),
+			dbType: column.GetType().DBType,
+		})
+	}
+	return expectedColumns
 }

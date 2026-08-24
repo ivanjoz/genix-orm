@@ -685,7 +685,8 @@ func syncTableBackedViews[T TableBaseInterface[E, T], E TableSchemaInterface[E]]
 			}
 
 			recordsChunk := (*records)[start:end]
-			if err := executeViewTableSyncChunk(view, &recordsChunk, session, scyllaTable); err != nil {
+			chunkPointerAt := func(i int) unsafe.Pointer { return xunsafe.AsPointer(&recordsChunk[i]) }
+			if err := executeViewTableSyncChunk(view, len(recordsChunk), chunkPointerAt, session, scyllaTable); err != nil {
 				return err
 			}
 		}
@@ -719,7 +720,8 @@ func MakeUpdateStatements[T TableBaseInterface[E, T], E TableSchemaInterface[E]]
 		panic(err)
 	}
 
-	resolvedTable, columnsToUpdate := resolveUpdateColumnsForWrite(records, columnsToInclude, nil, false)
+	resolvedTable, columnsToUpdate := resolveUpdateColumnsForWrite(scyllaTable, len(*records),
+		func(i int) unsafe.Pointer { return xunsafe.AsPointer(&(*records)[i]) }, columnsToInclude, nil, false)
 	columnsWhere := collectUpdateWhereColumns(resolvedTable)
 
 	setParts := make([]string, 0, len(columnsToUpdate))
@@ -795,8 +797,8 @@ func UpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 
 func mergeManagedWriteValues(first managedWriteValues, second managedWriteValues) managedWriteValues {
 	return managedWriteValues{
-		createdValues:       append(append([]any{}, first.createdValues...), second.createdValues...),
-		updatedValues:       append(append([]any{}, first.updatedValues...), second.updatedValues...),
+		createdValues:        append(append([]any{}, first.createdValues...), second.createdValues...),
+		updatedValues:        append(append([]any{}, first.updatedValues...), second.updatedValues...),
 		updatedVersionValues: append(append([]any{}, first.updatedVersionValues...), second.updatedVersionValues...),
 	}
 }
@@ -1137,11 +1139,13 @@ func InsertUpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	})
 }
 
-func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
-	records *[]T, columnsToInclude []Coln, columnsToExclude []Coln, onlyVirtual bool,
+// Non-generic on purpose: the body works on ScyllaTable and IColInfo, and reaches records only
+// through unsafe.Pointer. A type parameter here stencilled all ~190 lines once per table type.
+// See BINARY_SIZE_PLAN.md §6.
+func resolveUpdateColumnsForWrite(
+	scyllaTable ScyllaTable, recordCount int, recordPointerAt func(int) unsafe.Pointer,
+	columnsToInclude []Coln, columnsToExclude []Coln, onlyVirtual bool,
 ) (ScyllaTable, []IColInfo) {
-	refTable := db.InitStructTable[E, T](new(E))
-	scyllaTable := getOrCompileScyllaTable(refTable)
 	columnsToUpdate := []IColInfo{}
 
 	if len(columnsToInclude) > 0 {
@@ -1289,8 +1293,8 @@ func resolveUpdateColumnsForWrite[T TableBaseInterface[E, T], E TableSchemaInter
 		}
 
 		if len(includedSourceColumns) > 0 && len(missingSourceColumns) > 0 {
-			for recordIndex := range *records {
-				recordPointer := xunsafe.AsPointer(&(*records)[recordIndex])
+			for recordIndex := 0; recordIndex < recordCount; recordIndex++ {
+				recordPointer := recordPointerAt(recordIndex)
 				missingValuesInStruct := []string{}
 
 				for _, sourceColumn := range indexGroup.sourceColumns {
@@ -1345,7 +1349,8 @@ func collectUpdateWhereColumns(scyllaTable ScyllaTable) []IColInfo {
 func appendUpdateQueriesToBatch[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	batch *gocql.Batch, records *[]T, managedValues managedWriteValues, columnsToInclude []Coln, columnsToExclude []Coln, onlyVirtual bool,
 ) {
-	scyllaTable, columnsToUpdate := resolveUpdateColumnsForWrite(records, columnsToInclude, columnsToExclude, onlyVirtual)
+	scyllaTable, columnsToUpdate := resolveUpdateColumnsForWrite(MakeScyllaTable[T, E](), len(*records),
+		func(i int) unsafe.Pointer { return xunsafe.AsPointer(&(*records)[i]) }, columnsToInclude, columnsToExclude, onlyVirtual)
 	columnsWhere := collectUpdateWhereColumns(scyllaTable)
 
 	setStatements := []string{}

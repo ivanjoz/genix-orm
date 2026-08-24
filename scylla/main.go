@@ -105,6 +105,10 @@ type viewInfo struct {
 	getStatementPrepared  func(statements ...ColumnStatement) []boundWhereClause
 	decomposeVirtualValue func(rawValue any) []any
 	getCreateScript       func() string
+	// getExpectedColumns reports the columns this view must hold in the DB. Deploy compares it
+	// against the live catalog: a column added to the base table does not reach a derived view on
+	// its own, and the view then breaks every read or write that touches it.
+	getExpectedColumns func() []viewExpectedColumn
 	fanoutColumnName      string
 	tableColumns          []viewTableColumnInfo
 	tableKeyColumns       []viewTableColumnInfo
@@ -115,6 +119,13 @@ type viewInfo struct {
 type viewTableColumnInfo struct {
 	SourceColumn     IColInfo
 	UsesSliceElement bool
+}
+
+// viewExpectedColumn is one column a compiled view must have in the DB, with the CQL type the view
+// stores it as — a view table's fan-out key stores the slice element type, not the slice type.
+type viewExpectedColumn struct {
+	name   string
+	dbType string
 }
 
 func MakeScyllaTable[T TableBaseInterface[E, T], E TableSchemaInterface[E]]() ScyllaTable {

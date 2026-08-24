@@ -8,7 +8,6 @@ import (
 
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
-	"github.com/viant/xunsafe"
 )
 
 type viewTableDeleteRow struct {
@@ -240,8 +239,11 @@ func fetchExistingViewTableDeleteRows(
 	return deleteRows, nil
 }
 
-func executeViewTableSyncChunk[T any](
-	view *viewInfo, recordsChunk *[]T, session *gocql.Session, scyllaTable *ScyllaTable,
+// Non-generic: the chunk is only ever iterated and turned into an unsafe.Pointer, so the type
+// parameter stencilled all 131 lines once per table type. See BINARY_SIZE_PLAN.md §6.
+func executeViewTableSyncChunk(
+	view *viewInfo, recordCount int, recordPointerAt func(int) unsafe.Pointer,
+	session *gocql.Session, scyllaTable *ScyllaTable,
 ) error {
 	batch := session.NewBatch(gocql.UnloggedBatch)
 	deleteStatementsCount := 0
@@ -252,8 +254,8 @@ func executeViewTableSyncChunk[T any](
 	// Track rows that will be reinserted with the same derived primary key to avoid unnecessary tombstones.
 	rowsToKeep := map[string]struct{}{}
 
-	for recordIndex := range *recordsChunk {
-		recordPointer := xunsafe.AsPointer(&(*recordsChunk)[recordIndex])
+	for recordIndex := 0; recordIndex < recordCount; recordIndex++ {
+		recordPointer := recordPointerAt(recordIndex)
 		partValue := scyllaTable.GetPartValue(recordPointer)
 		keyValues := scyllaTable.GetKeyValues(recordPointer)
 		if len(keyValues) == 0 {
@@ -335,8 +337,8 @@ func executeViewTableSyncChunk[T any](
 		strings.Join(columnPlaceholders, ", "),
 	)
 
-	for recordIndex := range *recordsChunk {
-		recordPointer := xunsafe.AsPointer(&(*recordsChunk)[recordIndex])
+	for recordIndex := 0; recordIndex < recordCount; recordIndex++ {
+		recordPointer := recordPointerAt(recordIndex)
 		fanoutValues := getViewTableFanoutValues(view, recordPointer)
 		if len(fanoutValues) == 0 {
 			if DebugFull {
@@ -362,7 +364,7 @@ func executeViewTableSyncChunk[T any](
 
 	if DebugFull {
 		fmt.Printf("ViewTable sync batch: base_table=%s view=%s deletes=%d inserts=%d records=%d\n",
-			scyllaTable.Name, view.name, deleteStatementsCount, insertStatementsCount, len(*recordsChunk))
+			scyllaTable.Name, view.name, deleteStatementsCount, insertStatementsCount, recordCount)
 	}
 
 	// Stale deletes and current inserts no longer target the same derived key, so one batch is enough.

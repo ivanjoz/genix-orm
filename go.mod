@@ -2,6 +2,8 @@ module github.com/ivanjoz/genix-orm
 
 go 1.26
 
+toolchain go1.27.0
+
 require (
 	github.com/fatih/color v1.19.0
 	github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613

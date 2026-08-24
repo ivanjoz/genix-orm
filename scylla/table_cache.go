@@ -24,7 +24,7 @@ func getOrCompileScyllaTable[T TableInterface[T]](schemaStruct *T) ScyllaTable {
 		if ShouldLogFull() {
 			fmt.Printf("Compiling ScyllaTable metadata once for %s\n", cacheKey)
 		}
-		cacheEntry.table = makeTable(schemaStruct)
+		cacheEntry.table = makeTable((*schemaStruct).GetSchema(), reflect.ValueOf(schemaStruct).Elem())
 	})
 	return cacheEntry.table
 }

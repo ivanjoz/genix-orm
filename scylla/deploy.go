@@ -12,7 +12,6 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/scylla/text_search"
-	"github.com/viant/xunsafe"
 )
 
 type ScyllaController[T db.RecordWithExecutor[E, T, Exec[E, T]], E TableSchemaInterface[E]] struct {
@@ -21,8 +20,10 @@ type ScyllaController[T db.RecordWithExecutor[E, T, Exec[E, T]], E TableSchemaIn
 	Schema    TableSchema
 }
 
-type virtualColumnsRecalcUpdate[T any] struct {
-	record                T
+// record is a reflect.Value rather than a T so the recalc body can stay non-generic. Keeping the
+// Value (not just the pointer) is what holds the allocation alive for the GC.
+type virtualColumnsRecalcUpdate struct {
+	record                reflect.Value
 	changedVirtualColumns []IColInfo
 }
 
@@ -93,8 +94,14 @@ func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
 	return nil
 }
 
+// RecalcVirtualColumns is a shim over a non-generic body; T survives only as a reflect.Type used
+// to allocate one record per scanned row. See BINARY_SIZE_PLAN.md §6.
 func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
-	scyllaTable := getOrCompileScyllaTable(db.InitStructTable[E, T](new(E)))
+	return recalcVirtualColumnsForTable(
+		getOrCompileScyllaTable(db.InitStructTable[E, T](new(E))), reflect.TypeFor[T](), partValue)
+}
+
+func recalcVirtualColumnsForTable(scyllaTable ScyllaTable, recordType reflect.Type, partValue int32) error {
 	virtualColumns := []IColInfo{}
 	selectedColumns := make([]IColInfo, 0, len(scyllaTable.Columns))
 	for _, column := range scyllaTable.Columns {
@@ -138,7 +145,7 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 		return Err("RecalcVirtualColumns RowData failed for table", scyllaTable.Name, ":", err)
 	}
 
-	updatesToApply := []virtualColumnsRecalcUpdate[T]{}
+	updatesToApply := []virtualColumnsRecalcUpdate{}
 	rowsScanned := 0
 	updatedRowsByVirtualColumn := map[string]int{}
 
@@ -149,8 +156,8 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 		}
 		rowsScanned++
 
-		record := *new(T)
-		recordPointer := xunsafe.AsPointer(&record)
+		record := reflect.New(recordType).Elem()
+		recordPointer := record.Addr().UnsafePointer()
 		persistedVirtualValueByName := map[string]string{}
 
 		for valueIndex, selectedColumn := range selectedColumns {
@@ -176,7 +183,7 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 			continue
 		}
 
-		updatesToApply = append(updatesToApply, virtualColumnsRecalcUpdate[T]{
+		updatesToApply = append(updatesToApply, virtualColumnsRecalcUpdate{
 			record:                record,
 			changedVirtualColumns: changedVirtualColumns,
 		})
@@ -215,7 +222,7 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 		batch := session.NewBatch(gocql.UnloggedBatch)
 		for chunkRowIndex := range chunk {
 			updateToApply := &chunk[chunkRowIndex]
-			recordPointer := xunsafe.AsPointer(&updateToApply.record)
+			recordPointer := updateToApply.record.Addr().UnsafePointer()
 
 			setParts := make([]string, 0, len(updateToApply.changedVirtualColumns))
 			boundValues := make([]any, 0, len(updateToApply.changedVirtualColumns)+len(whereColumns))
@@ -256,8 +263,14 @@ func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
 	return nil
 }
 
+// RecalcGroupIndexHashes is a shim over a non-generic body, for the same reason as
+// RecalcVirtualColumns.
 func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
-	scyllaTable := getOrCompileScyllaTable(db.InitStructTable[E, T](new(E)))
+	return recalcGroupIndexHashesForTable(
+		getOrCompileScyllaTable(db.InitStructTable[E, T](new(E))), reflect.TypeFor[T](), partValue)
+}
+
+func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.Type, partValue int32) error {
 	if scyllaTable.indexUpdatedTable == nil || len(scyllaTable.indexGroups) == 0 {
 		return nil
 	}
@@ -338,8 +351,8 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 		}
 		rowsScanned++
 
-		record := *new(T)
-		recordPointer := xunsafe.AsPointer(&record)
+		record := reflect.New(recordType).Elem()
+		recordPointer := record.Addr().UnsafePointer()
 		updateCounterValue := int64(0)
 
 		for valueIndex, selectedColumn := range selectedColumns {
@@ -428,8 +441,14 @@ func makeVirtualValueSignature(value any) string {
 	}
 }
 
+// ResetCounter is a shim: the body below is non-generic so it exists once instead of once per
+// table type. See BINARY_SIZE_PLAN.md §6.
 func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
-	scyllaTable := &e.Table
+	return resetCounterForTable(&e.Table, partValue)
+}
+
+func resetCounterForTable(controllerTable *ScyllaTable, partValue any) error {
+	scyllaTable := &(*controllerTable)
 
 	// Sequence reset only applies to partitioned tables with explicit autoincrement usage.
 	partitionColumn := scyllaTable.GetPartKey()
@@ -525,8 +544,13 @@ func (e *ScyllaController[T, E]) FlushTextSearchIndex(partValue int32) error {
 	return nil
 }
 
+// DeleteViewsAndIndexes is a shim over a non-generic body, for the same reason as ResetCounter.
 func (e *ScyllaController[T, E]) DeleteViewsAndIndexes() error {
-	scyllaTable := &e.Table
+	return deleteViewsAndIndexesForTable(&e.Table)
+}
+
+func deleteViewsAndIndexesForTable(controllerTable *ScyllaTable) error {
+	scyllaTable := &(*controllerTable)
 
 	// Read the live catalog first so old DB artifacts are deleted even if the current schema no longer declares them.
 	session := getScyllaConnection()
@@ -696,6 +720,88 @@ type ScyllaView struct {
 var cacheCodePrev int32
 var scyllaColumnsSaved []ScyllaColumns
 var scyllaIndexesSaved []ScyllaIndexes
+
+// getViewMissingColumns diffs a compiled view's declared columns against the live DB catalog and
+// returns the ones the DB is missing. A type mismatch on an existing column is only reported: the
+// same as the base table does, since changing a column type is not something deploy can decide.
+func getViewMissingColumns(view *viewInfo, liveViewColumns []ScyllaColumns) []viewExpectedColumn {
+	if view.getExpectedColumns == nil {
+		return nil
+	}
+
+	liveColumnTypes := map[string]string{}
+	for _, liveColumn := range liveViewColumns {
+		liveColumnTypes[liveColumn.Name] = liveColumn.Type
+	}
+
+	missingColumns := []viewExpectedColumn{}
+	for _, expectedColumn := range view.getExpectedColumns() {
+		liveType, exists := liveColumnTypes[expectedColumn.name]
+		if !exists {
+			missingColumns = append(missingColumns, expectedColumn)
+			continue
+		}
+		if liveType != expectedColumn.dbType {
+			Logx(5, fmt.Sprintf(`La columna "%v" de la view "%v" está en la BD como "%v" pero el Struct la declara como "%v".`+"\n",
+				expectedColumn.name, view.name, liveType, expectedColumn.dbType))
+		}
+	}
+	return missingColumns
+}
+
+// repairViewMissingColumns realigns a live view with the columns its schema declares. Adding a
+// column to a base table never reaches that table's derived views on its own — a materialized view
+// only carries the columns named in its CREATE, and a view table is a separate physical table — so
+// without this every read or write touching the new column fails on the view while the base table
+// looks correct.
+//
+// The repair differs by view kind:
+//   - A materialized view cannot be ALTERed, so it is dropped and recreated. Scylla repopulates it
+//     from the base table, so nothing is lost, but the rebuild is not instant on a large table.
+//   - A view table holds rows only the ORM's write path produces and nothing rebuilds them in bulk,
+//     so it is ALTERed instead. Dropping it would empty the view until every base row is rewritten.
+func repairViewMissingColumns(table *ScyllaTable, view *viewInfo, liveViewColumns []ScyllaColumns) {
+	missingColumns := getViewMissingColumns(view, liveViewColumns)
+	if len(missingColumns) == 0 {
+		return
+	}
+
+	viewFullName := table.Namespace + "." + view.name
+	missingColumnNames := []string{}
+	for _, missingColumn := range missingColumns {
+		missingColumnNames = append(missingColumnNames, missingColumn.name)
+	}
+	Logx(5, fmt.Sprintf(`A la view "%v" le faltan las columnas: %v. Reparando...`+"\n",
+		view.name, strings.Join(missingColumnNames, ", ")))
+
+	if view.Type == TypeViewTable {
+		for _, missingColumn := range missingColumns {
+			alterStatement := fmt.Sprintf(`ALTER TABLE %v ADD %v %v`, viewFullName, missingColumn.name, missingColumn.dbType)
+			fmt.Println(alterStatement)
+			if err := QueryExec(alterStatement); err != nil {
+				panic(fmt.Sprintf(`Error agregando la columna "%v" a la view table "%v" | %v`, missingColumn.name, view.name, err))
+			}
+		}
+		Logx(2, fmt.Sprintf(`View table columns added "%v": %v`+"\n", view.name, strings.Join(missingColumnNames, ", ")))
+		return
+	}
+
+	// Build the CREATE before dropping so only the DB can fail between the two statements. If it
+	// does, the view is simply absent and the next run recreates it through the not-found branch.
+	createScript := view.getCreateScript()
+
+	dropStatement := fmt.Sprintf(`DROP MATERIALIZED VIEW IF EXISTS %v`, viewFullName)
+	fmt.Println(dropStatement)
+	if err := QueryExec(dropStatement); err != nil {
+		panic(fmt.Sprintf(`Error eliminando la view "%v" para recrearla | %v`, view.name, err))
+	}
+
+	fmt.Println(createScript)
+	if err := QueryExec(createScript); err != nil {
+		panic(fmt.Sprintf(`Error recreando la view "%v" en %v | %v`, view.name, table.GetFullName(), err))
+	}
+	Logx(2, fmt.Sprintf(`View rebuilt with the missing columns "%v"`+"\n", view.name))
+}
 
 func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 	// The ORM's own tables are raw CQL, so the homologation pass below can never discover them —
@@ -918,7 +1024,8 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 		// Revisa si posee views, en su defecto las crea
 		for _, view := range table.views {
 			name := table.Namespace + "." + view.name
-			if _, ok := tableColumnsMap[name]; ok {
+			if liveViewColumns, ok := tableColumnsMap[name]; ok {
+				repairViewMissingColumns(&table, view, liveViewColumns)
 			} else {
 				Logx(5, fmt.Sprintf(`No se encontró la view "%v" en la tabla "%v". Preparando creación...`+"\n", view.name, table.Name))
 

@@ -350,7 +350,7 @@ func (e *TableStruct[D, T, E]) Autoincrement(randDecimalSize int8) Col[T, E] {
 	if randDecimalSize > 8 {
 		panic("randDecimalSize TOO BIG.")
 	}
-	return Col[T, E]{info: ColumnInfo{AutoincrementRandDigits: randDecimalSize}}
+	return Col[T, E]{colCore: colCore{info: ColumnInfo{AutoincrementRandDigits: randDecimalSize}}}
 }
 
 func (e *TableStruct[D, T, E]) Limit(limit int32) *T {
