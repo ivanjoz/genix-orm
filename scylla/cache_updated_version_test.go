@@ -130,7 +130,7 @@ func TestWriteRefusesAVersionWiderThanTheDeltaSlot(t *testing.T) {
 	}
 
 	records := []deltaViewRecord{{CompanyID: 7, ID: 1}}
-	_, err := fetchManagedCounterValues(&records, scyllaTable)
+	_, err := fetchManagedCounterValues(recordSliceGroup{makeRecordSlice(&records)}, scyllaTable)
 	if err == nil {
 		t.Fatal("expected a version past the delta slot to be refused")
 	}
@@ -142,7 +142,7 @@ func TestWriteRefusesAVersionWiderThanTheDeltaSlot(t *testing.T) {
 	getWriteCounterValue = func(string, string, int) (int64, error) {
 		return scyllaTable.maxDeltaVersionValue, nil
 	}
-	if _, err := fetchManagedCounterValues(&records, scyllaTable); err != nil {
+	if _, err := fetchManagedCounterValues(recordSliceGroup{makeRecordSlice(&records)}, scyllaTable); err != nil {
 		t.Fatalf("expected the widest fitting version to be accepted, got: %v", err)
 	}
 }

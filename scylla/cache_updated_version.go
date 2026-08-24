@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
-	"github.com/viant/xunsafe"
 )
 
 // The by-IDs cache lets a client ask "give me these records" and get back only the ones that
@@ -152,8 +151,8 @@ func loadSlotVersions(keyspace string, partitionTableID int32) (map[uint8]uint16
 
 // Write path: one blind UPDATE per touched slot, batched. Nothing is read first, and the records
 // are left untouched — their "upv" already holds the value being stored here.
-func updateSlotVersionsAfterWrite[T any](records *[]T, scyllaTable ScyllaTable) error {
-	if !shouldUseSlotVersionFeature(scyllaTable) || len(*records) == 0 {
+func updateSlotVersionsAfterWrite(records recordSliceGroup, scyllaTable ScyllaTable) error {
+	if !shouldUseSlotVersionFeature(scyllaTable) || records.len() == 0 {
 		return nil
 	}
 	if scyllaTable.UpdatedVersionCol == nil || scyllaTable.UpdatedVersionCol.IsNil() {
@@ -167,8 +166,8 @@ func updateSlotVersionsAfterWrite[T any](records *[]T, scyllaTable ScyllaTable) 
 
 	// Keep the highest version per slot so a batch spanning several writes still lands monotonically.
 	versionBySlotKey := map[slotKey]int64{}
-	for i := range *records {
-		rawRecordPtr := xunsafe.AsPointer(&(*records)[i])
+	for i := range records.len() {
+		rawRecordPtr := records.at(i)
 
 		updatedVersion := convertToInt64(scyllaTable.UpdatedVersionCol.GetRawValue(rawRecordPtr))
 		if updatedVersion <= 0 {
@@ -397,9 +396,9 @@ func forEachCachedIDsBatch(
 // against. This is the value the client sends back on its next by-IDs request; the record's own
 // write version is not useful there, because a record is refetched whenever any record in its slot
 // moves and would otherwise mismatch forever.
-func stampSlotVersionsOnRecords[T any](records *[]T, scyllaTable ScyllaTable, plan cachedIDsFetchPlan) {
-	for i := range *records {
-		rawRecordPtr := xunsafe.AsPointer(&(*records)[i])
+func stampSlotVersionsOnRecords(records recordSlice, scyllaTable ScyllaTable, plan cachedIDsFetchPlan) {
+	for i := range records.len() {
+		rawRecordPtr := records.at(i)
 
 		partitionID := convertToInt32(scyllaTable.SlotVersionPartitionCol.GetRawValue(rawRecordPtr))
 		recordID := convertToInt64(scyllaTable.SlotVersionKeyCol.GetRawValue(rawRecordPtr))
@@ -447,14 +446,14 @@ func QueryCachedIDs[T TableBaseInterface[E, T], E TableSchemaInterface[E]](refSl
 		func(queryString string, queryValues []any, _ int32) error {
 			return scanSelectQueryRows(
 				queryString, queryValues, scanColumns, scyllaTable,
-				&fetchedRecords, nil, nil, time.Now(),
+				makeRecordSink(&fetchedRecords), nil, nil, time.Now(),
 			)
 		})
 	if err != nil {
 		return err
 	}
 
-	stampSlotVersionsOnRecords(&fetchedRecords, scyllaTable, plan)
+	stampSlotVersionsOnRecords(makeRecordSlice(&fetchedRecords), scyllaTable, plan)
 
 	*refSlice = append(*refSlice, fetchedRecords...)
 	return nil

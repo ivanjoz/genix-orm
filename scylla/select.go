@@ -523,14 +523,14 @@ func normalizeScannedValue(value any) any {
 	return valueRef.Interface()
 }
 
-func scanSelectQueryRows[E any](
+func scanSelectQueryRows(
 	queryStr string,
 	queryValues []any,
 	scanColumns []selectScanColumn,
 	scyllaTable ScyllaTable,
-	refRecords *[]E,
+	sink recordSink,
 	postFilterStatements []ColumnStatement,
-	scanHandler func(record *E) bool,
+	scanHandler func(unsafe.Pointer) bool,
 	queryNoticeTime time.Time,
 ) error {
 	usePostFilter := len(postFilterStatements) > 0
@@ -571,8 +571,7 @@ func scanSelectQueryRows[E any](
 				return err
 			}
 
-			record := new(E)
-			recordPtr := xunsafe.AsPointer(record)
+			recordPtr := sink.newRecord()
 			// shouldLog := ShouldLogFull()
 
 			/*
@@ -623,17 +622,17 @@ func scanSelectQueryRows[E any](
 			*/
 
 			// Post-filter keeps exact semantics when indexed query planning intentionally overfetches.
-			if usePostFilter && !recordMatchesPostFilter(xunsafe.AsPointer(record), postFilterStatements, scyllaTable) {
+			if usePostFilter && !recordMatchesPostFilter(recordPtr, postFilterStatements, scyllaTable) {
 				continue
 			}
 
 			// Let callers process the decoded row and optionally avoid storing it to reduce peak memory.
-			if scanHandler != nil && scanHandler(record) {
+			if scanHandler != nil && scanHandler(recordPtr) {
 				continue
 			}
 
 			rowsFinal++
-			*refRecords = append(*refRecords, *record)
+			sink.appendRecord(recordPtr)
 		}
 
 		fmt.Printf(`Table %v | Rows Scanned %v | Final %v`+"\n", scyllaTable.Name, rowsScaned, rowsFinal)
@@ -695,9 +694,9 @@ func executeBoundSelectQueries[E any](
 				boundStatement.QueryValues,
 				scanColumns,
 				scyllaTable,
-				recordsTarget,
+				makeRecordSink(recordsTarget),
 				boundStatement.PostFilterStatements,
-				scanHandler,
+				erasedScanHandler(scanHandler),
 				queryNoticeTime,
 			)
 		})

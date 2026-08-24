@@ -8,7 +8,6 @@ import (
 
 	"github.com/ivanjoz/genix-orm/scylla/text_search"
 
-	"github.com/viant/xunsafe"
 )
 
 // configureTextSearchIndex validates that the ORM table declaring a
@@ -113,8 +112,8 @@ type ftsBucket struct {
 // but ignored here: status is encoded in the bucket name, and the
 // Sonic upsert path already clears the opposite-status bucket on every
 // write, so stale rows from a previous status group cannot linger.
-func syncTextSearchIndexAfterWrite[T any](records *[]T, scyllaTable *ScyllaTable, _ bool, skipRecordIDs map[int64]bool) error {
-	if scyllaTable.textSearchIndex == nil || records == nil || len(*records) == 0 {
+func syncTextSearchIndexAfterWrite(records recordSlice, scyllaTable *ScyllaTable, _ bool, skipRecordIDs map[int64]bool) error {
+	if scyllaTable.textSearchIndex == nil || records.len() == 0 {
 		return nil
 	}
 	buckets := groupRecordsForTextSearch(records, scyllaTable, skipRecordIDs)
@@ -142,7 +141,7 @@ func syncTextSearchIndexAfterWrite[T any](records *[]T, scyllaTable *ScyllaTable
 // into the Sonic bucket implied by the new status. Same upsert path as
 // the general sync — the opposite-bucket FLUSHO inside UpsertBatch
 // guarantees the stale row in the previous bucket is gone.
-func syncTextSearchStatusAfterWrite[T any](records *[]T, scyllaTable *ScyllaTable) error {
+func syncTextSearchStatusAfterWrite(records recordSlice, scyllaTable *ScyllaTable) error {
 	// Status-only changes must always reroute every record into its new bucket, so no skip set here.
 	return syncTextSearchIndexAfterWrite(records, scyllaTable, false, nil)
 }
@@ -151,13 +150,13 @@ func syncTextSearchStatusAfterWrite[T any](records *[]T, scyllaTable *ScyllaTabl
 // the per-bucket Record lists used by UpsertBatch. Iteration order is
 // not preserved across buckets, but it is preserved within each bucket,
 // which matches the SQLite WAL writer's single-threaded commit order.
-func groupRecordsForTextSearch[T any](records *[]T, scyllaTable *ScyllaTable, skipRecordIDs map[int64]bool) []ftsBucket {
+func groupRecordsForTextSearch(records recordSlice, scyllaTable *ScyllaTable, skipRecordIDs map[int64]bool) []ftsBucket {
 	info := scyllaTable.textSearchIndex
 	indexByKey := map[uint32]int{}
 	buckets := make([]ftsBucket, 0, 4)
 
-	for i := range *records {
-		recordPointer := xunsafe.AsPointer(&(*records)[i])
+	for i := range records.len() {
+		recordPointer := records.at(i)
 		partition := int32(scyllaTable.GetPartValue(recordPointer))
 		recordID := convertToInt32(scyllaTable.Keys[0].GetRawValue(recordPointer))
 		// Records whose searchable content and status are unchanged were flagged by the caller
@@ -170,7 +169,7 @@ func groupRecordsForTextSearch[T any](records *[]T, scyllaTable *ScyllaTable, sk
 			status = int8(convertToInt64(info.statusColumn.GetRawValue(recordPointer)))
 		}
 		statusGroup := text_search.PickStatusGroup(status)
-		searchText := buildSearchText(&(*records)[i], recordPointer, info)
+		searchText := buildSearchText(records.recordPointerAt(i), recordPointer, info)
 
 		// Pack (partition, statusGroup) into a single uint32 key. Partition
 		// is the company_id which is comfortably below 2^24 in practice;

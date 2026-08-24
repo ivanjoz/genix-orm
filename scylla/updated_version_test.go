@@ -192,7 +192,7 @@ func TestApplyWriteManagedColumnsUsesPartitionScopedUpdatedCounter(t *testing.T)
 		}
 	}
 
-	managedValues, err := applyWriteManagedColumns(&records, scyllaTable, true)
+	managedValues, err := applyWriteManagedColumns(makeRecordSlice(&records), scyllaTable, true)
 	if err != nil {
 		t.Fatalf("applyWriteManagedColumns returned error: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 		updatedVersionValues: []any{int32(41)},
 	}
 
-	if err := syncIndexGroupsAfterWrite(&records, &scyllaTable, managedValues); err != nil {
+	if err := syncIndexGroupsAfterWrite(recordSliceGroup{makeRecordSlice(&records)}, &scyllaTable, managedValues); err != nil {
 		t.Fatalf("syncIndexGroupsAfterWrite returned error: %v", err)
 	}
 

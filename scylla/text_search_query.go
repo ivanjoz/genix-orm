@@ -135,7 +135,7 @@ func selectRecordsByPartitionIDs[T any](scyllaTable ScyllaTable, partition int32
 		)
 		if err := scanSelectQueryRows(
 			queryString, queryValues, buildDefaultScanColumns(columnNames),
-			scyllaTable, refSlice, nil, nil, time.Now(),
+			scyllaTable, makeRecordSink(refSlice), nil, nil, time.Now(),
 		); err != nil {
 			return err
 		}

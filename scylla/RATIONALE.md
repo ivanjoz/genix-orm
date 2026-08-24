@@ -1,3 +1,64 @@
+## Type-erase the write path and the row scan below the Executor boundary
+**Context** — Every engine function was generic on `[T record, E table]`, so one write engine and
+one scan loop were compiled once per table: 54 stencils each, 2,000–4,000 bytes apiece. The type
+parameters were doing almost no work — column reads and writes already go through the precompiled
+`unsafe.Pointer` accessors on `ScyllaTable`, so `T` was used for exactly one thing,
+`xunsafe.AsPointer(&(*records)[i])`.
+**Decision** — Added `recordSlice` (a type-erased view over a `*[]T`) and `recordSink` (a
+type-erased appender) in `record_slice.go`. The exported entry points stay generic and become thin
+shims that build one of those and call a shared non-generic body; `executeInsertUpdateBatch` splits
+into a shim plus `executeInsertUpdateBatchErased`. Converted: the whole write path
+(`applyWriteManagedColumns*`, `fetchManagedCounterValues`, `fetchAutoincrementCounterStarts`,
+`applyPrefetchedManagedCounterValues`, `handlePreInsert`, `appendInsertQueriesToBatch`,
+`appendUpdateQueriesToBatch`, `syncTableBackedViews`, `syncIndexGroupsAfterWrite`,
+`syncTextSearchIndexAfterWrite`, `groupRecordsForTextSearch`, `updateSlotVersionsAfterWrite`,
+`stampSlotVersionsOnRecords`, `runSelfParseIfDefined`) and `scanSelectQueryRows`.
+**Rationale** — Measured −2,359,296 on the production binary with no query-API change: the erasure
+is entirely below `Executor`, so `db.Query(&recs).X.Equals(1).Exec()` is untouched.
+`executeInsertUpdateBatch` fell from 766,236 bytes across 378 stencils to nothing measurable;
+`scanSelectQueryRows` from 219,193 across 108 stencils to 3,633 in 2 symbols. Cost is one indirect
+call where there used to be an inlined index expression, against a CQL round trip — not measurable.
+The read path's outer plumbing (`executeBoundSelectQueries`, `selectRecordsByPartitionIDs`,
+`execIndexGroupQuery`, `Merge`, `preloadExistingRecordsBySingleKey`) is deliberately still generic:
+it allocates and merges intermediate `[]T` slices, which needs the real element type.
+
+## recordSlice holds unsafe.Pointer, not uintptr
+**Context** — A type-erased view has to carry the address of the slice's backing array.
+**Decision** — `firstElement unsafe.Pointer`, and `sub()` derives views from it by offset.
+**Rationale** — The GC traces `unsafe.Pointer` struct fields, so holding one keeps the backing array
+alive for as long as the view does. A `uintptr` would compile and pass every test, then produce a
+use-after-free whenever a GC landed between building the view and reading through it. Also why
+`recordSlice` is passed by value and never outlives its call.
+
+## recordSink allocates then copies, rather than growing the destination in place
+**Context** — The scan loop could write decoded rows straight into the destination slice, saving a
+copy per row.
+**Decision** — `newRecord()` allocates a standalone record and `appendRecord()` copies it in,
+matching what the typed code did.
+**Rationale** — Growing in place would hand `ExecScan`'s scan handler a pointer into the
+destination slice, which a later `append` can invalidate by reallocating the backing array. The
+handler is caller-supplied and may retain what it is given. One record copy per row is not worth a
+dangling-pointer hazard in a public API.
+
+## A method-set escape hatch, because not everything is a column
+**Context** — `SelfParse` and `GetTextSearchIndex` are declared on the record type, so no column
+accessor can reach them. They are the one thing a plain `unsafe.Pointer` cannot express.
+**Decision** — `recordSlice.asRecordPointer`, a `func(unsafe.Pointer) any` returning `(*T)(p)`,
+built by `makeRecordSlice`.
+**Rationale** — The closure captures nothing, so it is a static func value: no allocation, one per
+table. It keeps `groupRecordsForTextSearch` and `runSelfParseIfDefined` erased instead of leaving
+them as the last two generic stragglers in the write path.
+
+## slices.Concat replaced by a view over both slices
+**Context** — `executeInsertUpdateBatch` called `slices.Concat(*recordsForInsert, *recordsForUpdate)`
+twice: once for the counter prefetch, then again after the write phase for the marker syncs.
+**Decision** — `recordSliceGroup{insertRecords, updateRecords}` indexes across both without copying,
+and both concats are gone.
+**Rationale** — The syncs only walk the records; copying every record to do it was pure waste on
+every write. The second concat also existed for a subtle reason — the first one held stale,
+pre-mutation records because `handlePreInsert` and the managed-column pass write through the
+originals. A view is always current, so that trap is gone rather than worked around.
+
 ## `TableHandle` — recover the part of the constraint a pointer argument can satisfy
 
 **Context** — Phase A (below) had to drop `TableInterface[T]` from `Col` and `ColSlice`, which left

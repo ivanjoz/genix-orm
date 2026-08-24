@@ -428,7 +428,7 @@ func fetchIndexGroupRecordGroups[E any](
 				queryValues,
 				scanColumns,
 				scyllaTable,
-				&records,
+				makeRecordSink(&records),
 				postFilterStatements,
 				nil,
 				queryNoticeTime,

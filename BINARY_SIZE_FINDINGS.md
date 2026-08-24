@@ -1,5 +1,16 @@
 # Binary Size — Root-Cause Findings
 
+> **Superseded in part by `docs/BINARY_SIZE_PLAN.md` in the parent repo.** Section 3 of this
+> document ("dead-method elimination is globally disabled") identifies the right mechanism but the
+> wrong sources, and Section 7 understates the TODO by 5x. The real sources were
+> `google.golang.org/protobuf/internal/descfmt` and the promoted `reflect.Type` wrappers on
+> `github.com/viant/xunsafe.Field`; `gocql/recreate.go` is not a source at all, and the qdrant chain
+> is removed by grpc's own `grpcnotrace` build tag. Measured on the real tree the TODO was worth
+> **12,058,624 bytes (−27.3%)**, and it has now shipped. Everything else here — the cost model in
+> §1, the killed hypotheses H1 and H2 in §4, and the `Col[*T, E]` measurements — still stands, and
+> §4.2's prediction that `Col[*T, E]` is worth ~4x more once pruning is on was confirmed:
+> `db.Col` fell from 1,672,704 to 313,152 bytes.
+
 Status: **investigation complete, nothing shipped.** The executable work is in
 `COL_INSTANTIATION_PLAN.md`.
 

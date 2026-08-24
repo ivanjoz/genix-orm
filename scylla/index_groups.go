@@ -8,7 +8,6 @@ import (
 
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
-	"github.com/viant/xunsafe"
 )
 
 type indexUpdatedRow struct {
@@ -422,10 +421,10 @@ func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, inde
 	}
 }
 
-func syncIndexGroupsAfterWrite[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
-	records *[]T, scyllaTable *ScyllaTable, managedValues managedWriteValues,
+func syncIndexGroupsAfterWrite(
+	records recordSliceGroup, scyllaTable *ScyllaTable, managedValues managedWriteValues,
 ) error {
-	if len(*records) == 0 || len(scyllaTable.indexGroups) == 0 || scyllaTable.indexUpdatedTable == nil {
+	if records.len() == 0 || len(scyllaTable.indexGroups) == 0 || scyllaTable.indexUpdatedTable == nil {
 		return nil
 	}
 	if len(managedValues.updatedVersionValues) == 0 {
@@ -434,8 +433,8 @@ func syncIndexGroupsAfterWrite[T TableBaseInterface[E, T], E TableSchemaInterfac
 
 	rowsByPartitionAndHash := map[string]indexUpdatedRow{}
 	rowsToPersist := []indexUpdatedRow{}
-	for recordIndex := range *records {
-		recordPointer := xunsafe.AsPointer(&(*records)[recordIndex])
+	for recordIndex := range records.len() {
+		recordPointer := records.at(recordIndex)
 		partitionValue := int32(scyllaTable.GetPartValue(recordPointer))
 		updateCounterValue := convertToInt64(managedValues.updatedVersionValues[recordIndex])
 		appendIndexUpdatedRowsForRecord(recordPointer, scyllaTable, partitionValue, updateCounterValue, rowsByPartitionAndHash, &rowsToPersist)
