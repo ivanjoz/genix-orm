@@ -27,6 +27,7 @@ require (
 	github.com/ivanjoz/genix-orm/db v0.0.0
 )
 
-replace github.com/gocql/gocql v1.6.0 => github.com/scylladb/gocql v1.13.0
+// Forked from github.com/scylladb/gocql v1.13.0 without recreate.go; see thirdparty/README.md.
+replace github.com/gocql/gocql v1.6.0 => ./thirdparty/gocql
 
 replace github.com/ivanjoz/genix-orm/db => ./db
