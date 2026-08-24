@@ -78,8 +78,8 @@ type routedRecord struct {
 
 type routedTable struct {
 	TableStruct[routedTable, routedRecord]
-	EmpresaID db.Col[routedTable, int32]
-	ID        db.Col[routedTable, int32]
+	EmpresaID db.Col[*routedTable, int32]
+	ID        db.Col[*routedTable, int32]
 }
 
 func (e routedTable) GetSchema() db.TableSchema {

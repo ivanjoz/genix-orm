@@ -21,13 +21,13 @@ type Product struct {
 
 type ProductTable struct {
 	Model[ProductTable, Product]
-	ID       Col[ProductTable, string]
-	Category Col[ProductTable, string]
-	Brand    Col[ProductTable, string]
-	Price    Col[ProductTable, int64]
-	Stock    Col[ProductTable, int32]
-	Created  Col[ProductTable, int64]
-	Name     Col[ProductTable, string]
+	ID       Col[*ProductTable, string]
+	Category Col[*ProductTable, string]
+	Brand    Col[*ProductTable, string]
+	Price    Col[*ProductTable, int64]
+	Stock    Col[*ProductTable, int32]
+	Created  Col[*ProductTable, int64]
+	Name     Col[*ProductTable, string]
 }
 
 func (t ProductTable) GetSchema() Schema {
@@ -205,12 +205,12 @@ type widths struct {
 
 type widthsTable struct {
 	Model[widthsTable, widths]
-	PK  Col[widthsTable, string]
-	A8  Col[widthsTable, int8]
-	A16 Col[widthsTable, int16]
-	A32 Col[widthsTable, int32]
-	A64 Col[widthsTable, int64]
-	U32 Col[widthsTable, uint32]
+	PK  Col[*widthsTable, string]
+	A8  Col[*widthsTable, int8]
+	A16 Col[*widthsTable, int16]
+	A32 Col[*widthsTable, int32]
+	A64 Col[*widthsTable, int64]
+	U32 Col[*widthsTable, uint32]
 }
 
 func (t widthsTable) GetSchema() Schema {

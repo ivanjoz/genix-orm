@@ -19,12 +19,12 @@ type groupedMovementRecord struct {
 
 type groupedMovementSchema struct {
 	TableStruct[groupedMovementSchema, groupedMovementRecord]
-	CompanyID Col[groupedMovementSchema, int32]
-	ID        Col[groupedMovementSchema, int64]
-	Date      Col[groupedMovementSchema, int16]
-	ProductID Col[groupedMovementSchema, int32]
-	Cantidad  Col[groupedMovementSchema, int32]
-	Promedio  Col[groupedMovementSchema, float64]
+	CompanyID Col[*groupedMovementSchema, int32]
+	ID        Col[*groupedMovementSchema, int64]
+	Date      Col[*groupedMovementSchema, int16]
+	ProductID Col[*groupedMovementSchema, int32]
+	Cantidad  Col[*groupedMovementSchema, int32]
+	Promedio  Col[*groupedMovementSchema, float64]
 }
 
 func (e groupedMovementSchema) GetSchema() TableSchema {
@@ -51,11 +51,11 @@ type fullViewRecord struct {
 
 type fullViewSchema struct {
 	TableStruct[fullViewSchema, fullViewRecord]
-	CompanyID Col[fullViewSchema, int32]
-	ID        Col[fullViewSchema, int64]
-	Status    Col[fullViewSchema, int8]
-	Updated   Col[fullViewSchema, int32]
-	Nombre    Col[fullViewSchema, string]
+	CompanyID Col[*fullViewSchema, int32]
+	ID        Col[*fullViewSchema, int64]
+	Status    Col[*fullViewSchema, int8]
+	Updated   Col[*fullViewSchema, int32]
+	Nombre    Col[*fullViewSchema, string]
 }
 
 func (e fullViewSchema) GetSchema() TableSchema {
@@ -84,13 +84,13 @@ type hashIndexedFullViewRecord struct {
 
 type hashIndexedFullViewSchema struct {
 	TableStruct[hashIndexedFullViewSchema, hashIndexedFullViewRecord]
-	CompanyID  Col[hashIndexedFullViewSchema, int32]
-	ID         Col[hashIndexedFullViewSchema, int64]
-	Status     Col[hashIndexedFullViewSchema, int8]
-	Updated    Col[hashIndexedFullViewSchema, int32]
-	Date       Col[hashIndexedFullViewSchema, int16]
-	ProductIDs Col[hashIndexedFullViewSchema, []int32]
-	Nombre     Col[hashIndexedFullViewSchema, string]
+	CompanyID  Col[*hashIndexedFullViewSchema, int32]
+	ID         Col[*hashIndexedFullViewSchema, int64]
+	Status     Col[*hashIndexedFullViewSchema, int8]
+	Updated    Col[*hashIndexedFullViewSchema, int32]
+	Date       Col[*hashIndexedFullViewSchema, int16]
+	ProductIDs Col[*hashIndexedFullViewSchema, []int32]
+	Nombre     Col[*hashIndexedFullViewSchema, string]
 }
 
 func (e hashIndexedFullViewSchema) GetSchema() TableSchema {
@@ -117,10 +117,10 @@ type int32PackedViewRecord struct {
 
 type int32PackedViewSchema struct {
 	TableStruct[int32PackedViewSchema, int32PackedViewRecord]
-	CompanyID   Col[int32PackedViewSchema, int32]
-	ID          Col[int32PackedViewSchema, int64]
-	StatusTrace Col[int32PackedViewSchema, int8]
-	Updated     Col[int32PackedViewSchema, int32]
+	CompanyID   Col[*int32PackedViewSchema, int32]
+	ID          Col[*int32PackedViewSchema, int64]
+	StatusTrace Col[*int32PackedViewSchema, int8]
+	Updated     Col[*int32PackedViewSchema, int32]
 }
 
 func (e int32PackedViewSchema) GetSchema() TableSchema {

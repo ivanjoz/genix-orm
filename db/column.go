@@ -18,9 +18,16 @@ type colCore struct {
 	tableInfo *TableInfo
 }
 
-type Col[T TableInterface[T], E any] struct {
+// T is the pointer type *<X>Table, never <X>Table. A pointer type argument collapses to a
+// single gcshape, so all tables share one stencil per column value type rather than one stencil
+// each. See BINARY_SIZE_FINDINGS.md §1.
+//
+// The constraint is TableHandle, not TableInterface[T]: *XTable cannot satisfy the latter because
+// GetTableStruct() T is inherited from TableStruct and returns the table by value. TableHandle
+// documents what that costs in checking power.
+type Col[T TableHandle, E any] struct {
 	colCore
-	schemaStruct *T
+	schemaStruct T
 }
 
 // --- non-generic cores. The generic methods below are shims over these. ---
@@ -107,68 +114,78 @@ func (q *Col[T, E]) GetInfoPointer() *ColumnInfo {
 	return q.colCore.resolveInfoPointer(reflect.TypeFor[E]().String())
 }
 
-func (q Col[T, E]) DecimalSize(size int8) Col[T, E] {
+// colRef carries the result of a declaration-time modifier. The modifiers return this instead of
+// Col[T, E] so their bodies stop copying the whole generic handle: that copy is stencilled per
+// (table, column type) pair and was 64% of db.Col's code. colRef is one non-generic type, and
+// every call site already consumes the result as a Coln — db.Cols(...), FixedValues{Col: ...},
+// GroupBy(...). See BINARY_SIZE_FINDINGS.md §6.
+type colRef struct{ info ColumnInfo }
+
+func (c colRef) GetInfo() ColumnInfo { return c.info }
+func (c colRef) GetName() string     { return c.info.Name }
+
+func (q Col[T, E]) DecimalSize(size int8) Coln {
 	q.setDecimalSize(size)
-	return q
+	return colRef{q.GetInfo()}
 }
 
-func (q Col[T, E]) Int32() Col[T, E] {
+func (q Col[T, E]) Int32() Coln {
 	q.setInt32Packing()
-	return q
+	return colRef{q.GetInfo()}
 }
 
-func (q Col[T, E]) CompositeBucketing(buketsSize ...int8) Col[T, E] {
+func (q Col[T, E]) CompositeBucketing(buketsSize ...int8) Coln {
 	q.setCompositeBucketing(buketsSize)
-	return q
+	return colRef{q.GetInfo()}
 }
 
-func (q Col[T, E]) IsWeek() Col[T, E] {
+func (q Col[T, E]) IsWeek() Coln {
 	q.setIsWeek()
-	return q
+	return colRef{q.GetInfo()}
 }
 
-func (q Col[T, E]) Autoincrement(randSufixSize int8) Col[T, E] {
+func (q Col[T, E]) Autoincrement(randSufixSize int8) Coln {
 	q.setAutoincrement(randSufixSize)
-	return q
+	return colRef{q.GetInfo()}
 }
 
 func (c *Col[T, E]) SetSchemaStruct(schemaStruct any) {
-	if schema, ok := schemaStruct.(*T); ok {
+	if schema, ok := schemaStruct.(T); ok {
 		c.schemaStruct = schema
 	} else {
 		fmt.Println("no seteado!!")
 	}
 }
 
-func (e *Col[T, E]) Exclude(v E) *T {
+func (e *Col[T, E]) Exclude(v E) T {
 	return e.schemaStruct
 }
 
-func (e *Col[T, E]) Equals(v E) *T {
+func (e *Col[T, E]) Equals(v E) T {
 	return e.addStatementReturningTable("=", any(v))
 }
 
-func (e *Col[T, E]) Contains(v any) *T {
+func (e *Col[T, E]) Contains(v any) T {
 	return e.addStatementReturningTable("CONTAINS", v)
 }
 
-func (e *Col[T, E]) GreaterThan(v E) *T {
+func (e *Col[T, E]) GreaterThan(v E) T {
 	return e.addStatementReturningTable(">", any(v))
 }
 
-func (e *Col[T, E]) GreaterEqual(v E) *T {
+func (e *Col[T, E]) GreaterEqual(v E) T {
 	return e.addStatementReturningTable(">=", any(v))
 }
 
-func (e *Col[T, E]) LessThan(v E) *T {
+func (e *Col[T, E]) LessThan(v E) T {
 	return e.addStatementReturningTable("<", any(v))
 }
 
-func (e *Col[T, E]) LessEqual(v E) *T {
+func (e *Col[T, E]) LessEqual(v E) T {
 	return e.addStatementReturningTable("<=", any(v))
 }
 
-func (e *Col[T, E]) In(values_ ...E) *T {
+func (e *Col[T, E]) In(values_ ...E) T {
 	values := make([]any, 0, len(values_))
 	for _, v := range values_ {
 		values = append(values, any(v))
@@ -177,36 +194,37 @@ func (e *Col[T, E]) In(values_ ...E) *T {
 	return e.schemaStruct
 }
 
-func (e *Col[T, E]) Between(v1 E, v2 E) *T {
+func (e *Col[T, E]) Between(v1 E, v2 E) T {
 	e.addBetweenStatement(any(v1), any(v2))
 	return e.schemaStruct
 }
 
-func (e *Col[T, E]) addStatementReturningTable(operator string, value any) *T {
+func (e *Col[T, E]) addStatementReturningTable(operator string, value any) T {
 	e.addStatement(operator, value)
 	return e.schemaStruct
 }
 
-func (e Col[T, E]) Sum() Col[T, E] {
+func (e Col[T, E]) Sum() Coln {
 	e.setAggregateFn("SUM")
-	return e
+	return colRef{e.GetInfo()}
 }
 
-func (e Col[T, E]) Avg() Col[T, E] {
+func (e Col[T, E]) Avg() Coln {
 	e.setAggregateFn("AVG")
-	return e
+	return colRef{e.GetInfo()}
 }
 
-func (e Col[T, E]) Max() Col[T, E] {
+func (e Col[T, E]) Max() Coln {
 	e.setAggregateFn("MAX")
-	return e
+	return colRef{e.GetInfo()}
 }
 
 // ColSlice is the handle for a column holding a collection of primitives. E is
 // the *element* type, so a []int32 column is declared ColSlice[XTable, int32].
-type ColSlice[T TableInterface[T], E any] struct {
+// T is the pointer type *<X>Table, unconstrained, for the same reason as Col.
+type ColSlice[T TableHandle, E any] struct {
 	colCore
-	schemaStruct *T
+	schemaStruct T
 }
 
 //go:noinline
@@ -238,12 +256,12 @@ func (q *ColSlice[T, E]) GetInfoPointer() *ColumnInfo {
 }
 
 func (c *ColSlice[T, E]) SetSchemaStruct(schemaStruct any) {
-	if schema, ok := schemaStruct.(*T); ok {
+	if schema, ok := schemaStruct.(T); ok {
 		c.schemaStruct = schema
 	}
 }
 
-func (e *ColSlice[T, E]) Contains(v E) *T {
+func (e *ColSlice[T, E]) Contains(v E) T {
 	e.addStatement("CONTAINS", any(v))
 	return e.schemaStruct
 }

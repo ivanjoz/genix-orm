@@ -22,15 +22,15 @@ type genericLabelRecord struct {
 
 type genericLabelSchema struct {
 	TableStruct[genericLabelSchema, genericLabelRecord]
-	CompanyID      Col[genericLabelSchema, int32]
-	ID             Col[genericLabelSchema, int32]
-	Name           Col[genericLabelSchema, string]
-	SKU            Col[genericLabelSchema, string]
-	City           Col[genericLabelSchema, string]
-	Price          Col[genericLabelSchema, int64]
-	BrandID        Col[genericLabelSchema, int16]
-	Status         Col[genericLabelSchema, int8]
-	UpdatedVersion Col[genericLabelSchema, int32]
+	CompanyID      Col[*genericLabelSchema, int32]
+	ID             Col[*genericLabelSchema, int32]
+	Name           Col[*genericLabelSchema, string]
+	SKU            Col[*genericLabelSchema, string]
+	City           Col[*genericLabelSchema, string]
+	Price          Col[*genericLabelSchema, int64]
+	BrandID        Col[*genericLabelSchema, int16]
+	Status         Col[*genericLabelSchema, int8]
+	UpdatedVersion Col[*genericLabelSchema, int32]
 }
 
 func (e genericLabelSchema) GetSchema() TableSchema {
@@ -57,10 +57,10 @@ type genericOptedOutRecord struct {
 
 type genericOptedOutSchema struct {
 	TableStruct[genericOptedOutSchema, genericOptedOutRecord]
-	CompanyID      Col[genericOptedOutSchema, int32]
-	ID             Col[genericOptedOutSchema, int32]
-	Name           Col[genericOptedOutSchema, string]
-	UpdatedVersion Col[genericOptedOutSchema, int32]
+	CompanyID      Col[*genericOptedOutSchema, int32]
+	ID             Col[*genericOptedOutSchema, int32]
+	Name           Col[*genericOptedOutSchema, string]
+	UpdatedVersion Col[*genericOptedOutSchema, int32]
 }
 
 func (e genericOptedOutSchema) GetSchema() TableSchema {
@@ -83,9 +83,9 @@ type genericNoSlotVersionRecord struct {
 
 type genericNoSlotVersionSchema struct {
 	TableStruct[genericNoSlotVersionSchema, genericNoSlotVersionRecord]
-	CompanyID Col[genericNoSlotVersionSchema, int32]
-	ID        Col[genericNoSlotVersionSchema, int32]
-	Name      Col[genericNoSlotVersionSchema, string]
+	CompanyID Col[*genericNoSlotVersionSchema, int32]
+	ID        Col[*genericNoSlotVersionSchema, int32]
+	Name      Col[*genericNoSlotVersionSchema, string]
 }
 
 func (e genericNoSlotVersionSchema) GetSchema() TableSchema {
@@ -109,10 +109,10 @@ type genericBadNameRecord struct {
 
 type genericBadNameSchema struct {
 	TableStruct[genericBadNameSchema, genericBadNameRecord]
-	CompanyID      Col[genericBadNameSchema, int32]
-	ID             Col[genericBadNameSchema, int32]
-	Amount         Col[genericBadNameSchema, int32]
-	UpdatedVersion Col[genericBadNameSchema, int32]
+	CompanyID      Col[*genericBadNameSchema, int32]
+	ID             Col[*genericBadNameSchema, int32]
+	Amount         Col[*genericBadNameSchema, int32]
+	UpdatedVersion Col[*genericBadNameSchema, int32]
 }
 
 func (e genericBadNameSchema) GetSchema() TableSchema {

@@ -18,11 +18,11 @@ type partitionedRangeViewRecord struct {
 
 type partitionedRangeViewSchema struct {
 	TableStruct[partitionedRangeViewSchema, partitionedRangeViewRecord]
-	GroupID  Col[partitionedRangeViewSchema, int8]
-	ID       Col[partitionedRangeViewSchema, int32]
-	Category Col[partitionedRangeViewSchema, int16]
-	Payload  Col[partitionedRangeViewSchema, string]
-	Updated  Col[partitionedRangeViewSchema, int32]
+	GroupID  Col[*partitionedRangeViewSchema, int8]
+	ID       Col[*partitionedRangeViewSchema, int32]
+	Category Col[*partitionedRangeViewSchema, int16]
+	Payload  Col[*partitionedRangeViewSchema, string]
+	Updated  Col[*partitionedRangeViewSchema, int32]
 }
 
 func (e partitionedRangeViewSchema) GetSchema() TableSchema {
@@ -171,9 +171,9 @@ type relocatedPartitionViewRecord struct {
 
 type relocatedPartitionViewSchema struct {
 	TableStruct[relocatedPartitionViewSchema, relocatedPartitionViewRecord]
-	CompanyID Col[relocatedPartitionViewSchema, int32]
-	ID        Col[relocatedPartitionViewSchema, int32]
-	Payload   Col[relocatedPartitionViewSchema, string]
+	CompanyID Col[*relocatedPartitionViewSchema, int32]
+	ID        Col[*relocatedPartitionViewSchema, int32]
+	Payload   Col[*relocatedPartitionViewSchema, string]
 }
 
 func (e relocatedPartitionViewSchema) GetSchema() TableSchema {

@@ -23,12 +23,12 @@ type deltaViewRecord struct {
 
 type deltaViewSchema struct {
 	TableStruct[deltaViewSchema, deltaViewRecord]
-	CompanyID      Col[deltaViewSchema, int32]
-	ID             Col[deltaViewSchema, int32]
-	Status         Col[deltaViewSchema, int8]
-	Type           Col[deltaViewSchema, int8]
-	RegistryNumber Col[deltaViewSchema, string]
-	UpdatedVersion Col[deltaViewSchema, int32]
+	CompanyID      Col[*deltaViewSchema, int32]
+	ID             Col[*deltaViewSchema, int32]
+	Status         Col[*deltaViewSchema, int8]
+	Type           Col[*deltaViewSchema, int8]
+	RegistryNumber Col[*deltaViewSchema, string]
+	UpdatedVersion Col[*deltaViewSchema, int32]
 }
 
 func (e deltaViewSchema) GetSchema() TableSchema {
@@ -101,11 +101,11 @@ type deltaWideLeadRecord struct {
 
 type deltaWideLeadSchema struct {
 	TableStruct[deltaWideLeadSchema, deltaWideLeadRecord]
-	CompanyID      Col[deltaWideLeadSchema, int32]
-	ID             Col[deltaWideLeadSchema, int32]
-	Status         Col[deltaWideLeadSchema, int8]
-	Type           Col[deltaWideLeadSchema, int8]
-	UpdatedVersion Col[deltaWideLeadSchema, int32]
+	CompanyID      Col[*deltaWideLeadSchema, int32]
+	ID             Col[*deltaWideLeadSchema, int32]
+	Status         Col[*deltaWideLeadSchema, int8]
+	Type           Col[*deltaWideLeadSchema, int8]
+	UpdatedVersion Col[*deltaWideLeadSchema, int32]
 }
 
 func (e deltaWideLeadSchema) GetSchema() TableSchema {
@@ -150,10 +150,10 @@ type deltaSingleKeyRecord struct {
 
 type deltaSingleKeySchema struct {
 	TableStruct[deltaSingleKeySchema, deltaSingleKeyRecord]
-	CompanyID      Col[deltaSingleKeySchema, int32]
-	ID             Col[deltaSingleKeySchema, int32]
-	Type           Col[deltaSingleKeySchema, int8]
-	UpdatedVersion Col[deltaSingleKeySchema, int32]
+	CompanyID      Col[*deltaSingleKeySchema, int32]
+	ID             Col[*deltaSingleKeySchema, int32]
+	Type           Col[*deltaSingleKeySchema, int8]
+	UpdatedVersion Col[*deltaSingleKeySchema, int32]
 }
 
 func (e deltaSingleKeySchema) GetSchema() TableSchema {
@@ -200,11 +200,11 @@ type deltaElasticRecord struct {
 
 type deltaElasticSchema struct {
 	TableStruct[deltaElasticSchema, deltaElasticRecord]
-	CompanyID      Col[deltaElasticSchema, int32]
-	ID             Col[deltaElasticSchema, int32]
-	Status         Col[deltaElasticSchema, int8]
-	ListID         Col[deltaElasticSchema, int32]
-	UpdatedVersion Col[deltaElasticSchema, int32]
+	CompanyID      Col[*deltaElasticSchema, int32]
+	ID             Col[*deltaElasticSchema, int32]
+	Status         Col[*deltaElasticSchema, int8]
+	ListID         Col[*deltaElasticSchema, int32]
+	UpdatedVersion Col[*deltaElasticSchema, int32]
 }
 
 func (e deltaElasticSchema) GetSchema() TableSchema {
@@ -251,10 +251,10 @@ type deltaElasticLeadRecord struct {
 
 type deltaElasticLeadSchema struct {
 	TableStruct[deltaElasticLeadSchema, deltaElasticLeadRecord]
-	CompanyID      Col[deltaElasticLeadSchema, int32]
-	ID             Col[deltaElasticLeadSchema, int32]
-	ListID         Col[deltaElasticLeadSchema, int32]
-	UpdatedVersion Col[deltaElasticLeadSchema, int32]
+	CompanyID      Col[*deltaElasticLeadSchema, int32]
+	ID             Col[*deltaElasticLeadSchema, int32]
+	ListID         Col[*deltaElasticLeadSchema, int32]
+	UpdatedVersion Col[*deltaElasticLeadSchema, int32]
 }
 
 func (e deltaElasticLeadSchema) GetSchema() TableSchema {
@@ -290,9 +290,9 @@ type deltaWatermarkOnlyRecord struct {
 
 type deltaWatermarkOnlySchema struct {
 	TableStruct[deltaWatermarkOnlySchema, deltaWatermarkOnlyRecord]
-	CompanyID      Col[deltaWatermarkOnlySchema, int32]
-	ID             Col[deltaWatermarkOnlySchema, int32]
-	UpdatedVersion Col[deltaWatermarkOnlySchema, int32]
+	CompanyID      Col[*deltaWatermarkOnlySchema, int32]
+	ID             Col[*deltaWatermarkOnlySchema, int32]
+	UpdatedVersion Col[*deltaWatermarkOnlySchema, int32]
 }
 
 func (e deltaWatermarkOnlySchema) GetSchema() TableSchema {
@@ -359,11 +359,11 @@ type deltaTwoElasticRecord struct {
 
 type deltaTwoElasticSchema struct {
 	TableStruct[deltaTwoElasticSchema, deltaTwoElasticRecord]
-	CompanyID      Col[deltaTwoElasticSchema, int32]
-	ID             Col[deltaTwoElasticSchema, int32]
-	ListID         Col[deltaTwoElasticSchema, int32]
-	GroupID        Col[deltaTwoElasticSchema, int32]
-	UpdatedVersion Col[deltaTwoElasticSchema, int32]
+	CompanyID      Col[*deltaTwoElasticSchema, int32]
+	ID             Col[*deltaTwoElasticSchema, int32]
+	ListID         Col[*deltaTwoElasticSchema, int32]
+	GroupID        Col[*deltaTwoElasticSchema, int32]
+	UpdatedVersion Col[*deltaTwoElasticSchema, int32]
 }
 
 func (e deltaTwoElasticSchema) GetSchema() TableSchema {
@@ -404,11 +404,11 @@ type deltaForcedInt32Record struct {
 
 type deltaForcedInt32Schema struct {
 	TableStruct[deltaForcedInt32Schema, deltaForcedInt32Record]
-	CompanyID      Col[deltaForcedInt32Schema, int32]
-	ID             Col[deltaForcedInt32Schema, int32]
-	Channel        Col[deltaForcedInt32Schema, int32]
-	Type           Col[deltaForcedInt32Schema, int8]
-	UpdatedVersion Col[deltaForcedInt32Schema, int32]
+	CompanyID      Col[*deltaForcedInt32Schema, int32]
+	ID             Col[*deltaForcedInt32Schema, int32]
+	Channel        Col[*deltaForcedInt32Schema, int32]
+	Type           Col[*deltaForcedInt32Schema, int8]
+	UpdatedVersion Col[*deltaForcedInt32Schema, int32]
 }
 
 func (e deltaForcedInt32Schema) GetSchema() TableSchema {
@@ -539,11 +539,11 @@ type deltaInferredRecord struct {
 
 type deltaInferredSchema struct {
 	TableStruct[deltaInferredSchema, deltaInferredRecord]
-	CompanyID      Col[deltaInferredSchema, int32]
-	ID             Col[deltaInferredSchema, int32]
-	Channel        Col[deltaInferredSchema, int8]
-	Type           Col[deltaInferredSchema, int8]
-	UpdatedVersion Col[deltaInferredSchema, int32]
+	CompanyID      Col[*deltaInferredSchema, int32]
+	ID             Col[*deltaInferredSchema, int32]
+	Channel        Col[*deltaInferredSchema, int8]
+	Type           Col[*deltaInferredSchema, int8]
+	UpdatedVersion Col[*deltaInferredSchema, int32]
 }
 
 func (e deltaInferredSchema) GetSchema() TableSchema {
@@ -596,11 +596,11 @@ type deltaMultiShapeRecord struct {
 
 type deltaMultiShapeSchema struct {
 	TableStruct[deltaMultiShapeSchema, deltaMultiShapeRecord]
-	CompanyID      Col[deltaMultiShapeSchema, int32]
-	ID             Col[deltaMultiShapeSchema, int32]
-	WarehouseID    Col[deltaMultiShapeSchema, int32]
-	Status         Col[deltaMultiShapeSchema, int8]
-	UpdatedVersion Col[deltaMultiShapeSchema, int32]
+	CompanyID      Col[*deltaMultiShapeSchema, int32]
+	ID             Col[*deltaMultiShapeSchema, int32]
+	WarehouseID    Col[*deltaMultiShapeSchema, int32]
+	Status         Col[*deltaMultiShapeSchema, int8]
+	UpdatedVersion Col[*deltaMultiShapeSchema, int32]
 }
 
 func (e deltaMultiShapeSchema) GetSchema() TableSchema {
@@ -702,9 +702,9 @@ type deltaMissingIndexRecord struct {
 
 type deltaMissingIndexSchema struct {
 	TableStruct[deltaMissingIndexSchema, deltaMissingIndexRecord]
-	CompanyID      Col[deltaMissingIndexSchema, int32]
-	ID             Col[deltaMissingIndexSchema, int32]
-	UpdatedVersion Col[deltaMissingIndexSchema, int32]
+	CompanyID      Col[*deltaMissingIndexSchema, int32]
+	ID             Col[*deltaMissingIndexSchema, int32]
+	UpdatedVersion Col[*deltaMissingIndexSchema, int32]
 }
 
 func (e deltaMissingIndexSchema) GetSchema() TableSchema {
@@ -1059,11 +1059,11 @@ type deltaSparseValuesRecord struct {
 
 type deltaSparseValuesSchema struct {
 	TableStruct[deltaSparseValuesSchema, deltaSparseValuesRecord]
-	CompanyID      Col[deltaSparseValuesSchema, int32]
-	ID             Col[deltaSparseValuesSchema, int32]
-	Status         Col[deltaSparseValuesSchema, int8]
-	Type           Col[deltaSparseValuesSchema, int8]
-	UpdatedVersion Col[deltaSparseValuesSchema, int32]
+	CompanyID      Col[*deltaSparseValuesSchema, int32]
+	ID             Col[*deltaSparseValuesSchema, int32]
+	Status         Col[*deltaSparseValuesSchema, int8]
+	Type           Col[*deltaSparseValuesSchema, int8]
+	UpdatedVersion Col[*deltaSparseValuesSchema, int32]
 }
 
 func (e deltaSparseValuesSchema) GetSchema() TableSchema {
@@ -1124,11 +1124,11 @@ type deltaUnenumerableLeadRecord struct {
 
 type deltaUnenumerableLeadSchema struct {
 	TableStruct[deltaUnenumerableLeadSchema, deltaUnenumerableLeadRecord]
-	CompanyID      Col[deltaUnenumerableLeadSchema, int32]
-	ID             Col[deltaUnenumerableLeadSchema, int32]
-	Kind           Col[deltaUnenumerableLeadSchema, int16]
-	Status         Col[deltaUnenumerableLeadSchema, int8]
-	UpdatedVersion Col[deltaUnenumerableLeadSchema, int32]
+	CompanyID      Col[*deltaUnenumerableLeadSchema, int32]
+	ID             Col[*deltaUnenumerableLeadSchema, int32]
+	Kind           Col[*deltaUnenumerableLeadSchema, int16]
+	Status         Col[*deltaUnenumerableLeadSchema, int8]
+	UpdatedVersion Col[*deltaUnenumerableLeadSchema, int32]
 }
 
 func (e deltaUnenumerableLeadSchema) GetSchema() TableSchema {

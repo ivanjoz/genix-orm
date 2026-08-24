@@ -346,11 +346,15 @@ func (e *TableStruct[D, T, E]) AllowFilter() *T {
 // Autoincrement declares the table's key as generated. randDecimalSize is a random
 // value appended to the counter to avoid taking the same value under high
 // concurrency: if 3, an ID of 100 becomes something like 100567.
-func (e *TableStruct[D, T, E]) Autoincrement(randDecimalSize int8) Col[T, E] {
+func (e *TableStruct[D, T, E]) Autoincrement(randDecimalSize int8) Coln {
 	if randDecimalSize > 8 {
 		panic("randDecimalSize TOO BIG.")
 	}
-	return Col[T, E]{colCore: colCore{info: ColumnInfo{AutoincrementRandDigits: randDecimalSize}}}
+	// Routing through synthetic.GetInfo() rather than building a ColumnInfo directly preserves
+	// today's ColType resolution exactly, including the fact that E here is the record type,
+	// not a column value type.
+	synthetic := Col[T, E]{colCore: colCore{info: ColumnInfo{AutoincrementRandDigits: randDecimalSize}}}
+	return colRef{synthetic.GetInfo()}
 }
 
 func (e *TableStruct[D, T, E]) Limit(limit int32) *T {

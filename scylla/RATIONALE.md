@@ -1,3 +1,97 @@
+## `TableHandle` — recover the part of the constraint a pointer argument can satisfy
+
+**Context** — Phase A (below) had to drop `TableInterface[T]` from `Col` and `ColSlice`, which left
+the table type argument completely unchecked: `db.Col[*int32, int32]` compiled. The question was
+whether any of that checking can come back without giving up the pointer argument, since restoring
+`TableInterface[T]` forces `T` back to the value form and costs the whole −393,216.
+
+**Decision** — constrain on a new non-generic `TableHandle interface{ GetSchema() TableSchema }`,
+which `*XTable` *does* satisfy (value-receiver methods are in the pointer's method set). Applied to
+`Col`, `ColSlice` and the two aliases in `scylla/aliases.go` and `backend/db/db.go`. Verified free:
+the production binary is the same 44,236,960 and, holding comments constant so line tables do not
+shift, the only bytes that differ are the 77 in `.note.go.buildid`. Nothing inside `Col` calls a
+method on `T`, so there is no dictionary and no codegen difference.
+
+**Rationale** — this is a *partial* check and the boundary is what matters:
+`db.Col[*int32, int32]` now fails with `*int32 does not satisfy db.TableHandle (missing method
+GetSchema)`, but `db.Col[*Expense, int32]` — the record type where the table type belongs, the
+mistake actually worth catching — still compiles. `XTable` and its record `X` embed the same
+`TableStruct[XTable, X]`, so their method sets are identical (`GetSchema`, `GetTableStruct`,
+`GetBaseStruct`); only the self-referential form tells them apart, and that is exactly the form the
+pointer rules out. Taken because it is free and strictly better than nothing, not because it closes
+the gap. Do not read `TableHandle` as proof that a declaration is well-formed.
+
+## Declaration-time modifiers return `Coln`, not `Col[T, E]`
+
+**Context** — after the pointer type argument below, the eight declaration-time modifiers
+(`DecimalSize` `Int32` `IsWeek` `CompositeBucketing` `Autoincrement` `Sum` `Avg` `Max`) were still
+the largest methods on `Col` despite having the simplest bodies — 1,506,584 bytes across 4,128
+symbols, 364 bytes each against the predicates' 162. An earlier pass had already reduced their
+bodies to shims over `colCore` and recovered only 65 KB, so the logic was not the cost. The cost
+was the **return type**: each returned `Col[T, E]` *by value*, and `ColumnInfo` is large (six
+function fields plus an embedded `ColType`), so every instantiation carried a full struct copy.
+
+**Decision** — introduce a non-generic `colRef struct{ info ColumnInfo }` satisfying `Coln`, and
+have the eight modifiers plus `TableStruct.Autoincrement` return `Coln` instead of `Col[T, E]`.
+Two ORM files change and **no call site anywhere**: no modifier is ever chained, and all 54 call
+sites already pass the result straight into a `Coln` position (`db.Cols(...)`,
+`FixedValues{Col: ...}`, `GroupBy(...)`). `TableStruct.Autoincrement` routes through
+`synthetic.GetInfo()` rather than building a `ColumnInfo` directly, which preserves today's
+`ColType` resolution exactly — including the fact that `E` there is the *record* type, not a column
+value type. Measured: modifier group 1,506,584 -> 1,073,237 (**−433,347**), predicate and interface
+groups moved by exactly 0, binary 44,630,176 -> 44,236,960 (**−393,216**).
+
+**Rationale** — the methods stay on `Col`, so they are still retained per instantiation while
+`reflect.Value.MethodByName` keeps dead-method elimination off; only the copy goes. Moving them off
+`Col` onto an exported non-generic type would have removed them from the method set entirely and
+recovered the full 1.5 MB, but that rewrites 54 declaration sites and changes how the ORM is used —
+rejected. Two side effects to know: `GetInfo()` is now called **eagerly**, at declaration time, so
+nothing added to `colRef` construction may panic on an unbound column (`InitStructTable` calls
+`GetSchema()` once before columns are bound, and discards the result); and `Int32`/`IsWeek` got
+*larger* by 8,781 bytes each, because their `colCore` setters are inlinable one-liners, so the new
+`colRef{q.GetInfo()}` body costs more than the struct copy it replaced. The other six more than pay
+for it.
+
+## `Col[*T, E]` — the table type argument is a pointer
+
+**Context** — `ExpenseTable` contains `Col[ExpenseTable, int32]`, so each table's gcshape is
+self-referential and unique by construction: the compiler emits one stencil per (table, column
+value type) pair, ~2,000 concrete instantiations of `db.Col` in the binary. A pointer type argument
+unifies to `go.shape.*uint8`, so all tables share one stencil per column value type.
+
+**Decision** — `Col`/`ColSlice` take the pointer-to-table type: `db.Col[*ExpenseTable, int32]`.
+1,014 declaration sites across 58 files, `db/column.go`, the two aliases in `scylla/aliases.go` and
+`backend/db/db.go`, genix-orm's own internal tables (`scylla.IncrementTable`, the dynamo schemas,
+the scylla test schemas), and — easy to miss — the column generator in
+`scripts/table/create_edit_table.go`, which builds the field type from a bare identifier and would
+otherwise silently reintroduce a per-table stencil on every newly added column. **Zero query call
+sites change**: `Equals` returns `T`, and `T` *is* `*ExpenseTable`, so
+`eq.CompanyID.Equals(x).ID.Equals(y)` still chains. `GetSchema()` bodies are untouched. Measured:
+45,023,392 -> 44,630,176 (**−393,216**).
+
+**Rationale** — the `TableInterface[T]` constraint had to be dropped from `Col` and `ColSlice`:
+`*ExpenseTable` cannot satisfy `TableInterface[*ExpenseTable]`, because `GetTableStruct() T` is
+inherited from the embedded `TableStruct` and returns the table by value. Nothing inside `Col` or
+`ColSlice` calls a constraint method, so this is safe. What it costs, measured against the
+compiler rather than assumed:
+
+- **Forgetting the `*` is a hard compile error**, and a better one than the constraint gave:
+  `schemaStruct` is now a value field, so `type XTable struct { ID db.Col[XTable, int32] }` is
+  `invalid recursive type` — `XTable` would contain itself. The old `schemaStruct *T` broke that
+  cycle, so this class of error is *newly* caught, not newly missed.
+- **A pointer to a non-table compiles silently.** `db.Col[*Expense, int32]` — the record type
+  instead of the table type — is what the constraint used to reject. It typechecks, and the
+  predicate chain quietly changes type: `q.CompanyID.Equals(7)` returns `*Expense`, not
+  `*ExpenseTable`. At runtime `InitStructTable` prints `no seteado!!` and leaves a nil handle,
+  because `SetSchemaStruct`'s `schemaStruct.(T)` assertion fails; the first chained dereference
+  then nil-panics. Verified: **`check_tables` does not catch this** — it still reports 53 pairs
+  with a deliberately broken declaration in place. The `TableHandle` constraint added afterwards
+  (entry above) narrows this to record types specifically; it does not close it.
+
+On its own this phase is worth only −393 KB, because dead-method elimination is globally disabled
+(`reflect.Value.MethodByName` is reachable) so the linker retains every concrete descriptor
+regardless of shape sharing; its value multiplies by roughly 4x if that is ever resolved.
+
 ## A shared non-generic core only helps if the compiler cannot inline it back
 
 **Context** — `db/column.go` was the largest single concentration of generic bloat: 4.33 MB across

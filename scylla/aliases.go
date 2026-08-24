@@ -33,13 +33,14 @@ type (
 	TableSchemaInterface[T any]      = db.TableSchemaInterface[T]
 	TableBaseInterface[T any, E any] = db.TableBaseInterface[T, E]
 	TableInterface[T any]            = db.TableInterface[T]
+	TableHandle                      = db.TableHandle
 	TableQueryInterface[T any]       = db.TableQueryInterface[T]
 	RecordGroup[T any]               = db.RecordGroup[T]
 )
 
 type (
-	Col[T TableInterface[T], E any]      = db.Col[T, E]
-	ColSlice[T TableInterface[T], E any] = db.ColSlice[T, E]
+	Col[T TableHandle, E any]      = db.Col[T, E]
+	ColSlice[T TableHandle, E any] = db.ColSlice[T, E]
 )
 
 // RecordOf constrains a record type to this driver. It is what generic helpers use

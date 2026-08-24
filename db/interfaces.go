@@ -29,6 +29,23 @@ type TableInterface[T any] interface {
 	GetTableStruct() T
 }
 
+// TableHandle is the minimum a Col's / ColSlice's table type argument must provide. It is
+// deliberately NOT self-referential like TableInterface[T]: Col's argument is the pointer type
+// *XTable (see column.go), and *XTable cannot satisfy TableInterface[*XTable] because
+// GetTableStruct() T is inherited from TableStruct and returns the table by value.
+//
+// This is a partial check, and knowing what it does not catch matters. XTable and its record X
+// embed the same TableStruct[XTable, X], so their method sets are identical — a record type
+// argument (db.Col[*Expense, int32] where *ExpenseTable belongs) satisfies this and is caught by
+// nothing until it nil-panics at query time. Only the self-referential form distinguishes the two,
+// and that is the form the pointer argument rules out. Closing the gap fully would need
+// Col[T TablePtr[D], D any, E any], and D is not inferrable in a field declaration, so all ~1,000
+// declaration sites would have to name both types. Measured free: adding this constraint left the
+// production binary byte-identical, because nothing inside Col calls a method on T.
+type TableHandle interface {
+	GetSchema() TableSchema
+}
+
 type TableQueryInterface[T any] interface {
 	GetSchema() TableSchema
 	SetWhere(string, string, any)

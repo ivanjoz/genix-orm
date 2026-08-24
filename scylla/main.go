@@ -159,8 +159,8 @@ type Increment struct {
 
 type IncrementTable struct {
 	TableStruct[IncrementTable, Increment]
-	Name         Col[IncrementTable, string] // `db:"name,pk"`
-	CurrentValue Col[IncrementTable, int64]  // `db:"current_value,counter"`
+	Name         Col[*IncrementTable, string] // `db:"name,pk"`
+	CurrentValue Col[*IncrementTable, int64]  // `db:"current_value,counter"`
 }
 
 func (e IncrementTable) GetSchema() TableSchema {

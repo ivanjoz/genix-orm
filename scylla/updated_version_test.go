@@ -31,10 +31,10 @@ type updateCounterRecord struct {
 
 type updateCounterSchema struct {
 	TableStruct[updateCounterSchema, updateCounterRecord]
-	CompanyID      Col[updateCounterSchema, int32]
-	ID             Col[updateCounterSchema, int64]
-	Nombre         Col[updateCounterSchema, string]
-	UpdatedVersion Col[updateCounterSchema, int32]
+	CompanyID      Col[*updateCounterSchema, int32]
+	ID             Col[*updateCounterSchema, int64]
+	Nombre         Col[*updateCounterSchema, string]
+	UpdatedVersion Col[*updateCounterSchema, int32]
 }
 
 type updateCounterDisabledRecord struct {
@@ -46,9 +46,9 @@ type updateCounterDisabledRecord struct {
 
 type updateCounterDisabledSchema struct {
 	TableStruct[updateCounterDisabledSchema, updateCounterDisabledRecord]
-	CompanyID Col[updateCounterDisabledSchema, int32]
-	ID        Col[updateCounterDisabledSchema, int64]
-	Nombre    Col[updateCounterDisabledSchema, string]
+	CompanyID Col[*updateCounterDisabledSchema, int32]
+	ID        Col[*updateCounterDisabledSchema, int64]
+	Nombre    Col[*updateCounterDisabledSchema, string]
 }
 
 type indexGroupRecord struct {
@@ -62,11 +62,11 @@ type indexGroupRecord struct {
 
 type indexGroupSchema struct {
 	TableStruct[indexGroupSchema, indexGroupRecord]
-	CompanyID  Col[indexGroupSchema, int32]
-	ID         Col[indexGroupSchema, int64]
-	Date       Col[indexGroupSchema, int16]
-	ClientID   Col[indexGroupSchema, int32]
-	ProductIDs Col[indexGroupSchema, []int32]
+	CompanyID  Col[*indexGroupSchema, int32]
+	ID         Col[*indexGroupSchema, int64]
+	Date       Col[*indexGroupSchema, int16]
+	ClientID   Col[*indexGroupSchema, int32]
+	ProductIDs Col[*indexGroupSchema, []int32]
 }
 
 func (e updateCounterSchema) GetSchema() TableSchema {

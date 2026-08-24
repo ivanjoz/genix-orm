@@ -15,9 +15,9 @@ type Ticket struct {
 
 type TicketTable struct {
 	Model[TicketTable, Ticket]
-	ID      Col[TicketTable, int64]
-	Subject Col[TicketTable, string]
-	Created Col[TicketTable, int64]
+	ID      Col[*TicketTable, int64]
+	Subject Col[*TicketTable, string]
+	Created Col[*TicketTable, int64]
 }
 
 func (t TicketTable) GetSchema() Schema {
@@ -137,8 +137,8 @@ type badAutoinc struct {
 
 type badAutoincTable struct {
 	Model[badAutoincTable, badAutoinc]
-	ID      Col[badAutoincTable, string]
-	Created Col[badAutoincTable, int64]
+	ID      Col[*badAutoincTable, string]
+	Created Col[*badAutoincTable, int64]
 }
 
 func (t badAutoincTable) GetSchema() Schema {

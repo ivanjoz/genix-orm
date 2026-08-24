@@ -1,7 +1,36 @@
 # Plan — Cut `db.Col` Instantiation Cost
 
-Status: **proposed, not started.** Evidence and measurements: `BINARY_SIZE_FINDINGS.md`,
-which also supersedes the project's earlier binary-size analysis (findings §7).
+Status: **both phases implemented.** Evidence and measurements: `BINARY_SIZE_FINDINGS.md`,
+which also supersedes the project's earlier binary-size analysis (findings §7). Design decisions
+are recorded in `scylla/RATIONALE.md`.
+
+Re-measured on the tree as shipped (which has advanced since the findings were written, so the
+baseline is 45,023,392 rather than 44,957,856). Every delta reproduced exactly:
+
+| Step | Binary | Delta |
+| --- | --- | --- |
+| Baseline | 45,023,392 | — |
+| Phase A — `Col[*T, E]` | 44,630,176 | **−393,216** |
+| Phase B — modifiers return `Coln` | 44,236,960 | **−393,216** |
+| Combined | | **−786,432 (−1.75%)** |
+
+Scope actually touched by Phase A: **1,014 declaration sites across 58 files** — the plan's 737
+counted only `db.Col`/`db.ColSlice` in `backend/`, and A.4 (genix-orm's own tables: `IncrementTable`,
+the dynamo schemas, the scylla test schemas) plus the dynamo/scylla test declarations add the rest.
+`scripts/table/create_edit_table.go` (A.5) is done.
+
+Verified: `go build ./...` and `go vet ./...` clean on `backend/`, `genix-orm/` and `genix-orm/db/`;
+`genix-orm` and `genix-orm/db` module tests pass (`scylla` included — `shared_schema_test.go` and
+`group_by_test.go` declare schemas through the changed `.DecimalSize()` / `.Autoincrement()` path);
+`app/accounting`, `app/libs`, `app/finance`, `app/exec` tests pass; `check_tables` reports
+**"Found 53 table struct pairs"**, identical to before the conversion.
+
+One deviation from B.5's prediction: the modifier group's symbol count rose 4,128 -> 4,552 rather
+than staying flat, and `Int32`/`IsWeek` each grew by 8,781 bytes instead of shrinking — their
+`colCore` setters are inlinable one-liners, so `colRef{q.GetInfo()}` is a larger body than the
+struct copy it replaced. The group still fell 1,506,584 -> 1,073,237 (**−433,347**, against the
+predicted −412,848) and the predicate and interface groups moved by exactly 0, so the diagnosis
+holds; only the per-method arithmetic differs.
 
 Two phases, independently shippable, independently measurable, in this order. Phase A edits table
 declarations and the ORM; Phase B edits two ORM files and nothing else. Neither touches a query

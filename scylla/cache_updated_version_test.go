@@ -101,8 +101,8 @@ type tableIDCollisionRecord struct {
 
 type tableIDCollisionSchema struct {
 	TableStruct[tableIDCollisionSchema, tableIDCollisionRecord]
-	CompanyID Col[tableIDCollisionSchema, int32]
-	ID        Col[tableIDCollisionSchema, int32]
+	CompanyID Col[*tableIDCollisionSchema, int32]
+	ID        Col[*tableIDCollisionSchema, int32]
 }
 
 func (e tableIDCollisionSchema) GetSchema() TableSchema {

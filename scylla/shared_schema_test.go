@@ -21,12 +21,12 @@ type sharedSchemaRecord struct {
 
 type sharedSchemaTable struct {
 	TableStruct[sharedSchemaTable, sharedSchemaRecord]
-	EmpresaID db.Col[sharedSchemaTable, int32]
-	ID        db.Col[sharedSchemaTable, int32]
-	Nombre    db.Col[sharedSchemaTable, string]
-	Tags      db.ColSlice[sharedSchemaTable, string]
-	Status    db.Col[sharedSchemaTable, int8]
-	Updated   db.Col[sharedSchemaTable, int32]
+	EmpresaID db.Col[*sharedSchemaTable, int32]
+	ID        db.Col[*sharedSchemaTable, int32]
+	Nombre    db.Col[*sharedSchemaTable, string]
+	Tags      db.ColSlice[*sharedSchemaTable, string]
+	Status    db.Col[*sharedSchemaTable, int8]
+	Updated   db.Col[*sharedSchemaTable, int32]
 }
 
 func (e sharedSchemaTable) GetSchema() db.TableSchema {

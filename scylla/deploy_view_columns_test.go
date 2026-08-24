@@ -19,11 +19,11 @@ type projectedViewRecord struct {
 
 type projectedViewSchema struct {
 	TableStruct[projectedViewSchema, projectedViewRecord]
-	CompanyID Col[projectedViewSchema, int32]
-	ID        Col[projectedViewSchema, int32]
-	NameHash  Col[projectedViewSchema, int32]
-	Status    Col[projectedViewSchema, int8]
-	Payload   Col[projectedViewSchema, string]
+	CompanyID Col[*projectedViewSchema, int32]
+	ID        Col[*projectedViewSchema, int32]
+	NameHash  Col[*projectedViewSchema, int32]
+	Status    Col[*projectedViewSchema, int8]
+	Payload   Col[*projectedViewSchema, string]
 }
 
 func (e projectedViewSchema) GetSchema() TableSchema {
@@ -51,11 +51,11 @@ type fanoutViewTableRecord struct {
 
 type fanoutViewTableSchema struct {
 	TableStruct[fanoutViewTableSchema, fanoutViewTableRecord]
-	CompanyID   Col[fanoutViewTableSchema, int32]
-	ID          Col[fanoutViewTableSchema, int32]
-	CategoryIDs Col[fanoutViewTableSchema, []int32]
-	Status      Col[fanoutViewTableSchema, int8]
-	Payload     Col[fanoutViewTableSchema, string]
+	CompanyID   Col[*fanoutViewTableSchema, int32]
+	ID          Col[*fanoutViewTableSchema, int32]
+	CategoryIDs Col[*fanoutViewTableSchema, []int32]
+	Status      Col[*fanoutViewTableSchema, int8]
+	Payload     Col[*fanoutViewTableSchema, string]
 }
 
 func (e fanoutViewTableSchema) GetSchema() TableSchema {
