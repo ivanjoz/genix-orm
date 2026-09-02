@@ -78,12 +78,14 @@ func (c *colCore) addBetweenStatement(v1, v2 any) {
 	})
 }
 
-func (c colCore) GetName() string           { return c.info.Name }
+func (c colCore) GetName() string            { return c.info.Name }
 func (c *colCore) SetTableInfo(t *TableInfo) { c.tableInfo = t }
+
 //go:noinline
 func (c *colCore) setAggregateFn(fn string) { c.info.AggregateFn = fn }
-func (c *colCore) setInt32Packing()          { c.info.UseInt32Packing = true }
-func (c *colCore) setIsWeek()                { c.info.IsWeek = true }
+func (c *colCore) setInt32Packing()         { c.info.UseInt32Packing = true }
+func (c *colCore) setIsWeek()               { c.info.IsWeek = true }
+
 //go:noinline
 func (c *colCore) setCompositeBucketing(sizes []int8) { c.info.CompositeBucketSizes = sizes }
 

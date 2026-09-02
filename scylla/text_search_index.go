@@ -7,7 +7,6 @@ import (
 	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/scylla/text_search"
-
 )
 
 // configureTextSearchIndex validates that the ORM table declaring a

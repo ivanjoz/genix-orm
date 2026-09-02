@@ -1,5 +1,5 @@
-// +build cassandra
-// +build !scylla
+//go:build cassandra && !scylla
+// +build cassandra,!scylla
 
 // Copyright (c) 2015 The gocql Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
