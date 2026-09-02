@@ -1,3 +1,30 @@
+## colbin v0.1.0 with omit-empty on, at the price of every blob already written
+**Context** — The driver serializes complex-type columns with `colbin.Marshal`, and the module was
+pinned at `20260720` while the parent app pinned `20260801`, so MVS resolved the whole build to the
+app's newer pin and this module's own was never what shipped. Since then colbin gained the varint
+and packed5 codecs, compact mode, a per-type compact plan, four-bit compact keys and `SetOmitEmpty`. A colbin column is
+positional — N records, N values — so a field a record never touches still costs a byte per record
+to say nothing, which is exactly the shape a complex-type blob has.
+**Decision** — Pinned `github.com/ivanjoz/colbin v0.1.0` in `go.mod`, `dynamo/go.mod` and the app's
+`backend/go.mod`, and turned the flag on in this driver's `init()` (and in `dynamo/client.go`,
+a separate module with its own copy of the dependency). It goes in `init()` because the flag is
+process-global and has to be set before the first `Marshal`: an entry point that forgot to call it
+would silently write dense blobs, and nothing would report it.
+**Rationale** — Measured on `webpage/types.ContentFields`, a 22-field struct with five fields set:
+123 B → 101 B for one record, 57067 B → 42060 B at a thousand. The stated semantic price is that a
+`*T` pointing at `T`'s zero value decodes back as `nil` (17 B → 2 B on a three-scalar-pointer
+struct), which costs this project nothing: no `*/types/*.go` declares a scalar pointer field, and a
+pointer-to-struct field like `SectionContent.Content` still round-trips non-nil. Decoding needs no
+matching setting — both forms are self-describing per column — so only new blobs change.
+
+The real cost is the version break, and it is not backwards compatible. The old pin wrote
+`formatVersion 0x01`; the new one writes `0x02`, or `0x06` under omit-empty, and routes any
+single-record message through compact mode instead. `0x01` is odd, and colbin discriminates compact
+mode on bit 0 of byte 0, so **an already-stored blob is not rejected — it is read as a compact
+message**, which yields garbage or a slice-bounds panic rather than an error. Every colbin blob in
+an existing keyspace has to be regarded as lost; pre-alpha, that means reseeding rather than
+migrating.
+
 ## Type-erase the write path and the row scan below the Executor boundary
 **Context** — Every engine function was generic on `[T record, E table]`, so one write engine and
 one scan loop were compiled once per table: 54 stencils each, 2,000–4,000 bytes apiece. The type

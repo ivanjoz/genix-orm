@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ivanjoz/colbin"
 	"github.com/ivanjoz/genix-orm/db"
 )
 
@@ -19,6 +20,23 @@ func init() {
 	db.GetAutoincrementID = GetAutoincrementID
 	db.QueryCachedGenericByIDs = QueryCachedGenericByIDs
 	db.SetDebugLogging = SetDebugLogging
+
+	// Omit-empty colbin encoding, set here because colbin's flag is process-global
+	// and has to be on before the first Marshal — an entry point that forgot to
+	// call it would silently write dense blobs instead.
+	//
+	// It pays for the shape the ORM actually stores: a complex-type column is a
+	// whole nested struct or slice serialized into one blob, and those are sparse.
+	// A colbin column is positional, so an untouched field still costs a byte per
+	// record; with the flag on, a column holding nothing but empty values is its
+	// type byte alone. A sparse ten-field struct at a thousand records goes from
+	// 9034 B to 1028 B.
+	//
+	// Decoding needs no matching setting — both forms are self-describing per
+	// column — so this only changes what new blobs weigh, not what can be read.
+	// The one semantic price is that a *T pointing at T's zero value decodes back
+	// as nil, since the flag is what lets compact mode carry pointers at all.
+	colbin.SetOmitEmpty(true)
 }
 
 // Init prepares a keyspace for use: it creates the keyspace and the ORM's own internal tables.

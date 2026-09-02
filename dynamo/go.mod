@@ -1,6 +1,6 @@
 module github.com/ivanjoz/genix-orm/dynamo
 
-go 1.26
+go 1.27
 
 toolchain go1.27.0
 
@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.31
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.0
-	github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613
+	github.com/ivanjoz/colbin v0.1.0
 	github.com/viant/xunsafe v0.11.0
 )
 

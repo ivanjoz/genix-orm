@@ -15,6 +15,8 @@ github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed h1:5upAirOpQc
 github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed/go.mod h1:tMWxXQ9wFIaZeTI9F+hmhFiGpFmhOHzyShyFUhRm0H4=
 github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613 h1:GqfQpA8y0aHoD74ETWud00au0H3Xj4Z6nwO1jFwc89A=
 github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613/go.mod h1:7H1tvZkQWq/TQkXqltx+l0jhuC5gCMOLvn6yXyNTcHg=
+github.com/ivanjoz/colbin v0.1.0 h1:XPIrgh0wNRnRJTJS3Lo2PrpDzr7VjHEmMfbcy8kvhvc=
+github.com/ivanjoz/colbin v0.1.0/go.mod h1:rek4A5VCaLUov8kkxEfvJOjnQvw3CxYms+dKKA4ClbU=
 github.com/kr/pretty v0.1.0 h1:L/CwN0zerZDmRFUapSPitk6f+Q3+0za1rQkzVuMiMFI=
 github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORNo=
 github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=

@@ -1,16 +1,8 @@
 module github.com/ivanjoz/genix-orm
 
-go 1.26
+go 1.27
 
 toolchain go1.27.0
-
-require (
-	github.com/fatih/color v1.19.0
-	github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613
-	github.com/kr/pretty v0.1.0
-	github.com/viant/xunsafe v0.11.0
-	golang.org/x/sync v0.22.0
-)
 
 require (
 	github.com/golang/snappy v0.0.3 // indirect
@@ -23,8 +15,13 @@ require (
 )
 
 require (
+	github.com/fatih/color v1.19.0
 	github.com/gocql/gocql v1.6.0
+	github.com/ivanjoz/colbin v0.1.0
 	github.com/ivanjoz/genix-orm/db v0.0.0
+	github.com/kr/pretty v0.1.0
+	github.com/viant/xunsafe v0.11.0
+	golang.org/x/sync v0.22.0
 )
 
 // Forked from github.com/scylladb/gocql v1.13.0 without recreate.go; see thirdparty/README.md.

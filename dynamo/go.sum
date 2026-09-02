@@ -34,6 +34,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613 h1:GqfQpA8y0aHoD74ETWud00au0H3Xj4Z6nwO1jFwc89A=
 github.com/ivanjoz/colbin v0.0.0-20260720041505-3f9040cb9613/go.mod h1:7H1tvZkQWq/TQkXqltx+l0jhuC5gCMOLvn6yXyNTcHg=
+github.com/ivanjoz/colbin v0.1.0 h1:XPIrgh0wNRnRJTJS3Lo2PrpDzr7VjHEmMfbcy8kvhvc=
+github.com/ivanjoz/colbin v0.1.0/go.mod h1:rek4A5VCaLUov8kkxEfvJOjnQvw3CxYms+dKKA4ClbU=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.8.2 h1:+h33VjcLVPDHtOdpUCuF+7gSuG3yGIftsP1YvFihtJ8=
