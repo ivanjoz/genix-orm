@@ -447,81 +447,72 @@ func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 	return resetCounterForTable(&e.Table, partValue)
 }
 
-func resetCounterForTable(controllerTable *ScyllaTable, partValue any) error {
-	scyllaTable := &(*controllerTable)
+// resetCounterForTable is a no-op that warns.
+//
+// It used to read max(key) in the partition and drive the counter to it. That was
+// wrong in three ways and only ever right for a table whose key is a bare
+// Autoincrement(0):
+//
+//   - the counter name hardcoded the autoincrement part as 0, so a table declaring
+//     AutoincrementPart (its counters are per part value) had its real counters
+//     missed and a phantom one written instead;
+//   - the target was max(key) itself, but a key is the counter *packed* with random
+//     digits and any KeyIntPacking columns, so the figure was orders of magnitude
+//     too large;
+//   - it skipped every table with no autoincrement column, which since the sale and
+//     document ids became caller-built is both of the tables anyone would want to
+//     realign.
+//
+// Rather than keep writing a wrong value confidently, it does nothing and says so.
+// A restore therefore leaves counters untouched: they keep climbing from where they
+// were, which yields gaps but never a reused id — the safe direction to fail in.
+//
+// TODO: implement it against the counter, not the key. A correct version needs the
+// counter name built the way the insert path builds it (per AutoincrementPart value,
+// which means enumerating the parts present in the partition), and a target that
+// divides out AutoincrementRandDigits and any KeyIntPacking width. Callers that mint
+// ids themselves — anything using db.GetAutoincrementID with its own counter name —
+// have to be reset by name, which no table-driven walk can discover. applyCounterReset
+// below is the primitive to build on; it already routes through the allocator so a
+// live reservation is dropped in the same critical section.
+func resetCounterForTable(_ *ScyllaTable, _ any) error {
+	// Silent: a caller walks every table, so warning here would print once per table
+	// for an operation that did nothing. The warning belongs at the call site.
+	return nil
+}
 
-	// Sequence reset only applies to partitioned tables with explicit autoincrement usage.
-	partitionColumn := scyllaTable.GetPartKey()
-	if partitionColumn == nil || partitionColumn.IsNil() {
-		return nil
-	}
-	if !scyllaTable.UseSequences || scyllaTable.AutoincrementCol == nil {
-		return nil
-	}
-	if len(scyllaTable.Keys) == 0 {
-		return Err("ResetCounter requires at least one key column for table:", scyllaTable.Name)
-	}
-	if partValue == nil {
-		return Err("ResetCounter requires a non-nil partition value for table:", scyllaTable.Name)
-	}
-
-	// Read max persisted key in the target partition to align sequence with current data.
-	keyColumn := scyllaTable.Keys[0]
-	// Use column metadata to validate the key once, then reuse the shared numeric converter.
-	switch keyColumn.GetType().Type {
-	case 2, 3, 4, 5:
-	default:
-		return Err("ResetCounter only supports numeric key types. table:", scyllaTable.Name, "key:", keyColumn.GetName())
-	}
-
-	maxValueQuery := fmt.Sprintf(
-		"SELECT max(%v) FROM %v WHERE %v = ?",
-		keyColumn.GetName(), scyllaTable.GetFullName(), partitionColumn.GetName(),
-	)
-
-	// Let gocql allocate the aggregate destination types, then normalize the first value.
-	queryIterator := getScyllaConnection().Query(maxValueQuery, partValue).Iter()
-	rowData, err := queryIterator.RowData()
-	if err != nil {
-		return Err("ResetCounter max-value query failed for table", scyllaTable.Name, ":", err)
-	}
-
-	maxKeyValue := int64(0)
-	rowScanner := queryIterator.Scanner()
-	if rowScanner.Next() {
-		if err := rowScanner.Scan(rowData.Values...); err != nil {
-			return Err("ResetCounter max-value query failed for table", scyllaTable.Name, ":", err)
+// applyCounterReset moves a counter to an absolute value and reports what it held before.
+//
+// An installed allocator owns the row and may be serving ids from a range it derived from the value
+// about to be replaced, so it has to do the move itself and drop that range at the same time.
+// Reading and writing the row here instead would leave it minting ids this reset just invalidated,
+// and the next range it claimed would repeat them.
+func applyCounterReset(namespace, counterName string, maxKeyValue int64) (int64, error) {
+	if SetCounterValue != nil {
+		previousCounterValue, err := SetCounterValue(namespace, counterName, maxKeyValue)
+		if err != nil {
+			return 0, Err("ResetCounter sequence assignment failed for", counterName, ":", err)
 		}
-		if len(rowData.Values) > 0 && rowData.Values[0] != nil {
-			maxKeyValue = db.ToInt64(rowData.Values[0])
-		}
-	}
-	if err := queryIterator.Close(); err != nil {
-		return Err("ResetCounter max-value query failed for table", scyllaTable.Name, ":", err)
+		return previousCounterValue, nil
 	}
 
-	// Counter naming must match the insert path (x{partition}_{table}_{autoincrementPart}).
-	counterName := fmt.Sprintf("x%v_%v_%v", partValue, scyllaTable.Name, 0)
 	currentCounterValue, err := getSequenceCurrentValue(counterName)
 	if err != nil {
-		return Err("ResetCounter sequence read failed for", counterName, ":", err)
+		return 0, Err("ResetCounter sequence read failed for", counterName, ":", err)
 	}
 
 	// Counters are increment-only, so we apply the delta to move to the target absolute value.
 	delta := maxKeyValue - currentCounterValue
 	if delta == 0 {
-		return nil
+		return currentCounterValue, nil
 	}
 
-	updateStatement := fmt.Sprintf("UPDATE %v.sequences SET current_value = current_value + ? WHERE name = ?", scyllaTable.Namespace)
+	updateStatement := fmt.Sprintf("UPDATE %v.sequences SET current_value = current_value + ? WHERE name = ?", namespace)
 	if err := getScyllaConnection().Query(updateStatement, delta, counterName).Exec(); err != nil {
-		return Err("ResetCounter sequence update failed for", counterName, ":", err)
+		return 0, Err("ResetCounter sequence update failed for", counterName, ":", err)
 	}
 
-	fmt.Printf("ResetCounter | table=%s | partition=%v | counter=%s | previous=%d | maxKey=%d | delta=%d\n",
-		scyllaTable.Name, partValue, counterName, currentCounterValue, maxKeyValue, delta)
-
-	return nil
+	return currentCounterValue, nil
 }
 
 // FlushTextSearchIndex erases this table's GenixSearch buckets for one

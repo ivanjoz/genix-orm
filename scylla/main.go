@@ -204,6 +204,41 @@ func GetCounter(keyspace string, name string, increment int) (int64, error) {
 	return currentValue, nil
 }
 
+// ReserveCounterRange, when set, replaces GetCounter as the allocator behind every managed
+// sequence: autoincrement keys, the updated_version write sequence, and GetAutoincrementID.
+//
+// It exists because GetCounter cannot be made safe on its own. It reads the counter and then
+// increments it, and Cassandra counters offer no way to read the result of your own increment, so
+// two concurrent writers read the same value and mint the same id. An external allocator that
+// serializes reservations — the fareward daemon, in this project — removes the race by being the
+// only process that advances the row.
+//
+// Which is also the constraint: whatever is installed here takes ownership of those rows. Mixing
+// it with the direct path in another process reintroduces exactly the collision it removes, so
+// there is deliberately no fallback when it returns an error. A failed write is recoverable; a
+// duplicate primary key is not.
+//
+// Left nil, nothing changes and GetCounter serves every caller as before.
+var ReserveCounterRange func(keyspace, name string, increment int) (int64, error)
+
+func reserveCounter(keyspace, name string, increment int) (int64, error) {
+	if ReserveCounterRange != nil {
+		return ReserveCounterRange(keyspace, name, increment)
+	}
+	return GetCounter(keyspace, name, increment)
+}
+
+// SetCounterValue moves a counter to an absolute value and returns what it held before. It must be
+// installed by whoever installs ReserveCounterRange, and for a reason that is easy to miss: an
+// external allocator reserves ranges *in advance*, so it may be serving ids derived from a value
+// this reset is about to erase. Writing the row directly would leave it handing out values from a
+// range that no longer means anything, and the next range it claimed would repeat them. Only the
+// allocator can move the counter and drop its own reservation together.
+//
+// Left nil, ResetCounter reads and writes the row itself, which is correct exactly while nothing
+// else owns it.
+var SetCounterValue func(keyspace, name string, value int64) (int64, error)
+
 // GetAutoincrementID reserves `recordsSize` consecutive autoincrement IDs for the
 // given counter key and returns the FIRST reserved raw value (1, 2, 3, …).
 // It uses the configured keyspace automatically. `key` is an arbitrary counter
@@ -212,7 +247,7 @@ func GetAutoincrementID(key string, recordsSize int) (int64, error) {
 	if recordsSize < 1 {
 		recordsSize = 1
 	}
-	return GetCounter(connParams.Keyspace, key, recordsSize)
+	return reserveCounter(connParams.Keyspace, key, recordsSize)
 }
 
 func nextCounterRange(storedCounterValue int64, increment int) (int64, int64) {

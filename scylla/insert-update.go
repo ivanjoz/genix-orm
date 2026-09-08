@@ -15,7 +15,11 @@ import (
 
 const maxInsertBatchRows = 500
 
-var getWriteCounterValue = GetCounter
+// The updated_version sequence reads through this var so tests can stub it; the autoincrement path
+// calls reserveCounter directly. Both end at the same allocator, which is what matters: installing
+// ReserveCounterRange redirects them together, and splitting them would leave one racing while the
+// other was safe.
+var getWriteCounterValue = reserveCounter
 var getManagedUnixTime = currentManagedUnixTime
 
 type managedWriteValues struct {
@@ -282,11 +286,11 @@ func fetchAutoincrementCounterStarts(
 
 		counterName := fmt.Sprintf("x%v_%v_%v", partValues[0], scyllaTable.Name, partValues[1])
 		keyspace := strings.Split(scyllaTable.GetFullName(), ".")[0]
-		counterStartValue, err := GetCounter(keyspace, counterName, recordsNeedingAutoincrement)
+		counterStartValue, err := reserveCounter(keyspace, counterName, recordsNeedingAutoincrement)
 		if err != nil {
 			return nil, err
 		}
-		// GetCounter reserves the whole batch and returns the first ID in that reserved range.
+		// The allocator reserves the whole batch and returns the first ID in that reserved range.
 		counterStartByGroup[groupKey] = counterStartValue
 	}
 

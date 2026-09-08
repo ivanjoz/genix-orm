@@ -9,7 +9,8 @@ import (
 
 // deltaVersionDigitsInt32 is the digit slot the implicit "updated_version" key gets when the packed
 // column fits an int. 8 digits is what keeps a two-key delta view inside 4 bytes; it caps the table
-// at 10^8 write calls per partition, after which writes fail loudly (see assertDeltaVersionFits).
+// at 10^8 write calls per partition, after which writes fail loudly (see the maxDeltaVersionValue
+// check in fetchManagedCounterValues).
 const deltaVersionDigitsInt32 = 8
 
 // deltaVersionDigitsInt64 is the slot used once the digit budget has already forced a bigint. The
