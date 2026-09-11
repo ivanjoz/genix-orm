@@ -106,3 +106,11 @@ var (
 	// SetDebugLogging raises the ORM's log verbosity: 0 off, 1 statements, 2 full.
 	SetDebugLogging func(level int)
 )
+
+// DebugLevel mirrors the verbosity the driver was given through SetDebugLogging, so this
+// package — where the query is *built*, before any driver sees it — can log under the same
+// flag as the driver that executes it.
+var DebugLevel int
+
+// ShouldLog reports whether the ORM is running with statement-level logging on.
+func ShouldLog() bool { return DebugLevel >= 1 }

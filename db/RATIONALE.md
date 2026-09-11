@@ -1,5 +1,21 @@
 # RATIONALE — db
 
+## `db.DebugLevel` mirrors the driver's verbosity instead of asking it
+
+**Context** — `Delta()` decides the whole shape of a delta read — which index it routes to, which
+filter values fan out, what watermark bound is emitted — and it does all of it in `db`, before any
+driver sees a statement. The flag that turns ORM logging on lives in the driver (`scylla.DebugNormal`,
+set through `SetDebugLogging`), and `db` cannot import the driver: the dependency runs the other way.
+
+**Decision** — `db.DebugLevel` + `db.ShouldLog()`, written by `scylla.SetDebugLogging` at the same
+moment it sets its own flags. `Delta()` logs the watermark and the filter it resolved under it.
+
+**Rationale** — The alternative was a `ShouldLog func() bool` hook in the driver-installed var block,
+which is what that block is for. A plain int wins because it is read on a query-building path and a
+function-pointer call is not free there, and because a driver that forgets to install it reads 0 —
+silent, which is the safe default for a log flag. The cost is that the two flags can drift if a
+future driver sets its own and skips this one; `SetDebugLogging` is the single place that can happen.
+
 ## Rejected: splitting TableStruct into a shape-collapsed queryBuilder half
 **Context** — `db.(*TableStruct)` was 287,601 bytes across 1,166 symbols. A stencil is keyed on the
 whole `[D, T, E]` tuple — driver, table, record, all three value types — so `Limit`, `OrderDesc`,

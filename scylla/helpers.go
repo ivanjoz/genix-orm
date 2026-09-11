@@ -30,6 +30,8 @@ var (
 func SetDebugLogging(level int) {
 	DebugNormal = level >= 1
 	DebugFull = level >= 2
+	// The db package builds the query before this driver executes it; it logs under the same flag.
+	db.DebugLevel = level
 }
 
 func ShouldLogFull() bool {

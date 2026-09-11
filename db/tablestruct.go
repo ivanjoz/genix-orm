@@ -163,10 +163,13 @@ func (e *TableStruct[D, T, E]) Delta(updatedSince int32, syncFilterValues ...int
 			schema.Name))
 	}
 
-	if len(syncFilterValues) > 0 {
-		syncFilterColumn := resolveDeltaSyncFilterColumn(schema, deltaIndexes, e.equalityPinnedColumns())
+	syncFilterColumn := ""
+	filterValues := []any{}
 
-		filterValues := make([]any, 0, len(syncFilterValues))
+	if len(syncFilterValues) > 0 {
+		syncFilterColumn = resolveDeltaSyncFilterColumn(schema, deltaIndexes, e.equalityPinnedColumns())
+
+		filterValues = make([]any, 0, len(syncFilterValues))
 		if updatedSince > 0 {
 			// A delta sync must carry every value of the filter column, or rows that moved to an
 			// inactive one would never reach the client that still caches them.
@@ -192,6 +195,14 @@ func (e *TableStruct[D, T, E]) Delta(updatedSince int32, syncFilterValues ...int
 	// its lower bound from the statement value and ignores the operator; versions start at 1, so a
 	// first sync still reads the whole slot.
 	e.SetWhere(ColumnNameUpdatedVersion, ">=", updatedSince+1)
+
+	// A delta read that returns the whole table is indistinguishable from a first sync in the
+	// scan counters, so the watermark it was actually given is printed with the shape it produced.
+	if ShouldLog() {
+		fmt.Printf("Delta:: table=%v isFirstSync=%v %v>=%v filter=%v in %v\n",
+			schema.Name, updatedSince == 0, ColumnNameUpdatedVersion, updatedSince+1,
+			syncFilterColumn, filterValues)
+	}
 	return e.schemaStruct
 }
 
