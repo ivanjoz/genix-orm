@@ -674,7 +674,7 @@ func assingValue(f *xunsafe.Field, ptr unsafe.Pointer, colType int8, value any) 
 	// Keep fallback switch focused on uncommon/collection types now that common cases have fast accessors.
 	// Any type not handled here routes to scalar fallback to preserve compatibility.
 	switch colType {
-	case 9: // IsComplexType = true | []byte as cbor
+	case 9: // IsComplexType = true | []byte, raw or a colbin message
 		if vl, ok := value.([]byte); ok {
 			f.Set(ptr, vl)
 		} else if vl, ok := value.(*[]byte); ok {
@@ -783,7 +783,7 @@ func makeScyllaValue(f *xunsafe.Field, ptr unsafe.Pointer, colType int8, colType
 			fieldValue := f.Interface(ptr)
 			recordBytes, err := colbin.Marshal(fieldValue)
 			if err != nil {
-				fmt.Println("Error al encodeding .colbin:: ", f.Name, err)
+				fmt.Println("Error colbin-encoding column:", f.Name, err)
 				return ""
 			}
 			hexString := hex.EncodeToString(recordBytes)

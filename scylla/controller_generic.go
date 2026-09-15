@@ -137,9 +137,10 @@ func (e *ScyllaController[T, E]) UpdateRecordsJSON(payload []byte, columnsToIncl
 	return len(records), nil
 }
 
-// parseRecords decodes the payload into the table's record type. Going through encoding/json is
-// what makes complex fields work — nested structs, slices and CBOR-backed blobs all decode by
-// their own rules, with no per-type assignment code here.
+// parseRecords decodes the payload into the table's record type. This is the HTTP payload, which is
+// JSON — colbin is the storage encoding and never appears here. Going through encoding/json is what
+// makes complex fields work: nested structs, slices and the blob-backed columns all decode by their
+// own rules, with no per-type assignment code here.
 func (e *ScyllaController[T, E]) parseRecords(payload []byte) ([]T, error) {
 	records := []T{}
 	if err := json.Unmarshal(payload, &records); err != nil {

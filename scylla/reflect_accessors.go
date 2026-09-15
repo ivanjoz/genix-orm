@@ -50,7 +50,7 @@ func (scyllaValueCodec) EncodeStatementValue(c *columnInfo, ptr unsafe.Pointer) 
 		fieldValue := c.Field.Interface(ptr)
 		recordBytes, err := colbin.Marshal(fieldValue)
 		if err != nil {
-			fmt.Println("Error al encodeding .colbin:: ", c.FieldName, err)
+			fmt.Println("Error colbin-encoding column:", c.FieldName, err)
 			return ""
 		}
 		return recordBytes
@@ -69,8 +69,7 @@ func (scyllaValueCodec) AssignValue(c *columnInfo, ptr unsafe.Pointer, v any) {
 
 	if decodedValue, decoded, err := decodeUnsignedValueFromBlob(v, c.RefType); decoded {
 		if err != nil {
-			// Keep backward compatibility with legacy CBOR blobs when binary decode is not possible.
-			fmt.Printf("Error decoding unsigned blob for Col %s, trying legacy CBOR: %v\n", c.Name, err)
+			fmt.Printf("Error decoding unsigned blob for Col %s, falling through to colbin: %v\n", c.Name, err)
 		} else {
 			// xunsafe generic Set does not reliably assign []uint16 slices; use direct typed memory assignment.
 			destination := reflect.NewAt(c.RefType, c.Field.Pointer(ptr)).Elem()
@@ -89,23 +88,52 @@ func (scyllaValueCodec) AssignValue(c *columnInfo, ptr unsafe.Pointer, v any) {
 	}
 
 	var vl []byte
+	isBlob := false
 	if b, ok := v.(*[]byte); ok {
-		vl = *b
+		vl, isBlob = *b, true
 	} else if b, ok := v.([]byte); ok {
-		vl = b
+		vl, isBlob = b, true
 	}
 
-	if len(vl) > 3 && c.Field != nil {
-		// Direct unmarshal into the field memory using xunsafe pointer. colbin's
-		// any decode yields map[string]any for nested objects (what the old
-		// cborDecMode was configured for), so JSON re-serialization keeps working.
-		dest := reflect.NewAt(c.RefType, c.Field.Pointer(ptr)).Interface()
-		err := colbin.Unmarshal(vl, dest)
-		if err != nil {
-			fmt.Printf("Error al convertir ComplexType for Col %s: %v\n", c.Name, err)
+	if c.Field == nil {
+		return
+	}
+	// Not bytes at all, so there is nothing to assign and nothing to decode. Leave
+	// the field alone rather than clearing it on a type the driver did not expect.
+	if !isBlob {
+		if ShouldLogFull() {
+			fmt.Printf("Blob column %s got a non-blob value (Type: %T)\n", c.Name, v)
 		}
-	} else if ShouldLogFull() {
-		fmt.Printf("Complex Type could not be parsed or empty: %s (Type: %T)\n", c.Name, v)
+		return
+	}
+
+	// A blob column holds one of two things, and the field's Go type says which —
+	// the same discriminator the encode side uses (makeScyllaValue, case 9). A
+	// []byte field was stored raw and must not be handed to a decoder; anything
+	// else went through colbin.
+	if c.RefType.Kind() == reflect.Slice && c.RefType.Elem().Kind() == reflect.Uint8 {
+		c.Field.Set(ptr, vl)
+		return
+	}
+
+	// IsColbin is the dispatch check the format is built for: a message always
+	// starts in the reserved root range, and no other byte can. It replaces a
+	// `len(vl) > 3` guess, which both dropped a valid short message — an all-zero
+	// record encodes to a single root byte — and fed non-colbin blobs to the
+	// decoder to fail further in.
+	if !colbin.IsColbin(vl) {
+		if len(vl) > 0 {
+			fmt.Printf("Blob for Col %s is not a colbin message (first byte %#x)\n", c.Name, vl[0])
+		} else if ShouldLogFull() {
+			fmt.Printf("Complex Type is empty: %s\n", c.Name)
+		}
+		return
+	}
+
+	// Direct unmarshal into the field memory using the xunsafe pointer.
+	dest := reflect.NewAt(c.RefType, c.Field.Pointer(ptr)).Interface()
+	if err := colbin.Unmarshal(vl, dest); err != nil {
+		fmt.Printf("Error decoding colbin ComplexType for Col %s: %v\n", c.Name, err)
 	}
 }
 

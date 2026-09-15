@@ -89,18 +89,14 @@ func tableName() string {
 // dataColumn is the attribute name of the binary record blob.
 const dataColumn = "d"
 
-// Omit-empty colbin encoding. It matters more here than anywhere else in the ORM:
-// the whole record is one blob, so every field a record leaves untouched is paid
-// for in that blob. A column of nothing but empty values becomes its type byte
-// alone instead of a slot per record. colbin's flag is process-global, so it is
-// set on import rather than left to a caller. Decoding is unaffected — both forms
-// are self-describing — at the price of a *T pointing at T's zero value decoding
-// back as nil.
-func init() { colbin.SetOmitEmpty(true) }
-
 // marshalItem produces the full DynamoDB item for a record. ptr is the struct
 // pointer (used by the precompiled key accessors); record is the same value (a
 // *E) handed to colbin for the "d" blob.
+//
+// A field left at its zero value is not written at all — colbin omits it and the
+// decoder restores the zero from the missing key. That is what keeps a whole
+// record in one blob affordable, and it is why a *T pointing at T's zero value
+// comes back nil rather than pointing at a zero.
 func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]types.AttributeValue, error) {
 	blob, err := colbin.Marshal(record)
 	if err != nil {

@@ -1,3 +1,60 @@
+## A blob column dispatches on `IsColbin` and on the field's type, not on `len(vl) > 3`
+
+**Context** — `AssignValue` decoded a blob column by trying `colbin.Unmarshal` on anything longer
+than three bytes. The threshold was a leftover from CBOR: it approximated "long enough to be a
+record" at a time when the encoding had no way to identify itself. It got three things wrong.
+
+An all-zero record encodes to a **single** root byte under the byte-aligned format — every field
+omitted — so a valid message was being dropped for being short, leaving the field holding whatever
+it had. A raw `[]byte` column was fed to the decoder and failed further in, because `db/coltype.go`
+marks plain `[]byte` `IsComplexType` too, so the flag cannot tell the two apart. And a value that
+was not bytes at all fell through to a log line that blamed the complex type.
+
+**Decision** — Three checks in place of the length guess. A non-blob value returns early. A field
+whose Go type is `[]byte` is assigned raw — the same discriminator `makeScyllaValue` case 9 already
+uses on the encode side. Everything else is gated on `colbin.IsColbin`, and a blob that fails it is
+reported with its first byte instead of being passed on.
+
+**Rationale** — `IsColbin` is what the reserved root range `0xD0..0xDF` exists for: colbin messages
+always start inside it and nothing else may, so this is an exact test where the length was a guess.
+Mirroring the encoder's own discriminator is what makes the round trip symmetric — the previous
+asymmetry is why a raw blob could be written correctly and never read back. The cost is that a
+corrupt blob now logs rather than attempting a decode that would have failed anyway, which is the
+same outcome with a better message.
+
+## The legacy CBOR fallback is gone, and so are the comments describing one
+
+**Context** — The driver still spoke of CBOR in three places: `AssignValue` logged "trying legacy
+CBOR" on an unsigned-blob failure, `assingValue` case 9 was labelled `[]byte as cbor`, and
+`parseRecords` credited `encoding/json` with decoding "CBOR-backed blobs". None of it was true —
+CBOR was removed when colbin landed, and the "fallback" fell through to colbin.
+
+**Decision** — Deleted. The unsigned-blob path says it falls through to colbin, case 9 says the
+column is raw bytes or a colbin message, and `parseRecords` says what it actually handles: the HTTP
+payload is JSON and colbin is the storage encoding, which never meets it.
+
+**Rationale** — Pre-alpha, no backwards compatibility: a comment naming a format the repo no longer
+carries is worse than no comment, because the next reader has to prove it is stale before touching
+the code. `rg -i cbor` over this module now returns nothing, which is the check worth keeping.
+
+## Omit-empty stopped being a setting, so the two `init()`s that turned it on are gone
+
+**Context** — This driver and `dynamo/client.go` each called `colbin.SetOmitEmpty(true)` on import,
+because the flag was process-global and had to be on before the first `Marshal` — an entry point
+that forgot would silently write dense blobs. colbin v0.2.0 removed the function: the byte-aligned
+format never writes a field holding its zero value, so there is nothing left to switch.
+
+**Decision** — Both `init()` calls deleted, along with the paragraphs explaining the flag. The one
+consequence a reader still needs — a `*T` pointing at `T`'s zero value decodes back as `nil` —
+moved onto `marshalItem`, next to the call it is about.
+
+**Rationale** — A call that no longer exists cannot be kept for safety, and the behaviour it used to
+request is now unconditional, so nothing about the stored shape changed except that it is no longer
+possible to get wrong. What did change is everything else about v0.2.0: the format is byte-aligned
+and incompatible with what v0.1.0 wrote, which is a re-encode of every blob in the database. That
+was affordable only because the operator chose to wipe and re-seed rather than migrate — see
+`fareward/PROTOCOL_SHAPES.md` §7 Phase 0, which is where the same decision was paid for.
+
 ## colbin v0.1.0 with omit-empty on, at the price of every blob already written
 **Context** — The driver serializes complex-type columns with `colbin.Marshal`, and the module was
 pinned at `20260720` while the parent app pinned `20260801`, so MVS resolved the whole build to the
