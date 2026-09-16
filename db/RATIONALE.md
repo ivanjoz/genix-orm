@@ -1,5 +1,22 @@
 # RATIONALE — db
 
+## The kind fallback covers every sized scalar except `int`
+
+**Context** — `GetColTypeByGoType` resolves a named scalar by the kind underneath it, so
+`type CashMovementType int8` stores as `tinyint` rather than reaching the blob catch-all. `int` is
+the one kind with no entry in `goTypes`: the table names `int8`…`int64` and nothing unsized.
+
+**Decision** — `underlyingScalarName` returns "" for `reflect.Int`, so a column declared `int` (or a
+named type over it) still falls to the catch-all and is refused by `assertColumnIsEncodable` at
+table-compile time.
+
+**Rationale** — mapping it would mean picking a width, and that is the declaration's to state, not
+this function's: `int` is 64-bit on every platform this runs on today, but a column's storage type
+leaks into persisted data, and silently choosing `bigint` for it is the same class of mistake as the
+blob fallback this change removes — a guess that looks right until the data is already written. A
+startup panic naming the column costs one line in the struct to fix. The cost is that `int` is the
+one scalar kind that cannot be used as a column without being spelled at a width.
+
 ## `db.DebugLevel` mirrors the driver's verbosity instead of asking it
 
 **Context** — `Delta()` decides the whole shape of a delta read — which index it routes to, which
