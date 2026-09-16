@@ -297,6 +297,8 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 			column.DBType = fmt.Sprintf("set<%v>", column.DBType)
 		} */
 
+		assertColumnIsEncodable(dbTable.Name, &column)
+
 		if _, ok := dbTable.ColumnsMap[column.GetName()]; ok {
 			panic("The following column name is repeated:" + column.GetName())
 		} else {

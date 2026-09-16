@@ -50,12 +50,40 @@ func (scyllaValueCodec) EncodeStatementValue(c *columnInfo, ptr unsafe.Pointer) 
 		fieldValue := c.Field.Interface(ptr)
 		recordBytes, err := colbin.Marshal(fieldValue)
 		if err != nil {
+			// Reaching here means the value, not the type, is the problem:
+			// assertColumnIsEncodable refused every type that cannot be planned
+			// before the table compiled. nil writes NULL, which is at least
+			// distinguishable from a column that encoded to nothing.
 			fmt.Println("Error colbin-encoding column:", c.FieldName, err)
-			return ""
+			return nil
 		}
 		return recordBytes
 	}
 	return c.Field.Interface(ptr)
+}
+
+// assertColumnIsEncodable refuses, at table-compile time, a column whose type the
+// serializer cannot plan.
+//
+// Whether colbin can carry a type is a property of the type, so it is knowable
+// before any record exists — and it has to be checked here, because the write
+// path has nowhere to report it. EncodeStatementValue returns a bare value on an
+// interface shared with every scalar accessor, so a column that could not encode
+// used to be logged and written as empty: the INSERT succeeded, and the data was
+// gone with nothing to tell the caller. A table that cannot store one of its
+// columns is a broken table, so it fails at startup, like a repeated column name.
+func assertColumnIsEncodable(tableName string, c *columnInfo) {
+	if !c.IsComplexType || c.Field == nil {
+		return
+	}
+	// A plain []byte is stored raw, not through colbin. Same test the encoder makes.
+	if c.Field.Type.Kind() == reflect.Slice && c.Field.Type.Elem().Kind() == reflect.Uint8 {
+		return
+	}
+	if _, err := colbin.Marshal(reflect.New(c.Field.Type).Elem().Interface()); err != nil {
+		panic(fmt.Sprintf("table %s: column %q (%s) cannot be serialized: %v",
+			tableName, c.GetName(), c.Field.Type, err))
+	}
 }
 
 // AssignValue writes a value returned by gocql into a record field. It is the
