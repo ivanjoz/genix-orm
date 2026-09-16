@@ -1,3 +1,21 @@
+## The backup exports colbin batches, and the CSV byte helpers it stopped calling stayed
+
+**Context** — `exportToCSV` / `CsvToRecords` were the whole backup codec: a pipe-separated,
+base64-per-value text format with a `name:type` header, built when the ORM had no record encoder of
+its own. It now has one, so `Controller` exports colbin batches instead (`ExportRecordsColbin` /
+`RestoreRecordsColbin`), and `db.CSVResult` went with the methods that returned it.
+
+**Decision** — `scylla/backup.go` was rewritten and nothing in it survives. `converter.go` was not
+touched, so `valueToCSVBase64`, `base64CSVStringToValue`, `sanitizeString` and `unSanitizeString`
+are left behind with no caller, along with `named_numeric_test.go`, which covers the first of them.
+
+**Rationale** — the backup was the only caller, so strictly they are dead and the pre-alpha rule
+says delete. They are also the ORM's value-level text encoding, sitting in the converter next to
+the blob and packed-key encoders rather than in the backup file, and removing a published encoder
+from a library is a call for whoever owns the library's surface. Leaving them costs an unused
+function per encoder and one test; deleting them costs nothing back if the answer is that no
+external reader wants them. Flagged rather than decided.
+
 ## A blob column dispatches on `IsColbin` and on the field's type, not on `len(vl) > 3`
 
 **Context** — `AssignValue` decoded a blob column by trying `colbin.Unmarshal` on anything longer

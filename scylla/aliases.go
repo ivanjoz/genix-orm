@@ -18,8 +18,7 @@ type (
 	GenericRecord       = db.GenericRecord
 	IDUpdatedVersion    = db.IDUpdatedVersion
 
-	Table     = db.Table
-	CSVResult = db.CSVResult
+	Table = db.Table
 )
 
 // RegisterTableFactory records how to compile one table by name, for endpoints that

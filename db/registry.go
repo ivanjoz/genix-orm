@@ -74,13 +74,6 @@ func RegisteredTableNames() []string {
 	return names
 }
 
-// CSVResult is a table exported as CSV, with the row count kept alongside so
-// callers do not have to re-parse the content to report progress.
-type CSVResult struct {
-	Content   []byte
-	RowsCount int32
-}
-
 // Controller is the driver-agnostic admin surface for one table: the operations
 // backup, restore and maintenance tooling needs without knowing which storage
 // engine is underneath.
@@ -89,8 +82,18 @@ type Controller interface {
 	GetTableName() string
 	GetRecords(partValue, limit int32, lastKey any) []any
 	GetRecordsGob(partValue, limit int32, lastKey any) ([]byte, error)
-	RestoreCSVRecords(partValue int32, content *[]byte) error
-	GetRecordsCSV(partValue int32) (CSVResult, error)
+
+	// ExportRecordsColbin streams one partition to emitBatch in colbin-encoded batches of
+	// batchSize records, and reports how many rows it exported. It is a callback and not a
+	// return value because a table is too big to hold whole: the caller writes each batch
+	// out as it arrives.
+	ExportRecordsColbin(partValue int32, batchSize int,
+		emitBatch func(encoded []byte, rowsCount int32) error) (int32, error)
+	// RestoreRecordsColbin inserts one batch written by ExportRecordsColbin, returning how
+	// many records it wrote. deletePartitionFirst belongs on the first batch of a table and
+	// nowhere else — see the implementation.
+	RestoreRecordsColbin(partValue int32, encoded []byte, deletePartitionFirst bool) (int, error)
+
 	ReloadRecords(partValue int32) error
 	RecalcVirtualColumns(partValue int32) error
 	RecalcGroupIndexHashes(partValue int32) error

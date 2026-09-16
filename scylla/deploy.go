@@ -66,9 +66,10 @@ func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any)
 	return recordsAny
 }
 
-func (e *ScyllaController[T, E]) GetRecordsCSV(partValue int32) (db.CSVResult, error) {
-	scyllaTable := &e.Table
-	return exportToCSV(scyllaTable, partValue)
+func (e *ScyllaController[T, E]) ExportRecordsColbin(
+	partValue int32, batchSize int, emitBatch func(encoded []byte, rowsCount int32) error,
+) (int32, error) {
+	return exportToColbin[T](&e.Table, partValue, batchSize, emitBatch)
 }
 
 func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
@@ -658,34 +659,35 @@ func (e *ScyllaController[T, E]) GetRecordsGob(partValue, limit int32, lastKey a
 	return buffer.Bytes(), nil
 }
 
-func (e *ScyllaController[T, E]) RestoreCSVRecords(partValue int32, content *[]byte) error {
-	scyllaTable := &e.Table
-	records, err := CsvToRecords[T](scyllaTable, content, partValue)
-
+// RestoreRecordsColbin inserts one exported batch. deletePartitionFirst wipes the
+// partition before inserting and must be set on the first batch of a table and only
+// there — a later batch asking for it would erase the batches already restored.
+func (e *ScyllaController[T, E]) RestoreRecordsColbin(
+	partValue int32, encoded []byte, deletePartitionFirst bool,
+) (int, error) {
+	records, err := colbinToRecords[T](&e.Table, encoded, partValue)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	pk := e.Table.GetPartKey()
-	if partValue > 0 && pk != nil && !pk.IsNil() {
-		statement := fmt.Sprintf(`DELETE FROM %v WHERE %v = %v`, e.Table.GetFullName(), pk.GetName(), partValue)
+	partKey := e.Table.GetPartKey()
+	if deletePartitionFirst && partValue > 0 && partKey != nil && !partKey.IsNil() {
+		statement := fmt.Sprintf(`DELETE FROM %v WHERE %v = %v`,
+			e.Table.GetFullName(), partKey.GetName(), partValue)
 		if err := QueryExec(statement); err != nil {
 			fmt.Println("Error en statement: ", statement)
-			return Err("Error al eliminar registros:", err)
+			return 0, Err("Error al eliminar registros:", err)
 		}
 	}
 
-	// Insert new records
-	fmt.Println("Registros a insertar:", len(records))
-
-	if len(records) > 0 {
-		Print(records[0])
+	if len(records) == 0 {
+		return 0, nil
 	}
 
 	if err := Insert(&records); err != nil {
-		return Err("Error al insertar registros:", err)
+		return 0, Err("Error al insertar registros:", err)
 	}
-	return nil
+	return len(records), nil
 }
 
 type ScyllaColumns struct {
