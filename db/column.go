@@ -90,9 +90,9 @@ func (c *colCore) setIsWeek()               { c.info.IsWeek = true }
 func (c *colCore) setCompositeBucketing(sizes []int8) { c.info.CompositeBucketSizes = sizes }
 
 //go:noinline
-func (c colCore) resolveInfo(elemTypeName string) ColumnInfo {
+func (c colCore) resolveInfo(elemType reflect.Type) ColumnInfo {
 	if c.info.Type == 0 {
-		c.info.ColType = GetColTypeByName(elemTypeName)
+		c.info.ColType = GetColTypeByGoType(elemType)
 		if c.info.Type == 0 {
 			c.info.ColType = GetColTypeByID(TypeBlob)
 		}
@@ -101,19 +101,19 @@ func (c colCore) resolveInfo(elemTypeName string) ColumnInfo {
 }
 
 //go:noinline
-func (c *colCore) resolveInfoPointer(elemTypeName string) *ColumnInfo {
+func (c *colCore) resolveInfoPointer(elemType reflect.Type) *ColumnInfo {
 	if c.info.Type == 0 {
-		c.info = c.resolveInfo(elemTypeName)
+		c.info = c.resolveInfo(elemType)
 	}
 	return &c.info
 }
 
 func (q Col[T, E]) GetInfo() ColumnInfo {
-	return q.colCore.resolveInfo(reflect.TypeFor[E]().String())
+	return q.colCore.resolveInfo(reflect.TypeFor[E]())
 }
 
 func (q *Col[T, E]) GetInfoPointer() *ColumnInfo {
-	return q.colCore.resolveInfoPointer(reflect.TypeFor[E]().String())
+	return q.colCore.resolveInfoPointer(reflect.TypeFor[E]())
 }
 
 // colRef carries the result of a declaration-time modifier. The modifiers return this instead of

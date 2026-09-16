@@ -1,6 +1,9 @@
 package db
 
-import "sync"
+import (
+	"reflect"
+	"sync"
+)
 
 // ColType describes how one record field maps onto storage.
 //
@@ -96,6 +99,58 @@ func GetColTypeByName(goTypeName string) ColType {
 		return ColType{}
 	}
 	return withDBType(colTypesByFieldType[goTypeName])
+}
+
+// GetColTypeByGoType resolves a record field's Go type to its ORM type: by the
+// type's own name first, and failing that by the kind underneath it.
+//
+// The second step is what a *declared* scalar needs. `type CashMovementType int8`
+// prints as pkg.Name, which is in no type table, so it used to reach the caller's
+// TypeBlob catch-all and be stored as an opaque blob — handed to the serializer
+// on every write, which refused it because the format has no root int8, and the
+// column was written empty. Such a column is a number whose name is merely
+// unfamiliar, and it stores exactly as the plain scalar beside it.
+//
+// A type with no native form at all (a struct, a map, a slice of either) still
+// resolves to nothing here, and the catch-all is still the caller's to apply.
+func GetColTypeByGoType(goType reflect.Type) ColType {
+	if goType == nil {
+		return ColType{}
+	}
+	if resolved := GetColTypeByName(goType.String()); resolved.Type != 0 {
+		return resolved
+	}
+	return GetColTypeByName(underlyingScalarName(goType))
+}
+
+// underlyingScalarName names the type-table entry a named scalar belongs to, or
+// "" for anything that is not one.
+func underlyingScalarName(goType reflect.Type) string {
+	pointerPrefix := ""
+	if goType.Kind() == reflect.Pointer {
+		pointerPrefix, goType = "*", goType.Elem()
+	}
+	switch goType.Kind() {
+	case reflect.Bool:
+		return pointerPrefix + "bool"
+	case reflect.Int8:
+		return pointerPrefix + "int8"
+	case reflect.Int16:
+		return pointerPrefix + "int16"
+	case reflect.Int32:
+		return pointerPrefix + "int32"
+	case reflect.Int64:
+		return pointerPrefix + "int64"
+	case reflect.Float32:
+		return pointerPrefix + "float32"
+	case reflect.Float64:
+		return pointerPrefix + "float64"
+	case reflect.String:
+		return pointerPrefix + "string"
+	}
+	// reflect.Int is deliberately absent: the table has no entry for it, so its
+	// storage width would be this function's choice rather than the declaration's.
+	return ""
 }
 
 func withDBType(columnType ColType) ColType {

@@ -32,7 +32,7 @@ func getOrBuildStructFieldMetadata(recordType reflect.Type) *structFieldMetadata
 		}
 
 		unsafeField := xunsafe.FieldByName(recordType, recordField.Name)
-		columnType := GetColTypeByName(recordField.Type.String())
+		columnType := GetColTypeByGoType(recordField.Type)
 		if columnType.Type == 0 {
 			// Anything with no native mapping is stored as an opaque blob.
 			columnType = GetColTypeByID(TypeBlob)
