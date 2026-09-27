@@ -275,8 +275,9 @@ func fetchAutoincrementCounterStarts(
 		partValues := strings.Split(groupKey, "|")
 		recordsNeedingAutoincrement := 0
 		for _, ptr := range group {
+			// A virtual TableStruct.Autoincrement() column has no field and reads nil: it always needs a value.
 			rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr)
-			if convertToInt64(rawAutoincrementValue) <= 0 {
+			if rawAutoincrementValue == nil || convertToInt64(rawAutoincrementValue) <= 0 {
 				recordsNeedingAutoincrement++
 			}
 		}
@@ -332,9 +333,11 @@ func handlePreInsert(
 
 		for _, ptr := range group {
 			autoincrementColumnValue := int64(0)
+			// A virtual TableStruct.Autoincrement() column reads nil and stays at 0: it always needs a value.
 			if scyllaTable.AutoincrementCol != nil {
-				rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr)
-				autoincrementColumnValue = convertToInt64(rawAutoincrementValue)
+				if rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr); rawAutoincrementValue != nil {
+					autoincrementColumnValue = convertToInt64(rawAutoincrementValue)
+				}
 			}
 
 			if autoincrementColumnValue <= 0 {
