@@ -1,5 +1,31 @@
 # RATIONALE — db
 
+## The bit-slot math and the KeyIntPacking layout live in `db`, not in `scylla`
+
+**Context** — `db.DecodePackedKey` must rebuild a KeyIntPacking layout from a schema alone. The
+layout rule (every slot but the last declares `Size`, the last takes the rest of 63 bits) used to be
+re-derived inline, once in the scylla insert path and again in the select path.
+
+**Decision** — `db/packing.go` holds `PackSlotValues`, `PackSlotPrefixBound`, `UnpackSlotValues`,
+`SlotMaxValue`, `KeyIntPackingSlotBits` and `DecodeKeyIntPacking`. Scylla resolves the layout once
+per table (`keyIntPackingSlotBits`) and keeps only the storage-specific part: the sign-flip
+encoding of virtual columns.
+
+**Rationale** — one engine-agnostic definition shared by insert, select and decode, so the three
+cannot drift. The cost: the `db` package now carries packing arithmetic that only the Scylla driver
+uses today.
+
+## `Autoincrement(n)` caps the random suffix at 26 bits on both setters
+
+**Context** — the two setters had different decimal caps: `Col.Autoincrement` allowed 15 digits
+and `TableStruct.Autoincrement` allowed 8.
+
+**Decision** — both share `maxAutoincrementRandBits = 26` (about 8 digits). `Size(n)` accepts
+1..63.
+
+**Rationale** — one unit deserves one limit. 26 bits keep the 8-digit cap the table-level setter
+already enforced; 15 digits (~50 bits) would starve the sequence of any packed slot.
+
 ## The kind fallback covers every sized scalar except `int`
 
 **Context** — `GetColTypeByGoType` resolves a named scalar by the kind underneath it, so

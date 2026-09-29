@@ -36,9 +36,9 @@ func (e sharedSchemaTable) GetSchema() db.TableSchema {
 		Partition: e.EmpresaID,
 		Keys:      db.Cols(e.ID.Autoincrement(0)),
 		Indexes: []db.Index{
-			// The first view key carries no DecimalSize: the ORM infers its width from
+			// The first view key carries no Size: the ORM infers its width from
 			// the remaining columns and rejects an explicit one.
-			{Type: db.TypeView, Keys: db.Cols(e.Status, e.Updated.DecimalSize(10))},
+			{Type: db.TypeView, Keys: db.Cols(e.Status, e.Updated.Size(31))},
 			{Type: db.TypeLocalIndex, Keys: db.Cols(e.Nombre)},
 		},
 	}

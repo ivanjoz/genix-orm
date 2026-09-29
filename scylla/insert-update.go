@@ -3,6 +3,7 @@ package scylla
 import (
 	"fmt"
 	"github.com/ivanjoz/genix-orm/db"
+	"math/rand/v2"
 	"reflect"
 	"slices"
 	"strings"
@@ -149,8 +150,8 @@ func fetchManagedCounterValues(
 		if err != nil {
 			return prefetchedManagedCounterValues{}, fmt.Errorf("write updated_version %s: %w", counterName, err)
 		}
-		// A delta view packs the version into a fixed digit slot and trims overruns from the right,
-		// which would silently collapse versions into buckets of ten. Refuse the write instead.
+		// A delta view packs the version into a fixed bit slot, and the packer panics on a version that
+		// overruns it. Refuse the write here first, with the counter's name.
 		if scyllaTable.maxDeltaVersionValue > 0 && nextCounterValue > scyllaTable.maxDeltaVersionValue {
 			return prefetchedManagedCounterValues{}, fmt.Errorf(
 				`table %q: updated_version %d exhausted the delta view slot (max %d) for counter %s`,
@@ -357,9 +358,9 @@ func handlePreInsert(
 				counterVal++
 
 				colInfo := scyllaTable.AutoincrementCol.(*columnInfo)
-				if colInfo.AutoincrementRandDigits > 0 {
-					suffix := GetRandomInt64(colInfo.AutoincrementRandDigits)
-					currentAutoVal = currentAutoVal*Pow10Int64(int64(colInfo.AutoincrementRandDigits)) + suffix
+				if colInfo.AutoincrementRandBits > 0 {
+					randomSuffix := rand.Int64N(int64(1) << colInfo.AutoincrementRandBits)
+					currentAutoVal = currentAutoVal<<colInfo.AutoincrementRandBits | randomSuffix
 				}
 
 				// If not packing, set directly
@@ -369,36 +370,18 @@ func handlePreInsert(
 			}
 
 			if len(scyllaTable.keyIntPacking) > 0 {
-				var packedValue int64
-				remainingDigits := int64(19)
+				componentValues := make([]int64, len(scyllaTable.keyIntPacking))
 				for i, col := range scyllaTable.keyIntPacking {
-					if col == nil {
-						continue
-					}
-					var val int64
 					if col == scyllaTable.AutoincrementCol {
-						val = currentAutoVal
+						componentValues[i] = currentAutoVal
 					} else {
-						val = convertToInt64(col.GetRawValue(ptr))
+						componentValues[i] = convertToInt64(col.GetRawValue(ptr))
 					}
-
-					colPackingInfo := col.(*columnInfo)
-					decSize := int64(colPackingInfo.DecimalDigits)
-					// If it's the last one and size is 0, it takes all remaining space
-					if i == len(scyllaTable.keyIntPacking)-1 && decSize == 0 {
-						decSize = remainingDigits
-					}
-
-					remainingDigits -= decSize
-					if remainingDigits < 0 {
-						remainingDigits = 0
-					}
-
-					shift := Pow10Int64(remainingDigits)
-					packedValue += val * shift
 				}
-				// Set into the only key
-				scyllaTable.Keys[0].SetValue(ptr, packedValue)
+				// Set into the only key. The 63-bit layout keeps the ID a positive int64.
+				packedKey := packRowValues(scyllaTable.Name, scyllaTable.Keys[0].GetName(),
+					scyllaTable.keyIntPacking, componentValues, scyllaTable.keyIntPackingSlotBits)
+				scyllaTable.Keys[0].SetValue(ptr, int64(packedKey))
 			}
 		}
 	}

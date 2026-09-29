@@ -44,7 +44,7 @@ which is what makes `BETWEEN` / `>` / `<` work on a string sort key.
 Two things make it work (`encoding.go`):
 
 1. **Fixed width** per column, declared with `.Base(n)` (n Base64 chars = 6·n
-   bits) — the DynamoDB analogue of genix's `DecimalSize`.
+   bits) — the DynamoDB analogue of genix's `Size(bits)`.
 2. An **alphabet in ascending ASCII order** (`-` `0-9` `A-Z` `_` `a-z`), so a
    bigger digit is also a bigger byte.
 

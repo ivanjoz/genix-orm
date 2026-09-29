@@ -313,7 +313,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 	// Default audit columns are added unless the schema explicitly opts out.
 	bindManagedAuditColumns(&dbTable, schema)
 
-	// Resolve declared value ranges before any index compiles, since TypeDelta sizes its digit
+	// Resolve declared value ranges before any index compiles, since TypeDelta sizes its bit
 	// slots from them.
 	dbTable.fixedValueRanges = resolveFixedValueRanges(&dbTable, schema.FixedValues)
 
@@ -329,13 +329,13 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		dbTable.Keys = append(dbTable.Keys, col)
 		dbTable.KeysIdx = append(dbTable.KeysIdx, col.GetInfo().Idx)
 
-		// Transfer AutoincrementRandDigits from Key to the actual column in columnsMap
+		// Transfer AutoincrementRandBits from Key to the actual column in columnsMap
 		// This enables autoincrement functionality when a Key is marked with .Autoincrement()
 		// Valid values: -1 (no random suffix) or >0 (with random suffix)
 		// Default value 0 means .Autoincrement() was never called
 		keyInfo := key.GetInfo()
-		if keyInfo.AutoincrementRandDigits != 0 {
-			col.SetAutoincrementRandSize(keyInfo.AutoincrementRandDigits)
+		if keyInfo.AutoincrementRandBits != 0 {
+			col.SetAutoincrementRandSize(keyInfo.AutoincrementRandBits)
 
 			// Set autoincrementCol if not already set
 			if dbTable.AutoincrementCol == nil {
@@ -362,7 +362,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 			// > 0 : autoincrement with random suffix of that size
 			// The previous condition `>= 0` incorrectly treated the default 0 as autoincrement and
 			// caused tables without Autoincrement() to still query `sequences` on insert.
-			if c.AutoincrementRandDigits != 0 && dbTable.AutoincrementCol == nil {
+			if c.AutoincrementRandBits != 0 && dbTable.AutoincrementCol == nil {
 				dbTable.AutoincrementCol = col
 			}
 		}
@@ -382,15 +382,15 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 			packedCol := dbTable.ColumnsMap[col.GetName()]
 			if packedCol == nil {
 				info := col.GetInfo()
-				if info.AutoincrementRandDigits >= 0 {
+				if info.AutoincrementRandBits >= 0 {
 					// It's an autoincrement placeholder
 					placeholder := &columnInfo{
 						ColInfo: colInfo{
 							Name:      "autoincrement_placeholder",
 							IsVirtual: true,
 						},
-						AutoincrementRandDigits: info.AutoincrementRandDigits,
-						DecimalDigits:           info.DecimalDigits,
+						AutoincrementRandBits: info.AutoincrementRandBits,
+						SlotBits:              info.SlotBits,
 					}
 					packedCol = placeholder
 					dbTable.AutoincrementCol = placeholder
@@ -398,14 +398,15 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 					panic(fmt.Sprintf(`Table "%v": Column "%v" in KeyIntPacking not found`, dbTable.Name, col.GetName()))
 				}
 			} else {
-				// If it's a real column, ensure DecimalDigits is transferred if set in KeyIntPacking
+				// If it's a real column, ensure SlotBits is transferred if set in KeyIntPacking
 				info := col.GetInfo()
-				if info.DecimalDigits > 0 {
-					packedCol.SetDecimalSize(info.DecimalDigits)
+				if info.SlotBits > 0 {
+					packedCol.SetSlotBits(info.SlotBits)
 				}
 			}
 			dbTable.keyIntPacking = append(dbTable.keyIntPacking, packedCol)
 		}
+		dbTable.keyIntPackingSlotBits = db.KeyIntPackingSlotBits(dbTable.Name, schema.KeyIntPacking)
 	}
 
 	if len(schema.KeyConcatenated) > 0 {

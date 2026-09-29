@@ -241,13 +241,21 @@ week-coded bucketing is a separate feature that lives in composite bucketing (§
 
 ### 8.2 Packed Indexes
 
-Packed indexes concatenate numeric components into one sortable number.
+Packed indexes concatenate numeric components into one sortable number, one bit slot per
+component, most significant first (`db.PackSlotValues`).
 
 Rules:
-- first component width is inferred
-- trailing components require `DecimalSize`
-- values exceeding slot width are truncated by rule
-- `.Int32()` allows packed value storage in `int32` with post-filter exactness when needed
+- first component width is inferred: it takes the bits the others leave
+- trailing components require `.Size(bits)`
+- `.Size(n)` is a range cap: values stay below 2^n. A value past its slot panics on write; nothing
+  is truncated, because a truncation shift depends on the value's own magnitude and breaks the
+  sort order when a value crosses a power of two
+- `.Int32()` stores the packed value in an `int` instead of a `bigint`
+- virtual packed columns (packed indexes, range and delta views) use all 64 (or 32) bits: the
+  unsigned layout is stored with its top bit flipped (`storeVirtualPacked`), which maps unsigned
+  order onto the signed order Scylla compares with. Every write and query bound goes through it
+- `KeyIntPacking` writes the record's own `ID`, so it keeps a 63-bit budget and stays a positive
+  `int64` (`db.KeyIntPackingSlotBits`); `db.DecodePackedKey` splits one back for debugging
 
 ### 8.3 Views
 
@@ -265,12 +273,12 @@ tier, while a partial prefix sits above the bare-partition plan (100) and below 
 equality (120) — a narrow index beats a broad prefix scan, and picking the view instead would leave
 the narrow predicate as an unservable leftover filter.
 
-`TypeDelta` is a range view whose digit layout is resolved from `TableSchema.FixedValues` instead of
-per-column `DecimalSize()` hints, with the managed `updated` column appended as the trailing key.
-`compileSchemaDeltaView` computes the maximum packed value from the declared ranges and picks `int`
-or `bigint` from it; the leading slot's magnitude is what decides the fit. A full-width scan's
-exclusive upper bound is capped at one past that maximum, which keeps it inside the packed column
-(a 10-digit layout would otherwise emit 10^10 for an `int`) and tightens the range.
+`TypeDelta` is a range view whose bit layout is resolved from `TableSchema.FixedValues` instead of
+per-column `Size()` hints, with the managed `updated_version` column appended as the trailing key.
+Each declared key takes `bits.Len64(max)` bits; `compileSchemaDeltaView` picks `int` when the keys
+plus the 27-bit version slot fit 32 bits, and `bigint` (34-bit version) otherwise. Only the sum of
+the slots decides the fit, so key order does not matter. Range upper bounds are inclusive (every
+trailing slot at its max), so no bound can overflow the packed column.
 
 ### 8.4 Composite Bucketing
 

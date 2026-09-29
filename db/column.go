@@ -7,7 +7,7 @@ import (
 
 // Col is a statically-typed column handle. T is the table struct, E the column's
 // Go value type. It serves two roles: at schema-declaration time it carries the
-// packing modifiers (.DecimalSize, .Autoincrement, …), and in a query it builds
+// packing modifiers (.Size, .Autoincrement, …), and in a query it builds
 // predicates. Both are pure data — nothing here touches a storage engine.
 // colCore is the part of a column handle that does not depend on the type parameters. It is
 // embedded (not named) so every existing q.info / c.tableInfo reference keeps resolving, while the
@@ -38,22 +38,22 @@ type Col[T TableHandle, E any] struct {
 // query-build time, never per row, so an out-of-line call costs nothing that matters.
 
 //go:noinline
-func (c *colCore) setDecimalSize(size int8) {
-	if size > 15 {
-		panic("Decimal size TOO BIG in:" + c.info.Name)
+func (c *colCore) setSize(bits int8) {
+	if bits < 1 || bits > 63 {
+		panic(fmt.Sprintf("Size(%v) out of range 1..63 in: %v", bits, c.info.Name))
 	}
-	c.info.DecimalDigits = size
+	c.info.SlotBits = bits
 }
 
 //go:noinline
-func (c *colCore) setAutoincrement(randSufixSize int8) {
-	if randSufixSize > 15 {
-		panic("Rand sufix size TOO BIG in:" + c.info.Name)
+func (c *colCore) setAutoincrement(randSuffixBits int8) {
+	if randSuffixBits > maxAutoincrementRandBits {
+		panic(fmt.Sprintf("Autoincrement(%v) random suffix wider than %v bits in: %v", randSuffixBits, maxAutoincrementRandBits, c.info.Name))
 	}
-	if randSufixSize == 0 {
-		randSufixSize = -1
+	if randSuffixBits == 0 {
+		randSuffixBits = -1
 	}
-	c.info.AutoincrementRandDigits = randSufixSize
+	c.info.AutoincrementRandBits = randSuffixBits
 }
 
 //go:noinline
@@ -126,8 +126,10 @@ type colRef struct{ info ColumnInfo }
 func (c colRef) GetInfo() ColumnInfo { return c.info }
 func (c colRef) GetName() string     { return c.info.Name }
 
-func (q Col[T, E]) DecimalSize(size int8) Coln {
-	q.setDecimalSize(size)
+// Size declares the bit width this column's slot takes inside a packed key: its values must stay
+// below 2^bits. A value that does not fit panics on write; it is never truncated.
+func (q Col[T, E]) Size(bits int8) Coln {
+	q.setSize(bits)
 	return colRef{q.GetInfo()}
 }
 
@@ -146,8 +148,10 @@ func (q Col[T, E]) IsWeek() Coln {
 	return colRef{q.GetInfo()}
 }
 
-func (q Col[T, E]) Autoincrement(randSufixSize int8) Coln {
-	q.setAutoincrement(randSufixSize)
+// Autoincrement marks the column as generated. randSuffixBits random low bits follow the
+// sequence: ID = sequence<<randSuffixBits | random.
+func (q Col[T, E]) Autoincrement(randSuffixBits int8) Coln {
+	q.setAutoincrement(randSuffixBits)
 	return colRef{q.GetInfo()}
 }
 

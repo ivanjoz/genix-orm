@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/ivanjoz/genix-orm/db"
 )
 
 type selectExecutionRoute int8
@@ -598,43 +600,33 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 		return nil, false
 	}
 
+	// The pinned prefix spans one contiguous block of the key; the bounds are inclusive and go
+	// straight into a BETWEEN.
 	makePackedRange := func(values []any, rangeStatement *ColumnStatement) (int64, int64, bool) {
-		// Keep the exact packing math in one helper so compile and bind follow the same physical-key semantics.
-		remainingDigits := int64(19)
-		var packedValue int64
-
-		for columnIndex, column := range scyllaTable.keyIntPacking {
-			columnInfo := column.(*columnInfo)
-			DecimalDigits := int64(columnInfo.DecimalDigits)
-			if columnIndex == len(scyllaTable.keyIntPacking)-1 && DecimalDigits == 0 {
-				DecimalDigits = remainingDigits
-			}
-			remainingDigits -= DecimalDigits
-
-			if columnIndex < len(values) {
-				packedValue += convertToInt64(values[columnIndex]) * Pow10Int64(remainingDigits)
-				continue
-			}
-
-			if rangeStatement != nil && column.GetName() == rangeStatement.Col {
-				if rangeStatement.Operator == "BETWEEN" {
-					fromValue := packedValue + convertToInt64(rangeStatement.From[0].Value)*Pow10Int64(remainingDigits)
-					toValue := packedValue + (convertToInt64(rangeStatement.To[0].Value)+1)*Pow10Int64(remainingDigits)
-					return fromValue, toValue, false
-				}
-
-				rangeValue := convertToInt64(rangeStatement.Value)
-				fromValue := packedValue + rangeValue*Pow10Int64(remainingDigits)
-				return fromValue, fromValue + Pow10Int64(remainingDigits), false
-			}
-
-			fromValue := packedValue
-			toValue := packedValue + Pow10Int64(remainingDigits+DecimalDigits)
-			isEquality := columnIndex == len(scyllaTable.keyIntPacking)
-			return fromValue, toValue, isEquality
+		slotBits := scyllaTable.keyIntPackingSlotBits
+		prefix := make([]int64, 0, len(slotBits))
+		for _, value := range values {
+			prefix = append(prefix, convertToInt64(value))
+		}
+		if len(prefix) == len(slotBits) {
+			packedKey := int64(db.PackSlotValues(prefix, slotBits))
+			return packedKey, packedKey, true
 		}
 
-		return packedValue, packedValue, true
+		fromPrefix, toPrefix := prefix, prefix
+		if rangeStatement != nil {
+			if rangeStatement.Operator == "BETWEEN" {
+				fromPrefix = append(slices.Clone(prefix), convertToInt64(rangeStatement.From[0].Value))
+				toPrefix = append(slices.Clone(prefix), convertToInt64(rangeStatement.To[0].Value))
+			} else {
+				// Any other range operator scans the block of its own value.
+				fromPrefix = append(slices.Clone(prefix), convertToInt64(rangeStatement.Value))
+				toPrefix = fromPrefix
+			}
+		}
+		fromValue := int64(db.PackSlotPrefixBound(fromPrefix, slotBits, false))
+		toValue := int64(db.PackSlotPrefixBound(toPrefix, slotBits, true))
+		return fromValue, toValue, false
 	}
 
 	fromValue, toValue, isEquality := makePackedRange(prefixValues, rangeStatement)

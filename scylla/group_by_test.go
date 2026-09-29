@@ -5,7 +5,15 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/ivanjoz/genix-orm/db"
 )
+
+// storedPackedValue packs a prefix bound the way the view stores its key, sign bit flipped.
+func storedPackedValue(view *viewInfo, fillWithMax bool, values ...int64) int64 {
+	packed := db.PackSlotPrefixBound(values, view.packedSlotBitsPerColumn, fillWithMax)
+	return convertToInt64(storeVirtualPacked(packed, view.packedIsInt32))
+}
 
 type groupedMovementRecord struct {
 	TableStruct[groupedMovementSchema, groupedMovementRecord]
@@ -35,7 +43,7 @@ func (e groupedMovementSchema) GetSchema() TableSchema {
 		Keys:      Cols(e.ID),
 		Indexes: []Index{
 			// Keep the packed grouping view minimal: partition + packed key + aggregated payload column.
-			{Type: TypeView, Keys: Cols(e.Date, e.ProductID.DecimalSize(10)), Cols: Cols(e.Cantidad)},
+			{Type: TypeView, Keys: Cols(e.Date, e.ProductID.Size(31)), Cols: Cols(e.Cantidad)},
 		},
 	}
 }
@@ -66,7 +74,7 @@ func (e fullViewSchema) GetSchema() TableSchema {
 		Keys:      Cols(e.ID),
 		Indexes: []Index{
 			// No Cols means the MV keeps the full base payload with an explicit non-virtual projection.
-			{Type: TypeView, Keys: Cols(e.Status, e.Updated.DecimalSize(9))},
+			{Type: TypeView, Keys: Cols(e.Status, e.Updated.Size(31))},
 		},
 	}
 }
@@ -102,7 +110,7 @@ func (e hashIndexedFullViewSchema) GetSchema() TableSchema {
 		Indexes: []Index{
 			{Keys: Cols(e.ProductIDs, e.Date.CompositeBucketing(2, 6))},
 			// Full-payload packed view should keep only its own view key virtual column.
-			{Type: TypeView, Keys: Cols(e.Status.Int32(), e.Updated.DecimalSize(8))},
+			{Type: TypeView, Keys: Cols(e.Status.Int32(), e.Updated.Size(27))},
 		},
 	}
 }
@@ -130,8 +138,8 @@ func (e int32PackedViewSchema) GetSchema() TableSchema {
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
 		Indexes: []Index{
-			// Match the sale-order status trace view: a small enum prefix packed with an 8-digit updated slot.
-			{Type: TypeView, Keys: Cols(e.StatusTrace.Int32(), e.Updated.DecimalSize(8))},
+			// Match the sale-order status trace view: a small enum prefix packed with a 27-bit updated slot.
+			{Type: TypeView, Keys: Cols(e.StatusTrace.Int32(), e.Updated.Size(27))},
 		},
 	}
 }
@@ -184,7 +192,7 @@ func TestBuildNativeGroupByPlanWithPackedView(t *testing.T) {
 	if len(plan.WhereStatements) != 1 || plan.WhereStatements[0].Clause != expectedClause {
 		t.Fatalf("unexpected packed where clauses: %v", plan.WhereStatements)
 	}
-	if got := plan.WhereStatements[0].Values; len(got) != 2 || convertToInt64(got[0]) != 7 || convertToInt64(got[1]) <= 0 {
+	if got := plan.WhereStatements[0].Values; len(got) != 2 || convertToInt64(got[0]) != 7 || convertToInt64(got[1]) != storedPackedValue(packedView, false, 15) {
 		t.Fatalf("unexpected packed where values: %v", got)
 	}
 }
@@ -193,8 +201,7 @@ func TestPackedGroupByDecomposesVirtualValue(t *testing.T) {
 	scyllaTable := MakeScyllaTable[groupedMovementRecord, groupedMovementSchema]()
 	packedView := findPackedGroupView(t, scyllaTable)
 
-	packedValue := computePackedInt64ValueNonNegative([]int64{31, 4567}, packedView.packedSlotDigitsPerColumn)
-	values := packedView.decomposeVirtualValue(packedValue)
+	values := packedView.decomposeVirtualValue(storedPackedValue(packedView, false, 31, 4567))
 	if len(values) != 2 {
 		t.Fatalf("expected 2 decomposed values, got %v", values)
 	}
@@ -337,9 +344,9 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 	}
 
 	packedView := bestCapability.Source
-	expectedLowerBound := computePackedInt64ValueNonNegative([]int64{6, 0}, packedView.packedSlotDigitsPerColumn)
-	expectedUpperBound := computePackedInt64ValueNonNegative([]int64{7, 0}, packedView.packedSlotDigitsPerColumn)
-	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s < ?",
+	expectedLowerBound := storedPackedValue(packedView, false, 6, 0)
+	expectedUpperBound := storedPackedValue(packedView, true, 6)
+	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
 		packedView.column.GetName(),
 		packedView.column.GetName(),
 	)
@@ -351,7 +358,9 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 	}
 }
 
-func TestInt32PackedViewUpperBoundKeepsCarryDigit(t *testing.T) {
+// An int32 packed view spends all 32 bits, so its bounds only fit an int once the sign bit is
+// flipped: StatusTrace 9 alone already lands past MaxInt32 in the unsigned layout.
+func TestInt32PackedViewBoundsAreSignFlippedInt32s(t *testing.T) {
 	scyllaTable := MakeScyllaTable[int32PackedViewRecord, int32PackedViewSchema]()
 	results := []int32PackedViewRecord{}
 	query := Query[int32PackedViewRecord, int32PackedViewSchema](&results)
@@ -373,14 +382,21 @@ func TestInt32PackedViewUpperBoundKeepsCarryDigit(t *testing.T) {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}
 
-	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s < ?",
-		bestCapability.Source.column.GetName(),
-		bestCapability.Source.column.GetName(),
+	packedView := bestCapability.Source
+	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
+		packedView.column.GetName(),
+		packedView.column.GetName(),
 	)
 	if whereStatements[0].Clause != expectedWhere {
 		t.Fatalf("unexpected int32 packed where clause: %v", whereStatements[0])
 	}
-	if got := whereStatements[0].Values; len(got) != 3 || convertToInt64(got[0]) != 1 || convertToInt64(got[1]) != 938768176 || convertToInt64(got[2]) != 1000000000 {
+	got := whereStatements[0].Values
+	if len(got) != 3 || convertToInt64(got[0]) != 1 ||
+		convertToInt64(got[1]) != storedPackedValue(packedView, false, 9, 38768176) ||
+		convertToInt64(got[2]) != storedPackedValue(packedView, true, 9) {
 		t.Fatalf("unexpected int32 packed where values: %v", got)
+	}
+	if _, isInt32 := got[1].(int32); !isInt32 {
+		t.Fatalf("expected the bound to bind as an int32, got %T", got[1])
 	}
 }

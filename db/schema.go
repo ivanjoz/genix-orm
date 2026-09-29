@@ -36,9 +36,9 @@ const (
 	TypeView           int8 = 6
 	TypeViewTable      int8 = 9
 	// TypeDelta is a TypeView packed range view with the table's "updated_version" column appended
-	// as its last key, so one index serves both halves of a delta-cache sync. The digit width of
-	// every declared key comes from its FixedValues instead of a .DecimalSize() decorator, and the
-	// packed column is int32 whenever the resulting maximum fits. Keys[0] is also the column Delta()
+	// as its last key, so one index serves both halves of a delta-cache sync. The bit width of
+	// every declared key comes from its FixedValues instead of a .Size() decorator, and the
+	// packed column is int32 whenever the slots fit its 32 bits. Keys[0] is also the column Delta()
 	// filters on; see TableStruct.Delta for the query side.
 	TypeDelta int8 = 10
 )
@@ -92,7 +92,7 @@ type Index struct {
 }
 
 // FixedValues pins down the set of values a column can hold. Declaring it lets the schema
-// compiler size the column's digit slot inside a packed key (see TypeDelta) and lets Delta()
+// compiler size the column's bit slot inside a packed key (see TypeDelta) and lets Delta()
 // enumerate every value of a sync-filter column, neither of which is derivable from the Go type.
 type FixedValues struct {
 	Col          Coln

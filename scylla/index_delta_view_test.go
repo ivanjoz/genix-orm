@@ -2,10 +2,11 @@ package scylla
 
 import (
 	"fmt"
-	"math"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/ivanjoz/genix-orm/db"
 )
 
 // The delta fixture mirrors client_provider: a tenant partition, a two-value Status that leads the
@@ -66,11 +67,11 @@ func TestDeltaViewSizesSlotsFromFixedValues(t *testing.T) {
 	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
 	view := deltaPackedView(t, scyllaTable)
 
-	// Status {0,1} and Type 1..2 each need one digit, so the implicit version slot keeps 8 and the
-	// packed maximum (1_2_99999999) still fits an int.
-	expectedSlots := []int64{1, 1, 8}
-	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	// Status {0,1} needs one bit and Type 1..2 two, so with the 27-bit version slot the layout takes
+	// 30 of an int's 32 bits.
+	expectedSlots := []int64{1, 2, 27}
+	if !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
 	}
 	if view.column.GetType().DBType != "int" {
 		t.Fatalf("expected an int packed column, got %v", view.column.GetType().DBType)
@@ -88,8 +89,8 @@ func TestDeltaViewSizesSlotsFromFixedValues(t *testing.T) {
 	}
 }
 
-// A wide leading slot overflows int32 even though the digit count is unchanged, because only the
-// most significant slot's magnitude decides the fit.
+// Keys whose slots sum past the int's 32 bits spill to a bigint. Only the sum counts: every slot is
+// a whole number of bits, so no key order would have fit.
 type deltaWideLeadRecord struct {
 	TableStruct[deltaWideLeadSchema, deltaWideLeadRecord]
 	CompanyID      int32 `db:"company_id"`
@@ -116,9 +117,9 @@ func (e deltaWideLeadSchema) GetSchema() TableSchema {
 		Keys:      Cols(e.ID),
 		FixedValues: []FixedValues{
 			{Col: e.Status, Values: []int64{0, 1}},
-			{Col: e.Type, Min: 1, Max: 2},
+			{Col: e.Type, Min: 1, Max: 100},
 		},
-		// Type leads, so the maximum packed value is 2_1_99999999 — past the int32 ceiling.
+		// Type 1..100 takes 7 bits: 7 + 1 + the 27-bit version is 35, past the int's 32.
 		Indexes: []Index{{Type: TypeDelta, Keys: Cols(e.Type, e.Status)}},
 	}
 }
@@ -132,10 +133,10 @@ func TestDeltaViewFallsBackToBigintAndWidensUpdated(t *testing.T) {
 	if view.column.GetType().DBType != "bigint" {
 		t.Fatalf("expected a bigint packed column when the leading slot overflows, got %v", view.column.GetType().DBType)
 	}
-	// The extra digits are already paid for, so they are spent on sequence headroom.
-	expectedSlots := []int64{1, 1, 10}
-	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	// The extra bits are already paid for, so they are spent on sequence headroom.
+	expectedSlots := []int64{7, 1, 34}
+	if !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
 	}
 }
 
@@ -173,11 +174,11 @@ func TestDeltaViewMatchesEquivalentDecoratedTypeView(t *testing.T) {
 	scyllaTable := MakeScyllaTable[deltaSingleKeyRecord, deltaSingleKeySchema]()
 	view := deltaPackedView(t, scyllaTable)
 
-	// A single declared key plus the 8-digit version slot resolves to the same [1, 8] layout the
-	// hand-decorated TypeView produced.
-	expectedSlots := []int64{1, 8}
-	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	// A single declared key plus the 27-bit version slot resolves to the same [2, 27] layout a
+	// hand-decorated TypeView would produce.
+	expectedSlots := []int64{2, 27}
+	if !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
 	}
 	if view.column.GetType().DBType != "int" {
 		t.Fatalf("expected an int packed column, got %v", view.column.GetType().DBType)
@@ -187,8 +188,8 @@ func TestDeltaViewMatchesEquivalentDecoratedTypeView(t *testing.T) {
 	}
 }
 
-// A key with no FixedValues and no DecimalSize absorbs the digit remainder instead of being
-// rejected: the layout goes bigint and the version slot pins to deltaVersionDigitsElastic.
+// A key with no FixedValues and no Size absorbs the bit remainder instead of being
+// rejected: the layout goes bigint and the version slot pins to deltaVersionBitsElastic.
 type deltaElasticRecord struct {
 	TableStruct[deltaElasticSchema, deltaElasticRecord]
 	CompanyID      int32 `db:"company_id"`
@@ -214,12 +215,12 @@ func (e deltaElasticSchema) GetSchema() TableSchema {
 		Partition:   e.CompanyID,
 		Keys:        Cols(e.ID),
 		FixedValues: []FixedValues{{Col: e.Status, Values: []int64{0, 1}}},
-		// ListID has no declared ceiling, so it takes every digit the others leave over.
+		// ListID has no declared ceiling, so it takes every bit the others leave over.
 		Indexes: []Index{{Type: TypeDelta, Keys: Cols(e.Status, e.ListID)}},
 	}
 }
 
-func TestDeltaViewLetsAnUndeclaredKeyAbsorbTheDigitRemainder(t *testing.T) {
+func TestDeltaViewLetsAnUndeclaredKeyAbsorbTheBitRemainder(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[deltaElasticRecord, deltaElasticSchema]()
@@ -228,14 +229,14 @@ func TestDeltaViewLetsAnUndeclaredKeyAbsorbTheDigitRemainder(t *testing.T) {
 	if view.column.GetType().DBType != "bigint" {
 		t.Fatalf("expected a bigint packed column for an elastic layout, got %v", view.column.GetType().DBType)
 	}
-	// 1 digit for the declared Status, 9 for the version, and the remaining 8 of the 18-digit
-	// int64 budget for ListID.
-	expectedSlots := []int64{1, 8, 9}
-	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	// 1 bit for the declared Status, 30 for the version, and the remaining 33 of the 64-bit budget
+	// for ListID.
+	expectedSlots := []int64{1, 33, 30}
+	if !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
 	}
-	if scyllaTable.maxDeltaVersionValue != 999_999_999 {
-		t.Fatalf("expected the 9-digit version ceiling, got %v", scyllaTable.maxDeltaVersionValue)
+	if scyllaTable.maxDeltaVersionValue != 1<<30-1 {
+		t.Fatalf("expected the 30-bit version ceiling, got %v", scyllaTable.maxDeltaVersionValue)
 	}
 }
 
@@ -273,10 +274,10 @@ func TestDeltaViewSizesALoneElasticKey(t *testing.T) {
 	scyllaTable := MakeScyllaTable[deltaElasticLeadRecord, deltaElasticLeadSchema]()
 	view := deltaPackedView(t, scyllaTable)
 
-	// Nothing else claims a slot, so ListID takes 9 of the 18 digits and the version takes 9.
-	expectedSlots := []int64{9, 9}
-	if !slices.Equal(view.packedSlotDigitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotDigitsPerColumn)
+	// Nothing else claims a slot, so ListID takes 34 of the 64 bits and the version takes 30.
+	expectedSlots := []int64{34, 30}
+	if !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
 	}
 }
 
@@ -324,7 +325,7 @@ func TestDeltaViewWithNoKeysIsAPlainUpdatedVersionView(t *testing.T) {
 	if watermarkView == nil {
 		t.Fatal("expected a view keyed on updated_version")
 	}
-	// No digit slot means no trimming, so writes keep the column's full range.
+	// No bit slot means no ceiling, so writes keep the column's full range.
 	if scyllaTable.maxDeltaVersionValue != 0 {
 		t.Fatalf("expected no version ceiling for an unpacked delta view, got %v", scyllaTable.maxDeltaVersionValue)
 	}
@@ -433,7 +434,7 @@ func TestDeltaViewRejectsForcedInt32ThatDoesNotFit(t *testing.T) {
 		if recovered == nil {
 			t.Fatal("expected a panic when .Int32() cannot hold the declared ranges")
 		}
-		if !strings.Contains(fmt.Sprint(recovered), "2147483647") {
+		if !strings.Contains(fmt.Sprint(recovered), "cannot pack into an int32") {
 			t.Fatalf("expected the panic to report the int32 limit, got: %v", recovered)
 		}
 	}()
@@ -443,9 +444,16 @@ func TestDeltaViewRejectsForcedInt32ThatDoesNotFit(t *testing.T) {
 
 // ─── Delta() query shape ───────────────────────────────────────────────────────
 
+// packDeltaValue packs a full key the way the view stores it, sign bit flipped.
 func packDeltaValue(t *testing.T, view *viewInfo, componentValues ...int64) int64 {
 	t.Helper()
-	return computePackedInt64ValueNonNegative(componentValues, view.packedSlotDigitsPerColumn)
+	return convertToInt64(storeVirtualPacked(db.PackSlotValues(componentValues, view.packedSlotBitsPerColumn), view.packedIsInt32))
+}
+
+// packDeltaUpperBound is the stored inclusive upper bound of the block a prefix pins.
+func packDeltaUpperBound(t *testing.T, view *viewInfo, prefixValues ...int64) int64 {
+	t.Helper()
+	return convertToInt64(storeVirtualPacked(db.PackSlotPrefixBound(prefixValues, view.packedSlotBitsPerColumn, true), view.packedIsInt32))
 }
 
 func TestDeltaFirstSyncPinsFilterColumn(t *testing.T) {
@@ -469,7 +477,7 @@ func TestDeltaFirstSyncPinsFilterColumn(t *testing.T) {
 	// version 1 rather than 0 because Delta() is exclusive, and no record ever carries version 0.
 	expectedValues := []any{
 		packDeltaValue(t, view, 1, 2, 1),
-		packDeltaValue(t, view, 1, 2, 0) + 100_000_000,
+		packDeltaUpperBound(t, view, 1, 2),
 	}
 	assertClauseValues(t, whereStatements[0], expectedValues)
 }
@@ -485,19 +493,18 @@ func TestDeltaSyncFansOutOverEveryDeclaredValue(t *testing.T) {
 	query := Query[deltaViewRecord, deltaViewSchema](&records)
 	query.CompanyID.Equals(7)
 	query.Type.Equals(int8(2))
-	query.Delta(390_698_501, 1)
+	query.Delta(98_698_501, 1)
 
 	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
 	// Both declared Status values are scanned so rows flipped to 0 still reach the client.
 	if len(whereStatements) != 2 {
 		t.Fatalf("expected one range clause per declared status, got %d", len(whereStatements))
 	}
-	// The watermark is trimmed to the 8-digit slot, which floors it onto its 20-second bucket.
-	trimmedWatermark := trimRightToDigitsNonNegative(390_698_501, 8)
+	// Delta() is exclusive, so the scan starts one version past the watermark.
 	for statusIndex, statusValue := range []int64{0, 1} {
 		expectedValues := []any{
-			packDeltaValue(t, view, statusValue, 2, trimmedWatermark),
-			packDeltaValue(t, view, statusValue, 2, 0) + 100_000_000,
+			packDeltaValue(t, view, statusValue, 2, 98_698_502),
+			packDeltaUpperBound(t, view, statusValue, 2),
 		}
 		assertClauseValues(t, whereStatements[statusIndex], expectedValues)
 	}
@@ -611,7 +618,7 @@ func (e deltaMultiShapeSchema) GetSchema() TableSchema {
 		Keys:        Cols(e.ID),
 		FixedValues: []FixedValues{{Col: e.Status, Values: []int64{0, 1}}},
 		Indexes: []Index{
-			{Type: TypeDelta, Keys: Cols(e.WarehouseID.DecimalSize(5), e.Status)},
+			{Type: TypeDelta, Keys: Cols(e.WarehouseID.Size(17), e.Status)},
 			{Type: TypeDelta, Keys: Cols(e.Status)},
 		},
 	}
@@ -785,16 +792,14 @@ func TestPackedViewServesLeadingKeyAlone(t *testing.T) {
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one prefix range, got %d", len(whereStatements))
 	}
-	// Status = 1 spans every Type and every version. The block ends at 2_0_00000000, but no row can
-	// pack past the declared maximum, so the bound is capped there — which also keeps it inside the
-	// int packed column.
+	// Status = 1 spans every Type slot value and every version: the inclusive block [1_0_0, 1_3_max].
 	assertClauseValues(t, whereStatements[0], []any{
 		packDeltaValue(t, view, 1, 0, 0),
-		packDeltaValue(t, view, 1, 2, 99_999_999) + 1,
+		packDeltaUpperBound(t, view, 1),
 	})
 }
 
-func TestPackedViewCapsUpperBoundAtTheColumnCeiling(t *testing.T) {
+func TestPackedViewUpperBoundIsTheLayoutMaximum(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
@@ -804,20 +809,17 @@ func TestPackedViewCapsUpperBoundAtTheColumnCeiling(t *testing.T) {
 	records := []deltaViewRecord{}
 	query := Query[deltaViewRecord, deltaViewSchema](&records)
 	query.CompanyID.Equals(7)
-	// A range on the leading key spans the whole packed width, whose natural exclusive bound is
-	// 10^10 — past what an int column holds.
+	// A range on the leading key spans the whole packed width. Its inclusive upper bound is every
+	// slot at its max, bound as an int32 so it fits the int packed column.
 	query.Status.GreaterEqual(int8(1))
 
 	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one range clause, got %d", len(whereStatements))
 	}
-	upperBound := whereStatements[0].Values[len(whereStatements[0].Values)-1].(int64)
-	if upperBound > math.MaxInt32 {
-		t.Fatalf("upper bound %d does not fit the int packed column", upperBound)
-	}
-	if upperBound != packDeltaValue(t, view, 1, 2, 99_999_999)+1 {
-		t.Fatalf("expected the bound capped at the declared maximum, got %d", upperBound)
+	upperBound, isInt32 := whereStatements[0].Values[len(whereStatements[0].Values)-1].(int32)
+	if !isInt32 || int64(upperBound) != packDeltaUpperBound(t, view) {
+		t.Fatalf("expected the int32 layout maximum as the upper bound, got %v", whereStatements[0].Values)
 	}
 }
 
@@ -840,7 +842,7 @@ func TestPackedViewServesTwoColumnPrefix(t *testing.T) {
 	}
 	assertClauseValues(t, whereStatements[0], []any{
 		packDeltaValue(t, view, 1, 2, 0),
-		packDeltaValue(t, view, 1, 3, 0),
+		packDeltaUpperBound(t, view, 1, 2),
 	})
 }
 
@@ -882,7 +884,7 @@ func TestPackedViewKeepsBetweenOnTrailingKey(t *testing.T) {
 	}
 	assertClauseValues(t, whereStatements[0], []any{
 		packDeltaValue(t, view, 1, 2, 10_000_000),
-		packDeltaValue(t, view, 1, 2, 20_000_000) + 1,
+		packDeltaValue(t, view, 1, 2, 20_000_000),
 	})
 }
 
@@ -1016,8 +1018,13 @@ func TestFixedValueFanoutFillsAGapInThePackedKeyPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected bind error: %v", err)
 	}
-	// Slots are [1,1,8], so status s with type 1 spans [s*10^9 + 10^8, s*10^9 + 2*10^8).
-	expectedRanges := [][2]int64{{100_000_000, 200_000_000}, {1_100_000_000, 1_200_000_000}}
+	// Status s with type 1 spans the inclusive block [s_1_0, s_1_max].
+	view := deltaPackedView(t, scyllaTable)
+	expectedRanges := [][2]int64{}
+	for _, statusValue := range []int64{0, 1} {
+		expectedRanges = append(expectedRanges,
+			[2]int64{packDeltaValue(t, view, statusValue, 1, 0), packDeltaUpperBound(t, view, statusValue, 1)})
+	}
 	if !slices.Equal(boundPackedRanges(t, boundPlan), expectedRanges) {
 		t.Fatalf("expected packed ranges %v, got %v", expectedRanges, boundPackedRanges(t, boundPlan))
 	}
@@ -1103,9 +1110,17 @@ func TestFixedValueFanoutUsesTheDeclaredListNotItsSpan(t *testing.T) {
 	if len(boundPlan.Statements) != 3 {
 		t.Fatalf("expected 3 fanned-out queries, got %d", len(boundPlan.Statements))
 	}
-	// A status reaching 9 pushes the layout to a bigint, so the version slot widens to 10 digits.
-	expectedRanges := [][2]int64{{10_000_000_000, 20_000_000_000}, {510_000_000_000, 520_000_000_000},
-		{910_000_000_000, 920_000_000_000}}
+	// A status reaching 9 needs 4 bits, which pushes the layout past the int's 32 bits to a bigint,
+	// so the version slot widens to 34 bits.
+	view := deltaPackedView(t, scyllaTable)
+	if !slices.Equal(view.packedSlotBitsPerColumn, []int64{4, 2, 34}) {
+		t.Fatalf("expected slot widths [4 2 34], got %v", view.packedSlotBitsPerColumn)
+	}
+	expectedRanges := [][2]int64{}
+	for _, statusValue := range []int64{0, 5, 9} {
+		expectedRanges = append(expectedRanges,
+			[2]int64{packDeltaValue(t, view, statusValue, 1, 0), packDeltaUpperBound(t, view, statusValue, 1)})
+	}
 	if !slices.Equal(boundPackedRanges(t, boundPlan), expectedRanges) {
 		t.Fatalf("expected packed ranges %v, got %v", expectedRanges, boundPackedRanges(t, boundPlan))
 	}

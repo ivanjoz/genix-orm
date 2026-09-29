@@ -47,13 +47,13 @@ type ColumnInfo struct {
 	// column type in CompileFastAccessors.
 	GetValueStringFn func(ptr unsafe.Pointer) string
 	FieldsEqualFn    func(a, b unsafe.Pointer) bool
-	// DecimalDigits is the digit width this column occupies inside a packed key. It
-	// is named for the field rather than the Col.DecimalSize(n) setter because Go
-	// forbids a field and a method sharing one name.
-	DecimalDigits int8
-	// AutoincrementRandDigits is the number of trailing digits of a generated ID
-	// filled with randomness, so IDs are non-consecutive and collide less often.
-	AutoincrementRandDigits int8
+	// SlotBits is the bit width this column occupies inside a packed key, set by
+	// Col.Size(n). Go forbids a field and a method sharing one name.
+	SlotBits int8
+	// AutoincrementRandBits is the number of low bits of a generated ID filled with
+	// randomness, so IDs are non-consecutive and collide less often. -1 means an
+	// autoincrement with no random suffix; 0 means no autoincrement.
+	AutoincrementRandBits int8
 	CompositeBucketSizes    []int8
 	IsWeek                  bool
 	UseInt32Packing         bool
@@ -104,8 +104,8 @@ type IColInfo interface {
 	IsNil() bool
 	// SetAutoincrementRandSize sets the random suffix size for autoincrement columns
 	SetAutoincrementRandSize(size int8)
-	// SetDecimalSize sets the decimal size for KeyIntPacking columns
-	SetDecimalSize(size int8)
+	// SetSlotBits sets the packed-key slot width for KeyIntPacking columns
+	SetSlotBits(bits int8)
 }
 
 func (c *ColumnInfo) GetValue(ptr unsafe.Pointer) any {
@@ -204,9 +204,9 @@ func (c *ColumnInfo) IsNil() bool {
 }
 
 func (c *ColumnInfo) SetAutoincrementRandSize(size int8) {
-	c.AutoincrementRandDigits = size
+	c.AutoincrementRandBits = size
 }
 
-func (c *ColumnInfo) SetDecimalSize(size int8) {
-	c.DecimalDigits = size
+func (c *ColumnInfo) SetSlotBits(bits int8) {
+	c.SlotBits = bits
 }

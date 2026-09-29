@@ -1,4 +1,49 @@
-## The backup exports colbin batches, and the CSV byte helpers it stopped calling stayed
+## Packed range bounds are inclusive (`<=` the max-filled prefix), not exclusive (`<` next block)
+
+**Context** — with bit slots, a virtual packed column can use all 64 bits. The old exclusive upper
+bound `prefix + 10^remaining` becomes `prefix + 2^remaining`, which reaches `2^64` on a full-width
+scan and wraps. The decimal code dodged this by capping layouts at 18 digits and clamping the bound
+(`clampPackedUpperBound`, `maxPackedValue`).
+
+**Decision** — every range builder (range/delta views, GroupBy, KeyIntPacking) now emits
+`>= lower AND <= upper`, with `upper = db.PackSlotPrefixBound(prefix, slots, fillWithMax=true)`.
+GroupBy's `>`/`<=` bind the max-filled bound and `>=`/`<` the zero-filled one, so no bound adds 1
+to a slot value. The clamp helpers and `deltaSlotPlan.maxPackedValue` are gone. KeyIntPacking's
+BETWEEN also loses an off-by-one: it used to bind the exclusive end inside an inclusive BETWEEN.
+
+**Rationale** — an inclusive bound can never overflow, so the full 64 bits need no special case.
+The cost: generated CQL text changes from `< ?` to `<= ?`, so any prepared-statement cache keyed on
+the old text is cold on the first deploy.
+
+## A query value that does not fit its slot panics, the same as a write
+
+**Context** — the range-cap rule you chose ("Size(n) means < 2^n, panic on overflow") was stated
+for writes. Query bounds used to be silently trimmed, like writes were.
+
+**Decision** — `db.PackSlotPrefixBound` panics for any value outside its slot, whether it comes
+from a record or from a predicate (`Equals`, `Between`, `Delta` watermark).
+
+**Rationale** — clamping an equality value would return another key's rows, and there is no
+packed value that means "match nothing", so failing loudly is the only exact option. The cost: a
+handler that passes an unvalidated client value into a packed-key predicate now panics instead of
+returning wrong rows. Handlers must validate ranges, which they are required to do anyway.
+
+## Delta views drop the key-order hint and the FixedValues ceiling guard
+
+**Context** — in decimal, the leading slot's non-power-of-ten ceiling decided whether a Delta view
+fit an int, so `logDeltaInt32KeyOrderHint` looked for a reordering that would fit, and the write
+path checked each packed value against `maxPackedValue`.
+
+**Decision** — both are deleted, along with `moveToFront`. A declared key takes
+`max(1, bits.Len64(max))` bits (a `Values{0}` column still gets one bit), and the int32 decision is
+`sum(slots) + 27 <= 32`.
+
+**Rationale** — with whole-bit slots only the sum counts, so no reordering can change the fit. The
+per-slot overflow panic in `packRowValues` replaces the ceiling guard, because a value can no
+longer spill into a neighbouring slot. The cost: a value above its FixedValues max but inside its
+slot (e.g. 7 for a 0..6 column in a 3-bit slot) is now accepted silently. It still packs to a
+valid key; it just isn't a declared value.
+
 
 **Context** — `exportToCSV` / `CsvToRecords` were the whole backup codec: a pipe-separated,
 base64-per-value text format with a `name:type` header, built when the ORM had no record encoder of

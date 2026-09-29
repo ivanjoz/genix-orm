@@ -458,7 +458,7 @@ func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 //     AutoincrementPart (its counters are per part value) had its real counters
 //     missed and a phantom one written instead;
 //   - the target was max(key) itself, but a key is the counter *packed* with random
-//     digits and any KeyIntPacking columns, so the figure was orders of magnitude
+//     bits and any KeyIntPacking columns, so the figure was orders of magnitude
 //     too large;
 //   - it skipped every table with no autoincrement column, which since the sale and
 //     document ids became caller-built is both of the tables anyone would want to
@@ -471,7 +471,7 @@ func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
 // TODO: implement it against the counter, not the key. A correct version needs the
 // counter name built the way the insert path builds it (per AutoincrementPart value,
 // which means enumerating the parts present in the partition), and a target that
-// divides out AutoincrementRandDigits and any KeyIntPacking width. Callers that mint
+// divides out AutoincrementRandBits and any KeyIntPacking width. Callers that mint
 // ids themselves — anything using db.GetAutoincrementID with its own counter name —
 // have to be reset by name, which no table-driven walk can discover. applyCounterReset
 // below is the primitive to build on; it already routes through the allocator so a

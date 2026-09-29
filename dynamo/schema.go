@@ -95,7 +95,7 @@ func (c *Col[T, E]) infoPtr() *colMeta { return &c.info }
 
 // Base sets the order-preserving Base64 width (number of base64 characters, 6
 // bits each) reserved for this numeric column when it is packed into a composite
-// key. It is the DynamoDB analogue of genix's DecimalSize: it fixes the column's
+// key. It is the DynamoDB analogue of genix's Size(bits): it fixes the column's
 // slot width so concatenated keys stay sortable. Widths are 1..11 (11 covers a
 // full uint64). Only valid on integer columns.
 func (c Col[T, E]) Base(width int) Col[T, E] {

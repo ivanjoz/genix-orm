@@ -354,17 +354,20 @@ func (e *TableStruct[D, T, E]) AllowFilter() *T {
 	return e.schemaStruct
 }
 
-// Autoincrement declares the table's key as generated. randDecimalSize is a random
-// value appended to the counter to avoid taking the same value under high
-// concurrency: if 3, an ID of 100 becomes something like 100567.
-func (e *TableStruct[D, T, E]) Autoincrement(randDecimalSize int8) Coln {
-	if randDecimalSize > 8 {
-		panic("randDecimalSize TOO BIG.")
+// maxAutoincrementRandBits caps the random suffix so the sequence keeps most of its slot.
+const maxAutoincrementRandBits = 26
+
+// Autoincrement declares the table's key as generated. randSuffixBits random low bits
+// follow the counter so concurrent writers rarely take the same value: with 8, sequence
+// 100 becomes 100<<8 | random(0..255).
+func (e *TableStruct[D, T, E]) Autoincrement(randSuffixBits int8) Coln {
+	if randSuffixBits > maxAutoincrementRandBits {
+		panic(fmt.Sprintf("Autoincrement(%v): the random suffix is capped at %v bits", randSuffixBits, maxAutoincrementRandBits))
 	}
 	// Routing through synthetic.GetInfo() rather than building a ColumnInfo directly preserves
 	// today's ColType resolution exactly, including the fact that E here is the record type,
 	// not a column value type.
-	synthetic := Col[T, E]{colCore: colCore{info: ColumnInfo{AutoincrementRandDigits: randDecimalSize}}}
+	synthetic := Col[T, E]{colCore: colCore{info: ColumnInfo{AutoincrementRandBits: randSuffixBits}}}
 	return colRef{synthetic.GetInfo()}
 }
 
@@ -492,8 +495,8 @@ func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
 			if column1, ok1 := fieldAddr.Interface().(Coln); ok1 {
 				// Transfer properties from Col if they were set
 				if c, ok := any(column1).(*Col[T, E]); ok {
-					colInfo.DecimalDigits = c.info.DecimalDigits
-					colInfo.AutoincrementRandDigits = c.info.AutoincrementRandDigits
+					colInfo.SlotBits = c.info.SlotBits
+					colInfo.AutoincrementRandBits = c.info.AutoincrementRandBits
 					colInfo.UseInt32Packing = c.info.UseInt32Packing
 				}
 

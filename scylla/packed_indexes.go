@@ -53,10 +53,9 @@ func registerPackedIndex(
 
 	sourceColumns := make([]IColInfo, 0, len(indexColumns))
 	sourceColumnNames := make([]string, 0, len(indexColumns))
-	slotDigitsPerColumn := make([]int64, 0, len(indexColumns))
+	slotBitsPerColumn := make([]int64, 0, len(indexColumns))
 
 	isInt32Packed := false
-	totalDigits := int64(19)
 
 	for columnIndex, indexColumnConfig := range indexColumns {
 		configInfo := indexColumnConfig.GetInfo()
@@ -71,44 +70,30 @@ func registerPackedIndex(
 
 		if configInfo.UseInt32Packing {
 			isInt32Packed = true
-			totalDigits = 9
 		}
 
-		// DecimalSize rules:
-		// - First component MUST NOT set DecimalSize() (its width is implied by remaining digit budget).
-		// - All remaining components MUST set DecimalSize().
-		if columnIndex == 0 && configInfo.DecimalDigits > 0 {
-			panic(fmt.Sprintf(`Table "%v": %v first column "%v" must not set DecimalSize()`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
+		// Size rules:
+		// - First component MUST NOT set Size() (it takes the bits the others leave).
+		// - All remaining components MUST set Size().
+		if columnIndex == 0 && configInfo.SlotBits > 0 {
+			panic(fmt.Sprintf(`Table "%v": %v first column "%v" must not set Size()`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
 		}
-		if columnIndex > 0 && configInfo.DecimalDigits <= 0 {
-			panic(fmt.Sprintf(`Table "%v": %v requires DecimalSize() for column "%v" (all columns after the first must set DecimalSize)`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
+		if columnIndex > 0 && configInfo.SlotBits <= 0 {
+			panic(fmt.Sprintf(`Table "%v": %v requires Size() for column "%v" (all columns after the first must set Size)`, dbTable.Name, cfg.schemaFieldName, configInfo.Name))
 		}
 
 		sourceColumns = append(sourceColumns, column)
 		sourceColumnNames = append(sourceColumnNames, column.GetName())
-		slotDigitsPerColumn = append(slotDigitsPerColumn, int64(configInfo.DecimalDigits)) // first column set after digit budget calc
+		slotBitsPerColumn = append(slotBitsPerColumn, int64(configInfo.SlotBits)) // first column set after the budget calc
 	}
 
-	sumTrailingDigits := int64(0)
-	for i := 1; i < len(slotDigitsPerColumn); i++ {
-		sumTrailingDigits += slotDigitsPerColumn[i]
+	budgetBits := packedVirtualBudgetBits(isInt32Packed)
+	firstSlotBits := budgetBits - sumSlotBits(slotBitsPerColumn, 1)
+	if firstSlotBits <= 0 {
+		panic(fmt.Sprintf(`Table "%v": %v trailing Size() slots take all %v bits, leaving none for "%v"`,
+			dbTable.Name, cfg.schemaFieldName, budgetBits, sourceColumnNames[0]))
 	}
-
-	if isInt32Packed {
-		if sumTrailingDigits > 8 {
-			panic(fmt.Sprintf(`Table "%v": int32 packed %v requires sum(DecimalSize(columns[1:])) <= 8. Got: %v`, dbTable.Name, cfg.schemaFieldName, sumTrailingDigits))
-		}
-	} else {
-		if sumTrailingDigits > 18 {
-			panic(fmt.Sprintf(`Table "%v": int64 packed %v requires sum(DecimalSize(columns[1:])) <= 18. Got: %v`, dbTable.Name, cfg.schemaFieldName, sumTrailingDigits))
-		}
-	}
-
-	firstSlotDigits := totalDigits - sumTrailingDigits
-	if firstSlotDigits <= 0 {
-		panic(fmt.Sprintf(`Table "%v": %v invalid digit budget: totalDigits=%v sumTrailingDigits=%v`, dbTable.Name, cfg.schemaFieldName, totalDigits, sumTrailingDigits))
-	}
-	slotDigitsPerColumn[0] = firstSlotDigits
+	slotBitsPerColumn[0] = firstSlotBits
 
 	virtualPackedColName := fmt.Sprintf("%s%s", cfg.virtualColumnPrefix, strings.Join(sourceColumnNames, "_"))
 	if _, exists := dbTable.ColumnsMap[virtualPackedColName]; exists {
@@ -121,7 +106,7 @@ func registerPackedIndex(
 	}
 
 	sourceColumnsLocal := slices.Clone(sourceColumns)
-	slotDigitsLocal := slices.Clone(slotDigitsPerColumn)
+	slotBitsLocal := slices.Clone(slotBitsPerColumn)
 	isInt32PackedLocal := isInt32Packed
 
 	virtualPackedColumn := &columnInfo{
@@ -136,22 +121,10 @@ func registerPackedIndex(
 	virtualPackedColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
 		componentValues := make([]int64, 0, len(sourceColumnsLocal))
 		for _, sourceColumn := range sourceColumnsLocal {
-			valueI64 := convertToInt64(sourceColumn.GetRawValue(ptr))
-			if valueI64 < 0 {
-				panic(fmt.Sprintf(`Table "%v": packed %v column "%v" produced negative value %d`, dbTable.Name, cfg.schemaFieldName, sourceColumn.GetName(), valueI64))
-			}
-			componentValues = append(componentValues, valueI64)
+			componentValues = append(componentValues, convertToInt64(sourceColumn.GetRawValue(ptr)))
 		}
-
-		packed := computePackedInt64ValueNonNegative(componentValues, slotDigitsLocal)
-		if !isInt32PackedLocal {
-			return any(packed)
-		}
-
-		// Keep stored packed int within int32 constraints by trimming on the right side.
-		// Reads must post-filter for exact semantics because trimming can overfetch.
-		packedTrimmed := trimRightToDigitsNonNegative(packed, 9)
-		return any(int32(packedTrimmed))
+		packed := packRowValues(dbTable.Name, virtualPackedColName, sourceColumnsLocal, componentValues, slotBitsLocal)
+		return storeVirtualPacked(packed, isInt32PackedLocal)
 	}
 	virtualPackedColumn.GetValueFn = virtualPackedColumn.GetRawValueFn
 
@@ -193,8 +166,7 @@ func registerPackedIndex(
 			packedColumnName:    virtualPackedColName,
 			sourceColumnNames:   slices.Clone(sourceColumnNames),
 			partitionColumnName: partitionName,
-			slotDigitsPerColumn: slices.Clone(slotDigitsPerColumn),
-			totalDigits:         totalDigits,
+			slotBitsPerColumn:   slices.Clone(slotBitsPerColumn),
 			isInt32Packed:       isInt32Packed,
 		})
 
@@ -208,8 +180,7 @@ func registerPackedIndex(
 			packedColumnName:    virtualPackedColName,
 			sourceColumnNames:   slices.Clone(sourceColumnNames),
 			partitionColumnName: "",
-			slotDigitsPerColumn: slices.Clone(slotDigitsPerColumn),
-			totalDigits:         totalDigits,
+			slotBitsPerColumn:   slices.Clone(slotBitsPerColumn),
 			isInt32Packed:       isInt32Packed,
 		})
 	default:
@@ -264,28 +235,13 @@ func registerPackedIndex(
 			return nil
 		}
 
-		finalizePackedForStorageType := func(packed int64) int64 {
-			if !isInt32PackedLocal {
-				return packed
-			}
-			return trimRightToDigitsNonNegative(packed, 9)
-		}
-
+		// The range column is the last slot, so a bound packs exactly. A one-sided bound still spills
+		// into the neighbouring prefixes, which the post-filter drops (RequiresPostFilter).
 		emitRangeClause := func(prefixValues []int64, operator string, boundValue int64) boundWhereClause {
-			componentValues := append(slices.Clone(prefixValues), boundValue)
-			packed := finalizePackedForStorageType(computePackedInt64ValueNonNegative(componentValues, slotDigitsLocal))
-
-			// Truncation can widen the physical bound, so keep the ORM exact with post-filtering.
-			switch operator {
-			case ">":
-				operator = ">="
-			case "<":
-				operator = "<="
-			}
-
+			packed := db.PackSlotValues(append(slices.Clone(prefixValues), boundValue), slotBitsLocal)
 			return boundWhereClause{
 				Clause: fmt.Sprintf("%v %v ?", packedColumnNameLocal, operator),
-				Values: []any{packed},
+				Values: []any{storeVirtualPacked(packed, isInt32PackedLocal)},
 			}
 		}
 
@@ -293,12 +249,7 @@ func registerPackedIndex(
 		for _, prefixValues := range prefixValueGroups {
 			switch lastStatement.Operator {
 			case "=":
-				componentValues := append(slices.Clone(prefixValues), convertToInt64(lastStatement.Value))
-				packed := finalizePackedForStorageType(computePackedInt64ValueNonNegative(componentValues, slotDigitsLocal))
-				whereStatements = append(whereStatements, boundWhereClause{
-					Clause: fmt.Sprintf("%v = ?", packedColumnNameLocal),
-					Values: []any{packed},
-				})
+				whereStatements = append(whereStatements, emitRangeClause(prefixValues, "=", convertToInt64(lastStatement.Value)))
 			case "BETWEEN":
 				if len(lastStatement.From) == 0 || len(lastStatement.To) == 0 {
 					return nil
@@ -324,6 +275,6 @@ func registerPackedIndex(
 	*idxCount = *idxCount + 1
 	dbTable.indexes[index.name] = index
 
-	fmt.Printf("Packed index registered: table=%s scope=%v index=%s packedCol=%s isInt32=%v slotDigits=%v\n",
-		dbTable.Name, cfg.scope, index.name, virtualPackedColName, isInt32Packed, slotDigitsPerColumn)
+	fmt.Printf("Packed index registered: table=%s scope=%v index=%s packedCol=%s isInt32=%v slotBits=%v\n",
+		dbTable.Name, cfg.scope, index.name, virtualPackedColName, isInt32Packed, slotBitsPerColumn)
 }

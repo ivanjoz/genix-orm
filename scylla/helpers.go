@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"math/rand/v2"
 	"reflect"
 	"strings"
 	"unsafe"
@@ -287,21 +286,6 @@ func convertToInt32(val any) int32 {
 	}
 }
 
-func Pow10Int64(m int64) int64 {
-	if m == 0 {
-		return 1
-	}
-
-	if m == 1 {
-		return 10
-	}
-
-	number := int64(10)
-	for i := int64(2); i <= m; i++ {
-		number *= 10
-	}
-	return number
-}
 
 func Concatx[T any](sep string, slice1 []T) string {
 	sliceOfStrings := []string{}
@@ -357,12 +341,4 @@ func reflectToSliceValue(value any) []any {
 
 func Print(Struct any) {
 	pretty.Println(Struct)
-}
-
-func GetRandomInt64(digits int8) int64 {
-	if digits <= 0 {
-		return 0
-	}
-	max := Pow10Int64(int64(digits))
-	return rand.Int64N(max)
 }

@@ -22,10 +22,12 @@ type ScyllaTable struct {
 	ViewsExcluded       []string
 	keyConcatenated     []IColInfo
 	keyIntPacking       []IColInfo
+	// keyIntPackingSlotBits is the resolved bit layout of keyIntPacking (db.KeyIntPackingSlotBits).
+	keyIntPackingSlotBits []int64
 	// packedIndexes stores metadata for packed indexes declared in schema (local and global).
 	packedIndexes []*packedIndexInfo
 	// fixedValueRanges holds the schema's FixedValues per column name, which is what lets a
-	// TypeDelta view size each key's digit slot without a .DecimalSize() decorator.
+	// TypeDelta view size each key's bit slot without a .Size() decorator.
 	fixedValueRanges map[string]columnValueRange
 	// maxDeltaVersionValue is the widest "updated_version" the delta view's trailing slot can hold.
 	// Zero means the table declares no delta view and nothing needs checking.
@@ -96,8 +98,10 @@ type viewInfo struct {
 	availableColumns []string
 	// packedSourceColumns keeps the original key columns behind packed range views so grouped scans can decompose them back.
 	packedSourceColumns []IColInfo
-	// packedSlotDigitsPerColumn mirrors packedSourceColumns and is reused for prefix-range planning and scan decomposition.
-	packedSlotDigitsPerColumn []int64
+	// packedSlotBitsPerColumn mirrors packedSourceColumns and is reused for prefix-range planning and scan decomposition.
+	packedSlotBitsPerColumn []int64
+	// packedIsInt32 tells which storage encoding (storeVirtualPacked) the packed column uses.
+	packedIsInt32 bool
 	Operators                 []string
 	// RequiresPostFilter indicates the index/view can overfetch and should be exact-filtered in memory.
 	// Keep this for hash-style plans that intentionally trade exact routing for bounded overfetch.

@@ -314,7 +314,7 @@ func makePrimaryKeyRecordKey(ptr unsafe.Pointer, scyllaTable ScyllaTable) string
 }
 
 func recordMatchesPostFilter(ptr unsafe.Pointer, statements []ColumnStatement, scyllaTable ScyllaTable) bool {
-	// Final in-memory filtering guarantees exact semantics after overfetch (e.g. packed indexes with DecimalSize truncation).
+	// Final in-memory filtering guarantees exact semantics after overfetch (e.g. a one-sided packed index bound spilling into neighbouring prefixes).
 	for _, statement := range statements {
 		column := scyllaTable.ColumnsMap[statement.Col]
 		if column == nil {

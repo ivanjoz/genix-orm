@@ -158,7 +158,7 @@ func (e ProductTable) GetSchema() db.TableSchema {
         Name:      "products",
         Partition: e.EmpresaID,
         Keys:      db.Cols(e.ID.Autoincrement(0)),
-        // Declared value ranges let a TypeDelta index size its packed digit slots.
+        // Declared value ranges let a TypeDelta index size its packed bit slots.
         FixedValues: []db.FixedValues{
             {Col: e.Status, Values: []int64{0, 1}},
         },

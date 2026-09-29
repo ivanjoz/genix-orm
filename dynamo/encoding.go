@@ -23,9 +23,9 @@ import (
 //  2. An alphabet whose 64 characters are already in ascending ASCII order, so a
 //     bigger base-64 digit is also a bigger byte.
 //
-// This mirrors genix's packed-integer indexes (`DecimalSize` per column packed
-// into one sortable int64), but instead of packing into a 19-digit int64 we pack
-// into an arbitrary-length Base64 string — no 2^63 ceiling, and it lives happily
+// This mirrors genix's packed-integer indexes (`Size(bits)` per column packed
+// into one sortable int64), but instead of packing into a 64-bit integer we pack
+// into an arbitrary-length Base64 string — no 64-bit ceiling, and it lives happily
 // inside a DynamoDB string key.
 // ─────────────────────────────────────────────────────────────────────────────
 
