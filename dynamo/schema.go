@@ -173,7 +173,7 @@ type Schema struct {
 	// one sk across the base table and every GSI, this is also the range/order
 	// dimension for index queries. Numeric sort columns must declare .Base(n).
 	Sort []Coln
-	// Indexes map onto the physical GSI slots (N1, N2, S1, S2, S3).
+	// Indexes map onto the physical GSI slots (N1..N5, S1..S5).
 	Indexes []Index
 
 	// UseAutoincrement makes the ORM assign the record's integer "ID" field
@@ -191,23 +191,28 @@ type Schema struct {
 	AutoincrementRandomPadding int
 }
 
-// Slot identifies one of the five physical GSI attributes.
+// Slot identifies one of the ten physical GSI attributes.
 type Slot struct {
-	attr     string // "n1".."s3"
+	attr     string // "n1".."n5", "s1".."s5"
 	index    string // GSI name, e.g. "gsi-n1"
 	isNumber bool
 }
 
 var (
-	// N1, N2 are the numeric GSI slots (a single integer column, stored as a
+	// N1..N5 are the numeric GSI slots (a single integer column, stored as a
 	// native DynamoDB number — natively range-ordered).
 	N1 = Slot{attr: "n1", index: "gsi-n1", isNumber: true}
 	N2 = Slot{attr: "n2", index: "gsi-n2", isNumber: true}
-	// S1, S2, S3 are the string GSI slots (one column or a composite of several;
+	N3 = Slot{attr: "n3", index: "gsi-n3", isNumber: true}
+	N4 = Slot{attr: "n4", index: "gsi-n4", isNumber: true}
+	N5 = Slot{attr: "n5", index: "gsi-n5", isNumber: true}
+	// S1..S5 are the string GSI slots (one column or a composite of several;
 	// numeric components are order-preserving Base64 via .Base(n)).
 	S1 = Slot{attr: "s1", index: "gsi-s1"}
 	S2 = Slot{attr: "s2", index: "gsi-s2"}
 	S3 = Slot{attr: "s3", index: "gsi-s3"}
+	S4 = Slot{attr: "s4", index: "gsi-s4"}
+	S5 = Slot{attr: "s5", index: "gsi-s5"}
 )
 
 // Index maps a set of key columns onto one physical GSI slot.

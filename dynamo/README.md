@@ -24,15 +24,15 @@ non-key field is applied **in memory after decode** (see the planner below).
 ## The physical table it targets
 
 One table (`cloud/cloudformation.yml`): base key `pk`+`sk` (both strings) and
-five **sparse GSIs** that all share `sk` as their range key:
+ten **sparse GSIs** that all share `sk` as their range key:
 
-| Slot | Attribute | Type   |
-| ---- | --------- | ------ |
-| `N1` | `n1`      | Number |
-| `N2` | `n2`      | Number |
-| `S1` | `s1`      | String |
-| `S2` | `s2`      | String |
-| `S3` | `s3`      | String |
+| Slot         | Attribute    | Type   |
+| ------------ | ------------ | ------ |
+| `N1`..`N5`   | `n1`..`n5`   | Number |
+| `S1`..`S5`   | `s1`..`s5`   | String |
+
+Sparse means an item only enters a GSI when its schema fills that slot, so
+unused slots cost nothing.
 
 ## The core idea: order-preserving Base64
 

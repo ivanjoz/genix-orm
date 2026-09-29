@@ -37,7 +37,7 @@ type ColumnInfo struct {
 // IndexKind classifies an access path in a serialized schema.
 const (
 	IndexPrimary = "primary" // the base table's pk (+ shared sk range)
-	IndexGSI     = "gsi"     // a global secondary index slot (n1..s3)
+	IndexGSI     = "gsi"     // a global secondary index slot (n1..n5, s1..s5)
 )
 
 // IndexInfo describes one queryable access path: the base-table primary key or
@@ -48,7 +48,7 @@ const (
 type IndexInfo struct {
 	Kind          string       `json:"kind"`          // IndexPrimary | IndexGSI
 	Name          string       `json:"name"`          // GSI name ("gsi-n1"...) or "" for the primary key
-	Attr          string       `json:"attr"`          // partition attribute: "pk" or "n1".."s3"
+	Attr          string       `json:"attr"`          // partition attribute: "pk", "n1".."n5" or "s1".."s5"
 	IsNumber      bool         `json:"isNumber"`      // numeric slot (native DynamoDB number) vs string
 	SharesSortKey bool         `json:"sharesSortKey"` // uses the table's shared sk as its range key
 	Columns       []ColumnInfo `json:"columns"`       // the index's key columns, in order
