@@ -26,7 +26,7 @@ func (m *tableMeta) keyPartsFor(ptr unsafe.Pointer, cols []keyCol) []keyPart {
 		case kindString:
 			parts = append(parts, stringPart(kc.acc.getStr(ptr)))
 		case kindInt, kindUint:
-			parts = append(parts, numberPart(kc.acc.getU64(ptr), kc.base))
+			parts = append(parts, numberPart(kc.acc.getU64(ptr), kc.bits))
 		default:
 			panic(fmt.Sprintf("db: key column %q has unsupported type for a composite key", kc.fieldName))
 		}

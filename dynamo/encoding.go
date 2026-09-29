@@ -137,8 +137,17 @@ type keyPart struct {
 	width    int
 }
 
-func stringPart(s string) keyPart        { return keyPart{str: s} }
-func numberPart(v uint64, w int) keyPart { return keyPart{num: v, isNumber: true, width: w} }
+func stringPart(s string) keyPart { return keyPart{str: s} }
+
+// numberPart encodes v for a column declared .Size(bits): ceil(bits/6) Base64
+// digits. It checks v against the declared bits, not the rounded-up width, so
+// Size(32) rejects 2^32 even though its 6 digits could hold it.
+func numberPart(v uint64, bits int8) keyPart {
+	if bits < 64 && v>>bits != 0 {
+		panic(fmt.Sprintf("db: value %d overflows Size(%d) (max %d)", v, bits, uint64(1)<<bits-1))
+	}
+	return keyPart{num: v, isNumber: true, width: (int(bits) + 5) / 6}
+}
 
 // buildCompositeKey renders the parts into a single order-preserving string.
 func buildCompositeKey(parts []keyPart) string {

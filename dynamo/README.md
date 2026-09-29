@@ -43,8 +43,10 @@ which is what makes `BETWEEN` / `>` / `<` work on a string sort key.
 
 Two things make it work (`encoding.go`):
 
-1. **Fixed width** per column, declared with `.Base(n)` (n Base64 chars = 6·n
-   bits) — the DynamoDB analogue of genix's `Size(bits)`.
+1. **Fixed width** per column, declared with `.Size(bits)` (1..64, the same unit
+   as genix-orm/db's `Size(bits)`). The key stores `ceil(bits/6)` Base64 chars,
+   and values `>= 2^bits` are rejected: `Size(32)` is 6 chars that still cap at
+   2^32 - 1.
 2. An **alphabet in ascending ASCII order** (`-` `0-9` `A-Z` `_` `a-z`), so a
    bigger digit is also a bigger byte.
 
@@ -84,7 +86,7 @@ func (t ProductTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Entity:    "prod",                             // namespaces pk & string slots
         Partition: dynamo.Keys(t.Category),                // -> pk = "prod#coffee"
-        Sort:      dynamo.Keys(t.Created.Base(8), t.ID),   // -> sk, order-preserving
+        Sort:      dynamo.Keys(t.Created.Size(48), t.ID),  // -> sk, order-preserving
         Indexes: []dynamo.Index{
             {Slot: dynamo.N1, Keys: dynamo.Keys(t.Price)},     // numeric GSI (native number)
             {Slot: dynamo.S1, Keys: dynamo.Keys(t.Brand)},     // string GSI
@@ -97,7 +99,7 @@ Derived attributes per item (plus `d` = colbin blob of the whole record):
 
 ```
 pk = "prod#" + Category
-sk = EncodeOrderedUint(Created, 8) + "#" + ID
+sk = EncodeOrderedUint(Created, 8) + "#" + ID   (Size(48) = 8 Base64 chars)
 n1 = Price                        (native DynamoDB number)
 s1 = "prod#" + Brand
 d  = colbin.Marshal(product)      (binary)
@@ -122,8 +124,8 @@ type Invoice struct {
 func (t InvoiceTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Entity:                     "inv",
-        Partition:                  dynamo.Keys(t.ID.Base(8)),
-        Sort:                       dynamo.Keys(t.Created.Base(8)),
+        Partition:                  dynamo.Keys(t.ID.Size(48)),
+        Sort:                       dynamo.Keys(t.Created.Size(48)),
         UseAutoincrement:           true,   // fill ID on Put/PutMany when zero
         AutoincrementRandomPadding: 3,       // low 3 digits are random
     }
@@ -236,7 +238,7 @@ json.NewEncoder(w).Encode(schema)
   "tableName": "demo-app",      // physical DynamoDB table
   "partition": [{ "field": "Category", "attr": "Category", "type": "string" }],
   "sort": [
-    { "field": "Created", "attr": "Created", "type": "int", "base": 8 },
+    { "field": "Created", "attr": "Created", "type": "int", "size": 48 },
     { "field": "ID",      "attr": "ID",      "type": "string" }
   ],
   "indexes": [

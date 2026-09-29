@@ -28,10 +28,10 @@ type ColumnInfo struct {
 	Field string `json:"field"` // Go struct field name, e.g. "Category"
 	Attr  string `json:"attr"`  // DynamoDB attribute name (defaults to Field)
 	Type  string `json:"type"`  // value type: "string","int","uint","float","bool","other"
-	Base  int    `json:"base,omitempty"`
-	// Base is the order-preserving Base64 width (in 6-bit chars) reserved for
-	// this column when it is an integer packed into a composite string key
-	// (sort key or a string GSI). Zero for strings and for native-number slots.
+	Size  int8   `json:"size,omitempty"`
+	// Size is the declared bit size (.Size(bits)) of this column when it is an
+	// integer packed into a composite string key (sort key or a string GSI); the
+	// key holds ceil(Size/6) Base64 chars. Zero for strings and native-number slots.
 }
 
 // IndexKind classifies an access path in a serialized schema.
@@ -135,7 +135,7 @@ func describeCols(cols []Coln) []ColumnInfo {
 			Field: m.fieldName,
 			Attr:  m.attrName,
 			Type:  m.kind.String(),
-			Base:  m.base,
+			Size:  m.bits,
 		})
 	}
 	return out

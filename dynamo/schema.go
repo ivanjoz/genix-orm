@@ -1,6 +1,9 @@
 package dynamo
 
-import "reflect"
+import (
+	"fmt"
+	"reflect"
+)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Statically-typed schema declaration
@@ -28,7 +31,7 @@ import "reflect"
 //	    return db.Schema{
 //	        Entity:    "prod",
 //	        Partition: db.Keys(t.Category),                 // -> pk
-//	        Sort:      db.Keys(t.Created.Base(8), t.ID),    // -> sk (order-preserving)
+//	        Sort:      db.Keys(t.Created.Size(48), t.ID),   // -> sk (order-preserving)
 //	        Indexes: []db.Index{
 //	            {Slot: db.N1, Keys: db.Keys(t.Price)},      // numeric GSI
 //	            {Slot: db.S1, Keys: db.Keys(t.Category)},   // string GSI
@@ -58,7 +61,7 @@ type colMeta struct {
 	fieldName string    // Go struct field name, e.g. "Category"
 	attrName  string    // DynamoDB attribute name; defaults to fieldName
 	kind      valueKind // resolved from the column's value type
-	base      int       // order-preserving base64 width for numeric key columns
+	bits      int8      // declared bit size (1..64) for numeric key columns
 }
 
 // Coln is the type-erased column handle used inside schema, index and query
@@ -93,13 +96,17 @@ func (c Col[T, E]) col() colMeta {
 // GetInfoPointer trick for assigning field names via reflection.
 func (c *Col[T, E]) infoPtr() *colMeta { return &c.info }
 
-// Base sets the order-preserving Base64 width (number of base64 characters, 6
-// bits each) reserved for this numeric column when it is packed into a composite
-// key. It is the DynamoDB analogue of genix's Size(bits): it fixes the column's
-// slot width so concatenated keys stay sortable. Widths are 1..11 (11 covers a
-// full uint64). Only valid on integer columns.
-func (c Col[T, E]) Base(width int) Col[T, E] {
-	c.info.base = width
+// Size declares how many bits (1..64) this numeric column needs when it is
+// packed into a composite key, the same unit as genix-orm/db's Size(bits). The
+// key stores ceil(bits/6) order-preserving Base64 characters, so the width is
+// fixed and concatenated keys stay sortable. The declared bits are the real cap:
+// Size(32) stores 6 characters (room for 36 bits) yet rejects values >= 2^32.
+// Only valid on integer columns.
+func (c Col[T, E]) Size(bits int8) Col[T, E] {
+	if bits < 1 || bits > 64 {
+		panic(fmt.Sprintf("db: Size(%d) on %q: bits must be 1..64", bits, c.info.fieldName))
+	}
+	c.info.bits = bits
 	return c
 }
 
@@ -171,7 +178,7 @@ type Schema struct {
 	Partition []Coln
 	// Sort columns build the base table sk. Because the physical table shares
 	// one sk across the base table and every GSI, this is also the range/order
-	// dimension for index queries. Numeric sort columns must declare .Base(n).
+	// dimension for index queries. Numeric sort columns must declare .Size(bits).
 	Sort []Coln
 	// Indexes map onto the physical GSI slots (N1..N5, S1..S5).
 	Indexes []Index
@@ -207,7 +214,7 @@ var (
 	N4 = Slot{attr: "n4", index: "gsi-n4", isNumber: true}
 	N5 = Slot{attr: "n5", index: "gsi-n5", isNumber: true}
 	// S1..S5 are the string GSI slots (one column or a composite of several;
-	// numeric components are order-preserving Base64 via .Base(n)).
+	// numeric components are order-preserving Base64 via .Size(bits)).
 	S1 = Slot{attr: "s1", index: "gsi-s1"}
 	S2 = Slot{attr: "s2", index: "gsi-s2"}
 	S3 = Slot{attr: "s3", index: "gsi-s3"}

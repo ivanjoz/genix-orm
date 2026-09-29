@@ -42,7 +42,7 @@ type colAccessor struct {
 type keyCol struct {
 	fieldName string
 	kind      valueKind
-	base      int // base64 width for numeric components of composite string keys
+	bits      int8 // declared bit size of numeric components of composite string keys
 	acc       *colAccessor
 }
 
@@ -321,10 +321,10 @@ func intReader(xf *xunsafe.Field, k reflect.Kind) func(unsafe.Pointer) int64 {
 }
 
 // resolveKeyCols turns Colns into keyCols, attaching each column's precompiled
-// accessor. When requireBaseForNumbers is true (composite string keys: sort key,
-// string GSI slots), every integer component must declare .Base(n) so its slot
+// accessor. When requireSizeForNumbers is true (composite string keys: sort key,
+// string GSI slots), every integer component must declare .Size(bits) so its slot
 // width is fixed and the key stays sortable.
-func resolveKeyCols(recordType reflect.Type, accessors map[string]*colAccessor, cols []Coln, requireBaseForNumbers bool) []keyCol {
+func resolveKeyCols(recordType reflect.Type, accessors map[string]*colAccessor, cols []Coln, requireSizeForNumbers bool) []keyCol {
 	out := make([]keyCol, 0, len(cols))
 	for _, c := range cols {
 		m := c.col()
@@ -332,10 +332,10 @@ func resolveKeyCols(recordType reflect.Type, accessors map[string]*colAccessor, 
 		if !ok {
 			panic(fmt.Sprintf("db: key column %q is not an exported field of %s", m.fieldName, recordType.Name()))
 		}
-		if m.kind.isInteger() && requireBaseForNumbers && m.base <= 0 {
-			panic(fmt.Sprintf("db: numeric key column %q used in a composite/sort key must declare .Base(n)", m.fieldName))
+		if m.kind.isInteger() && requireSizeForNumbers && m.bits <= 0 {
+			panic(fmt.Sprintf("db: numeric key column %q used in a composite/sort key must declare .Size(bits)", m.fieldName))
 		}
-		out = append(out, keyCol{fieldName: m.fieldName, kind: m.kind, base: m.base, acc: acc})
+		out = append(out, keyCol{fieldName: m.fieldName, kind: m.kind, bits: m.bits, acc: acc})
 	}
 	return out
 }

@@ -620,7 +620,7 @@ func keyPartFromValue(kc keyCol, v any) keyPart {
 		}
 		return stringPart(s)
 	case kindInt, kindUint:
-		return numberPart(uint64(valueToInt64(v, kc.fieldName)), kc.base)
+		return numberPart(uint64(valueToInt64(v, kc.fieldName)), kc.bits)
 	default:
 		panic(fmt.Sprintf("db: cannot build key from column %q value", kc.fieldName))
 	}

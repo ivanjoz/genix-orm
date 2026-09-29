@@ -81,11 +81,28 @@ func TestOverflowPanics(t *testing.T) {
 	EncodeOrderedUint(64*64, 1) // width 1 holds 0..63
 }
 
+// TestSizeCapIsTheDeclaredBits: Size(32) stores 6 digits (room for 36 bits), but
+// the declared 32 bits are the limit, and Size(64) takes every uint64.
+func TestSizeCapIsTheDeclaredBits(t *testing.T) {
+	if got := numberPart(1<<32-1, 32).width; got != 6 {
+		t.Fatalf("Size(32) must use 6 digits, got %d", got)
+	}
+	if got := numberPart(^uint64(0), 64).width; got != maxBase64Width {
+		t.Fatalf("Size(64) must use %d digits, got %d", maxBase64Width, got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic: 2^32 overflows Size(32)")
+		}
+	}()
+	numberPart(1<<32, 32)
+}
+
 // TestCompositeKeyRangeOrdering checks the real use case: an equality prefix
 // plus a numeric suffix keeps numeric order within the same prefix.
 func TestCompositeKeyRangeOrdering(t *testing.T) {
 	mk := func(brand string, created uint64) string {
-		return buildCompositeKey([]keyPart{stringPart(brand), numberPart(created, 8)})
+		return buildCompositeKey([]keyPart{stringPart(brand), numberPart(created, 48)})
 	}
 	a := mk("acme", 1700000000)
 	b := mk("acme", 1700000500)

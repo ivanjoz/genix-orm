@@ -34,7 +34,7 @@ func (t ProductTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "prod",
 		Partition: Keys(t.Category),
-		Sort:      Keys(t.Created.Base(8), t.ID),
+		Sort:      Keys(t.Created.Size(48), t.ID),
 		Indexes: []Index{
 			{Slot: N1, Keys: Keys(t.Price)}, // numeric GSI
 			{Slot: S1, Keys: Keys(t.Brand)}, // string GSI
@@ -52,8 +52,8 @@ func TestColumnNamesPopulated(t *testing.T) {
 	if got := r.T.Category.col().fieldName; got != "Category" {
 		t.Fatalf("expected Category, got %q", got)
 	}
-	if got := r.T.Price.Base(8).col().base; got != 8 {
-		t.Fatalf("expected base 8, got %d", got)
+	if got := r.T.Price.Size(48).col().bits; got != 48 {
+		t.Fatalf("expected size 48, got %d", got)
 	}
 }
 
@@ -217,7 +217,7 @@ func (t widthsTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "w",
 		Partition: Keys(t.PK),
-		Sort:      Keys(t.A8.Base(2), t.A16.Base(3), t.A32.Base(6), t.A64.Base(11), t.U32.Base(6)),
+		Sort:      Keys(t.A8.Size(8), t.A16.Size(16), t.A32.Size(32), t.A64.Size(64), t.U32.Size(32)),
 	}
 }
 
