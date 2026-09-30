@@ -10,7 +10,7 @@ import (
 // Deriving physical key attributes from a record.
 //
 //	pk  = TableID ‖ decimal(partition columns)          (DynamoDB number)
-//	sk  = composite(sort columns)                       (order-preserving string)
+//	sk  = composite(Keys columns)                       (order-preserving string)
 //	nN  = TableID ‖ decimal(the one slot column)        (DynamoDB number)
 //	sN  = "<TableID>#" + composite(string-slot columns) (order-preserving string)
 //
@@ -59,7 +59,7 @@ func (m *tableMeta) pkValue(ptr unsafe.Pointer) string {
 
 // skValue builds the base-table sort key.
 func (m *tableMeta) skValue(ptr unsafe.Pointer) string {
-	return buildCompositeKey(m.keyPartsFor(ptr, m.sort))
+	return buildCompositeKey(m.keyPartsFor(ptr, m.keys))
 }
 
 // slotValue builds one index slot's stored value: a decimal number string for

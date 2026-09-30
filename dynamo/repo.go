@@ -140,7 +140,7 @@ func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Point
 	for i, ptr := range ptrs {
 		keys[i] = r.meta.keyOnly(ptr)
 	}
-	items, err := batchGet(client, keys, true)
+	items, _, err := batchGet(client, keys, true)
 	if err != nil {
 		return nil, err
 	}
@@ -240,9 +240,20 @@ func (r *Repo[T, E]) Get(key E) (*E, error) {
 	return &record, nil
 }
 
-// Query starts a new statically-typed query for this entity.
+// Query starts a new statically-typed query for this entity. It is strict:
+// every predicate must be served by the key condition, and Exec fails on one
+// that would have to be filtered in memory (use QueryScan for that).
 func (r *Repo[T, E]) Query() *QueryBuilder[E] {
 	return &QueryBuilder[E]{meta: r.meta}
+}
+
+// QueryScan is Query plus an in-memory filter: one index still has to serve it
+// (partition equality, a full GSI key or a Contains), and the predicates no key
+// can serve are evaluated on each decoded record. It pays for every row the index
+// range holds, not only the ones it returns, so it fails once it has read 5 MB
+// and still has more to read (see queryScanMaxReadUnits).
+func (r *Repo[T, E]) QueryScan() *QueryBuilder[E] {
+	return &QueryBuilder[E]{meta: r.meta, allowsMemoryFilter: true}
 }
 
 // TopN returns up to n records from a single partition, in ascending sort-key

@@ -1,5 +1,30 @@
 # RATIONALE — dynamo
 
+## Fan-out rows are validated against the full row sk; internals keep the "array index" name
+**Context** — `ArrayIndexes` became `Index` entries whose `Keys` hold a `ColSlice` plus scalar columns. Before, Contains dropped a stale row when the record no longer held the element. With scalar columns in the row sk, a row can also go stale when a scalar changes (e.g. `Updated`): the record still holds the element, but the row's range position is wrong. A stale keys-only row can now also point at the same record as a live one, and BatchGetItem rejects duplicate keys.
+**Decision** — A returned record must still write the exact row that led to it (`writesArrayRow`: its current row sks contain that row's sk). Keys-only reads fetch each base record once per page. Internally the code keeps `arrayIndexMeta`, `array_index.go` and the introspection kind `"array"`, which the Database viewer reads. Only the public API changed, and the docs call these "fan-out indexes".
+**Rationale** — Comparing the full row sk covers both the removed-element case and the changed-scalar case with one check. It costs one pass over the slice per returned record, the same as before. Keeping the internal names avoids churn in the frontend contract. The cost is two names for one concept (the public `Index` holding a `ColSlice`, the internal "array index").
+
+## TableSchema.Fields comes from the table struct; QueryRecords takes a desc flag
+**Context** — A table visualizer needs every column before it reads a record, but `TableSchema` only described key columns. It also needs newest-first reads, which `QueryRecords` could not do.
+**Decision** — `Fields` lists every `Coln` field of the table struct in declaration order, described like the key columns. `QueryRecords(preds, limit, desc bool)` calls `Desc()` when desc is set, which is a breaking signature change on `Controller`.
+**Rationale** — `GetSchema[T]` only knows the table type, and the table struct mirrors the record field by field, so no record type or metaCache is needed. A plain bool is the smallest change; an options struct would only pay off with a second option.
+
+## A no-partition entity routes a GSI equality to the GSI, not to its whole-entity pk
+**Context** — An entity without `Partition` columns can always be read from its base pk (the TableID alone), and the planner preferred the base table whenever it was available. So `Eq(Username)` on Users read every user and filtered in memory instead of using gsi-s1. The strict `Query()` exposed it by rejecting those queries, which would have broken login.
+**Decision** — The base table wins only when the entity has partition columns and all of them are pinned by `=`. Otherwise the first GSI whose key columns all have `=` is used, and the whole-entity base pk is the last resort.
+**Rationale** — A pinned partition is as narrow as a GSI key, so keeping base first there saves the GSI's extra replication lag. A whole-entity pk is never narrower than a GSI key.
+
+## QueryScan's 5 MB cap is counted in read units, checked before each Query page
+**Context** — The cap on `QueryScan()` reads was set at 5 MB. A page count doesn't measure it: a keys-only `Contains` also spends BatchGetItem reads outside the Query pages, and pages can be smaller than 1 MB.
+**Decision** — `QueryScan()` requests `ConsumedCapacity` and adds up the RCU of Query pages and BatchGets. Before issuing another Query call it fails if the total has passed 640 RCU (5 MB at 0.5 RCU per 4 KB, eventually consistent). The error is `QueryScan read more than 5 MB … narrow its index predicates`. It never returns partial results. `Query()` has no cap, because every row it reads is a match.
+**Rationale** — Read units are what DynamoDB bills and they cover both read paths. Checking between calls means one call can overshoot by up to one page (≤1 MB) or one batch. Failing instead of truncating means a handler can't silently serve an incomplete delta sync.
+
+## Query() rejects non-key predicates; strict `<` under a prefix stays allowed
+**Context** — Before this change, predicates on fields inside `d` were silently filtered in memory, so any query could cost a whole partition read.
+**Decision** — `Query()` fails at plan time if a predicate isn't served by a key. The in-memory check of a strict `<` under an equality prefix (the key condition can't express it exactly) is a separate `keyFilter`, and `Query()` accepts it. Only unindexed fields require `QueryScan()`. `QueryRecords` no longer has its own post-filter check.
+**Rationale** — The `keyFilter` only drops rows at the edge of a range the index already bounded, so it doesn't change the read cost. Treating it as a scan would push ordinary range queries onto `QueryScan()` for no reason.
+
 ## Partition packing is TableID · 10^w, not TableID · 100
 **Context** — The request was `pk = TableID * 100 + partitionID`. A ×100 factor only holds partitions 0..99, and the cron tables partition on `Slot.Size(32)`, which takes up to 10 digits.
 **Decision** — Each integer partition column is zero-padded to the decimal width of its `Size(bits)` and appended after the TableID, so `pk = TableID * 10^w + partition`, and several columns chain the same way. It is built as a decimal string, so it isn't limited to int64. DynamoDB's 38-digit limit is checked at compile.
@@ -16,7 +41,7 @@
 **Rationale** — It is the minimum that gives ANY semantics without a merge sort. Cost: N round trips for N values, and no global ordering when N > 1.
 
 ## Sort ranges are exact at any position of a composite sort key
-**Context** — There were two bugs in `resolveSort`, both older than this work. First, `Eq(A).Gt(B)` became `sk > "a#b"`, which also matches every row with a larger A; every `Contains(...).Gt(...)` hits this, because the element is always a prefix. Second, a bound on a non-last sort column compared against a key that continues past it: `Created <= 1000` became `sk <= enc(1000)`, which misses the stored `enc(1000)#<ID>`. The live check (`./deploy.sh 4`) caught the second one. The README called part of this "`>` behaves as `>=`".
+**Context** — There were two bugs in `resolveKeys`, both older than this work. First, `Eq(A).Gt(B)` became `sk > "a#b"`, which also matches every row with a larger A; every `Contains(...).Gt(...)` hits this, because the element is always a prefix. Second, a bound on a non-last Keys column compared against a key that continues past it: `Created <= 1000` became `sk <= enc(1000)`, which misses the stored `enc(1000)#<ID>`. The live check (`./deploy.sh 4`) caught the second one. The README called part of this "`>` behaves as `>=`".
 **Decision** — The rows whose ranged column equals `v` sort in `[v, v$)` (`$` is the byte after `#`). So `<= v` becomes `< v$`, `> v` becomes `>= v$`, and `BETWEEN a AND b` becomes `BETWEEN a AND b$`. After an equality prefix, a one-sided range becomes a `BETWEEN` bounded by `[prefix#, prefix$]`. Only a strict `<` there stays in the in-memory post-filter, because BETWEEN includes its upper bound.
 **Rationale** — The results are what was asked for, with no post-filter except in that one case. Cost: `QueryRecords`, which refuses any post-filter, rejects `Eq(A).Lt(B)` instead of silently returning wrong rows.
 

@@ -32,14 +32,13 @@ import (
 //
 //	func (t ProductTable) GetSchema() db.Schema {
 //	    return db.Schema{
-//	        Entity:    "prod",
-//	        Partition: db.Keys(t.CategoryID.Size(16)),      // -> pk = TableID ‖ CategoryID (number)
-//	        Sort:      db.Keys(t.Created.Size(48), t.ID),   // -> sk (order-preserving)
+//	        Entity: "prod",                                  // pk = TableID (no Partition)
+//	        Keys:   db.Keys(t.ID),                           // -> sk: the record's key
 //	        Indexes: []db.Index{
-//	            {Slot: db.N1, Keys: db.Keys(t.Price.Size(40))}, // numeric GSI
-//	            {Slot: db.S1, Keys: db.Keys(t.Brand)},          // string GSI
+//	            {Slot: db.N1, Keys: db.Keys(t.Price.Size(40))},          // numeric GSI
+//	            {Slot: db.S1, Keys: db.Keys(t.Brand)},                   // string GSI
+//	            {Keys: db.Keys(t.TagIDs.Size(32), t.Created.Size(48))}, // fan-out: Contains(TagIDs, ...)
 //	        },
-//	        ArrayIndexes: []db.ArrayIndex{{Column: t.TagIDs.Size(32)}}, // Contains(TagIDs, ...)
 //	    }
 //	}
 //
@@ -118,14 +117,14 @@ func checkedBits(bits int8, fieldName string) int8 {
 	return bits
 }
 
-// ColSlice is the handle for a slice column: the only kind ArrayIndexes and
-// QueryBuilder.Contains accept. E is the *element* type, as in genix-orm/db, so a
-// []int32 field is declared ColSlice[XTable, int32].
+// ColSlice is the handle for a slice column: the one that makes an Index fan out,
+// and the only kind QueryBuilder.Contains accepts. E is the *element* type, as in
+// genix-orm/db, so a []int32 field is declared ColSlice[XTable, int32].
 type ColSlice[T any, E any] struct {
 	info colMeta
 }
 
-// col reports the column itself, which is a slice (kindOther): ArrayIndexes
+// col reports the column itself, which is a slice (kindOther): a fan-out Index
 // resolves the element kind from the record field.
 func (c ColSlice[T, E]) col() colMeta {
 	m := c.info
@@ -140,8 +139,8 @@ func (c *ColSlice[T, E]) infoPtr() *colMeta { return &c.info }
 
 func (c ColSlice[T, E]) elementType() reflect.Type { return reflect.TypeFor[E]() }
 
-// Size declares how many bits (1..64) each integer element needs: the array
-// index rows pack the element into their sk, like an integer sort column.
+// Size declares how many bits (1..64) each integer element needs: the fan-out
+// rows pack the element into their sk, like an integer Keys column.
 func (c ColSlice[T, E]) Size(bits int8) ColSlice[T, E] {
 	c.info.bits = checkedBits(bits, c.info.fieldName)
 	return c
@@ -222,19 +221,20 @@ type Schema struct {
 	// rows. Leave it 0 to use HashTableID(Entity); set it explicitly to pin it
 	// (renaming Entity then no longer moves the data) or to resolve a collision.
 	TableID int32
-	// Partition columns build the base table pk after the TableID. The pk is a
-	// DynamoDB number, so they must be integers declaring .Size(bits).
+	// Partition columns are optional and build the base table pk after the
+	// TableID; without them the pk is the TableID alone. The pk is a DynamoDB
+	// number, so they must be integers declaring .Size(bits).
 	Partition []Coln
-	// Sort columns build the base table sk. Because the physical table shares
-	// one sk across the base table and every GSI, this is also the range/order
-	// dimension for index queries. Numeric sort columns must declare .Size(bits).
-	Sort []Coln
-	// Indexes map onto the physical GSI slots (N1..N5, S1..S5).
+	// Keys are the record's key inside its partition: they build the base table
+	// sk, so pk + sk identify the record (Get/Delete take them, and a Put with
+	// other values writes another item). Because the physical table shares one
+	// sk across the base table and every GSI, Keys are also the only range/order
+	// dimension, for base and index queries alike. Numeric Keys columns must
+	// declare .Size(bits).
+	Keys []Coln
+	// Indexes are the secondary access paths: GSI slots (N1..N5, S1..S5) and
+	// fan-out indexes over a slice field (see Index).
 	Indexes []Index
-	// ArrayIndexes make a slice field queryable with QueryBuilder.Contains. Each
-	// one fans the record out into one hidden row per slice element, kept in
-	// sync by Put/PutMany/PutIfAbsent/Delete (see array_index.go).
-	ArrayIndexes []ArrayIndex
 
 	// UseAutoincrement makes the ORM assign the record's integer "ID" field
 	// automatically on Put/PutMany when it is still zero. IDs come from a
@@ -275,19 +275,36 @@ var (
 	S5 = Slot{attr: "s5", index: "gsi-s5"}
 )
 
-// Index maps a set of key columns onto one physical GSI slot.
+// Index is one secondary access path, of one of two shapes:
+//
+//   - A GSI: Slot is set and Keys are scalar columns mapped onto that slot.
+//   - A fan-out index: exactly one of the Keys is a ColSlice (of integers
+//     declaring .Size(bits), or of strings), anywhere in the list, and Slot is
+//     left empty. DynamoDB cannot index inside a list, so the record is fanned
+//     out into one hidden base-table row per distinct element, whose sk is the
+//     Keys with the slice replaced by that element. Contains (or Eq) on the slice
+//     queries them; every Keys column before the slice needs an Eq, and the ones
+//     after it take ranges: Keys(ProductIDs.Size(32), Created.Size(32)) serves
+//     Contains(ProductIDs, 5).Gt(Created, 1000). The slice field must carry a
+//     `cb:"N"` tag (1..999): that stable id, not the Go name, locates its rows,
+//     so a slice field takes one fan-out index. The rows are kept in sync by
+//     Put/PutMany/PutIfAbsent/Delete (see array_index.go); a scalar column in
+//     Keys that changes on a write rewrites every element row.
 type Index struct {
 	Slot Slot
 	Keys []Coln
+	// FullCopy (fan-out indexes only) stores the whole record blob on every
+	// element row, so Contains reads it in one Query. Without it a row holds only
+	// keys, and Contains reads the base records in a second BatchGetItem.
+	FullCopy bool
 }
 
-// ArrayIndex declares one slice field (of integers declaring .Size(bits), or of
-// strings) as queryable by element. The field must carry a `cb:"N"` tag
-// (1..999): that stable id, not the Go name, locates its rows.
-type ArrayIndex struct {
-	Column SliceColn
-	// FullCopy stores the whole record blob on every element row, so Contains
-	// reads it in one Query. Without it a row holds only keys, and Contains
-	// reads the base records in a second BatchGetItem.
-	FullCopy bool
+// holdsSliceColumn reports whether the index is a fan-out index: one of its Keys is a ColSlice.
+func holdsSliceColumn(index Index) bool {
+	for _, column := range index.Keys {
+		if _, isSlice := column.(SliceColn); isSlice {
+			return true
+		}
+	}
+	return false
 }

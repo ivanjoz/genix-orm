@@ -63,7 +63,7 @@ type tableMeta struct {
 	recordType      reflect.Type
 	partition       []keyCol
 	partitionDigits int // total decimal width of the partition columns in pk
-	sort            []keyCol
+	keys            []keyCol
 	indexes         []indexMeta
 	arrayIndexes    []arrayIndexMeta
 	accessors       map[string]*colAccessor // record field name -> precompiled accessor
@@ -127,8 +127,8 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	if schema.Entity == "" {
 		panic(fmt.Sprintf("db: %s schema is missing Entity", recordType.Name()))
 	}
-	if len(schema.Sort) == 0 {
-		panic(fmt.Sprintf("db: %s schema must declare at least one Sort column (the sk)", recordType.Name()))
+	if len(schema.Keys) == 0 {
+		panic(fmt.Sprintf("db: %s schema must declare at least one Keys column (the sk)", recordType.Name()))
 	}
 
 	accessors := buildAccessors(recordType)
@@ -143,7 +143,7 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		tableID:    strconv.Itoa(int(tableID)),
 		recordType: recordType,
 		partition:  resolveKeyCols(recordType, accessors, schema.Partition),
-		sort:       resolveKeyCols(recordType, accessors, schema.Sort),
+		keys:       resolveKeyCols(recordType, accessors, schema.Keys),
 		accessors:  accessors,
 	}
 
@@ -154,19 +154,26 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		}
 		meta.partitionDigits += decimalWidth(partitionCol.bits)
 	}
-	pkDigits := len(meta.tableID) + meta.partitionDigits
-	if len(schema.ArrayIndexes) > 0 {
-		pkDigits += arrayIndexColumnIDDigits
-	}
-	if pkDigits > maxNumericKeyDigits {
-		panic(fmt.Sprintf("db: %s pk takes %d digits, over DynamoDB's %d: shrink the partition Size(bits)",
-			recordType.Name(), pkDigits, maxNumericKeyDigits))
-	}
 
 	usedSlots := map[string]bool{}
+	usedArrayFields := map[string]bool{}
 	for _, idx := range schema.Indexes {
+		// An Index holding a ColSlice is a fan-out index: hidden base-table rows, no GSI slot.
+		if holdsSliceColumn(idx) {
+			resolved := resolveArrayIndex(recordType, accessors, idx)
+			if usedArrayFields[resolved.element.fieldName] {
+				panic(fmt.Sprintf("db: %s declares two fan-out indexes on %q: its rows are located by its cb id, so it takes one",
+					recordType.Name(), resolved.element.fieldName))
+			}
+			usedArrayFields[resolved.element.fieldName] = true
+			meta.arrayIndexes = append(meta.arrayIndexes, resolved)
+			continue
+		}
 		if idx.Slot.attr == "" {
-			panic(fmt.Sprintf("db: %s has an index with no Slot", recordType.Name()))
+			panic(fmt.Sprintf("db: %s has an index with no Slot (only an Index holding a ColSlice goes without one)", recordType.Name()))
+		}
+		if idx.FullCopy {
+			panic(fmt.Sprintf("db: %s index %s sets FullCopy, which only applies to an Index holding a ColSlice", recordType.Name(), idx.Slot.attr))
 		}
 		if usedSlots[idx.Slot.attr] {
 			panic(fmt.Sprintf("db: %s reuses slot %s", recordType.Name(), idx.Slot.attr))
@@ -184,14 +191,13 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		meta.indexes = append(meta.indexes, indexMeta{slot: idx.Slot, keys: keys})
 	}
 
-	usedArrayFields := map[string]bool{}
-	for _, arrayIndex := range schema.ArrayIndexes {
-		resolved := resolveArrayIndex(recordType, arrayIndex)
-		if usedArrayFields[resolved.element.fieldName] {
-			panic(fmt.Sprintf("db: %s declares ArrayIndexes on %q twice", recordType.Name(), resolved.element.fieldName))
-		}
-		usedArrayFields[resolved.element.fieldName] = true
-		meta.arrayIndexes = append(meta.arrayIndexes, resolved)
+	pkDigits := len(meta.tableID) + meta.partitionDigits
+	if len(meta.arrayIndexes) > 0 {
+		pkDigits += arrayIndexColumnIDDigits
+	}
+	if pkDigits > maxNumericKeyDigits {
+		panic(fmt.Sprintf("db: %s pk takes %d digits, over DynamoDB's %d: shrink the partition Size(bits)",
+			recordType.Name(), pkDigits, maxNumericKeyDigits))
 	}
 
 	if schema.UseAutoincrement {

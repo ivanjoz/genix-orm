@@ -28,3 +28,25 @@ func TestControllerAccessors(t *testing.T) {
 		t.Fatal("Schema().Autoincrement should be true for TicketTable")
 	}
 }
+
+// TestSchemaFieldsListEveryColumn checks Fields holds every table column in
+// declaration order, slice columns included and the embedded Model skipped.
+func TestSchemaFieldsListEveryColumn(t *testing.T) {
+	fields := GetSchema[ProductTable]().Fields
+	gotNames := make([]string, len(fields))
+	for i, field := range fields {
+		gotNames[i] = field.Field
+	}
+	wantNames := []string{"ID", "CategoryID", "Brand", "Price", "Stock", "Created", "Name", "TagIDs", "Labels"}
+	if len(gotNames) != len(wantNames) {
+		t.Fatalf("Fields: got %v, want %v", gotNames, wantNames)
+	}
+	for i := range wantNames {
+		if gotNames[i] != wantNames[i] {
+			t.Fatalf("Fields: got %v, want %v", gotNames, wantNames)
+		}
+	}
+	if fields[1].Type != "int" || fields[2].Type != "string" {
+		t.Fatalf("Fields types: got CategoryID=%q Brand=%q", fields[1].Type, fields[2].Type)
+	}
+}

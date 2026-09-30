@@ -5,7 +5,7 @@ package ormcheck
 
 import "github.com/ivanjoz/genix-orm/dynamo"
 
-// CheckOrder exercises every key shape on a partitioned entity. Its array indexes are keys-only:
+// CheckOrder exercises every key shape on a partitioned entity. Its fan-out indexes are keys-only:
 // Contains reads the matching base records in a second BatchGetItem.
 type CheckOrder struct {
 	StoreID    int32    `cb:"1"`
@@ -40,22 +40,21 @@ func (table CheckOrderTable) GetSchema() dynamo.Schema {
 		Entity:    "ormcheck_order",
 		Partition: dynamo.Keys(table.StoreID.Size(16)), // pk = TableID ‖ StoreID (5 digits)
 		// The packed integer sort key: Created then ID, each order-preserving Base64.
-		Sort: dynamo.Keys(table.Created.Size(32), table.ID.Size(24)),
+		Keys: dynamo.Keys(table.Created.Size(32), table.ID.Size(24)),
 		Indexes: []dynamo.Index{
 			{Slot: dynamo.N1, Keys: dynamo.Keys(table.CustomerID.Size(32))},           // numeric GSI
 			{Slot: dynamo.S1, Keys: dynamo.Keys(table.Channel, table.Status.Size(8))}, // composite string GSI
 			{Slot: dynamo.S2, Keys: dynamo.Keys(table.Code)},                          // single string GSI
-		},
-		ArrayIndexes: []dynamo.ArrayIndex{
-			{Column: table.ProductIDs.Size(32)},
-			{Column: table.Tags},
+			// Fan-out: row sk = ProductID ‖ Created ‖ base sk, so a product ranges on Created.
+			{Keys: dynamo.Keys(table.ProductIDs.Size(32), table.Created.Size(32))},
+			{Keys: dynamo.Keys(table.Tags)}, // fan-out on the element alone
 		},
 	}
 }
 
 var CheckOrders = dynamo.NewRepo[CheckOrderTable, CheckOrder]()
 
-// CheckProduct is an entity without Partition (the whole entity is the pk TableID). Its array
+// CheckProduct is an entity without Partition (the whole entity is the pk TableID). Its fan-out
 // index is FullCopy: every element row carries the record, so Contains is a single Query.
 type CheckProduct struct {
 	ID          int32   `cb:"1"`
@@ -78,13 +77,11 @@ func (table CheckProductTable) GetSchema() dynamo.Schema {
 	return dynamo.Schema{
 		Name:   "ORM check: products",
 		Entity: "ormcheck_product",
-		Sort:   dynamo.Keys(table.ID.Size(24)),
+		Keys:   dynamo.Keys(table.ID.Size(24)),
 		Indexes: []dynamo.Index{
 			{Slot: dynamo.N1, Keys: dynamo.Keys(table.Price.Size(32))},
 			{Slot: dynamo.S1, Keys: dynamo.Keys(table.Brand)},
-		},
-		ArrayIndexes: []dynamo.ArrayIndex{
-			{Column: table.CategoryIDs.Size(16), FullCopy: true},
+			{Keys: dynamo.Keys(table.CategoryIDs.Size(16)), FullCopy: true},
 		},
 	}
 }

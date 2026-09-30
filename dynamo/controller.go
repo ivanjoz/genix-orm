@@ -39,9 +39,9 @@ type Controller interface {
 	// deleted. See the method on *Repo for details.
 	DeleteRecordsAll() (int, error)
 	// QueryRecords runs a dynamic, type-erased query and returns the matching
-	// records as JSON-serializable values. See the method on *Repo for the strict
-	// key rules it enforces.
-	QueryRecords(preds []QueryPredicate, limit int32) ([]any, error)
+	// records as JSON-serializable values, newest first when desc is set. See the
+	// method on *Repo for the strict key rules it enforces.
+	QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error)
 }
 
 // NewController compiles the schema (like NewRepo) and returns it as a

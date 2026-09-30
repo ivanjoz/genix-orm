@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"os"
+	"reflect"
 	"testing"
 	"unsafe"
 
@@ -81,19 +82,24 @@ func TestArrayIndexWritesNewAndDeletedRecord(t *testing.T) {
 
 func TestArrayRowSKRoundTripsTheBaseSK(t *testing.T) {
 	baseSK := EncodeOrderedUint(5, 8) + "#sku1"
-	if got := baseSKOfArrayRow(tagRowSK(3, baseSK)); got != baseSK {
+	if got := baseSKOfArrayRow(tagRowSK(3, baseSK), 1); got != baseSK {
 		t.Fatalf("baseSKOfArrayRow = %q, want %q", got, baseSK)
+	}
+	twoPartRowSK := EncodeOrderedUint(3, 6) + "#" + EncodeOrderedUint(100, 6) + "#" + baseSK
+	if got := baseSKOfArrayRow(twoPartRowSK, 2); got != baseSK {
+		t.Fatalf("baseSKOfArrayRow with 2 index keys = %q, want %q", got, baseSK)
 	}
 }
 
-func TestHoldsElementIsTheReadSideCheck(t *testing.T) {
+func TestWritesArrayRowIsTheReadSideCheck(t *testing.T) {
 	r := newProducts(t)
 	arrayIndex := &r.meta.arrayIndexes[0]
-	record := Product{TagIDs: []int32{2, 9}}
-	if !arrayIndex.holdsElement(unsafe.Pointer(&record), keyPartFromValue(arrayIndex.element, 9)) {
+	record := Product{ID: "sku1", CategoryID: 7, Created: 5, TagIDs: []int32{2, 9}}
+	_, baseSK := productBaseKeys(r, &record)
+	if !r.meta.writesArrayRow(arrayIndex, unsafe.Pointer(&record), tagRowSK(9, baseSK)) {
 		t.Fatal("record holds 9")
 	}
-	if arrayIndex.holdsElement(unsafe.Pointer(&record), keyPartFromValue(arrayIndex.element, 3)) {
+	if r.meta.writesArrayRow(arrayIndex, unsafe.Pointer(&record), tagRowSK(3, baseSK)) {
 		t.Fatal("record does not hold 3")
 	}
 }
@@ -239,6 +245,157 @@ func TestArrayIndexSyncLive(t *testing.T) {
 	}
 }
 
+// ── Composite fan-out indexes: scalar Keys before and after the slice ─────────
+
+type fanOutOrder struct {
+	StoreID    int32    `cb:"1"`
+	ID         int32    `cb:"2"`
+	Updated    int32    `cb:"3"`
+	Channel    string   `cb:"4"`
+	ProductIDs []int32  `cb:"5"`
+	Tags       []string `cb:"6"`
+}
+
+type fanOutOrderTable struct {
+	Model[fanOutOrderTable, fanOutOrder]
+	StoreID    Col[*fanOutOrderTable, int32]
+	ID         Col[*fanOutOrderTable, int32]
+	Updated    Col[*fanOutOrderTable, int32]
+	Channel    Col[*fanOutOrderTable, string]
+	ProductIDs ColSlice[*fanOutOrderTable, int32]
+	Tags       ColSlice[*fanOutOrderTable, string]
+}
+
+func (t fanOutOrderTable) GetSchema() Schema {
+	return Schema{
+		Entity:    "fan_out_order",
+		TableID:   23456789,
+		Partition: Keys(t.StoreID.Size(16)),
+		Keys:      Keys(t.ID.Size(32)),
+		Indexes: []Index{
+			{Keys: Keys(t.ProductIDs.Size(32), t.Updated.Size(32))}, // slice first, range on Updated
+			{Keys: Keys(t.Channel, t.Tags)},                         // slice after a scalar
+		},
+	}
+}
+
+func fanOutOrderRowSK(productID, updated, id uint64) string {
+	return EncodeOrderedUint(productID, 6) + "#" + EncodeOrderedUint(updated, 6) + "#" + EncodeOrderedUint(id, 6)
+}
+
+func TestCompositeFanOutRowsCarryTheScalarKeys(t *testing.T) {
+	orders := NewRepo[fanOutOrderTable, fanOutOrder]()
+	record := fanOutOrder{StoreID: 7, ID: 1, Updated: 100, Channel: "web", ProductIDs: []int32{5, 5, 8}, Tags: []string{"gift"}}
+	basePK := orders.meta.pkValue(unsafe.Pointer(&record))
+
+	puts, deletes := orders.meta.arrayIndexWrites(nil, unsafe.Pointer(&record), nil)
+	wantPuts := []string{
+		basePK + "005 " + fanOutOrderRowSK(5, 100, 1),
+		basePK + "005 " + fanOutOrderRowSK(8, 100, 1),
+		basePK + "006 web#gift#" + EncodeOrderedUint(1, 6),
+	}
+	if got := writeKeys(puts); !equalStrings(got, wantPuts) || len(deletes) != 0 {
+		t.Fatalf("puts = %v\nwant %v (deletes %v)", got, wantPuts, writeKeys(deletes))
+	}
+}
+
+// A changed scalar index column moves every element row: the old ones go, the new ones come.
+func TestCompositeFanOutRewritesRowsWhenAScalarKeyChanges(t *testing.T) {
+	orders := NewRepo[fanOutOrderTable, fanOutOrder]()
+	stored := fanOutOrder{StoreID: 7, ID: 1, Updated: 100, Channel: "web", ProductIDs: []int32{5}}
+	written := stored
+	written.Updated = 200
+	basePK := orders.meta.pkValue(unsafe.Pointer(&written))
+
+	puts, deletes := orders.meta.arrayIndexWrites(unsafe.Pointer(&stored), unsafe.Pointer(&written), nil)
+	if got, want := writeKeys(puts), []string{basePK + "005 " + fanOutOrderRowSK(5, 200, 1)}; !equalStrings(got, want) {
+		t.Fatalf("puts = %v, want %v", got, want)
+	}
+	if got, want := writeKeys(deletes), []string{basePK + "005 " + fanOutOrderRowSK(5, 100, 1)}; !equalStrings(got, want) {
+		t.Fatalf("deletes = %v, want %v", got, want)
+	}
+	// The row still holding Updated = 100 is stale for the record as it is now.
+	if orders.meta.writesArrayRow(&orders.meta.arrayIndexes[0], unsafe.Pointer(&written), fanOutOrderRowSK(5, 100, 1)) {
+		t.Fatal("a row with an outdated scalar index column must not count as the record's")
+	}
+}
+
+func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
+	orders := NewRepo[fanOutOrderTable, fanOutOrder]()
+	product5 := EncodeOrderedUint(5, 6)
+	for name, query := range map[string]*QueryBuilder[fanOutOrder]{
+		"Contains": orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int32(10_000)),
+		"Eq":       orders.Query().Eq(orders.T.StoreID, int32(7)).Eq(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int32(10_000)),
+	} {
+		plan := onlyPlan(t, query)
+		if plan.keyCond != "#pk = :pk AND #sk BETWEEN :lo AND :hi" {
+			t.Fatalf("%s: keyCond = %q", name, plan.keyCond)
+		}
+		if s(plan.values[":pk"]) != "23456789"+"00007"+"005" {
+			t.Fatalf("%s: pk = %q", name, s(plan.values[":pk"]))
+		}
+		if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(10_000, 6)+"$" || s(plan.values[":hi"]) != product5+"$" {
+			t.Fatalf("%s: range = [%q, %q]", name, s(plan.values[":lo"]), s(plan.values[":hi"]))
+		}
+		if len(plan.postFilter) != 0 || len(plan.keyFilter) != 0 {
+			t.Fatalf("%s: the range must be exact, got post %+v key %+v", name, plan.postFilter, plan.keyFilter)
+		}
+	}
+
+	// Every index column pinned: the range goes on to the base Keys.
+	plan := onlyPlan(t, orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Eq(orders.T.Updated, int32(100)).Gte(orders.T.ID, int32(3)))
+	if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(100, 6)+"#"+EncodeOrderedUint(3, 6) {
+		t.Fatalf("lo = %q", s(plan.values[":lo"]))
+	}
+}
+
+func TestPlanCompositeFanOutNeedsTheColumnsBeforeTheSlice(t *testing.T) {
+	orders := NewRepo[fanOutOrderTable, fanOutOrder]()
+	if _, err := orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.Tags, "gift").plans(); err == nil {
+		t.Fatal("Contains(Tags) without Eq(Channel) must fail")
+	}
+	plan := onlyPlan(t, orders.Query().Eq(orders.T.StoreID, int32(7)).Eq(orders.T.Channel, "web").Contains(orders.T.Tags, "gift"))
+	if plan.keyCond != "#pk = :pk AND begins_with(#sk, :sk)" || s(plan.values[":sk"]) != "web#gift#" {
+		t.Fatalf("keyCond = %q, sk = %q", plan.keyCond, s(plan.values[":sk"]))
+	}
+}
+
+type badFanOutRecord struct {
+	ID     int32   `cb:"1"`
+	Price  int32   `cb:"2"`
+	TagIDs []int32 `cb:"3"`
+	Other  []int32 `cb:"4"`
+}
+
+type badFanOutTable struct {
+	Model[badFanOutTable, badFanOutRecord]
+	ID     Col[*badFanOutTable, int32]
+	Price  Col[*badFanOutTable, int32]
+	TagIDs ColSlice[*badFanOutTable, int32]
+	Other  ColSlice[*badFanOutTable, int32]
+}
+
+func TestFanOutIndexDeclarationRules(t *testing.T) {
+	for name, index := range map[string]func(t badFanOutTable) Index{
+		"a slice with a Slot": func(t badFanOutTable) Index { return Index{Slot: S1, Keys: Keys(t.TagIDs.Size(32))} },
+		"two slices":          func(t badFanOutTable) Index { return Index{Keys: Keys(t.TagIDs.Size(32), t.Other.Size(32))} },
+		"FullCopy on a GSI":   func(t badFanOutTable) Index { return Index{Slot: N1, Keys: Keys(t.Price.Size(32)), FullCopy: true} },
+		"no Slot, no slice":   func(t badFanOutTable) Index { return Index{Keys: Keys(t.Price.Size(32))} },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s: expected a panic", name)
+				}
+			}()
+			tablePtr := new(badFanOutTable)
+			populateColumnNames(tablePtr)
+			schema := Schema{Entity: "bad_fan_out", TableID: 34567890, Keys: Keys(tablePtr.ID.Size(32)), Indexes: []Index{index(*tablePtr)}}
+			buildTableMeta(schema, reflect.TypeFor[badFanOutRecord]())
+		}()
+	}
+}
+
 // ── ColSlice element type must match the record field ────────────────────────
 
 type mismatchedSliceRecord struct {
@@ -253,7 +410,7 @@ type mismatchedSliceTable struct {
 }
 
 func (t mismatchedSliceTable) GetSchema() Schema {
-	return Schema{Entity: "mismatched_slice", Sort: Keys(t.ID.Size(32)), ArrayIndexes: []ArrayIndex{{Column: t.TagIDs.Size(32)}}}
+	return Schema{Entity: "mismatched_slice", Keys: Keys(t.ID.Size(32)), Indexes: []Index{{Keys: Keys(t.TagIDs.Size(32))}}}
 }
 
 func TestColSliceElementTypeMustMatchTheField(t *testing.T) {
@@ -278,7 +435,7 @@ type clashingTable struct {
 
 // Same explicit TableID as ProductTable, different entity.
 func (t clashingTable) GetSchema() Schema {
-	return Schema{Entity: "clash", TableID: 12345678, Sort: Keys(t.ID.Size(32))}
+	return Schema{Entity: "clash", TableID: 12345678, Keys: Keys(t.ID.Size(32))}
 }
 
 func TestTableIDCollisionPanics(t *testing.T) {

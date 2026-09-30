@@ -43,14 +43,12 @@ func (t ProductTable) GetSchema() Schema {
 		Entity:    "prod",
 		TableID:   12345678,
 		Partition: Keys(t.CategoryID.Size(16)),
-		Sort:      Keys(t.Created.Size(48), t.ID),
+		Keys:      Keys(t.Created.Size(48), t.ID),
 		Indexes: []Index{
 			{Slot: N1, Keys: Keys(t.Price.Size(40))}, // numeric GSI
 			{Slot: S1, Keys: Keys(t.Brand)},          // string GSI
-		},
-		ArrayIndexes: []ArrayIndex{
-			{Column: t.TagIDs.Size(32)},
-			{Column: t.Labels, FullCopy: true},
+			{Keys: Keys(t.TagIDs.Size(32))},          // fan-out, keys-only
+			{Keys: Keys(t.Labels), FullCopy: true},   // fan-out, FullCopy
 		},
 	}
 }
@@ -225,13 +223,58 @@ func TestPlanStringGSI(t *testing.T) {
 	}
 }
 
-func TestPlanPostFilter(t *testing.T) {
+func TestQueryScanFiltersANonKeyFieldInMemory(t *testing.T) {
 	r := newProducts(t)
 	// Stock is a non-key field (it lives inside "d"), so it becomes a post-filter.
-	plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Gte(r.T.Stock, int32(5)))
+	plan := onlyPlan(t, r.QueryScan().Eq(r.T.CategoryID, int32(7)).Gte(r.T.Stock, int32(5)))
 	if len(plan.postFilter) != 1 || plan.postFilter[0].field != "Stock" {
 		t.Fatalf("expected a post-filter on Stock, got %+v", plan.postFilter)
 	}
+}
+
+// ── An entity without Partition: its whole-entity pk must not shadow the GSIs ──
+
+type account struct {
+	ID       int32  `cb:"1"`
+	Username string `cb:"2"`
+}
+
+type accountTable struct {
+	Model[accountTable, account]
+	ID       Col[*accountTable, int32]
+	Username Col[*accountTable, string]
+}
+
+func (t accountTable) GetSchema() Schema {
+	return Schema{Entity: "account", Keys: Keys(t.ID.Size(32)), Indexes: []Index{{Slot: S1, Keys: Keys(t.Username)}}}
+}
+
+func TestNoPartitionEntityUsesItsGSI(t *testing.T) {
+	accounts := NewRepo[accountTable, account]()
+	plan := onlyPlan(t, accounts.Query().Eq(accounts.T.Username, "ana"))
+	if plan.indexName != "gsi-s1" {
+		t.Fatalf("expected gsi-s1, got %q (the whole-entity pk shadowed the GSI)", plan.indexName)
+	}
+	if plan := onlyPlan(t, accounts.Query()); plan.indexName != "" {
+		t.Fatalf("without predicates the whole entity is the base pk, got %q", plan.indexName)
+	}
+}
+
+func TestStrictQueryRejectsWhatNoKeyServes(t *testing.T) {
+	r := newProducts(t)
+	for name, query := range map[string]*QueryBuilder[Product]{
+		"a non-key field":             r.Query().Eq(r.T.CategoryID, int32(7)).Gte(r.T.Stock, int32(5)),
+		"a range on a GSI hash":       r.Query().Eq(r.T.CategoryID, int32(7)).Gt(r.T.Price, int64(10)),
+		"a Keys column after a gap":   r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.ID, "sku1"),
+		"a filter beside a Contains":  r.Query().Eq(r.T.CategoryID, int32(7)).Contains(r.T.TagIDs, 3).Eq(r.T.Name, "x"),
+		"no index at all (QueryScan)": r.QueryScan().Gte(r.T.Stock, int32(5)),
+	} {
+		if _, err := query.plans(); err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+	}
+	// The key filter of a strict < under an equality prefix is the ORM's own, not a user filter.
+	onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Created, int64(5)).Lt(r.T.ID, "b"))
 }
 
 func TestPostFilterEval(t *testing.T) {
@@ -277,7 +320,7 @@ func (t widthsTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "w",
 		Partition: Keys(t.PK.Size(8)),
-		Sort:      Keys(t.A8.Size(8), t.A16.Size(16), t.A32.Size(32), t.A64.Size(64), t.U32.Size(32)),
+		Keys:      Keys(t.A8.Size(8), t.A16.Size(16), t.A32.Size(32), t.A64.Size(64), t.U32.Size(32)),
 	}
 }
 
@@ -319,7 +362,7 @@ func TestQueryRecordsRejectsMissingPartition(t *testing.T) {
 	// A range on the sort key with no partition equality: no usable index.
 	_, err := r.QueryRecords([]QueryPredicate{
 		{Field: "Created", Op: ">", Value: 100},
-	}, 0)
+	}, 0, false)
 	if err == nil {
 		t.Fatal("expected error for missing partition/index")
 	}
@@ -333,7 +376,7 @@ func TestQueryRecordsRejectsRangeOnHash(t *testing.T) {
 	_, err := r.QueryRecords([]QueryPredicate{
 		{Field: "CategoryID", Op: "=", Value: 7},
 		{Field: "Price", Op: ">", Value: 1000},
-	}, 0)
+	}, 0, false)
 	if err == nil {
 		t.Fatal("expected error for a range on a hash/GSI column")
 	}
@@ -345,7 +388,7 @@ func TestQueryRecordsRejectsNonIndexedField(t *testing.T) {
 	_, err := r.QueryRecords([]QueryPredicate{
 		{Field: "CategoryID", Op: "=", Value: 7},
 		{Field: "Name", Op: "=", Value: "beans"},
-	}, 0)
+	}, 0, false)
 	if err == nil {
 		t.Fatal("expected error for a filter on a non-indexed field")
 	}
@@ -355,7 +398,7 @@ func TestQueryRecordsRejectsUnknownField(t *testing.T) {
 	r := newProducts(t)
 	_, err := r.QueryRecords([]QueryPredicate{
 		{Field: "Nope", Op: "=", Value: "x"},
-	}, 0)
+	}, 0, false)
 	if err == nil {
 		t.Fatal("expected error for an unknown field")
 	}
@@ -366,7 +409,7 @@ func TestQueryRecordsRejectsBadCoercion(t *testing.T) {
 	// Price is int64; a non-numeric string can't be coerced.
 	_, err := r.QueryRecords([]QueryPredicate{
 		{Field: "Price", Op: "=", Value: "not-a-number"},
-	}, 0)
+	}, 0, false)
 	if err == nil {
 		t.Fatal("expected error coercing a non-numeric value to an integer column")
 	}

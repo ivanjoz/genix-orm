@@ -38,12 +38,12 @@ type ColumnInfo struct {
 const (
 	IndexPrimary = "primary" // the base table's pk (+ shared sk range)
 	IndexGSI     = "gsi"     // a global secondary index slot (n1..n5, s1..s5)
-	IndexArray   = "array"   // an ArrayIndexes field: hidden rows under pk ‖ cb id
+	IndexArray   = "array"   // a fan-out Index over a slice field: hidden rows under pk ‖ cb id
 )
 
 // IndexInfo describes one queryable access path: the base-table primary key or
 // a GSI slot. In this store every GSI shares the base table's sort key as its
-// range dimension, so Sort on TableSchema applies to the primary key and to
+// range dimension, so Keys on TableSchema applies to the primary key and to
 // every GSI alike (SharesSortKey is always true for a GSI here, and is exposed
 // so the frontend can say so explicitly).
 type IndexInfo struct {
@@ -53,7 +53,7 @@ type IndexInfo struct {
 	IsNumber      bool         `json:"isNumber"`           // numeric partition attribute (pk, n1..n5) vs string
 	SharesSortKey bool         `json:"sharesSortKey"`      // uses the table's shared sk as its range key
 	Columns       []ColumnInfo `json:"columns"`            // the index's key columns, in order
-	FullCopy      bool         `json:"fullCopy,omitempty"` // array index rows carry the record blob
+	FullCopy      bool         `json:"fullCopy,omitempty"` // fan-out rows carry the record blob
 }
 
 // TableSchema is the JSON-serializable description of one entity's schema.
@@ -64,8 +64,12 @@ type TableSchema struct {
 	TableID   int32        `json:"tableID"`   // the 8-digit prefix of every key of this entity
 	TableName string       `json:"tableName"` // physical DynamoDB table (shared by all entities)
 	Partition []ColumnInfo `json:"partition"` // base-table pk columns (after the TableID)
-	Sort      []ColumnInfo `json:"sort"`      // shared sort key columns (base table + every GSI)
+	Keys      []ColumnInfo `json:"keys"`      // sk columns: the record's key, shared as range by every GSI
 	Indexes   []IndexInfo  `json:"indexes"`   // access paths: the primary key first, then the GSIs
+	// Fields is every column of the table struct in declaration order — the whole
+	// record shape, key columns included — so a visualizer can lay out its columns
+	// before (or without) reading a single record.
+	Fields []ColumnInfo `json:"fields"`
 
 	// Autoincrement reports the schema's UseAutoincrement setting; AutoincPadding
 	// is the random low-digit count (0 when disabled or unpadded). The ID field
@@ -96,7 +100,8 @@ func GetSchema[T any]() TableSchema {
 		TableID:   resolveTableID(schema),
 		TableName: tableName(),
 		Partition: describeCols(schema.Partition),
-		Sort:      describeCols(schema.Sort),
+		Keys:      describeCols(schema.Keys),
+		Fields:    describeCols(tableColumns(tablePtr)),
 
 		Autoincrement:  schema.UseAutoincrement,
 		AutoincPadding: schema.AutoincrementRandomPadding,
@@ -114,17 +119,18 @@ func GetSchema[T any]() TableSchema {
 		SharesSortKey: true,
 		Columns:       out.Partition,
 	})
-	for _, arrayIndex := range schema.ArrayIndexes {
-		out.Indexes = append(out.Indexes, IndexInfo{
-			Kind:          IndexArray,
-			Attr:          "pk",
-			IsNumber:      true,
-			SharesSortKey: true, // the base sk follows the element in the row sk
-			Columns:       describeCols([]Coln{arrayIndex.Column}),
-			FullCopy:      arrayIndex.FullCopy,
-		})
-	}
 	for _, idx := range schema.Indexes {
+		if holdsSliceColumn(idx) {
+			out.Indexes = append(out.Indexes, IndexInfo{
+				Kind:          IndexArray,
+				Attr:          "pk",
+				IsNumber:      true,
+				SharesSortKey: true, // the base sk follows the index Keys in the row sk
+				Columns:       describeCols(idx.Keys),
+				FullCopy:      idx.FullCopy,
+			})
+			continue
+		}
 		out.Indexes = append(out.Indexes, IndexInfo{
 			Kind:          IndexGSI,
 			Name:          idx.Slot.index,
@@ -140,6 +146,19 @@ func GetSchema[T any]() TableSchema {
 // Schema returns this repo's serializable schema — the method form of
 // GetSchema[T], for when you already hold a *Repo.
 func (r *Repo[T, E]) Schema() TableSchema { return GetSchema[T]() }
+
+// tableColumns returns the column handles of a name-populated table struct, in
+// field order, skipping the embedded Model.
+func tableColumns(tablePtr any) []Coln {
+	tableValue := reflect.ValueOf(tablePtr).Elem()
+	columns := make([]Coln, 0, tableValue.NumField())
+	for i := 0; i < tableValue.NumField(); i++ {
+		if column, isColumn := tableValue.Field(i).Interface().(Coln); isColumn {
+			columns = append(columns, column)
+		}
+	}
+	return columns
+}
 
 // describeCols projects resolved key columns into their serializable form.
 func describeCols(cols []Coln) []ColumnInfo {

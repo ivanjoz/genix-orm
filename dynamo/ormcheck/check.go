@@ -65,7 +65,7 @@ func Run(output io.Writer) error {
 	runner.expect("Base pk: StoreID = 8 (another partition)", nil, queryOrders(CheckOrders.Query().Eq(orders.StoreID, int32(8))))
 	runner.expect("Packed sk range: Created BETWEEN 900 AND 1100", []string{"1"}, queryOrders(storeOrders().Between(orders.Created, int32(900), int32(1_100))))
 	runner.expect("Packed sk range: Created BETWEEN 1100 AND 2000", nil, queryOrders(storeOrders().Between(orders.Created, int32(1_100), int32(2_000))))
-	// Created is not the last sort column, so the stored sk is Created#ID: each bound on the
+	// Created is not the last Keys column, so the stored sk is Created#ID: each bound on the
 	// record's own Created (1000) must still include or exclude it exactly.
 	runner.expect("Packed sk range: Created BETWEEN 900 AND 1000 (upper = value)", []string{"1"}, queryOrders(storeOrders().Between(orders.Created, int32(900), int32(1_000))))
 	runner.expect("Packed sk range: Created <= 1000", []string{"1"}, queryOrders(storeOrders().Lte(orders.Created, int32(1_000))))
@@ -81,13 +81,22 @@ func Run(output io.Writer) error {
 	runner.expect("GSI s1 (composite string): Channel = web, Status = 2", []string{"1"}, queryOrders(CheckOrders.Query().Eq(orders.Channel, "web").Eq(orders.Status, int8(2))))
 	runner.expect("GSI s1 (composite string): Channel = web, Status = 3", nil, queryOrders(CheckOrders.Query().Eq(orders.Channel, "web").Eq(orders.Status, int8(3))))
 	runner.expect("GSI s2 (string): Code = ORD-0001", []string{"1"}, queryOrders(CheckOrders.Query().Eq(orders.Code, "ORD-0001")))
-	runner.expect("In-memory post-filter: StoreID = 7 AND Total >= 4000", []string{"1"}, queryOrders(storeOrders().Gte(orders.Total, int64(4_000))))
-	runner.expect("In-memory post-filter: StoreID = 7 AND Total >= 5000", nil, queryOrders(storeOrders().Gte(orders.Total, int64(5_000))))
+	storeOrdersScan := func() *dynamo.QueryBuilder[CheckOrder] {
+		return CheckOrders.QueryScan().Eq(orders.StoreID, checkStoreID)
+	}
+	runner.expectRejected("Query(): StoreID = 7 AND Total >= 4000 (Total is not a key)", queryOrders(storeOrders().Gte(orders.Total, int64(4_000))))
+	runner.expectRejected("Query(): CustomerID > 50 (range on a GSI hash)", queryOrders(CheckOrders.Query().Gt(orders.CustomerID, int32(50))))
+	runner.expect("QueryScan(): StoreID = 7 AND Total >= 4000 (in memory)", []string{"1"}, queryOrders(storeOrdersScan().Gte(orders.Total, int64(4_000))))
+	runner.expect("QueryScan(): StoreID = 7 AND Total >= 5000 (in memory)", nil, queryOrders(storeOrdersScan().Gte(orders.Total, int64(5_000))))
+	runner.expect("QueryScan(): Tags contains gift AND Channel = web (in memory)", []string{"1"}, queryOrders(storeOrdersScan().Contains(orders.Tags, "gift").Eq(orders.Channel, "web")))
+	runner.expectRejected("QueryScan(): Total >= 4000 alone (no index serves it)", queryOrders(CheckOrders.QueryScan().Gte(orders.Total, int64(4_000))))
 	runner.expect("Array keys-only: ProductIDs contains 20", []string{"1"}, queryOrders(storeOrders().Contains(orders.ProductIDs, 20)))
 	runner.expect("Array keys-only: ProductIDs contains 99 or 30", []string{"1"}, queryOrders(storeOrders().Contains(orders.ProductIDs, 99, 30)))
 	runner.expect("Array keys-only: ProductIDs contains 99", nil, queryOrders(storeOrders().Contains(orders.ProductIDs, 99)))
 	runner.expect("Array keys-only: Tags contains gift AND Created 900..1100", []string{"1"}, queryOrders(storeOrders().Contains(orders.Tags, "gift").Between(orders.Created, int32(900), int32(1_100))))
 	runner.expect("Array keys-only: ProductIDs contains 20 AND Created > 1000", nil, queryOrders(storeOrders().Contains(orders.ProductIDs, 20).Gt(orders.Created, int32(1_000))))
+	runner.expect("Array keys-only: ProductIDs = 20 (Eq) AND Created >= 1000", []string{"1"}, queryOrders(storeOrders().Eq(orders.ProductIDs, 20).Gte(orders.Created, int32(1_000))))
+	runner.expect("Array keys-only: ProductIDs = 20, Created = 1000, ID >= 1", []string{"1"}, queryOrders(storeOrders().Eq(orders.ProductIDs, 20).Eq(orders.Created, int32(1_000)).Gte(orders.ID, int32(1))))
 
 	products := CheckProducts.T
 	runner.section(fmt.Sprintf("Products (TableID %d): no Partition, pk = TableID, sk = ID", CheckProducts.Schema().TableID))
@@ -167,6 +176,23 @@ func (runner *checkRunner) expect(name string, want []string, read func() ([]str
 
 func (runner *checkRunner) expectOnce(name string, want []string, read func() ([]string, error)) {
 	runner.runCheck(name, want, 1, read)
+}
+
+// expectRejected passes when the read fails before calling DynamoDB: the planner refused it.
+func (runner *checkRunner) expectRejected(name string, read func() ([]string, error)) {
+	meter.reset()
+	_, err := read()
+	mark, result := "✓", "rejected"
+	if err == nil {
+		mark, result = "✗", "was not rejected"
+		runner.failed++
+	} else {
+		runner.passed++
+	}
+	fmt.Fprintf(runner.output, "  %s %-62s %-15s %s\n", mark, name, result, meter.summary())
+	if err != nil {
+		fmt.Fprintf(runner.output, "      %v\n", err)
+	}
 }
 
 func (runner *checkRunner) runCheck(name string, want []string, maxAttempts int, read func() ([]string, error)) {

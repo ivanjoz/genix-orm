@@ -25,7 +25,7 @@ func (t TicketTable) GetSchema() Schema {
 	return Schema{
 		Entity:                     "tick",
 		Partition:                  Keys(t.ID.Size(48)),
-		Sort:                       Keys(t.Created.Size(48)),
+		Keys:                       Keys(t.Created.Size(48)),
 		UseAutoincrement:           true,
 		AutoincrementRandomPadding: 3,
 	}
@@ -145,7 +145,7 @@ type badAutoincTable struct {
 func (t badAutoincTable) GetSchema() Schema {
 	return Schema{
 		Entity:           "bad",
-		Sort:             Keys(t.Created.Size(48)),
+		Keys:             Keys(t.Created.Size(48)),
 		UseAutoincrement: true,
 	}
 }

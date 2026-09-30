@@ -5,6 +5,9 @@ demo's single-table DynamoDB store. You declare a table as two Go structs and a
 `GetSchema()`; the ORM derives the physical keys, runs the queries, and marshals
 rows — all with compile-time-checked column references.
 
+Coding agents: `skill/SKILL.md` is the usage guide for an agent (a Claude Code skill). Symlink it
+into a project's `.claude/skills/genix-dynamo-orm`.
+
 ## Storage model: keys + one binary blob
 
 Every item contains **only**: the key columns (`pk`, `sk`), the index columns
@@ -109,15 +112,12 @@ type ProductTable struct {
 
 func (t ProductTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
-        Entity:    "prod",                                    // TableID = HashTableID("prod")
-        Partition: dynamo.Keys(t.CategoryID.Size(16)),        // -> pk = TableID ‖ 5 digits
-        Sort:      dynamo.Keys(t.Created.Size(48), t.ID),     // -> sk, order-preserving
+        Entity: "prod",                                       // TableID = HashTableID("prod"), pk = TableID
+        Keys:   dynamo.Keys(t.ID),                            // -> sk: the record's key
         Indexes: []dynamo.Index{
-            {Slot: dynamo.N1, Keys: dynamo.Keys(t.Price.Size(40))}, // numeric GSI
-            {Slot: dynamo.S1, Keys: dynamo.Keys(t.Brand)},          // string GSI
-        },
-        ArrayIndexes: []dynamo.ArrayIndex{
-            {Column: t.TagIDs.Size(32)},                      // Contains(TagIDs, ...)
+            {Slot: dynamo.N1, Keys: dynamo.Keys(t.CategoryID.Size(16))}, // numeric GSI
+            {Slot: dynamo.S1, Keys: dynamo.Keys(t.Brand)},               // string GSI
+            {Keys: dynamo.Keys(t.TagIDs.Size(32))},                      // fan-out: Contains(TagIDs, ...)
         },
     }
 }
@@ -127,52 +127,96 @@ Derived attributes per item, for a TableID of `12345678` (plus `d` = colbin blob
 of the whole record):
 
 ```
-pk = 12345678 ‖ CategoryID as 5 digits           (number: 1234567800007)
-sk = EncodeOrderedUint(Created, 8) + "#" + ID    (Size(48) = 8 Base64 chars)
-n1 = 12345678 ‖ Price as 13 digits               (number)
+pk = 12345678                                    (number: no Partition, the TableID alone)
+sk = ID                                          (Keys, order-preserving composite)
+n1 = 12345678 ‖ CategoryID as 5 digits           (number: 1234567800007)
 s1 = "12345678#" + Brand
 d  = colbin.Marshal(product)                     (binary)
 ```
 
-## Array indexes: query a slice by element (`array_index.go`)
+### `Keys` is the record's identity, and its only range
 
-DynamoDB can't index inside a list, so an `ArrayIndexes` field is fanned out into
-hidden rows, one per distinct element, which the ORM keeps in sync:
+`pk + sk` identify a record: `Get`/`Delete` take the `Keys` values, and a `Put`
+with different ones writes another item. The `sk` is also the **only** range and
+order dimension: GSI keys are equality only, and every GSI shares the base `sk`
+as its range key. So a key column is chosen for two reasons at once:
+
+- **Identity** — the usual case is `Keys: dynamo.Keys(t.ID)`.
+- **Ranges** — a range on a field (`Created` between two dates) is only possible
+  when that field is in `Keys`, before the ID: `Keys(t.Created.Size(32), t.ID)`.
+  The cost is identity: a `Get` then needs `Created` as well, and changing
+  `Created` means `Delete` + `Put`. Put a field in `Keys` only when it never
+  changes and its range query is a real access path.
+
+`Partition` is optional; without it the whole entity is one pk (the TableID).
+Declare one for a large entity that is always read per tenant/store/slot, so its
+reads and writes spread over DynamoDB partitions. A leading `Keys` column narrows
+a read the same way through an sk prefix, so a partition is a throughput choice,
+not a query one. `Contains` needs an equality on every Partition column.
+
+```go
+// orders: always read per store, listed by date
+Partition: dynamo.Keys(t.StoreID.Size(16)),               // pk = TableID ‖ StoreID (5 digits)
+Keys:      dynamo.Keys(t.Created.Size(32), t.ID.Size(24)), // sk = enc(Created)#enc(ID)
+```
+
+## Fan-out indexes: query a slice by element (`array_index.go`)
+
+DynamoDB can't index inside a list, so an `Index` whose `Keys` hold a
+`ColSlice` fans the record out into hidden rows, one per distinct element, which
+the ORM keeps in sync. The row sk is the index `Keys` with the slice replaced by
+the element, then the base sk:
 
 ```
-pk = base pk ‖ the field's cb id, 3 digits       (number: 1234567800007006)
-sk = composite(element) + "#" + base sk
+pk = base pk ‖ the slice field's cb id, 3 digits          (number: 12345678006)
+sk = composite(index Keys, slice → element) + "#" + base sk
 d  = the record blob, only with FullCopy: true
 ```
 
 ```go
-Products.Query().Eq(Products.T.CategoryID, int32(7)).Contains(Products.T.TagIDs, 3, 9).Exec(&out)
+// orders of a store holding product 5, updated after 10000: one exact sk range
+Indexes: []dynamo.Index{{Keys: dynamo.Keys(t.ProductIDs.Size(32), t.Updated.Size(32))}},
+Orders.Query().Eq(Orders.T.StoreID, 7).Contains(Orders.T.ProductIDs, 5).Gt(Orders.T.Updated, 10000).Exec(&out)
+Orders.Query().Eq(Orders.T.StoreID, 7).Eq(Orders.T.ProductIDs, 5).Exec(&out) // Eq on a ColSlice = Contains of one value
 ```
 
-- **Declaration:** one `ArrayIndex` per slice field; a table can have several.
-  The field's handle is a `ColSlice[T, E]` with `E` the **element** type (as in
-  genix-orm/db): `ArrayIndex.Column` and `Contains` accept nothing else, and the
-  compile checks `E` against the record field. Elements are integers declaring
-  `.Size(bits)`, or strings, and the field must carry a `cb:"N"` tag (1..999):
-  that stable id, not the Go name, names its rows.
-- **Contains** matches records holding ANY of the values: one Query per value,
-  a record matching several comes back once, results come value by value. It
-  needs an equality on every Partition column (the rows live under the base pk),
-  and base sort predicates narrow it further (`Contains(...).Gte(Created, x)`).
-  One Contains per query; the dynamic `QueryRecords` does not accept it.
+- **Declaration:** an `Index` with no `Slot` and exactly one `ColSlice` among its
+  `Keys`, anywhere in the list (`Keys(ProductIDs, Updated)` or
+  `Keys(Channel, Tags)`). The handle is a `ColSlice[T, E]` with `E` the
+  **element** type (as in genix-orm/db), checked against the record field.
+  Elements are integers declaring `.Size(bits)`, or strings, and the field must
+  carry a `cb:"N"` tag (1..999): that stable id, not the Go name, names its rows,
+  so a slice field takes **one** fan-out index. The other `Keys` are scalar key
+  columns, as in a GSI.
+- **Contains** (or `Eq` on the `ColSlice`) matches records holding ANY of the
+  values: one Query per value, a record matching several comes back once,
+  results come value by value. It needs an equality on every Partition column
+  (the rows live under the base pk) and on every index `Keys` column before the
+  slice. The columns after it take ranges, and once they are all pinned the base
+  `Keys` do too (`Contains(...).BeginsWith(ID, "sku")`). One Contains per query;
+  the dynamic `QueryRecords` does not accept it.
+- **Changing an index's `Keys`** changes the row sk of existing data, and there
+  is no rebuild yet. Re-putting the records does not fix it: a write diffs both
+  versions with the new shape, so it neither rewrites keys-only rows nor deletes
+  the old-shape ones. `Keys(Slice)` alone keeps the pre-`Index` (`ArrayIndexes`)
+  row format byte for byte.
+- **A scalar `Keys` column that changes** (e.g. `Updated`) moves every element
+  row on each write that changes it: a delete and a put per element. Prefer
+  columns that never change, like `Created`.
 - **Keys only (default)** — a row is `{pk, sk}`. Contains reads the matching
-  base records with a second `BatchGetItem`. A write that leaves the slice alone
-  writes no rows.
+  base records with a second `BatchGetItem`. A write that leaves the slice and
+  the scalar index columns alone writes no rows.
 - **`FullCopy: true`** — each row also carries `d`, so Contains is one Query,
   at the price of rewriting every element row on every write of the record.
 - **Sync on write:** `Put`/`PutMany` read the stored version (consistent
-  `BatchGetItem`), diff its elements against the new ones and write new rows →
+  `BatchGetItem`), diff its rows against the new ones and write new rows →
   base item → stale rows. `Delete` reads the stored version and deletes its rows
   after the item. `PutIfAbsent` writes the rows after the conditional put, since
   written first they could index a record that loses the race.
 - **Crash / race safety:** that order leaves extra rows, never a missing one,
-  and Contains re-checks every record it returns against the element it asked
-  for, so an extra keys-only row never becomes a result. A stale FullCopy row
+  and Contains re-checks every record it returns against the row that led to it
+  (the record must still write that exact row: same element, same scalar index
+  columns), so an extra keys-only row never becomes a result. A stale FullCopy row
   carries its own stale slice and can't be told apart until the next write of
   that record.
 
@@ -194,8 +238,7 @@ type Invoice struct {
 func (t InvoiceTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Entity:                     "inv",
-        Partition:                  dynamo.Keys(t.ID.Size(48)),
-        Sort:                       dynamo.Keys(t.Created.Size(48)),
+        Keys:                       dynamo.Keys(t.ID.Size(48)),
         UseAutoincrement:           true,   // fill ID on Put/PutMany when zero
         AutoincrementRandomPadding: 3,       // low 3 digits are random
     }
@@ -245,13 +288,14 @@ var Products = dynamo.NewRepo[ProductTable, Product]()   // compile once, reuse
 Products.Put(&p)
 Products.PutMany(list)          // batched (25/req) with unprocessed-item retry
 written, err := Products.PutIfAbsent(&p) // false when the key already exists: one conditional PutItem
-Products.Delete(&Product{CategoryID: 7, ID: "sku1", Created: 1700000000})
+Products.Delete(&Product{ID: "sku1"})
 
-// point read (only key fields needed)
-got, err := Products.Get(Product{CategoryID: 7, ID: "sku1", Created: 1700000000})
+// point read (only the Partition and Keys fields needed)
+got, err := Products.Get(Product{ID: "sku1"})
 
-// top N of one partition (one value per Partition column, in schema order)
-top, err := Products.TopN(10, int32(7))
+// top N of one partition (one value per Partition column, in schema order;
+// none for an entity without Partition)
+top, err := Products.TopN(10)
 
 // list an entity regardless of partition (a Query when the entity has no
 // Partition, else a Scan over its pk range; admin/debug)
@@ -260,30 +304,54 @@ all, err := Products.Scan(10)
 // queries — Products.T carries the named, typed columns
 var out []Product
 err := Products.Query().
-    Eq(Products.T.CategoryID, int32(7)).               // -> pk
-    Between(Products.T.Created, from, to).             // -> sk range (order-preserving)
+    Between(Products.T.ID, "sku1", "sku5").            // -> sk range (order-preserving)
     Desc().Limit(50).
     Exec(&out)
 
-// query a GSI: an equality on a full index key routes to that slot
-Products.Query().Eq(Products.T.Price, int64(1299)).Exec(&out)   // gsi-n1
-Products.Query().Eq(Products.T.Brand, "acme").Exec(&out)        // gsi-s1
+// query a GSI: an equality on a full index key routes to that slot, and the
+// shared sk still narrows it
+Products.Query().Eq(Products.T.CategoryID, int32(7)).Exec(&out)                          // gsi-n1
+Products.Query().Eq(Products.T.Brand, "acme").BeginsWith(Products.T.ID, "sku").Exec(&out) // gsi-s1
 
-// query an array index: records whose TagIDs hold 3 or 9
-Products.Query().Eq(Products.T.CategoryID, int32(7)).Contains(Products.T.TagIDs, 3, 9).Exec(&out)
+// query a fan-out index: records whose TagIDs hold 3 or 9
+Products.Query().Contains(Products.T.TagIDs, 3, 9).Exec(&out)
+
+// filter a non-key field (Price is in no key): only QueryScan() allows it,
+// and it reads at most 5 MB
+Products.QueryScan().Eq(Products.T.Brand, "acme").Gt(Products.T.Price, int64(1000)).Exec(&out)
 ```
+
+### `Query()` vs `QueryScan()`
+
+`Query()` is strict: every predicate must be served by a key (pk, sk or a GSI
+key). A predicate on a field that lives only inside `d` fails at plan time with
+`Query() cannot filter <field> through an index: use QueryScan()`. `QueryScan()`
+plans the same index read, then filters the decoded records in memory — so it
+pays for every row the index returns, matched or not. To keep that bounded it
+stops with an error once it has read more than **5 MB** (640 RCU, eventually
+consistent: 4 KB per 0.5 RCU) without finishing. The budget is counted in read
+units, not pages, because a keys-only `Contains` also spends BatchGetItem reads
+that are not Query pages. Predicate order never matters: the planner picks the
+index, not the call order.
 
 ### How a query is planned (`query.go`)
 
-1. **Partition source** — a `Contains` targets its array index rows (and needs
-   `=` on every `Partition` column). Otherwise, if every `Partition` column has
-   an `=`, use the base table (`pk`); otherwise the first GSI whose key columns
-   all have `=`. Base wins when both are available.
-2. **Sort condition** — predicates on the `Sort` columns become the shared `sk`
-   key condition (`=`, `begins_with`, range, `between`). On array rows the
-   element leads the sk, so it is a fixed prefix ahead of them.
+1. **Partition source** — a `Contains` targets its fan-out rows (and needs
+   `=` on every `Partition` column). Otherwise, if the entity has `Partition`
+   columns and all of them have an `=`, use the base table (`pk`); else the first
+   GSI whose key columns all have `=`; else the base table, when it is available
+   (an entity without `Partition` always is: its pk is the TableID alone). So a
+   no-partition entity still routes an `=` on a GSI key to that GSI instead of
+   reading the whole entity.
+2. **Keys condition** — predicates on the `Keys` columns become the shared `sk`
+   key condition (`=`, `begins_with`, range, `between`). On fan-out rows the
+   sort columns are the index `Keys` (the element pins the slice like an `=`)
+   followed by the `Keys`. What the key
+   condition can't express exactly (a strict `<` under an equality prefix) is
+   kept as a key filter, checked in memory — still a key predicate, so `Query()`
+   allows it.
 3. **Leftovers** — predicates on non-key fields (which live inside `d`) are
-   evaluated **in memory** against each decoded record.
+   rejected by `Query()` and evaluated **in memory** by `QueryScan()`.
 
 > Because the physical table shares one `sk` across the base table and all GSIs,
 > the sort/range dimension is uniform. Every range is exact at any position of a
@@ -334,22 +402,25 @@ json.NewEncoder(w).Encode(schema)
   "entity": "prod",
   "tableID": 12345678,          // Schema.TableID, or HashTableID(Entity)
   "tableName": "demo-app",      // physical DynamoDB table
-  "partition": [{ "field": "CategoryID", "attr": "CategoryID", "type": "int", "size": 16 }],
-  "sort": [
-    { "field": "Created", "attr": "Created", "type": "int", "size": 48 },
-    { "field": "ID",      "attr": "ID",      "type": "string" }
+  "partition": null,            // no Partition: pk = TableID
+  "keys": [
+    { "field": "ID", "attr": "ID", "type": "string" }
   ],
   "indexes": [
     { "kind": "primary", "attr": "pk", "isNumber": true, "sharesSortKey": true, "columns": [ /* pk cols */ ] },
     { "kind": "array", "attr": "pk", "isNumber": true, "sharesSortKey": true, "columns": [ /* TagIDs */ ] },
-    { "kind": "gsi", "name": "gsi-n1", "attr": "n1", "isNumber": true,  "sharesSortKey": true, "columns": [ /* Price */ ] },
+    { "kind": "gsi", "name": "gsi-n1", "attr": "n1", "isNumber": true,  "sharesSortKey": true, "columns": [ /* CategoryID */ ] },
     { "kind": "gsi", "name": "gsi-s1", "attr": "s1", "isNumber": false, "sharesSortKey": true, "columns": [ /* Brand */ ] }
+  ],
+  "fields": [                   // every table struct column, in declaration order
+    { "field": "ID", "attr": "ID", "type": "string" },
+    { "field": "Name", "attr": "Name", "type": "string" }
   ]
 }
 ```
 
 Every GSI shares the base table's `sk` as its range key (`sharesSortKey`), so
-the top-level `sort` applies to the primary key and every index alike. It's a
+the top-level `keys` applies to the primary key and every index alike. It's a
 cold path that reads the table struct's `GetSchema()` directly — no accessors,
 no `metaCache` — so it needs only the table type, not the record type.
 
@@ -366,6 +437,8 @@ type Controller interface {
     TableName() string          // physical DynamoDB table
     Schema() TableSchema        // serializable schema (see introspection)
     DeleteRecordsAll() (int, error)
+    // Strict, index-only dynamic query by field name; newest first when desc.
+    QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error)
 }
 
 // Registry — the analogue of genix's MakeScyllaControllers().
