@@ -249,6 +249,14 @@ type Schema struct {
 	// IDs (1, 2, 3, …); 3 turns sequence 42 into an ID like 42_837. Range 0..9.
 	// Ignored unless UseAutoincrement is true.
 	AutoincrementRandomPadding int
+
+	// SaveUpdatedVersion enables the by-IDs cache (cache_updated_version.go): every
+	// write bumps the version of the record's slot, and Repo.QueryCachedIDs returns
+	// only the requested records whose slot moved since the client's version. It
+	// needs exactly one integer Keys column (the ID) and a uint16 record field
+	// named "UpdatedVersion" (json "upv"), which the ORM manages: it is zeroed on
+	// write and stamped with the slot version on a by-IDs read.
+	SaveUpdatedVersion bool
 }
 
 // Slot identifies one of the ten physical GSI attributes.

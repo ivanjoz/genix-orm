@@ -57,6 +57,7 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
+	r.meta.prepareUpdatedVersions([]unsafe.Pointer{ptr})
 	item, err := r.meta.marshalItem(ptr, record)
 	if err != nil {
 		return false, err
@@ -80,7 +81,10 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	// Unlike PutMany, the array index rows go after the base item: written first,
 	// they would index a record that then loses the race for its key.
 	arrayRowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item[dataColumn].(*types.AttributeValueMemberB).Value)
-	return true, r.batchWriteAll(client, arrayRowPuts)
+	if err := r.batchWriteAll(client, arrayRowPuts); err != nil {
+		return true, err
+	}
+	return true, r.meta.bumpSlotVersions(client, []unsafe.Pointer{ptr})
 }
 
 // PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
@@ -88,6 +92,7 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 // in a single sequence reservation before the batch is written. With array
 // indexes it first reads the stored versions and writes in three passes: new
 // array rows, then the base items, then stale array rows (see array_index.go).
+// With SaveUpdatedVersion the touched slot versions are bumped last.
 func (r *Repo[T, E]) PutMany(records []E) error {
 	client, err := Client()
 	if err != nil {
@@ -100,6 +105,7 @@ func (r *Repo[T, E]) PutMany(records []E) error {
 	if err := r.meta.assignAutoIDs(ptrs); err != nil {
 		return err
 	}
+	r.meta.prepareUpdatedVersions(ptrs)
 	storedByKey, err := r.storedVersions(client, ptrs)
 	if err != nil {
 		return err
@@ -127,7 +133,7 @@ func (r *Repo[T, E]) PutMany(records []E) error {
 			return err
 		}
 	}
-	return nil
+	return r.meta.bumpSlotVersions(client, ptrs)
 }
 
 // storedVersions reads (consistently) the stored version of each record, keyed
@@ -213,7 +219,10 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if err != nil {
 		return err
 	}
-	return r.batchWriteAll(client, arrayRowDeletes)
+	if err := r.batchWriteAll(client, arrayRowDeletes); err != nil {
+		return err
+	}
+	return r.meta.bumpSlotVersions(client, []unsafe.Pointer{ptr})
 }
 
 // Get fetches one item by its full key. `key` only needs its partition and sort

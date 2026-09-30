@@ -279,6 +279,47 @@ value, returning the previous one (genix's `SetCounterValue`). The next ID uses
 Requirements: the record/table must declare an integer field named `ID`; padding
 is `0..9`. Both are checked at compile time (`NewRepo` panics otherwise).
 
+## By-IDs cache (`cache_updated_version.go`)
+
+Ported from genix-orm/scylla's slot versions. It answers "give me records
+[12, 87, 412]" with only the ones that changed since the version the client
+holds, which is what genix-ui's cache-by-ids sends (`ids`, `cc-ids`, `cc-ver`).
+
+```go
+type Customer struct {
+    ID             int32  `cb:"1"`
+    Name           string `cb:"2"`
+    UpdatedVersion uint16 `json:"upv,omitempty" cb:"3"` // managed by the ORM
+}
+
+func (t CustomerTable) GetSchema() dynamo.Schema {
+    return dynamo.Schema{
+        Entity:             "cust",
+        Keys:               dynamo.Keys(t.ID.Size(32)), // exactly one integer column
+        SaveUpdatedVersion: true,
+    }
+}
+
+changed, err := Customers.QueryCachedIDs([]dynamo.IDUpdatedVersion{{ID: 12}, {ID: 87, UpdatedVersion: 4}})
+```
+
+- A record belongs to slot `uint8(ID)`. Each base pk has one slot-versions
+  item, `pk = base pk ‖ 000`, `sk = "v"`, with one counter per slot
+  (`v0`..`v255`). `000` is the fan-out suffix no cb id takes, so no query or
+  Scan ever reads it, and `DeleteRecordsAll` keeps it.
+- **Write:** `Put`/`PutMany`/`PutIfAbsent`/`Delete` write the records, then
+  one UpdateItem per touched pk `ADD`s 1 to each touched slot. The record's
+  `UpdatedVersion` is zeroed before the write.
+- **Read:** one GetItem of the slot versions, then one consistent BatchGetItem
+  of the IDs whose client version differs (0 always differs). Returned records
+  carry the slot version, truncated to `uint16` (0 is reserved for "unknown").
+- Bumping after the write keeps it race-free: a reader that sees the new
+  version reads the new record (the read is consistent); one that sees the old
+  version only makes the client ask again.
+- A write refetches the whole slot (IDs 256 apart). A record not written since
+  the flag was enabled has no slot version and is read on every request, until
+  it is written once.
+
 ## Using it
 
 ```go
@@ -439,6 +480,12 @@ type Controller interface {
     DeleteRecordsAll() (int, error)
     // Strict, index-only dynamic query by field name; newest first when desc.
     QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error)
+    // The same, filtering what no key serves in memory (QueryScan, 5 MB cap).
+    QueryScanRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error)
+    // JSON array → E values, every key built: a bad payload fails before a write.
+    DecodeRecords(recordsJSON []byte) ([]any, error)
+    // PutMany of E values; returns them as written (autoincrement IDs assigned).
+    PutRecords(records []any) ([]any, error)
 }
 
 // Registry — the analogue of genix's MakeScyllaControllers().
@@ -478,11 +525,11 @@ path and the record body avoid it.
 
 ## What was intentionally dropped from genix
 
-Materialized/hash/radix views, `int64` packing, index groups, by-IDs slot versions
-hooks, and CQL deploy/homologation. DynamoDB's fixed physical schema and string
+Materialized/hash/radix views, `int64` packing, index groups, the generic-record
+by-IDs reads, and CQL deploy/homologation. DynamoDB's fixed physical schema and string
 keys make most of that unnecessary — so this is, as expected, a much smaller
-ORM. (Cached metadata, precompiled `xunsafe` accessors, autoincrement sequences
-and entity controllers are kept/ported — see above.)
+ORM. (Cached metadata, precompiled `xunsafe` accessors, autoincrement sequences,
+by-IDs slot versions and entity controllers are kept/ported — see above.)
 
 ## Config & tests
 

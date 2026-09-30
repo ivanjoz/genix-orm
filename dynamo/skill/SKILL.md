@@ -1,6 +1,6 @@
 ---
 name: genix-dynamo-orm
-description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement. Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
+description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
 ---
 
 # genix-orm/dynamo
@@ -108,6 +108,8 @@ A violation makes `NewRepo` panic at boot:
   - pin it when renaming an `Entity` without moving its data.
 - **Autoincrement** needs an integer field named `ID`. `AutoincrementRandomPadding` (0..9) adds
   random low digits.
+- **`SaveUpdatedVersion`** needs exactly one integer `Keys` column and a `uint16` field named
+  `UpdatedVersion` (`json:"upv"`) in the record and the table struct. See section 3b.
 
 ## 2. Writing and reading by key
 
@@ -193,6 +195,34 @@ Operators: `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, `BeginsWith`, `Contains`, 
   Query but rewrites every element row on every `Put`. Choose FullCopy for read-heavy, rarely
   written records with short slices.
 
+## 3b. By-IDs cache (`SaveUpdatedVersion`, `QueryCachedIDs`)
+
+Use it for "give me records [12, 87, 412], skip the ones I already have unchanged". It backs
+genix-ui's cache-by-ids (`getRecordByID`, `RecordByIDText`, `GetHandler.routeByID`).
+
+```go
+// schema: Keys(t.ID.Size(32)) and nothing else in Keys, plus
+SaveUpdatedVersion: true,
+// record and table struct:
+UpdatedVersion uint16 `json:"upv,omitempty" cb:"N"`
+UpdatedVersion dynamo.Col[OrderTable, uint16]
+
+changed, err := Orders.QueryCachedIDs(cachedIDs)          // []dynamo.IDUpdatedVersion{ID, UpdatedVersion}
+changed, err  = Orders.QueryCachedIDs(cachedIDs, storeID) // one value per Partition column
+```
+
+- A record is in slot `uint8(ID)`. Each partition has one hidden slot-versions item
+  (`pk = base pk ‖ 000`), where every write ADDs 1 to the slots it touched, after the record is
+  written.
+- `QueryCachedIDs` does one GetItem for the slot versions, then one consistent BatchGetItem for
+  the IDs whose client version (0 = none) differs. Unchanged and missing IDs are left out, and the
+  returned records carry the **slot** version in `UpdatedVersion`.
+- The ORM owns `UpdatedVersion`: it is zeroed on every write, so a delta list returns `upv` 0,
+  which costs one revalidation on the by-IDs path.
+- A write to one record makes the other records of its slot (IDs 256 apart) come back once too.
+- A record never written since the flag was turned on has no slot version, so it is read on every
+  request. Re-`Put` the existing records once after enabling the flag.
+
 ## 4. Pitfalls
 
 - **Put a two-sided range in one `Between`, never `Gte(f, a).Lte(f, b)`.** The planner keeps one
@@ -215,7 +245,7 @@ Operators: `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, `BeginsWith`, `Contains`, 
   not rewritten.
 - A field referenced by a **GSI or `Keys`** must be set on every write. A zero value is still a key.
 - `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows. It is destructive and
-  there is no undo.
+  there is no undo. It keeps the slot-versions items.
 
 ## 5. Checking your work
 

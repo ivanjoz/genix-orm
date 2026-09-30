@@ -96,11 +96,21 @@ type QueryPredicate struct {
 // order when desc is set (newest first on an autoincrement ID). See the package
 // comment above for the strict key rules it enforces.
 func (r *Repo[T, E]) QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
+	return r.queryRecords(r.Query(), preds, limit, desc)
+}
+
+// QueryScanRecords is QueryRecords over QueryScan: a partition or full GSI key
+// must still serve the read, and the predicates no key serves are filtered in
+// memory after it, within QueryScan's 5 MB read budget.
+func (r *Repo[T, E]) QueryScanRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
+	return r.queryRecords(r.QueryScan(), preds, limit, desc)
+}
+
+func (r *Repo[T, E]) queryRecords(q *QueryBuilder[E], preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
 	if limit <= 0 || limit > queryRecordsMaxLimit {
 		limit = queryRecordsMaxLimit
 	}
 
-	q := r.Query()
 	for _, p := range preds {
 		o, err := parseOp(p.Op)
 		if err != nil {
@@ -123,8 +133,8 @@ func (r *Repo[T, E]) QueryRecords(preds []QueryPredicate, limit int32, desc bool
 		q.preds = append(q.preds, predicate{field: p.Field, op: o, v1: v1, v2: v2})
 	}
 
-	// q is a strict Query: Exec plans before any DynamoDB call and rejects a
-	// predicate no index serves, as well as a missing partition/index.
+	// Exec plans before any DynamoDB call and rejects a missing partition/index; a
+	// strict Query also rejects a predicate no index serves.
 	q.Limit(limit)
 	if desc {
 		q.Desc()

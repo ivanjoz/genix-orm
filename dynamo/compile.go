@@ -68,6 +68,7 @@ type tableMeta struct {
 	arrayIndexes    []arrayIndexMeta
 	accessors       map[string]*colAccessor // record field name -> precompiled accessor
 	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
+	updatedVersion  *updatedVersionConfig   // nil unless the schema sets SaveUpdatedVersion
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -192,7 +193,8 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	}
 
 	pkDigits := len(meta.tableID) + meta.partitionDigits
-	if len(meta.arrayIndexes) > 0 {
+	// Fan-out rows and the slot-versions item both append 3 digits to the base pk.
+	if len(meta.arrayIndexes) > 0 || schema.SaveUpdatedVersion {
 		pkDigits += arrayIndexColumnIDDigits
 	}
 	if pkDigits > maxNumericKeyDigits {
@@ -202,6 +204,9 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 
 	if schema.UseAutoincrement {
 		meta.autoinc = resolveAutoincrement(schema, recordType, accessors, meta.tableID)
+	}
+	if schema.SaveUpdatedVersion {
+		meta.updatedVersion = resolveUpdatedVersion(recordType, accessors, meta.keys)
 	}
 
 	return meta

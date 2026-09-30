@@ -2,6 +2,9 @@ package dynamo
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -42,6 +45,15 @@ type Controller interface {
 	// records as JSON-serializable values, newest first when desc is set. See the
 	// method on *Repo for the strict key rules it enforces.
 	QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error)
+	// QueryScanRecords is QueryRecords with QueryScan's in-memory filter for the
+	// predicates no key serves.
+	QueryScanRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error)
+	// DecodeRecords decodes a JSON array into this entity's records (E values) and
+	// checks that each one builds its keys, so a bad payload fails before a write.
+	DecodeRecords(recordsJSON []byte) ([]any, error)
+	// PutRecords upserts E values (from DecodeRecords or QueryRecords) through
+	// PutMany and returns them as written, autoincrement IDs assigned.
+	PutRecords(records []any) ([]any, error)
 }
 
 // NewController compiles the schema (like NewRepo) and returns it as a
@@ -61,7 +73,8 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 //
 // It is scoped to this entity's pk ranges (its base rows and its array index
 // rows), so sibling entities (and the internal sequence counters) in the shared
-// table are untouched. The returned count includes array index rows. This is a
+// table are untouched, and it keeps the by-IDs slot-versions items that share the
+// array range. The returned count includes array index rows. This is a
 // destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	client, err := Client()
@@ -104,6 +117,11 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 			return deleted, err
 		}
 		for _, item := range res.Items {
+			// Slot versions survive a wipe: counting again from 0 could hand a
+			// recreated record a version a client still holds for the old one.
+			if isSlotVersionsPK(item["pk"].(*types.AttributeValueMemberN).Value) {
+				continue
+			}
 			batch = append(batch, types.WriteRequest{
 				DeleteRequest: &types.DeleteRequest{
 					Key: map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]},
@@ -124,4 +142,53 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 		return deleted, err
 	}
 	return deleted, nil
+}
+
+// DecodeRecords decodes a JSON array of records (keyed by the record's json
+// tags) and builds every key of each one: the item and its fan-out rows. A key
+// value that overflows its Size(bits) or is negative panics on the write path;
+// here it comes back as an error, so a type-erased caller can validate a payload
+// without writing it.
+func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error) {
+	var decodedRecords []E
+	if err := json.Unmarshal(recordsJSON, &decodedRecords); err != nil {
+		return nil, fmt.Errorf("db: %s records are not a valid JSON array: %w", r.meta.recordType.Name(), err)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			records, err = nil, fmt.Errorf("%v", recovered)
+		}
+	}()
+	records = make([]any, len(decodedRecords))
+	for i := range decodedRecords {
+		ptr := unsafe.Pointer(&decodedRecords[i])
+		if _, err := r.meta.marshalItem(ptr, &decodedRecords[i]); err != nil {
+			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
+		}
+		for arrayIndex := range r.meta.arrayIndexes {
+			r.meta.arrayRowSKs(&r.meta.arrayIndexes[arrayIndex], ptr)
+		}
+		records[i] = decodedRecords[i]
+	}
+	return records, nil
+}
+
+// PutRecords is PutMany for type-erased records: each must be an E value.
+func (r *Repo[T, E]) PutRecords(records []any) ([]any, error) {
+	typedRecords := make([]E, len(records))
+	for i, record := range records {
+		typedRecord, isRecord := record.(E)
+		if !isRecord {
+			return nil, fmt.Errorf("db: %s PutRecords got a %T at %d", r.meta.recordType.Name(), record, i)
+		}
+		typedRecords[i] = typedRecord
+	}
+	if err := r.PutMany(typedRecords); err != nil {
+		return nil, err
+	}
+	writtenRecords := make([]any, len(typedRecords))
+	for i := range typedRecords {
+		writtenRecords[i] = typedRecords[i]
+	}
+	return writtenRecords, nil
 }
