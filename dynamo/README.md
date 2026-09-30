@@ -168,6 +168,7 @@ var Products = dynamo.NewRepo[ProductTable, Product]()   // compile once, reuse
 // writes
 Products.Put(&p)
 Products.PutMany(list)          // batched (25/req) with unprocessed-item retry
+written, err := Products.PutIfAbsent(&p) // false when the key already exists: one conditional PutItem
 Products.Delete(&Product{Category: "coffee", ID: "sku1", Created: 1700000000})
 
 // point read (only key fields needed)

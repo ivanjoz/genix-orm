@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -56,6 +57,35 @@ func (r *Repo[T, E]) Put(record *E) error {
 		Item:      item,
 	})
 	return err
+}
+
+// PutIfAbsent writes the record only when no item with its key exists yet, and
+// reports false (without an error) when the key was already taken. The check and
+// the write are one conditional PutItem, so of two concurrent writers of the same
+// key exactly one wins — the primitive for "enqueue once" and "claim once".
+// Autoincrement IDs are assigned as in Put.
+func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
+	if err := r.meta.assignAutoIDs([]unsafe.Pointer{unsafe.Pointer(record)}); err != nil {
+		return false, err
+	}
+	item, err := r.meta.marshalItem(unsafe.Pointer(record), record)
+	if err != nil {
+		return false, err
+	}
+	client, err := Client()
+	if err != nil {
+		return false, err
+	}
+	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName:           aws.String(tableName()),
+		Item:                item,
+		ConditionExpression: aws.String("attribute_not_exists(pk)"),
+	})
+	var keyTakenErr *types.ConditionalCheckFailedException
+	if errors.As(err, &keyTakenErr) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
