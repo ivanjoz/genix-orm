@@ -38,6 +38,7 @@ const (
 	opLte
 	opBetween
 	opBeginsWith
+	opContains // v1 holds the []any of values; served by an ArrayIndexes field
 )
 
 type predicate struct {
@@ -115,11 +116,14 @@ func (r *Repo[T, E]) QueryRecords(preds []QueryPredicate, limit int32) ([]any, e
 
 	// Plan up front so we can reject anything not served by an index before we
 	// ever hit DynamoDB. A missing partition/index surfaces here as an error.
-	plan, err := q.plan()
+	plans, err := q.plans()
 	if err != nil {
 		return nil, err
 	}
-	if len(plan.postFilter) > 0 {
+	for _, plan := range plans {
+		if len(plan.postFilter) == 0 {
+			continue
+		}
 		fields := make([]string, 0, len(plan.postFilter))
 		for _, p := range plan.postFilter {
 			fields = append(fields, p.field)
@@ -250,6 +254,14 @@ func (q *QueryBuilder[E]) BeginsWith(c Coln, prefix string) *QueryBuilder[E] {
 	return q.add(c, opBeginsWith, prefix, nil)
 }
 
+// Contains matches records whose slice field holds ANY of the values. The field
+// must be declared in ArrayIndexes, and the query needs an equality on every
+// Partition column. It runs one Query per value; a record matching several is
+// returned once, and results come value by value (each in sort-key order).
+func (q *QueryBuilder[E]) Contains(c SliceColn, values ...any) *QueryBuilder[E] {
+	return q.add(c, opContains, values, nil)
+}
+
 // Limit caps the number of returned items.
 func (q *QueryBuilder[E]) Limit(n int32) *QueryBuilder[E] { q.limit = n; return q }
 
@@ -263,11 +275,17 @@ type queryPlan struct {
 	names      map[string]string
 	values     map[string]types.AttributeValue
 	postFilter []predicate // evaluated in memory against the decoded record
+
+	// Set when the plan serves one value of a Contains: it queries the array
+	// index rows of arrayIndex for element, under the base pk basePK.
+	arrayIndex *arrayIndexMeta
+	element    keyPart
+	basePK     string
 }
 
 // Exec runs the query and appends results into *dst.
 func (q *QueryBuilder[E]) Exec(dst *[]E) error {
-	plan, err := q.plan()
+	plans, err := q.plans()
 	if err != nil {
 		return err
 	}
@@ -276,45 +294,66 @@ func (q *QueryBuilder[E]) Exec(dst *[]E) error {
 		return err
 	}
 
-	input := &dynamodb.QueryInput{
-		TableName:                 aws.String(tableName()),
-		KeyConditionExpression:    aws.String(plan.keyCond),
-		ExpressionAttributeNames:  plan.names,
-		ExpressionAttributeValues: plan.values,
-		ScanIndexForward:          aws.Bool(!q.desc),
-	}
-	if plan.indexName != "" {
-		input.IndexName = aws.String(plan.indexName)
-	}
-	// With an in-memory post-filter, page sizes no longer map 1:1 to results, so
-	// only push Limit to DynamoDB when there is nothing to filter out.
-	if q.limit > 0 && len(plan.postFilter) == 0 {
-		input.Limit = aws.Int32(q.limit)
-	}
-
-	for {
-		out, err := client.Query(context.Background(), input)
-		if err != nil {
-			return err
+	// A record holding several of the Contains values is returned once.
+	returnedSKs := map[string]bool{}
+	for _, plan := range plans {
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(tableName()),
+			KeyConditionExpression:    aws.String(plan.keyCond),
+			ExpressionAttributeNames:  plan.names,
+			ExpressionAttributeValues: plan.values,
+			ScanIndexForward:          aws.Bool(!q.desc),
 		}
-		for _, item := range out.Items {
-			var record E
-			if err := q.meta.unmarshalItem(item, &record); err != nil {
+		if plan.indexName != "" {
+			input.IndexName = aws.String(plan.indexName)
+		}
+		// With an in-memory post-filter, page sizes no longer map 1:1 to results, so
+		// only push Limit to DynamoDB when there is nothing to filter out.
+		if q.limit > 0 && len(plan.postFilter) == 0 {
+			input.Limit = aws.Int32(q.limit)
+		}
+
+		for {
+			out, err := client.Query(context.Background(), input)
+			if err != nil {
 				return err
 			}
-			if !q.meta.matchesFilter(unsafe.Pointer(&record), plan.postFilter) {
-				continue
+			items := out.Items
+			if plan.arrayIndex != nil && !plan.arrayIndex.fullCopy {
+				if items, err = baseItemsOfArrayRows(client, plan.basePK, out.Items); err != nil {
+					return err
+				}
 			}
-			*dst = append(*dst, record)
-			if q.limit > 0 && int32(len(*dst)) >= q.limit {
-				return nil
+			for _, item := range items {
+				var record E
+				if err := q.meta.unmarshalItem(item, &record); err != nil {
+					return err
+				}
+				ptr := unsafe.Pointer(&record)
+				if plan.arrayIndex != nil {
+					recordSK := q.meta.skValue(ptr)
+					// A row left behind by a crash or a concurrent writer points at a
+					// record that no longer holds the element: it is not a result.
+					if returnedSKs[recordSK] || !plan.arrayIndex.holdsElement(ptr, plan.element) {
+						continue
+					}
+					returnedSKs[recordSK] = true
+				}
+				if !q.meta.matchesFilter(ptr, plan.postFilter) {
+					continue
+				}
+				*dst = append(*dst, record)
+				if q.limit > 0 && int32(len(*dst)) >= q.limit {
+					return nil
+				}
 			}
+			if len(out.LastEvaluatedKey) == 0 {
+				break
+			}
+			input.ExclusiveStartKey = out.LastEvaluatedKey
 		}
-		if len(out.LastEvaluatedKey) == 0 {
-			return nil
-		}
-		input.ExclusiveStartKey = out.LastEvaluatedKey
 	}
+	return nil
 }
 
 // First runs the query with limit 1 and unmarshals the single result, if any.
@@ -330,19 +369,65 @@ func (q *QueryBuilder[E]) First(dst *E) (bool, error) {
 	return true, nil
 }
 
-// plan resolves predicates into a queryPlan.
-func (q *QueryBuilder[E]) plan() (*queryPlan, error) {
+// plans resolves the predicates into one queryPlan, or into one per value when
+// the query has a Contains (each value is its own begins_with on the array rows).
+func (q *QueryBuilder[E]) plans() ([]*queryPlan, error) {
 	if q.planErr != nil {
 		return nil, q.planErr
 	}
+	var containsPredicate *predicate
+	for i, p := range q.preds {
+		if p.op != opContains {
+			continue
+		}
+		if containsPredicate != nil {
+			return nil, fmt.Errorf("db: a query on %s takes one Contains", q.meta.recordType.Name())
+		}
+		containsPredicate = &q.preds[i]
+	}
+	if containsPredicate == nil {
+		plan, err := q.plan(nil, keyPart{})
+		if err != nil {
+			return nil, err
+		}
+		return []*queryPlan{plan}, nil
+	}
+
+	var arrayIndex *arrayIndexMeta
+	for i := range q.meta.arrayIndexes {
+		if q.meta.arrayIndexes[i].element.fieldName == containsPredicate.field {
+			arrayIndex = &q.meta.arrayIndexes[i]
+		}
+	}
+	if arrayIndex == nil {
+		return nil, fmt.Errorf("db: Contains on %s.%s needs the field declared in ArrayIndexes",
+			q.meta.recordType.Name(), containsPredicate.field)
+	}
+	values := containsPredicate.v1.([]any)
+	plans := make([]*queryPlan, 0, len(values))
+	for _, value := range values {
+		plan, err := q.plan(arrayIndex, keyPartFromValue(arrayIndex.element, value))
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, plan)
+	}
+	return plans, nil
+}
+
+// plan resolves predicates into a queryPlan. With an arrayIndex it targets that
+// index's rows for one element instead of the base table or a GSI.
+func (q *QueryBuilder[E]) plan(arrayIndex *arrayIndexMeta, element keyPart) (*queryPlan, error) {
 	byField := map[string]predicate{}
 	for _, p := range q.preds {
 		byField[p.field] = p
 	}
 
 	plan := &queryPlan{
-		names:  map[string]string{},
-		values: map[string]types.AttributeValue{},
+		names:      map[string]string{},
+		values:     map[string]types.AttributeValue{},
+		arrayIndex: arrayIndex,
+		element:    element,
 	}
 
 	// 1. Choose the partition source.
@@ -351,8 +436,14 @@ func (q *QueryBuilder[E]) plan() (*queryPlan, error) {
 		return nil, err
 	}
 
-	// 2. Build the shared sk condition from sort-column predicates.
-	usedSortFields, err := q.resolveSort(byField, plan)
+	// 2. Build the shared sk condition from sort-column predicates. Array rows
+	// prefix the base sk with the element.
+	var leadingParts []keyPart
+	if arrayIndex != nil {
+		leadingParts = []keyPart{element}
+		usedPartitionFields[arrayIndex.element.fieldName] = true
+	}
+	usedSortFields, err := q.resolveSort(byField, plan, leadingParts)
 	if err != nil {
 		return nil, err
 	}
@@ -386,15 +477,24 @@ func (q *QueryBuilder[E]) resolvePartition(byField map[string]predicate, plan *q
 		}
 	}
 	if baseOK {
-		parts := []keyPart{stringPart(m.entity)}
-		for _, kc := range m.partition {
-			parts = append(parts, keyPartFromValue(kc, byField[kc.fieldName].v1))
+		partitionValues := make([]uint64, len(m.partition))
+		for i, kc := range m.partition {
+			partitionValues[i] = uint64(valueToInt64(byField[kc.fieldName].v1, kc.fieldName))
 			used[kc.fieldName] = true
 		}
+		pk := m.numericKey(partitionValues, m.partition)
+		if plan.arrayIndex != nil {
+			plan.basePK = pk
+			pk += plan.arrayIndex.columnID
+		}
 		plan.names["#pk"] = "pk"
-		plan.values[":pk"] = &types.AttributeValueMemberS{Value: buildCompositeKey(parts)}
+		plan.values[":pk"] = &types.AttributeValueMemberN{Value: pk}
 		plan.keyCond = "#pk = :pk"
 		return used, nil
+	}
+	if plan.arrayIndex != nil {
+		return nil, fmt.Errorf("db: Contains on %s.%s needs an equality on every Partition column",
+			m.recordType.Name(), plan.arrayIndex.element.fieldName)
 	}
 
 	// Otherwise try each GSI slot whose key columns all have equality predicates.
@@ -414,11 +514,11 @@ func (q *QueryBuilder[E]) resolvePartition(byField map[string]predicate, plan *q
 		if idx.slot.isNumber {
 			kc := idx.keys[0]
 			plan.values[":pk"] = &types.AttributeValueMemberN{
-				Value: strconv.FormatInt(valueToInt64(byField[kc.fieldName].v1, kc.fieldName), 10),
+				Value: m.numericKey([]uint64{uint64(valueToInt64(byField[kc.fieldName].v1, kc.fieldName))}, idx.keys),
 			}
 			used[kc.fieldName] = true
 		} else {
-			parts := []keyPart{stringPart(m.entity)}
+			parts := []keyPart{stringPart(m.tableID)}
 			for _, kc := range idx.keys {
 				parts = append(parts, keyPartFromValue(kc, byField[kc.fieldName].v1))
 				used[kc.fieldName] = true
@@ -433,12 +533,13 @@ func (q *QueryBuilder[E]) resolvePartition(byField map[string]predicate, plan *q
 }
 
 // resolveSort builds the sk key condition from predicates on the sort columns.
-func (q *QueryBuilder[E]) resolveSort(byField map[string]predicate, plan *queryPlan) (map[string]bool, error) {
+// leadingParts are fixed parts ahead of the sort columns (an array row's element).
+func (q *QueryBuilder[E]) resolveSort(byField map[string]predicate, plan *queryPlan, leadingParts []keyPart) (map[string]bool, error) {
 	m := q.meta
 	used := map[string]bool{}
 
 	// Longest leading run of sort columns constrained by equality.
-	prefix := []keyPart{}
+	prefix := clone(leadingParts)
 	i := 0
 	for ; i < len(m.sort); i++ {
 		kc := m.sort[i]
@@ -450,11 +551,9 @@ func (q *QueryBuilder[E]) resolveSort(byField map[string]predicate, plan *queryP
 		used[kc.fieldName] = true
 	}
 
-	// No sort predicates at all → whole partition.
-	if i == 0 && (i >= len(m.sort) || byFieldHasNoSortPred(byField, m.sort)) {
-		if len(prefix) == 0 {
-			return used, nil
-		}
+	// No sort predicates and no leading parts → whole partition.
+	if len(prefix) == 0 && byFieldHasNoSortPred(byField, m.sort) {
+		return used, nil
 	}
 
 	// Case A: all sort columns pinned by equality → sk = <exact>.
@@ -470,29 +569,45 @@ func (q *QueryBuilder[E]) resolveSort(byField map[string]predicate, plan *queryP
 	if p, ok := byField[next.fieldName]; ok {
 		plan.names["#sk"] = "sk"
 		used[next.fieldName] = true
+		// Every sk whose next column equals v sorts in [v, v$): v itself when that column is the
+		// last one, v#<suffix> otherwise. So "<= v" is "< v$" and "> v" is ">= v$", which keeps
+		// every bound exact at any position of a composite sort key.
+		boundOf := func(value any) string {
+			return buildCompositeKey(append(clone(prefix), keyPartFromValue(next, value)))
+		}
 		switch p.op {
 		case opBetween:
-			lo := buildCompositeKey(append(clone(prefix), keyPartFromValue(next, p.v1)))
-			hi := buildCompositeKey(append(clone(prefix), keyPartFromValue(next, p.v2)))
+			plan.values[":lo"] = &types.AttributeValueMemberS{Value: boundOf(p.v1)}
+			plan.values[":hi"] = &types.AttributeValueMemberS{Value: boundOf(p.v2) + keySeparatorSuccessor}
+			plan.keyCond += " AND #sk BETWEEN :lo AND :hi"
+		case opGt, opGte, opLt, opLte:
+			v := boundOf(p.v1)
+			if p.op == opGt || p.op == opLte {
+				v += keySeparatorSuccessor
+			}
+			isLowerBound := p.op == opGt || p.op == opGte
+			if len(prefix) == 0 {
+				cmp := "<"
+				if isLowerBound {
+					cmp = ">="
+				}
+				plan.values[":sk"] = &types.AttributeValueMemberS{Value: v}
+				plan.keyCond += " AND #sk " + cmp + " :sk"
+				break
+			}
+			// With an equality prefix a one-sided range must stay inside it, or it runs into the
+			// rows of the next prefix value: every sk under the prefix sorts in [prefix#, prefix$).
+			lo, hi := v, buildCompositeKey(prefix)+keySeparatorSuccessor
+			if !isLowerBound {
+				lo, hi = buildCompositeKey(prefix)+keySeparator, v
+			}
 			plan.values[":lo"] = &types.AttributeValueMemberS{Value: lo}
 			plan.values[":hi"] = &types.AttributeValueMemberS{Value: hi}
 			plan.keyCond += " AND #sk BETWEEN :lo AND :hi"
-		case opGt, opGte:
-			v := buildCompositeKey(append(clone(prefix), keyPartFromValue(next, p.v1)))
-			plan.values[":sk"] = &types.AttributeValueMemberS{Value: v}
-			cmp := ">="
-			if p.op == opGt && i == len(m.sort)-1 {
-				cmp = ">"
+			// BETWEEN includes its upper bound, which for "< v" can be a real key: the post-filter drops it.
+			if p.op == opLt {
+				delete(used, next.fieldName)
 			}
-			plan.keyCond += " AND #sk " + cmp + " :sk"
-		case opLt, opLte:
-			v := buildCompositeKey(append(clone(prefix), keyPartFromValue(next, p.v1)))
-			plan.values[":sk"] = &types.AttributeValueMemberS{Value: v}
-			cmp := "<="
-			if p.op == opLt && i == len(m.sort)-1 {
-				cmp = "<"
-			}
-			plan.keyCond += " AND #sk " + cmp + " :sk"
 		case opBeginsWith:
 			v := buildCompositeKey(append(clone(prefix), stringPart(fmt.Sprintf("%v", p.v1))))
 			plan.values[":sk"] = &types.AttributeValueMemberS{Value: v}

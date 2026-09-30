@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"sync"
 	"unsafe"
 
@@ -30,6 +29,11 @@ var (
 	clientErr  error
 )
 
+// ClientOptions are applied to the shared client when it is built, so they must be set before the
+// first call (an init() is the safe place). They exist for instrumentation, e.g. the middleware in
+// ormcheck that asks every call for its consumed capacity.
+var ClientOptions []func(*dynamodb.Options)
+
 // Client returns the shared DynamoDB client.
 func Client() (*dynamodb.Client, error) {
 	clientOnce.Do(func() {
@@ -48,7 +52,7 @@ func Client() (*dynamodb.Client, error) {
 				o.BaseEndpoint = aws.String(endpoint)
 			})
 		}
-		clientRef = dynamodb.NewFromConfig(cfg, dynOpts...)
+		clientRef = dynamodb.NewFromConfig(cfg, append(dynOpts, ClientOptions...)...)
 	})
 	return clientRef, clientErr
 }
@@ -102,11 +106,8 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	if err != nil {
 		return nil, fmt.Errorf("db: colbin marshaling %s: %w", m.recordType.Name(), err)
 	}
-	item := map[string]types.AttributeValue{
-		"pk":       &types.AttributeValueMemberS{Value: m.pkValue(ptr)},
-		"sk":       &types.AttributeValueMemberS{Value: m.skValue(ptr)},
-		dataColumn: &types.AttributeValueMemberB{Value: blob},
-	}
+	item := m.keyOnly(ptr)
+	item[dataColumn] = &types.AttributeValueMemberB{Value: blob}
 	for _, idx := range m.indexes {
 		item[idx.slot.attr] = attributeForSlot(m.slotValue(ptr, idx), idx.slot.isNumber)
 	}
@@ -125,17 +126,22 @@ func (m *tableMeta) unmarshalItem(item map[string]types.AttributeValue, dst any)
 	return nil
 }
 
-func attributeForSlot(v any, isNumber bool) types.AttributeValue {
+func attributeForSlot(v string, isNumber bool) types.AttributeValue {
 	if isNumber {
-		return &types.AttributeValueMemberN{Value: strconv.FormatInt(v.(int64), 10)}
+		return &types.AttributeValueMemberN{Value: v}
 	}
-	return &types.AttributeValueMemberS{Value: v.(string)}
+	return &types.AttributeValueMemberS{Value: v}
 }
 
 // keyOnly builds just the {pk, sk} key map for Get/Delete.
 func (m *tableMeta) keyOnly(ptr unsafe.Pointer) map[string]types.AttributeValue {
+	return itemKey(m.pkValue(ptr), m.skValue(ptr))
+}
+
+// itemKey is the {pk, sk} map of any row: pk is a number, sk a string.
+func itemKey(pk, sk string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
-		"pk": &types.AttributeValueMemberS{Value: m.pkValue(ptr)},
-		"sk": &types.AttributeValueMemberS{Value: m.skValue(ptr)},
+		"pk": &types.AttributeValueMemberN{Value: pk},
+		"sk": &types.AttributeValueMemberS{Value: sk},
 	}
 }

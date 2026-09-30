@@ -3,6 +3,7 @@ package dynamo
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -57,16 +58,24 @@ type indexMeta struct {
 // xunsafe accessor per record field, used to read key columns and to evaluate
 // in-memory post-filters without runtime reflection.
 type tableMeta struct {
-	entity     string
-	recordType reflect.Type
-	partition  []keyCol
-	sort       []keyCol
-	indexes    []indexMeta
-	accessors  map[string]*colAccessor // record field name -> precompiled accessor
-	autoinc    *autoincConfig          // nil unless the schema sets UseAutoincrement
+	entity          string
+	tableID         string // the 8-digit TableID, as the decimal prefix of every key
+	recordType      reflect.Type
+	partition       []keyCol
+	partitionDigits int // total decimal width of the partition columns in pk
+	sort            []keyCol
+	indexes         []indexMeta
+	arrayIndexes    []arrayIndexMeta
+	accessors       map[string]*colAccessor // record field name -> precompiled accessor
+	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
+
+// entityByTableID guards against two entities landing on the same TableID (a hash
+// collision, or a copy-pasted explicit ID): they would read and overwrite each
+// other's rows, so the second one to compile panics at boot.
+var entityByTableID sync.Map // int32 -> entity name
 
 // schemaProvider is satisfied by the table struct.
 type schemaProvider interface{ GetSchema() Schema }
@@ -123,13 +132,35 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	}
 
 	accessors := buildAccessors(recordType)
+	tableID := resolveTableID(schema)
+	if previousEntity, loaded := entityByTableID.LoadOrStore(tableID, schema.Entity); loaded && previousEntity != schema.Entity {
+		panic(fmt.Sprintf("db: entities %q and %q share TableID %d: set an explicit TableID on one of them",
+			previousEntity, schema.Entity, tableID))
+	}
 
 	meta := &tableMeta{
 		entity:     schema.Entity,
+		tableID:    strconv.Itoa(int(tableID)),
 		recordType: recordType,
-		partition:  resolveKeyCols(recordType, accessors, schema.Partition, false),
-		sort:       resolveKeyCols(recordType, accessors, schema.Sort, true),
+		partition:  resolveKeyCols(recordType, accessors, schema.Partition),
+		sort:       resolveKeyCols(recordType, accessors, schema.Sort),
 		accessors:  accessors,
+	}
+
+	// The pk is a DynamoDB number, so only integers can be packed after the TableID.
+	for _, partitionCol := range meta.partition {
+		if !partitionCol.kind.isInteger() {
+			panic(fmt.Sprintf("db: %s partition column %q must be an integer: the pk is a number", recordType.Name(), partitionCol.fieldName))
+		}
+		meta.partitionDigits += decimalWidth(partitionCol.bits)
+	}
+	pkDigits := len(meta.tableID) + meta.partitionDigits
+	if len(schema.ArrayIndexes) > 0 {
+		pkDigits += arrayIndexColumnIDDigits
+	}
+	if pkDigits > maxNumericKeyDigits {
+		panic(fmt.Sprintf("db: %s pk takes %d digits, over DynamoDB's %d: shrink the partition Size(bits)",
+			recordType.Name(), pkDigits, maxNumericKeyDigits))
 	}
 
 	usedSlots := map[string]bool{}
@@ -142,9 +173,9 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		}
 		usedSlots[idx.Slot.attr] = true
 
-		keys := resolveKeyCols(recordType, accessors, idx.Keys, !idx.Slot.isNumber)
+		keys := resolveKeyCols(recordType, accessors, idx.Keys)
 		if idx.Slot.isNumber {
-			// Numeric GSI slots store one native DynamoDB number.
+			// Numeric GSI slots store one DynamoDB number: TableID ‖ the column.
 			if len(keys) != 1 || !keys[0].kind.isInteger() {
 				panic(fmt.Sprintf("db: %s numeric slot %s requires exactly one integer key column",
 					recordType.Name(), idx.Slot.attr))
@@ -153,11 +184,32 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		meta.indexes = append(meta.indexes, indexMeta{slot: idx.Slot, keys: keys})
 	}
 
+	usedArrayFields := map[string]bool{}
+	for _, arrayIndex := range schema.ArrayIndexes {
+		resolved := resolveArrayIndex(recordType, arrayIndex)
+		if usedArrayFields[resolved.element.fieldName] {
+			panic(fmt.Sprintf("db: %s declares ArrayIndexes on %q twice", recordType.Name(), resolved.element.fieldName))
+		}
+		usedArrayFields[resolved.element.fieldName] = true
+		meta.arrayIndexes = append(meta.arrayIndexes, resolved)
+	}
+
 	if schema.UseAutoincrement {
-		meta.autoinc = resolveAutoincrement(schema, recordType, accessors)
+		meta.autoinc = resolveAutoincrement(schema, recordType, accessors, meta.tableID)
 	}
 
 	return meta
+}
+
+// resolveTableID returns the schema's explicit TableID, or HashTableID(Entity) when it is 0.
+func resolveTableID(schema Schema) int32 {
+	if schema.TableID == 0 {
+		return HashTableID(schema.Entity)
+	}
+	if schema.TableID < 10_000_000 || schema.TableID > 99_999_999 {
+		panic(fmt.Sprintf("db: %q TableID %d must have exactly 8 digits (10000000..99999999)", schema.Entity, schema.TableID))
+	}
+	return schema.TableID
 }
 
 // autoincFieldName is the record field the ORM fills for UseAutoincrement.
@@ -167,7 +219,7 @@ const autoincFieldName = "ID"
 // the read/write accessors for the ID field. The record must declare an integer
 // field named "ID"; the padding must be 0..9 so seq*10^padding stays well within
 // int64.
-func resolveAutoincrement(schema Schema, recordType reflect.Type, accessors map[string]*colAccessor) *autoincConfig {
+func resolveAutoincrement(schema Schema, recordType reflect.Type, accessors map[string]*colAccessor, tableID string) *autoincConfig {
 	padding := schema.AutoincrementRandomPadding
 	if padding < 0 || padding > 9 {
 		panic(fmt.Sprintf("db: %s AutoincrementRandomPadding must be 0..9, got %d", recordType.Name(), padding))
@@ -180,7 +232,7 @@ func resolveAutoincrement(schema Schema, recordType reflect.Type, accessors map[
 		panic(fmt.Sprintf("db: %s field %q must be an integer type to use UseAutoincrement", recordType.Name(), autoincFieldName))
 	}
 	return &autoincConfig{
-		seqName: schema.Entity,
+		seqName: tableID, // keyed by TableID, so renaming the Entity keeps the counter
 		padding: padding,
 		factor:  pow10(padding),
 		get:     acc.getI64,
@@ -321,10 +373,10 @@ func intReader(xf *xunsafe.Field, k reflect.Kind) func(unsafe.Pointer) int64 {
 }
 
 // resolveKeyCols turns Colns into keyCols, attaching each column's precompiled
-// accessor. When requireSizeForNumbers is true (composite string keys: sort key,
-// string GSI slots), every integer component must declare .Size(bits) so its slot
-// width is fixed and the key stays sortable.
-func resolveKeyCols(recordType reflect.Type, accessors map[string]*colAccessor, cols []Coln, requireSizeForNumbers bool) []keyCol {
+// accessor. Every integer key column must declare .Size(bits): it fixes the
+// column's width in every key shape (Base64 in sk and string slots, decimal after
+// the TableID in pk and numeric slots), which keeps keys sortable and tables apart.
+func resolveKeyCols(recordType reflect.Type, accessors map[string]*colAccessor, cols []Coln) []keyCol {
 	out := make([]keyCol, 0, len(cols))
 	for _, c := range cols {
 		m := c.col()
@@ -332,8 +384,8 @@ func resolveKeyCols(recordType reflect.Type, accessors map[string]*colAccessor, 
 		if !ok {
 			panic(fmt.Sprintf("db: key column %q is not an exported field of %s", m.fieldName, recordType.Name()))
 		}
-		if m.kind.isInteger() && requireSizeForNumbers && m.bits <= 0 {
-			panic(fmt.Sprintf("db: numeric key column %q used in a composite/sort key must declare .Size(bits)", m.fieldName))
+		if m.kind.isInteger() && m.bits <= 0 {
+			panic(fmt.Sprintf("db: numeric key column %q must declare .Size(bits)", m.fieldName))
 		}
 		out = append(out, keyCol{fieldName: m.fieldName, kind: m.kind, bits: m.bits, acc: acc})
 	}

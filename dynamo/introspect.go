@@ -38,6 +38,7 @@ type ColumnInfo struct {
 const (
 	IndexPrimary = "primary" // the base table's pk (+ shared sk range)
 	IndexGSI     = "gsi"     // a global secondary index slot (n1..n5, s1..s5)
+	IndexArray   = "array"   // an ArrayIndexes field: hidden rows under pk ‖ cb id
 )
 
 // IndexInfo describes one queryable access path: the base-table primary key or
@@ -46,21 +47,23 @@ const (
 // every GSI alike (SharesSortKey is always true for a GSI here, and is exposed
 // so the frontend can say so explicitly).
 type IndexInfo struct {
-	Kind          string       `json:"kind"`          // IndexPrimary | IndexGSI
-	Name          string       `json:"name"`          // GSI name ("gsi-n1"...) or "" for the primary key
-	Attr          string       `json:"attr"`          // partition attribute: "pk", "n1".."n5" or "s1".."s5"
-	IsNumber      bool         `json:"isNumber"`      // numeric slot (native DynamoDB number) vs string
-	SharesSortKey bool         `json:"sharesSortKey"` // uses the table's shared sk as its range key
-	Columns       []ColumnInfo `json:"columns"`       // the index's key columns, in order
+	Kind          string       `json:"kind"`               // IndexPrimary | IndexGSI | IndexArray
+	Name          string       `json:"name"`               // GSI name ("gsi-n1"...) or "" for the primary key and array indexes
+	Attr          string       `json:"attr"`               // partition attribute: "pk", "n1".."n5" or "s1".."s5"
+	IsNumber      bool         `json:"isNumber"`           // numeric partition attribute (pk, n1..n5) vs string
+	SharesSortKey bool         `json:"sharesSortKey"`      // uses the table's shared sk as its range key
+	Columns       []ColumnInfo `json:"columns"`            // the index's key columns, in order
+	FullCopy      bool         `json:"fullCopy,omitempty"` // array index rows carry the record blob
 }
 
 // TableSchema is the JSON-serializable description of one entity's schema.
 type TableSchema struct {
 	Name      string       `json:"name"`      // optional label from Schema.Name (may be empty)
 	Struct    string       `json:"struct"`    // Go table struct name, e.g. "ProductTable" (reflection)
-	Entity    string       `json:"entity"`    // this entity's namespace within the table
+	Entity    string       `json:"entity"`    // this entity's name
+	TableID   int32        `json:"tableID"`   // the 8-digit prefix of every key of this entity
 	TableName string       `json:"tableName"` // physical DynamoDB table (shared by all entities)
-	Partition []ColumnInfo `json:"partition"` // base-table pk columns (after the entity prefix)
+	Partition []ColumnInfo `json:"partition"` // base-table pk columns (after the TableID)
 	Sort      []ColumnInfo `json:"sort"`      // shared sort key columns (base table + every GSI)
 	Indexes   []IndexInfo  `json:"indexes"`   // access paths: the primary key first, then the GSIs
 
@@ -90,6 +93,7 @@ func GetSchema[T any]() TableSchema {
 		Name:      schema.Name,
 		Struct:    reflect.TypeOf((*T)(nil)).Elem().Name(),
 		Entity:    schema.Entity,
+		TableID:   resolveTableID(schema),
 		TableName: tableName(),
 		Partition: describeCols(schema.Partition),
 		Sort:      describeCols(schema.Sort),
@@ -106,9 +110,20 @@ func GetSchema[T any]() TableSchema {
 	out.Indexes = append(out.Indexes, IndexInfo{
 		Kind:          IndexPrimary,
 		Attr:          "pk",
+		IsNumber:      true,
 		SharesSortKey: true,
 		Columns:       out.Partition,
 	})
+	for _, arrayIndex := range schema.ArrayIndexes {
+		out.Indexes = append(out.Indexes, IndexInfo{
+			Kind:          IndexArray,
+			Attr:          "pk",
+			IsNumber:      true,
+			SharesSortKey: true, // the base sk follows the element in the row sk
+			Columns:       describeCols([]Coln{arrayIndex.Column}),
+			FullCopy:      arrayIndex.FullCopy,
+		})
+	}
 	for _, idx := range schema.Indexes {
 		out.Indexes = append(out.Indexes, IndexInfo{
 			Kind:          IndexGSI,

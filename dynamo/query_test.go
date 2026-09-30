@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"reflect"
 	"testing"
 	"unsafe"
 
@@ -10,34 +11,46 @@ import (
 // ── Example entity used across the query/marshal tests ───────────────────────
 
 type Product struct {
-	ID       string
-	Category string
-	Brand    string
-	Price    int64
-	Stock    int32
-	Created  int64
-	Name     string
+	ID         string   `cb:"1"`
+	CategoryID int32    `cb:"2"`
+	Brand      string   `cb:"3"`
+	Price      int64    `cb:"4"`
+	Stock      int32    `cb:"5"`
+	Created    int64    `cb:"6"`
+	Name       string   `cb:"7"`
+	TagIDs     []int32  `cb:"8"`
+	Labels     []string `cb:"9"`
 }
 
 type ProductTable struct {
 	Model[ProductTable, Product]
-	ID       Col[*ProductTable, string]
-	Category Col[*ProductTable, string]
-	Brand    Col[*ProductTable, string]
-	Price    Col[*ProductTable, int64]
-	Stock    Col[*ProductTable, int32]
-	Created  Col[*ProductTable, int64]
-	Name     Col[*ProductTable, string]
+	ID         Col[*ProductTable, string]
+	CategoryID Col[*ProductTable, int32]
+	Brand      Col[*ProductTable, string]
+	Price      Col[*ProductTable, int64]
+	Stock      Col[*ProductTable, int32]
+	Created    Col[*ProductTable, int64]
+	Name       Col[*ProductTable, string]
+	TagIDs     ColSlice[*ProductTable, int32]
+	Labels     ColSlice[*ProductTable, string]
 }
+
+// productTableID pins the TableID so the expected keys below are literal.
+const productTableID = "12345678"
 
 func (t ProductTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "prod",
-		Partition: Keys(t.Category),
+		TableID:   12345678,
+		Partition: Keys(t.CategoryID.Size(16)),
 		Sort:      Keys(t.Created.Size(48), t.ID),
 		Indexes: []Index{
-			{Slot: N1, Keys: Keys(t.Price)}, // numeric GSI
-			{Slot: S1, Keys: Keys(t.Brand)}, // string GSI
+			{Slot: N1, Keys: Keys(t.Price.Size(40))}, // numeric GSI
+			{Slot: S1, Keys: Keys(t.Brand)},          // string GSI
+		},
+		ArrayIndexes: []ArrayIndex{
+			{Column: t.TagIDs.Size(32)},
+			{Column: t.Labels, FullCopy: true},
 		},
 	}
 }
@@ -47,10 +60,23 @@ func newProducts(t *testing.T) *Repo[ProductTable, Product] {
 	return NewRepo[ProductTable, Product]()
 }
 
+// onlyPlan plans a query that must resolve to a single plan (no multi-value Contains).
+func onlyPlan[E any](t *testing.T, q *QueryBuilder[E]) *queryPlan {
+	t.Helper()
+	plans, err := q.plans()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+	return plans[0]
+}
+
 func TestColumnNamesPopulated(t *testing.T) {
 	r := newProducts(t)
-	if got := r.T.Category.col().fieldName; got != "Category" {
-		t.Fatalf("expected Category, got %q", got)
+	if got := r.T.CategoryID.col().fieldName; got != "CategoryID" {
+		t.Fatalf("expected CategoryID, got %q", got)
 	}
 	if got := r.T.Price.Size(48).col().bits; got != 48 {
 		t.Fatalf("expected size 48, got %d", got)
@@ -69,23 +95,25 @@ func s(av types.AttributeValue) string {
 
 func TestMarshalItemDerivesKeys(t *testing.T) {
 	r := newProducts(t)
-	p := Product{ID: "sku1", Category: "coffee", Brand: "acme", Price: 1299, Created: 1700000000}
+	p := Product{ID: "sku1", CategoryID: 7, Brand: "acme", Price: 1299, Created: 1700000000, TagIDs: []int32{3}}
 	item, err := r.meta.marshalItem(unsafe.Pointer(&p), &p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s(item["pk"]); got != "prod#coffee" {
-		t.Fatalf("pk = %q", got)
+	// pk = TableID ‖ CategoryID padded to Size(16)'s 5 decimal digits, as a number.
+	if _, isNumber := item["pk"].(*types.AttributeValueMemberN); !isNumber || s(item["pk"]) != productTableID+"00007" {
+		t.Fatalf("pk = %#v", item["pk"])
 	}
 	// sk = <created base64 width 8>#sku1
 	wantSK := EncodeOrderedUint(1700000000, 8) + "#sku1"
 	if got := s(item["sk"]); got != wantSK {
 		t.Fatalf("sk = %q want %q", got, wantSK)
 	}
-	if got := s(item["n1"]); got != "1299" {
+	// n1 = TableID ‖ Price padded to Size(40)'s 13 decimal digits.
+	if got := s(item["n1"]); got != productTableID+"0000000001299" {
 		t.Fatalf("n1 = %q", got)
 	}
-	if got := s(item["s1"]); got != "prod#acme" {
+	if got := s(item["s1"]); got != productTableID+"#acme" {
 		t.Fatalf("s1 = %q", got)
 	}
 	// The whole record lives in the binary column "d"; nothing else leaks.
@@ -104,18 +132,15 @@ func TestMarshalItemDerivesKeys(t *testing.T) {
 	if err := r.meta.unmarshalItem(item, &back); err != nil {
 		t.Fatal(err)
 	}
-	if back != p {
+	if !reflect.DeepEqual(back, p) {
 		t.Fatalf("round trip mismatch:\n got  %+v\n want %+v", back, p)
 	}
 }
 
 func TestPlanBaseTableBetween(t *testing.T) {
 	r := newProducts(t)
-	q := r.Query().Eq(r.T.Category, "coffee").Between(r.T.Created, int64(1700000000), int64(1800000000))
-	plan, err := q.plan()
-	if err != nil {
-		t.Fatal(err)
-	}
+	q := r.Query().Eq(r.T.CategoryID, int32(7)).Between(r.T.Created, int64(1700000000), int64(1800000000))
+	plan := onlyPlan(t, q)
 	if plan.indexName != "" {
 		t.Fatalf("expected base table, got index %q", plan.indexName)
 	}
@@ -123,7 +148,7 @@ func TestPlanBaseTableBetween(t *testing.T) {
 	if plan.keyCond != want {
 		t.Fatalf("keyCond = %q want %q", plan.keyCond, want)
 	}
-	if s(plan.values[":pk"]) != "prod#coffee" {
+	if s(plan.values[":pk"]) != productTableID+"00007" {
 		t.Fatalf("pk value = %q", s(plan.values[":pk"]))
 	}
 	if s(plan.values[":lo"]) != EncodeOrderedUint(1700000000, 8) {
@@ -131,32 +156,71 @@ func TestPlanBaseTableBetween(t *testing.T) {
 	}
 }
 
+// TestPlanRangeStaysInsideEqualityPrefix: Eq(Created) + Gt(ID) must not run past
+// the Created prefix into later Created values, and the strict > starts after "b".
+func TestPlanRangeStaysInsideEqualityPrefix(t *testing.T) {
+	r := newProducts(t)
+	plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Created, int64(5)).Gt(r.T.ID, "b"))
+	createdPrefix := EncodeOrderedUint(5, 8)
+	if plan.keyCond != "#pk = :pk AND #sk BETWEEN :lo AND :hi" {
+		t.Fatalf("keyCond = %q", plan.keyCond)
+	}
+	if s(plan.values[":lo"]) != createdPrefix+"#b$" || s(plan.values[":hi"]) != createdPrefix+"$" {
+		t.Fatalf("range = [%q, %q]", s(plan.values[":lo"]), s(plan.values[":hi"]))
+	}
+	if len(plan.postFilter) != 0 {
+		t.Fatalf("a strict > needs no post-filter, got %+v", plan.postFilter)
+	}
+}
+
+// TestPlanRangeOnANonLastSortColumn: sk = Created ‖ ID, so the row with Created = 5
+// is enc(5)#<ID>, which sorts after enc(5). Every bound must still include or
+// exclude it as asked.
+func TestPlanRangeOnANonLastSortColumn(t *testing.T) {
+	r := newProducts(t)
+	created5 := EncodeOrderedUint(5, 8)
+	for _, testCase := range []struct {
+		query        *QueryBuilder[Product]
+		wantKeyCond  string
+		wantBoundary map[string]string
+	}{
+		{r.Query().Lte(r.T.Created, int64(5)), "#sk < :sk", map[string]string{":sk": created5 + "$"}},
+		{r.Query().Lt(r.T.Created, int64(5)), "#sk < :sk", map[string]string{":sk": created5}},
+		{r.Query().Gt(r.T.Created, int64(5)), "#sk >= :sk", map[string]string{":sk": created5 + "$"}},
+		{r.Query().Gte(r.T.Created, int64(5)), "#sk >= :sk", map[string]string{":sk": created5}},
+		{r.Query().Between(r.T.Created, int64(1), int64(5)), "#sk BETWEEN :lo AND :hi",
+			map[string]string{":lo": EncodeOrderedUint(1, 8), ":hi": created5 + "$"}},
+	} {
+		plan := onlyPlan(t, testCase.query.Eq(r.T.CategoryID, int32(7)))
+		if plan.keyCond != "#pk = :pk AND "+testCase.wantKeyCond {
+			t.Fatalf("keyCond = %q, want %q", plan.keyCond, testCase.wantKeyCond)
+		}
+		for name, want := range testCase.wantBoundary {
+			if got := s(plan.values[name]); got != want {
+				t.Fatalf("%s: %s = %q, want %q", testCase.wantKeyCond, name, got, want)
+			}
+		}
+	}
+}
+
 func TestPlanNumericGSI(t *testing.T) {
 	r := newProducts(t)
-	q := r.Query().Eq(r.T.Price, int64(1299))
-	plan, err := q.plan()
-	if err != nil {
-		t.Fatal(err)
-	}
+	plan := onlyPlan(t, r.Query().Eq(r.T.Price, int64(1299)))
 	if plan.indexName != "gsi-n1" {
 		t.Fatalf("expected gsi-n1, got %q", plan.indexName)
 	}
-	if s(plan.values[":pk"]) != "1299" {
+	if s(plan.values[":pk"]) != productTableID+"0000000001299" {
 		t.Fatalf("pk value = %q", s(plan.values[":pk"]))
 	}
 }
 
 func TestPlanStringGSI(t *testing.T) {
 	r := newProducts(t)
-	q := r.Query().Eq(r.T.Brand, "acme")
-	plan, err := q.plan()
-	if err != nil {
-		t.Fatal(err)
-	}
+	plan := onlyPlan(t, r.Query().Eq(r.T.Brand, "acme"))
 	if plan.indexName != "gsi-s1" {
 		t.Fatalf("expected gsi-s1, got %q", plan.indexName)
 	}
-	if s(plan.values[":pk"]) != "prod#acme" {
+	if s(plan.values[":pk"]) != productTableID+"#acme" {
 		t.Fatalf("pk value = %q", s(plan.values[":pk"]))
 	}
 }
@@ -164,11 +228,7 @@ func TestPlanStringGSI(t *testing.T) {
 func TestPlanPostFilter(t *testing.T) {
 	r := newProducts(t)
 	// Stock is a non-key field (it lives inside "d"), so it becomes a post-filter.
-	q := r.Query().Eq(r.T.Category, "coffee").Gte(r.T.Stock, int32(5))
-	plan, err := q.plan()
-	if err != nil {
-		t.Fatal(err)
-	}
+	plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Gte(r.T.Stock, int32(5)))
 	if len(plan.postFilter) != 1 || plan.postFilter[0].field != "Stock" {
 		t.Fatalf("expected a post-filter on Stock, got %+v", plan.postFilter)
 	}
@@ -176,7 +236,7 @@ func TestPlanPostFilter(t *testing.T) {
 
 func TestPostFilterEval(t *testing.T) {
 	r := newProducts(t)
-	p := Product{Category: "coffee", Stock: 10, Brand: "acme"}
+	p := Product{CategoryID: 7, Stock: 10, Brand: "acme"}
 	ptr := unsafe.Pointer(&p)
 	pass := []predicate{{field: "Stock", op: opGte, v1: int32(5)}}
 	fail := []predicate{{field: "Stock", op: opGt, v1: int32(50)}}
@@ -195,7 +255,7 @@ func TestPostFilterEval(t *testing.T) {
 // ── Accessor width coverage ──────────────────────────────────────────────────
 
 type widths struct {
-	PK  string
+	PK  int32
 	A8  int8
 	A16 int16
 	A32 int32
@@ -205,7 +265,7 @@ type widths struct {
 
 type widthsTable struct {
 	Model[widthsTable, widths]
-	PK  Col[*widthsTable, string]
+	PK  Col[*widthsTable, int32]
 	A8  Col[*widthsTable, int8]
 	A16 Col[*widthsTable, int16]
 	A32 Col[*widthsTable, int32]
@@ -216,7 +276,7 @@ type widthsTable struct {
 func (t widthsTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "w",
-		Partition: Keys(t.PK),
+		Partition: Keys(t.PK.Size(8)),
 		Sort:      Keys(t.A8.Size(8), t.A16.Size(16), t.A32.Size(32), t.A64.Size(64), t.U32.Size(32)),
 	}
 }
@@ -226,7 +286,7 @@ func (t widthsTable) GetSchema() Schema {
 // that an unsigned value above int32 range is read as unsigned, not sign-flipped.
 func TestAccessorWidths(t *testing.T) {
 	r := NewRepo[widthsTable, widths]()
-	w := widths{PK: "p", A8: 5, A16: 300, A32: 70000, A64: 1 << 40, U32: 4_000_000_000}
+	w := widths{PK: 1, A8: 5, A16: 300, A32: 70000, A64: 1 << 40, U32: 4_000_000_000}
 	item, err := r.meta.marshalItem(unsafe.Pointer(&w), &w)
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +302,7 @@ func TestAccessorWidths(t *testing.T) {
 func TestPlanNoPartitionErrors(t *testing.T) {
 	r := newProducts(t)
 	// Only a sort predicate, no partition equality → cannot query.
-	_, err := r.Query().Between(r.T.Created, int64(1), int64(2)).plan()
+	_, err := r.Query().Between(r.T.Created, int64(1), int64(2)).plans()
 	if err == nil {
 		t.Fatal("expected error for missing partition")
 	}
@@ -271,7 +331,7 @@ func TestQueryRecordsRejectsRangeOnHash(t *testing.T) {
 	// With a valid base partition it would fall to the post-filter, which
 	// QueryRecords refuses.
 	_, err := r.QueryRecords([]QueryPredicate{
-		{Field: "Category", Op: "=", Value: "coffee"},
+		{Field: "CategoryID", Op: "=", Value: 7},
 		{Field: "Price", Op: ">", Value: 1000},
 	}, 0)
 	if err == nil {
@@ -283,7 +343,7 @@ func TestQueryRecordsRejectsNonIndexedField(t *testing.T) {
 	r := newProducts(t)
 	// Name lives inside "d" and is not part of any key; not queryable.
 	_, err := r.QueryRecords([]QueryPredicate{
-		{Field: "Category", Op: "=", Value: "coffee"},
+		{Field: "CategoryID", Op: "=", Value: 7},
 		{Field: "Name", Op: "=", Value: "beans"},
 	}, 0)
 	if err == nil {

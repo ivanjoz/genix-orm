@@ -2,6 +2,8 @@ package dynamo
 
 import (
 	"fmt"
+	"hash/fnv"
+	"strconv"
 	"strings"
 )
 
@@ -115,6 +117,45 @@ func capacityForWidth(width int) uint64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Decimal numeric keys
+//
+// pk and the numeric GSI slots are DynamoDB numbers built as a decimal string:
+// the 8-digit TableID followed by each integer column zero-padded to the decimal
+// width of its Size(bits). That is TableID * 10^w + value, generalized to several
+// columns. Because the TableID never has a leading zero and every width is fixed
+// per schema, two tables can never produce the same number. DynamoDB numbers keep
+// 38 significant digits, which caps the total width (checked at compile).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// maxNumericKeyDigits is DynamoDB's number precision.
+const maxNumericKeyDigits = 38
+
+// maxValueForBits is the largest value a Size(bits) column accepts.
+func maxValueForBits(bits int8) uint64 { return ^uint64(0) >> (64 - int(bits)) }
+
+// decimalWidth is how many decimal digits a Size(bits) column takes in a numeric key.
+func decimalWidth(bits int8) int { return len(strconv.FormatUint(maxValueForBits(bits), 10)) }
+
+// decimalDigits renders v zero-padded to the decimal width of Size(bits), panicking on
+// overflow for the same reason as EncodeOrderedUint: a silent overflow corrupts the key.
+func decimalDigits(v uint64, bits int8) string {
+	if v > maxValueForBits(bits) {
+		panic(fmt.Sprintf("db: value %d overflows Size(%d) (max %d)", v, bits, maxValueForBits(bits)))
+	}
+	return fmt.Sprintf("%0*d", decimalWidth(bits), v)
+}
+
+// HashTableID is the TableID an entity gets when its schema leaves TableID at 0:
+// FNV-1a 32 of the entity name, folded into 10_000_000..99_999_999 so it always
+// has exactly 8 digits (a plain modulo could yield 7, and break the fixed-width
+// prefix that keeps tables apart).
+func HashTableID(entity string) int32 {
+	hasher := fnv.New32a()
+	hasher.Write([]byte(entity))
+	return int32(10_000_000 + hasher.Sum32()%90_000_000)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Composite keys
 //
 // A pk / sk / GSI-slot value is the concatenation of one or more column parts.
@@ -127,6 +168,11 @@ func capacityForWidth(width int) uint64 {
 
 // keySeparator ('#', 0x23) sorts below every orderedAlphabet character.
 const keySeparator = "#"
+
+// keySeparatorSuccessor ('$', 0x24) is the byte right after keySeparator, so every
+// key starting with prefix+"#" sorts below prefix+"$": the exclusive upper bound
+// of a prefix range.
+const keySeparatorSuccessor = "$"
 
 // keyPart is one resolved component of a composite key: either a raw string or a
 // number to be order-encoded into `width` Base64 digits.

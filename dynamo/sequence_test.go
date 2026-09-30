@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"strconv"
 	"testing"
 	"unsafe"
 )
@@ -43,8 +44,8 @@ func TestAutoincrementCompiles(t *testing.T) {
 	if r.meta.autoinc.factor != 1000 {
 		t.Fatalf("expected factor 1000, got %d", r.meta.autoinc.factor)
 	}
-	if r.meta.autoinc.seqName != "tick" {
-		t.Fatalf("expected sequence name 'tick', got %q", r.meta.autoinc.seqName)
+	if wantSeqName := strconv.Itoa(int(HashTableID("tick"))); r.meta.autoinc.seqName != wantSeqName {
+		t.Fatalf("expected sequence name %q (the TableID), got %q", wantSeqName, r.meta.autoinc.seqName)
 	}
 
 	// The get/set accessors must round-trip through a real Ticket.
@@ -144,7 +145,6 @@ type badAutoincTable struct {
 func (t badAutoincTable) GetSchema() Schema {
 	return Schema{
 		Entity:           "bad",
-		Partition:        Keys(t.ID),
 		Sort:             Keys(t.Created.Size(48)),
 		UseAutoincrement: true,
 	}

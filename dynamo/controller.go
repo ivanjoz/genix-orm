@@ -29,7 +29,7 @@ import (
 
 // Controller exposes entity-level operations behind a non-generic interface.
 type Controller interface {
-	// Entity is the entity's namespace/discriminator within the shared table.
+	// Entity is the entity's name (its keys are namespaced by the TableID).
 	Entity() string
 	// TableName is the physical DynamoDB table (shared by every entity).
 	TableName() string
@@ -48,7 +48,7 @@ type Controller interface {
 // Controller. Use it to build a heterogeneous []Controller for admin commands.
 func NewController[T any, E any]() Controller { return NewRepo[T, E]() }
 
-// Entity returns the entity's namespace within the shared table.
+// Entity returns the entity's name.
 func (r *Repo[T, E]) Entity() string { return r.meta.entity }
 
 // TableName returns the physical DynamoDB table name.
@@ -59,28 +59,29 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 // decoding the "d" blob) and deletes in BatchWriteItem batches of 25 with the
 // same unprocessed-item retry as PutMany.
 //
-// It is scoped to this entity's pk prefix, so sibling entities (and the internal
-// sequence counters) in the shared table are untouched. This is a destructive
-// maintenance operation — there is no undo.
+// It is scoped to this entity's pk ranges (its base rows and its array index
+// rows), so sibling entities (and the internal sequence counters) in the shared
+// table are untouched. The returned count includes array index rows. This is a
+// destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	client, err := Client()
 	if err != nil {
 		return 0, err
 	}
 
-	// Same entity-namespace scoping as Repo.Scan.
-	filter := "begins_with(#pk, :p)"
-	prefix := r.meta.entity + keySeparator
-	if len(r.meta.partition) == 0 {
-		filter, prefix = "#pk = :p", r.meta.entity
-	}
-
+	lowestPK, highestPK := r.meta.partitionRange(0)
+	lowestArrayPK, highestArrayPK := r.meta.partitionRange(arrayIndexColumnIDDigits)
 	input := &dynamodb.ScanInput{
-		TableName:                 aws.String(tableName()),
-		FilterExpression:          aws.String(filter),
-		ProjectionExpression:      aws.String("#pk, #sk"),
-		ExpressionAttributeNames:  map[string]string{"#pk": "pk", "#sk": "sk"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: prefix}},
+		TableName:                aws.String(tableName()),
+		FilterExpression:         aws.String("#pk BETWEEN :lo AND :hi OR #pk BETWEEN :arrayLo AND :arrayHi"),
+		ProjectionExpression:     aws.String("#pk, #sk"),
+		ExpressionAttributeNames: map[string]string{"#pk": "pk", "#sk": "sk"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":lo":      &types.AttributeValueMemberN{Value: lowestPK},
+			":hi":      &types.AttributeValueMemberN{Value: highestPK},
+			":arrayLo": &types.AttributeValueMemberN{Value: lowestArrayPK},
+			":arrayHi": &types.AttributeValueMemberN{Value: highestArrayPK},
+		},
 	}
 
 	deleted := 0

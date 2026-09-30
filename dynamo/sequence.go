@@ -18,7 +18,7 @@ import (
 // Each entity with UseAutoincrement gets its own counter, stored as a single
 // item in the shared table:
 //
-//	pk = "seq#<name>"   sk = "seq"   cv = <current value, native DynamoDB number>
+//	pk = 0   sk = "<TableID>" (or the ReserveIDs name)   cv = <current value, native number>
 //
 // This mirrors genix's `sequences` table (name -> current_value counter), but
 // where genix issues a Scylla `UPDATE ... SET current_value = current_value + ?`
@@ -28,14 +28,14 @@ import (
 // DynamoDB treats a missing attribute in ADD as 0, so the first reservation of a
 // fresh sequence naturally yields 1 — no separate "seed to 1" step is needed.
 //
-// The sequence items live under their own entity prefix ("seq"), so no Repo.Scan
-// (which filters by its own entity prefix) ever returns them, and they never
-// carry a colbin "d" blob.
+// Every counter shares pk 0, which no entity can produce (a TableID has 8 digits),
+// so no Repo.Scan (which filters by its own TableID range) ever returns them, and
+// they never carry a colbin "d" blob.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	// seqEntity is the pk namespace (and sk) of sequence items.
-	seqEntity = "seq"
+	// sequencePartitionKey is the pk of every sequence item.
+	sequencePartitionKey = "0"
 	// seqValueAttr is the native numeric attribute holding the current value.
 	seqValueAttr = "cv"
 )
@@ -53,11 +53,8 @@ func reserveSequence(name string, count int) (int64, error) {
 		return 0, err
 	}
 	out, err := client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
-		TableName: aws.String(tableName()),
-		Key: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: seqEntity + keySeparator + name},
-			"sk": &types.AttributeValueMemberS{Value: seqEntity},
-		},
+		TableName:                aws.String(tableName()),
+		Key:                      sequenceKey(name),
 		UpdateExpression:         aws.String("ADD #cv :inc"),
 		ExpressionAttributeNames: map[string]string{"#cv": seqValueAttr},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -86,6 +83,73 @@ func reserveSequence(name string, count int) (int64, error) {
 // are raw counters with no random padding applied.
 func ReserveIDs(name string, count int) (int64, error) { return reserveSequence(name, count) }
 
+// GetAutoincrementValue returns the entity's sequence counter: the last value
+// handed out, 0 for a sequence that never reserved one.
+func (r *Repo[T, E]) GetAutoincrementValue() (int64, error) {
+	if r.meta.autoinc == nil {
+		return 0, fmt.Errorf("db: entity %q does not use autoincrement", r.meta.entity)
+	}
+	client, err := Client()
+	if err != nil {
+		return 0, err
+	}
+	out, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(tableName()),
+		Key:            sequenceKey(r.meta.autoinc.seqName),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("db: reading sequence %q: %w", r.meta.autoinc.seqName, err)
+	}
+	return sequenceCounterValue(r.meta.autoinc.seqName, out.Item)
+}
+
+// SetAutoincrementValue moves the entity's sequence counter to an absolute value
+// and returns what it held before (genix's SetCounterValue). The next generated
+// ID uses value+1. Moving it below an ID already in use makes the ORM hand that
+// ID out again, and Put is an upsert: the caller owns that check.
+func (r *Repo[T, E]) SetAutoincrementValue(value int64) (int64, error) {
+	if r.meta.autoinc == nil {
+		return 0, fmt.Errorf("db: entity %q does not use autoincrement", r.meta.entity)
+	}
+	client, err := Client()
+	if err != nil {
+		return 0, err
+	}
+	out, err := client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		TableName:                aws.String(tableName()),
+		Key:                      sequenceKey(r.meta.autoinc.seqName),
+		UpdateExpression:         aws.String("SET #cv = :value"),
+		ExpressionAttributeNames: map[string]string{"#cv": seqValueAttr},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":value": &types.AttributeValueMemberN{Value: strconv.FormatInt(value, 10)},
+		},
+		ReturnValues: types.ReturnValueUpdatedOld,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("db: setting sequence %q to %d: %w", r.meta.autoinc.seqName, value, err)
+	}
+	return sequenceCounterValue(r.meta.autoinc.seqName, out.Attributes)
+}
+
+func sequenceKey(name string) map[string]types.AttributeValue {
+	return itemKey(sequencePartitionKey, name)
+}
+
+// sequenceCounterValue reads cv from a sequence item; a missing item or
+// attribute is a sequence that never reserved a value, so 0.
+func sequenceCounterValue(name string, item map[string]types.AttributeValue) (int64, error) {
+	attr, ok := item[seqValueAttr].(*types.AttributeValueMemberN)
+	if !ok {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(attr.Value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("db: sequence %q counter %q is not an integer: %w", name, attr.Value, err)
+	}
+	return value, nil
+}
+
 // rangeStart converts the post-increment high-water mark into the first value of
 // the reserved [start, high] range. Kept separate so it is unit-testable without
 // touching DynamoDB.
@@ -108,7 +172,7 @@ func pow10(n int) int64 {
 // and hung off tableMeta. get/set read and write the record's integer ID field
 // through its xunsafe accessor (no per-call reflection).
 type autoincConfig struct {
-	seqName string // sequence key (the entity discriminator)
+	seqName string // sequence key (the entity's TableID)
 	padding int    // number of random low decimal digits
 	factor  int64  // 10^padding
 	get     func(ptr unsafe.Pointer) int64

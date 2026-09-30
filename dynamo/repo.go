@@ -39,23 +39,11 @@ func NewRepo[T any, E any]() *Repo[T, E] {
 
 // Put upserts a single record. When the entity uses autoincrement and the
 // record's ID is still zero, a fresh ID is reserved and written into *record
-// before it is stored.
+// before it is stored. It is PutMany of one, so array index rows sync the same way.
 func (r *Repo[T, E]) Put(record *E) error {
-	if err := r.meta.assignAutoIDs([]unsafe.Pointer{unsafe.Pointer(record)}); err != nil {
-		return err
-	}
-	item, err := r.meta.marshalItem(unsafe.Pointer(record), record)
-	if err != nil {
-		return err
-	}
-	client, err := Client()
-	if err != nil {
-		return err
-	}
-	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
-		TableName: aws.String(tableName()),
-		Item:      item,
-	})
+	records := []E{*record}
+	err := r.PutMany(records)
+	*record = records[0]
 	return err
 }
 
@@ -65,10 +53,11 @@ func (r *Repo[T, E]) Put(record *E) error {
 // key exactly one wins — the primitive for "enqueue once" and "claim once".
 // Autoincrement IDs are assigned as in Put.
 func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
-	if err := r.meta.assignAutoIDs([]unsafe.Pointer{unsafe.Pointer(record)}); err != nil {
+	ptr := unsafe.Pointer(record)
+	if err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
-	item, err := r.meta.marshalItem(unsafe.Pointer(record), record)
+	item, err := r.meta.marshalItem(ptr, record)
 	if err != nil {
 		return false, err
 	}
@@ -85,12 +74,20 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if errors.As(err, &keyTakenErr) {
 		return false, nil
 	}
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	// Unlike PutMany, the array index rows go after the base item: written first,
+	// they would index a record that then loses the race for its key.
+	arrayRowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item[dataColumn].(*types.AttributeValueMemberB).Value)
+	return true, r.batchWriteAll(client, arrayRowPuts)
 }
 
 // PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
 // entity uses autoincrement, every record whose ID is still zero is assigned one
-// in a single sequence reservation before the batch is written.
+// in a single sequence reservation before the batch is written. With array
+// indexes it first reads the stored versions and writes in three passes: new
+// array rows, then the base items, then stale array rows (see array_index.go).
 func (r *Repo[T, E]) PutMany(records []E) error {
 	client, err := Client()
 	if err != nil {
@@ -103,23 +100,70 @@ func (r *Repo[T, E]) PutMany(records []E) error {
 	if err := r.meta.assignAutoIDs(ptrs); err != nil {
 		return err
 	}
-	const batchSize = 25
-	for start := 0; start < len(records); start += batchSize {
-		end := start + batchSize
-		if end > len(records) {
-			end = len(records)
+	storedByKey, err := r.storedVersions(client, ptrs)
+	if err != nil {
+		return err
+	}
+
+	baseWrites := make([]types.WriteRequest, 0, len(records))
+	var arrayRowPuts, arrayRowDeletes []types.WriteRequest
+	for i := range records {
+		item, err := r.meta.marshalItem(ptrs[i], &records[i])
+		if err != nil {
+			return err
 		}
-		writes := make([]types.WriteRequest, 0, end-start)
-		for i := start; i < end; i++ {
-			item, err := r.meta.marshalItem(unsafe.Pointer(&records[i]), &records[i])
-			if err != nil {
-				return err
-			}
-			writes = append(writes, types.WriteRequest{
-				PutRequest: &types.PutRequest{Item: item},
-			})
+		baseWrites = append(baseWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: item}})
+		if len(r.meta.arrayIndexes) == 0 {
+			continue
 		}
-		if err := r.batchWrite(client, writes); err != nil {
+		blob := item[dataColumn].(*types.AttributeValueMemberB).Value
+		puts, deletes := r.meta.arrayIndexWrites(storedByKey[r.meta.recordKey(ptrs[i])], ptrs[i], blob)
+		arrayRowPuts = append(arrayRowPuts, puts...)
+		arrayRowDeletes = append(arrayRowDeletes, deletes...)
+	}
+
+	for _, writes := range [][]types.WriteRequest{arrayRowPuts, baseWrites, arrayRowDeletes} {
+		if err := r.batchWriteAll(client, writes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// storedVersions reads (consistently) the stored version of each record, keyed
+// by recordKey, so its array index rows can be diffed. Nil without array indexes.
+func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]unsafe.Pointer, error) {
+	if len(r.meta.arrayIndexes) == 0 {
+		return nil, nil
+	}
+	keys := make([]map[string]types.AttributeValue, len(ptrs))
+	for i, ptr := range ptrs {
+		keys[i] = r.meta.keyOnly(ptr)
+	}
+	items, err := batchGet(client, keys, true)
+	if err != nil {
+		return nil, err
+	}
+	storedByKey := make(map[string]unsafe.Pointer, len(items))
+	for _, item := range items {
+		storedRecord := new(E)
+		if err := r.meta.unmarshalItem(item, storedRecord); err != nil {
+			return nil, err
+		}
+		storedByKey[r.meta.recordKey(unsafe.Pointer(storedRecord))] = unsafe.Pointer(storedRecord)
+	}
+	return storedByKey, nil
+}
+
+// recordKey identifies a record by its pk and sk (pk is all digits, so the join is unambiguous).
+func (m *tableMeta) recordKey(ptr unsafe.Pointer) string {
+	return m.pkValue(ptr) + keySeparator + m.skValue(ptr)
+}
+
+// batchWriteAll writes any number of requests in BatchWriteItem chunks of 25.
+func (r *Repo[T, E]) batchWriteAll(client *dynamodb.Client, writes []types.WriteRequest) error {
+	for start := 0; start < len(writes); start += 25 {
+		if err := r.batchWrite(client, writes[start:min(start+25, len(writes))]); err != nil {
 			return err
 		}
 	}
@@ -146,17 +190,30 @@ func (r *Repo[T, E]) batchWrite(client *dynamodb.Client, writes []types.WriteReq
 }
 
 // Delete removes the item identified by the record's partition + sort fields.
-// Only the key fields of `record` need to be populated.
+// Only the key fields of `record` need to be populated: with array indexes the
+// stored version is read to find its rows, which are deleted after the item.
 func (r *Repo[T, E]) Delete(record *E) error {
 	client, err := Client()
 	if err != nil {
 		return err
 	}
+	ptr := unsafe.Pointer(record)
+	storedByKey, err := r.storedVersions(client, []unsafe.Pointer{ptr})
+	if err != nil {
+		return err
+	}
+	var arrayRowDeletes []types.WriteRequest
+	if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
+		_, arrayRowDeletes = r.meta.arrayIndexWrites(storedPtr, nil, nil)
+	}
 	_, err = client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName()),
-		Key:       r.meta.keyOnly(unsafe.Pointer(record)),
+		Key:       r.meta.keyOnly(ptr),
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return r.batchWriteAll(client, arrayRowDeletes)
 }
 
 // Get fetches one item by its full key. `key` only needs its partition and sort
@@ -211,25 +268,29 @@ func (r *Repo[T, E]) TopN(n int32, partitionValues ...any) ([]E, error) {
 
 // Scan returns up to limit records of this entity from the base table,
 // regardless of partition. It is a table Scan filtered to the entity's pk
-// namespace — handy for admin/debug listings, not for hot paths. Order is
+// range — handy for admin/debug listings, not for hot paths. Order is
 // unspecified (physical). limit <= 0 means no cap.
 func (r *Repo[T, E]) Scan(limit int32) ([]E, error) {
+	// Without partition columns the whole entity is the single pk TableID: a Query.
+	if len(r.meta.partition) == 0 {
+		var out []E
+		err := r.Query().Limit(limit).Exec(&out)
+		return out, err
+	}
 	client, err := Client()
 	if err != nil {
 		return nil, err
 	}
 
-	filter := "begins_with(#pk, :p)"
-	prefix := r.meta.entity + keySeparator
-	if len(r.meta.partition) == 0 {
-		filter, prefix = "#pk = :p", r.meta.entity
-	}
-
+	lowestPK, highestPK := r.meta.partitionRange(0)
 	input := &dynamodb.ScanInput{
-		TableName:                 aws.String(tableName()),
-		FilterExpression:          aws.String(filter),
-		ExpressionAttributeNames:  map[string]string{"#pk": "pk"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: prefix}},
+		TableName:                aws.String(tableName()),
+		FilterExpression:         aws.String("#pk BETWEEN :lo AND :hi"),
+		ExpressionAttributeNames: map[string]string{"#pk": "pk"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":lo": &types.AttributeValueMemberN{Value: lowestPK},
+			":hi": &types.AttributeValueMemberN{Value: highestPK},
+		},
 	}
 
 	var out []E
