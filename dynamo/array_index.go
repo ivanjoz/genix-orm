@@ -42,25 +42,49 @@ import (
 // arrayIndexColumnIDDigits is the width of the cb id appended to the base pk.
 const arrayIndexColumnIDDigits = 3
 
-// arrayIndexMeta is one resolved fan-out Index.
+// arrayIndexMeta is one resolved hidden-rows index: a fan-out Index, or a delta
+// index (delta.go), which may hold no ColSlice and then writes one row per record.
 type arrayIndexMeta struct {
 	// element describes one slice element as a key column: the slice's field name,
-	// the element's kind and the column's declared Size(bits).
+	// the element's kind and the column's declared Size(bits). Unset when
+	// elementPosition is -1 (a delta index without a ColSlice).
 	element keyCol
 	// keys are the index Keys in declared order, with element at elementPosition;
 	// the other columns are scalars read from the record.
 	keys            []keyCol
 	elementPosition int
-	columnID        string // the slice field's cb id, zero-padded to arrayIndexColumnIDDigits
-	fullCopy        bool
+	// columnID is the cb id that names the rows' pk, zero-padded to
+	// arrayIndexColumnIDDigits: the slice field's, or for a delta index without one,
+	// its first key's (UpdatedVersion's when it has none).
+	columnID string
+	fullCopy bool
 	// elements reads the slice straight from the record and returns one key part
 	// per element (duplicates included).
 	elements func(ptr unsafe.Pointer) []keyPart
+
+	// Delta indexes only: keys ends with the managed UpdatedVersion, and
+	// syncFilterField is the field Delta()'s values filter on a first sync ("" for none).
+	isDelta         bool
+	syncFilterField string
 }
 
+// cbColumnID returns a field's cb id, zero-padded: the stable id, unlike the Go
+// name, survives a field rename, so the rows it names stay findable.
+func cbColumnID(recordType reflect.Type, fieldName string) string {
+	field, _ := recordType.FieldByName(fieldName)
+	columnID, err := strconv.Atoi(field.Tag.Get("cb"))
+	if err != nil || columnID < 1 || columnID > 999 {
+		panic(fmt.Sprintf("db: index column %s.%s needs a `cb:\"N\"` tag with N in 1..999", recordType.Name(), fieldName))
+	}
+	return fmt.Sprintf("%0*d", arrayIndexColumnIDDigits, columnID)
+}
+
+// resolveArrayIndex resolves the Keys of a hidden-rows index. Without a ColSlice
+// it returns elementPosition -1 and no columnID: only a delta index goes without
+// one, and it picks its own.
 func resolveArrayIndex(recordType reflect.Type, accessors map[string]*colAccessor, index Index) arrayIndexMeta {
 	if index.Slot.attr != "" {
-		panic(fmt.Sprintf("db: %s index %s holds a ColSlice: a fan-out index lives in the base table and takes no Slot",
+		panic(fmt.Sprintf("db: %s index %s holds a ColSlice or is a delta index: it lives in the base table and takes no Slot",
 			recordType.Name(), index.Slot.attr))
 	}
 	elementPosition := -1
@@ -72,6 +96,9 @@ func resolveArrayIndex(recordType reflect.Type, accessors map[string]*colAccesso
 			panic(fmt.Sprintf("db: %s has an Index holding two ColSlice columns: a fan-out index takes one", recordType.Name()))
 		}
 		elementPosition = i
+	}
+	if elementPosition < 0 {
+		return arrayIndexMeta{keys: resolveKeyCols(recordType, accessors, index.Keys), elementPosition: -1, fullCopy: index.FullCopy}
 	}
 
 	sliceColumn := index.Keys[elementPosition].(SliceColn)
@@ -94,11 +121,6 @@ func resolveArrayIndex(recordType reflect.Type, accessors map[string]*colAccesso
 	if elementKind.isInteger() && column.bits <= 0 {
 		panic(fmt.Sprintf("db: fan-out index column %s.%s holds integers and must declare .Size(bits)", recordType.Name(), field.Name))
 	}
-	// The cb id, unlike the Go name, survives a field rename, so the rows stay findable.
-	columnID, err := strconv.Atoi(field.Tag.Get("cb"))
-	if err != nil || columnID < 1 || columnID > 999 {
-		panic(fmt.Sprintf("db: fan-out index column %s.%s needs a `cb:\"N\"` tag with N in 1..999", recordType.Name(), field.Name))
-	}
 
 	element := keyCol{fieldName: field.Name, kind: elementKind, bits: column.bits}
 	keys := resolveKeyCols(recordType, accessors, index.Keys)
@@ -108,7 +130,7 @@ func resolveArrayIndex(recordType reflect.Type, accessors map[string]*colAccesso
 		element:         element,
 		keys:            keys,
 		elementPosition: elementPosition,
-		columnID:        fmt.Sprintf("%0*d", arrayIndexColumnIDDigits, columnID),
+		columnID:        cbColumnID(recordType, field.Name),
 		fullCopy:        index.FullCopy,
 		elements: func(ptr unsafe.Pointer) []keyPart {
 			slice := reflect.NewAt(fieldType, unsafe.Add(ptr, fieldOffset)).Elem()
@@ -134,6 +156,10 @@ func (m *tableMeta) arrayRowSKs(arrayIndex *arrayIndexMeta, ptr unsafe.Pointer) 
 		if i != arrayIndex.elementPosition {
 			parts[i] = m.keyPartsFor(ptr, []keyCol{kc})[0]
 		}
+	}
+	// A delta index without a ColSlice writes one row per record.
+	if arrayIndex.elementPosition < 0 {
+		return []string{buildCompositeKey(parts) + keySeparator + baseSK}
 	}
 	var rowSKs []string
 	seen := map[string]bool{}
@@ -214,9 +240,9 @@ func (m *tableMeta) arrayIndexWrites(storedPtr, writtenPtr unsafe.Pointer, blob 
 // recordItemsOfArrayRows turns a page of fan-out rows into the record items they
 // point to, in row order, with the sk of the row each came from (for
 // writesArrayRow) and the read units spent. A FullCopy row is its own record
-// item; keys-only rows read their base records in a BatchGetItem, and a row whose
-// record is gone yields nothing.
-func recordItemsOfArrayRows(client *dynamodb.Client, basePK string, arrayIndex *arrayIndexMeta, rows []map[string]types.AttributeValue) ([]map[string]types.AttributeValue, []string, float64, error) {
+// item; keys-only rows read their base records in a BatchGetItem (consistent when
+// the query is), and a row whose record is gone yields nothing.
+func recordItemsOfArrayRows(client *dynamodb.Client, basePK string, arrayIndex *arrayIndexMeta, rows []map[string]types.AttributeValue, consistentRead bool) ([]map[string]types.AttributeValue, []string, float64, error) {
 	rowSKs := make([]string, len(rows))
 	for i, row := range rows {
 		rowSKs[i] = row["sk"].(*types.AttributeValueMemberS).Value
@@ -236,7 +262,7 @@ func recordItemsOfArrayRows(client *dynamodb.Client, basePK string, arrayIndex *
 			keys = append(keys, itemKey(basePK, baseSK))
 		}
 	}
-	items, readUnits, err := batchGet(client, keys, false)
+	items, readUnits, err := batchGet(client, keys, consistentRead)
 	if err != nil {
 		return nil, nil, 0, err
 	}

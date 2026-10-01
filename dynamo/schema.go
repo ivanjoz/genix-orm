@@ -253,11 +253,22 @@ type Schema struct {
 	// SaveUpdatedVersion enables the by-IDs cache (cache_updated_version.go): every
 	// write bumps the version of the record's slot, and Repo.QueryCachedIDs returns
 	// only the requested records whose slot moved since the client's version. It
-	// needs exactly one integer Keys column (the ID) and a uint16 record field
-	// named "UpdatedVersion" (json "upv"), which the ORM manages: it is zeroed on
-	// write and stamped with the slot version on a by-IDs read.
+	// needs exactly one integer Keys column (the ID) and the managed int32
+	// "UpdatedVersion" field (see delta.go), which a by-IDs read overwrites with
+	// the slot version.
 	SaveUpdatedVersion bool
+
+	// VersionedWrites enables Repo.Modify (modify.go) on a table that has neither
+	// SaveUpdatedVersion nor a TypeDelta index: every write stamps the managed int32
+	// "UpdatedVersion" field (delta.go) and stores it as the item attribute "upv".
+	// Those two already imply it.
+	VersionedWrites bool
 }
+
+// TypeDelta marks an Index as a delta index (delta.go): the ORM appends the
+// managed UpdatedVersion to its Keys, so Delta() reads "changed since the
+// client's watermark" as one exact sk range.
+const TypeDelta int8 = 10
 
 // Slot identifies one of the ten physical GSI attributes.
 type Slot struct {
@@ -298,7 +309,11 @@ var (
 //     so a slice field takes one fan-out index. The rows are kept in sync by
 //     Put/PutMany/PutIfAbsent/Delete (see array_index.go); a scalar column in
 //     Keys that changes on a write rewrites every element row.
+//   - A delta index: Type is TypeDelta (see delta.go). It lives in hidden rows
+//     like a fan-out index, with or without a ColSlice among its Keys.
 type Index struct {
+	// Type is 0, or TypeDelta for a delta index.
+	Type int8
 	Slot Slot
 	Keys []Coln
 	// FullCopy (fan-out indexes only) stores the whole record blob on every

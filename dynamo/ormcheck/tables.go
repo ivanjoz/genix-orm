@@ -55,22 +55,31 @@ func (table CheckOrderTable) GetSchema() dynamo.Schema {
 var CheckOrders = dynamo.NewRepo[CheckOrderTable, CheckOrder]()
 
 // CheckProduct is an entity without Partition (the whole entity is the pk TableID). Its fan-out
-// index is FullCopy: every element row carries the record, so Contains is a single Query.
+// index is FullCopy: every element row carries the record, so Contains is a single Query. Its two
+// delta indexes are keys-only: one row per record, and one per TeamIDs element.
 type CheckProduct struct {
-	ID          int32   `cb:"1"`
-	Brand       string  `cb:"2"`
-	Price       int32   `cb:"3"`
-	Name        string  `cb:"4"`
-	CategoryIDs []int16 `cb:"5"`
+	ID             int32   `cb:"1"`
+	Brand          string  `cb:"2"`
+	Price          int32   `cb:"3"`
+	Name           string  `cb:"4"`
+	CategoryIDs    []int16 `cb:"5"`
+	Status         int8    `cb:"6"`
+	TeamIDs        []int16 `cb:"7"`
+	Updated        int32   `cb:"8"`
+	UpdatedVersion int32   `cb:"9"`
 }
 
 type CheckProductTable struct {
 	dynamo.Model[CheckProductTable, CheckProduct]
-	ID          dynamo.Col[CheckProductTable, int32]
-	Brand       dynamo.Col[CheckProductTable, string]
-	Price       dynamo.Col[CheckProductTable, int32]
-	Name        dynamo.Col[CheckProductTable, string]
-	CategoryIDs dynamo.ColSlice[CheckProductTable, int16]
+	ID             dynamo.Col[CheckProductTable, int32]
+	Brand          dynamo.Col[CheckProductTable, string]
+	Price          dynamo.Col[CheckProductTable, int32]
+	Name           dynamo.Col[CheckProductTable, string]
+	CategoryIDs    dynamo.ColSlice[CheckProductTable, int16]
+	Status         dynamo.Col[CheckProductTable, int8]
+	TeamIDs        dynamo.ColSlice[CheckProductTable, int16]
+	Updated        dynamo.Col[CheckProductTable, int32]
+	UpdatedVersion dynamo.Col[CheckProductTable, int32]
 }
 
 func (table CheckProductTable) GetSchema() dynamo.Schema {
@@ -82,6 +91,8 @@ func (table CheckProductTable) GetSchema() dynamo.Schema {
 			{Slot: dynamo.N1, Keys: dynamo.Keys(table.Price.Size(32))},
 			{Slot: dynamo.S1, Keys: dynamo.Keys(table.Brand)},
 			{Keys: dynamo.Keys(table.CategoryIDs.Size(16)), FullCopy: true},
+			{Type: dynamo.TypeDelta, Keys: dynamo.Keys(table.Status)},
+			{Type: dynamo.TypeDelta, Keys: dynamo.Keys(table.TeamIDs.Size(8), table.Status)},
 		},
 	}
 }

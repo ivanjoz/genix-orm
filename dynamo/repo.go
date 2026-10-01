@@ -57,7 +57,9 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
-	r.meta.prepareUpdatedVersions([]unsafe.Pointer{ptr})
+	if err := r.meta.stampManagedColumns([]unsafe.Pointer{ptr}); err != nil {
+		return false, err
+	}
 	item, err := r.meta.marshalItem(ptr, record)
 	if err != nil {
 		return false, err
@@ -89,10 +91,11 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 
 // PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
 // entity uses autoincrement, every record whose ID is still zero is assigned one
-// in a single sequence reservation before the batch is written. With array
-// indexes it first reads the stored versions and writes in three passes: new
-// array rows, then the base items, then stale array rows (see array_index.go).
-// With SaveUpdatedVersion the touched slot versions are bumped last.
+// in a single sequence reservation before the batch is written, and the managed
+// Updated / UpdatedVersion are stamped (delta.go). With array or delta indexes it
+// first reads the stored versions and writes in three passes: new rows, then the
+// base items, then stale rows (see array_index.go). With SaveUpdatedVersion the
+// touched slot versions are bumped last.
 func (r *Repo[T, E]) PutMany(records []E) error {
 	client, err := Client()
 	if err != nil {
@@ -105,7 +108,9 @@ func (r *Repo[T, E]) PutMany(records []E) error {
 	if err := r.meta.assignAutoIDs(ptrs); err != nil {
 		return err
 	}
-	r.meta.prepareUpdatedVersions(ptrs)
+	if err := r.meta.stampManagedColumns(ptrs); err != nil {
+		return err
+	}
 	storedByKey, err := r.storedVersions(client, ptrs)
 	if err != nil {
 		return err
@@ -247,6 +252,51 @@ func (r *Repo[T, E]) Get(key E) (*E, error) {
 		return nil, err
 	}
 	return &record, nil
+}
+
+// GetMany reads records by key with a consistent BatchGetItem (100 keys per call;
+// each item is billed rounded up to 4 KB): the read before a PutManyIfVersion.
+// keys only need their partition and sort fields set. Missing records are left
+// out, and the order is not the keys' order.
+func (r *Repo[T, E]) GetMany(keys []E) ([]E, error) {
+	return r.getMany(keys, false)
+}
+
+// GetManyForUpdate is GetMany for records about to go through PutManyIfVersion:
+// it also keeps their stored blobs in the process write cache (write_cache.go),
+// so that write diffs their hidden rows without reading them again. On a table
+// without fan-out or delta indexes it is GetMany.
+func (r *Repo[T, E]) GetManyForUpdate(keys []E) ([]E, error) {
+	return r.getMany(keys, true)
+}
+
+func (r *Repo[T, E]) getMany(keys []E, rememberForUpdate bool) ([]E, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	client, err := Client()
+	if err != nil {
+		return nil, err
+	}
+	itemKeys := make([]map[string]types.AttributeValue, len(keys))
+	for i := range keys {
+		itemKeys[i] = r.meta.keyOnly(unsafe.Pointer(&keys[i]))
+	}
+	items, _, err := batchGet(client, itemKeys, true)
+	if err != nil {
+		return nil, err
+	}
+	// Without hidden rows a write diffs nothing, so there is nothing worth keeping.
+	if rememberForUpdate && len(r.meta.arrayIndexes) > 0 {
+		rememberStoredItems(items)
+	}
+	records := make([]E, len(items))
+	for i, item := range items {
+		if err := r.meta.unmarshalItem(item, &records[i]); err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
 }
 
 // Query starts a new statically-typed query for this entity. It is strict:

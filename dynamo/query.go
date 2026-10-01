@@ -47,6 +47,7 @@ const (
 	opBetween
 	opBeginsWith
 	opContains // v1 holds the []any of values; served by a fan-out Index
+	opIn       // v1 holds the []any of values; in-memory only (Delta's sync filter)
 )
 
 type predicate struct {
@@ -243,6 +244,12 @@ type QueryBuilder[E any] struct {
 	// allowsMemoryFilter is set by Repo.QueryScan: predicates no key serves are
 	// filtered in memory instead of rejected.
 	allowsMemoryFilter bool
+	// Set by Delta (delta.go): the TypeDelta index it reads, and the first-sync
+	// filter on its sync filter column.
+	deltaIndex *arrayIndexMeta
+	syncFilter *predicate
+	// consistentRead is set by Consistent.
+	consistentRead bool
 }
 
 func (q *QueryBuilder[E]) add(c Coln, o op, v1, v2 any) *QueryBuilder[E] {
@@ -282,6 +289,12 @@ func (q *QueryBuilder[E]) Limit(n int32) *QueryBuilder[E] { q.limit = n; return 
 
 // Desc returns items in descending sort-key order.
 func (q *QueryBuilder[E]) Desc() *QueryBuilder[E] { q.desc = true; return q }
+
+// Consistent reads with strong consistency: the query sees every write that
+// finished before it, at twice the read units. Only base-table reads can (a
+// partition or Keys query, Contains, Delta); a query planned on a GSI fails.
+// Read inside a Modify change (modify.go), it is what keeps derived data fresh.
+func (q *QueryBuilder[E]) Consistent() *QueryBuilder[E] { q.consistentRead = true; return q }
 
 // queryPlan is the resolved DynamoDB query input pieces.
 type queryPlan struct {
@@ -324,8 +337,12 @@ func (q *QueryBuilder[E]) Exec(dst *[]E) error {
 			ExpressionAttributeNames:  plan.names,
 			ExpressionAttributeValues: plan.values,
 			ScanIndexForward:          aws.Bool(!q.desc),
+			ConsistentRead:            aws.Bool(q.consistentRead),
 		}
 		if plan.indexName != "" {
+			if q.consistentRead {
+				return fmt.Errorf("db: %s Consistent() query is planned on %s, and a GSI cannot read consistently", q.meta.recordType.Name(), plan.indexName)
+			}
 			input.IndexName = aws.String(plan.indexName)
 		}
 		if q.allowsMemoryFilter {
@@ -355,7 +372,7 @@ func (q *QueryBuilder[E]) Exec(dst *[]E) error {
 			items, rowSKs := out.Items, []string(nil)
 			if plan.arrayIndex != nil {
 				var baseReadUnits float64
-				if items, rowSKs, baseReadUnits, err = recordItemsOfArrayRows(client, plan.basePK, plan.arrayIndex, out.Items); err != nil {
+				if items, rowSKs, baseReadUnits, err = recordItemsOfArrayRows(client, plan.basePK, plan.arrayIndex, out.Items, q.consistentRead); err != nil {
 					return err
 				}
 				readUnits += baseReadUnits
@@ -422,7 +439,8 @@ func (q *QueryBuilder[E]) plans() ([]*queryPlan, error) {
 		containsPredicate = &q.preds[i]
 	}
 	if containsPredicate == nil {
-		plan, err := q.plan(nil, nil)
+		// A Delta read without a Contains reads its delta index's single rows.
+		plan, err := q.plan(q.deltaIndex, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -431,12 +449,16 @@ func (q *QueryBuilder[E]) plans() ([]*queryPlan, error) {
 
 	var arrayIndex *arrayIndexMeta
 	for i := range q.meta.arrayIndexes {
-		if q.meta.arrayIndexes[i].element.fieldName == containsPredicate.field {
+		if q.meta.arrayIndexes[i].elementPosition >= 0 && q.meta.arrayIndexes[i].element.fieldName == containsPredicate.field {
 			arrayIndex = &q.meta.arrayIndexes[i]
 		}
 	}
 	if arrayIndex == nil {
 		return nil, fmt.Errorf("db: Contains on %s.%s needs an Index whose Keys hold that ColSlice",
+			q.meta.recordType.Name(), containsPredicate.field)
+	}
+	if q.deltaIndex != nil && q.deltaIndex != arrayIndex {
+		return nil, fmt.Errorf("db: %s Delta() with a Contains on %s needs a TypeDelta index holding that ColSlice",
 			q.meta.recordType.Name(), containsPredicate.field)
 	}
 	values := containsPredicate.v1.([]any)
@@ -475,17 +497,24 @@ func (q *QueryBuilder[E]) plan(arrayIndex *arrayIndexMeta, element any) (*queryP
 	// the index Keys then the base Keys, and the element pins the slice column
 	// like an equality.
 	sortColumns := q.meta.keys
+	hasElement := arrayIndex != nil && arrayIndex.elementPosition >= 0
 	if arrayIndex != nil {
 		sortColumns = append(append([]keyCol(nil), arrayIndex.keys...), q.meta.keys...)
+	}
+	if hasElement {
 		byField[arrayIndex.element.fieldName] = predicate{field: arrayIndex.element.fieldName, op: opEq, v1: element}
 	}
 	usedKeysFields, err := q.resolveKeys(byField, plan, sortColumns)
 	if err != nil {
 		return nil, err
 	}
-	if arrayIndex != nil && !usedKeysFields[arrayIndex.element.fieldName] {
+	if hasElement && !usedKeysFields[arrayIndex.element.fieldName] {
 		return nil, fmt.Errorf("db: Contains on %s.%s needs an Eq on every index Keys column before it",
 			q.meta.recordType.Name(), arrayIndex.element.fieldName)
+	}
+	// Delta's first-sync filter is not a user filter, so even a strict Query takes it.
+	if q.syncFilter != nil {
+		plan.keyFilter = append(plan.keyFilter, *q.syncFilter)
 	}
 
 	// 3. Remaining predicates no key serves: a QueryScan evaluates them in memory
@@ -704,6 +733,14 @@ func (m *tableMeta) matchesFilter(ptr unsafe.Pointer, preds []predicate) bool {
 }
 
 func evalPredicate(acc *colAccessor, ptr unsafe.Pointer, p predicate) bool {
+	if p.op == opIn {
+		for _, value := range p.v1.([]any) {
+			if evalPredicate(acc, ptr, predicate{field: p.field, op: opEq, v1: value}) {
+				return true
+			}
+		}
+		return false
+	}
 	switch acc.kind {
 	case kindString:
 		s := acc.getStr(ptr)

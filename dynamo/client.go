@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -46,7 +47,7 @@ func Client() (*dynamodb.Client, error) {
 			clientErr = fmt.Errorf("db: loading AWS config: %w", err)
 			return
 		}
-		var dynOpts []func(*dynamodb.Options)
+		dynOpts := []func(*dynamodb.Options){operationLogOption}
 		if endpoint := os.Getenv("DYNAMO_ENDPOINT"); endpoint != "" {
 			dynOpts = append(dynOpts, func(o *dynamodb.Options) {
 				o.BaseEndpoint = aws.String(endpoint)
@@ -108,6 +109,10 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	}
 	item := m.keyOnly(ptr)
 	item[dataColumn] = &types.AttributeValueMemberB{Value: blob}
+	// A versioned table exposes UpdatedVersion outside the blob: Modify's conditional write compares it.
+	if m.writeVersion != nil {
+		item[versionColumn] = &types.AttributeValueMemberN{Value: strconv.FormatInt(m.writeVersion.acc.getI64(ptr), 10)}
+	}
 	for _, idx := range m.indexes {
 		item[idx.slot.attr] = attributeForSlot(m.slotValue(ptr, idx), idx.slot.isNumber)
 	}

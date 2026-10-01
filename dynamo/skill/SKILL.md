@@ -1,6 +1,6 @@
 ---
 name: genix-dynamo-orm
-description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
+description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the managed Updated/UpdatedVersion, delta indexes (TypeDelta/Delta()), the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
 ---
 
 # genix-orm/dynamo
@@ -108,8 +108,16 @@ A violation makes `NewRepo` panic at boot:
   - pin it when renaming an `Entity` without moving its data.
 - **Autoincrement** needs an integer field named `ID`. `AutoincrementRandomPadding` (0..9) adds
   random low digits.
-- **`SaveUpdatedVersion`** needs exactly one integer `Keys` column and a `uint16` field named
+- **`SaveUpdatedVersion`** needs exactly one integer `Keys` column and an `int32` field named
   `UpdatedVersion` (`json:"upv"`) in the record and the table struct. See section 3b.
+- **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need the same `int32` `UpdatedVersion`, and
+  a `cb` tag on their first Key (on `UpdatedVersion` when they have none). See section 3c.
+- **`VersionedWrites`** needs the same `int32` `UpdatedVersion`; it only enables `Modify` (section 2)
+  on a table that has neither `SaveUpdatedVersion` nor a delta index (those imply it).
+- **Managed fields:** every Put stamps an integer field named `Updated` with the write time
+  (SUnixTime) and, on a versioned table (a delta index, `SaveUpdatedVersion` or `VersionedWrites`),
+  `UpdatedVersion` with the write sequence, also stored as the item attribute `upv`. Never set them
+  yourself.
 
 ## 2. Writing and reading by key
 
@@ -129,6 +137,28 @@ all, err := Orders.Scan(100)           // admin/debug only: reads the whole enti
   write them yourself. A scalar fan-out `Keys` column that changes (e.g. `Updated`) rewrites
   every element row (a delete + a put each) on the write that changes it.
 - Soft delete (a status field set to 0) is a normal `Put`. `Delete` removes the item and its array rows.
+- **Read-modify-write → `Modify`, never Get + Put.** A Put replaces the whole record, so a Get + Put
+  loses any write that landed in between. On a versioned table:
+
+  ```go
+  saved, err := Orders.Modify(Order{ID: 9}, func(order *Order, exists bool) error {
+      order.Status = 2 // edit the record as stored now; may run several times
+      return nil
+  })
+  ```
+
+  It reads consistently and writes only if `upv` still holds the version read, re-running the
+  change on a race (8 attempts, then `dynamo.ErrWriteConflict`). An unchanged record writes nothing.
+  Records stored before the table was versioned have no `upv`: `Put` them once.
+- **Many records → `GetMany` + `PutManyIfVersion`.** `GetMany(keys)` reads consistently;
+  `PutManyIfVersion(records)` writes each one only if its `UpdatedVersion` is still the stored one,
+  with one version reservation for the call, and returns the ones that lost a race: re-read, re-edit
+  and retry those (pause with `ConflictBackoff(attempt)`). On a table with fan-out or delta indexes,
+  read with `GetManyForUpdate` instead: it keeps the stored blobs in the process write cache (15 s),
+  so the write diffs the index rows without reading them again.
+- **Derived data** (a record computed from others): read the derived records first, then their
+  inputs with `Query().Consistent()` / `GetMany`, and have every writer of those inputs recompute
+  the derived records after its own write.
 
 ## 3. Querying
 
@@ -178,8 +208,8 @@ Operators: `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, `BeginsWith`, `Contains`, 
   - It pays for every row the index range holds, so narrow the index first.
   - It fails with `QueryScan read more than 5 MB` once it passes 640 RCU without finishing.
     It never returns partial results.
-  - Use it for delta syncs (`Gt(Updated, since)`), status filters on small entities, and filters
-    on non-key fields inside a narrow index read.
+  - Use it for status filters on small entities and for filters on non-key fields inside a
+    narrow index read. Delta syncs use `Delta()` (section 3c), not `Gt(Updated)`.
 - In-memory filters compare strings, bools and numbers. A predicate on a slice/struct field
   matches nothing. Use `Contains` on a fan-out indexed `ColSlice` instead.
 
@@ -204,8 +234,8 @@ genix-ui's cache-by-ids (`getRecordByID`, `RecordByIDText`, `GetHandler.routeByI
 // schema: Keys(t.ID.Size(32)) and nothing else in Keys, plus
 SaveUpdatedVersion: true,
 // record and table struct:
-UpdatedVersion uint16 `json:"upv,omitempty" cb:"N"`
-UpdatedVersion dynamo.Col[OrderTable, uint16]
+UpdatedVersion int32 `json:"upv,omitempty" cb:"N"`
+UpdatedVersion dynamo.Col[OrderTable, int32]
 
 changed, err := Orders.QueryCachedIDs(cachedIDs)          // []dynamo.IDUpdatedVersion{ID, UpdatedVersion}
 changed, err  = Orders.QueryCachedIDs(cachedIDs, storeID) // one value per Partition column
@@ -217,11 +247,38 @@ changed, err  = Orders.QueryCachedIDs(cachedIDs, storeID) // one value per Parti
 - `QueryCachedIDs` does one GetItem for the slot versions, then one consistent BatchGetItem for
   the IDs whose client version (0 = none) differs. Unchanged and missing IDs are left out, and the
   returned records carry the **slot** version in `UpdatedVersion`.
-- The ORM owns `UpdatedVersion`: it is zeroed on every write, so a delta list returns `upv` 0,
-  which costs one revalidation on the by-IDs path.
+- The ORM owns `UpdatedVersion`. As stored it is the write sequence (section 3c). Only a by-IDs
+  read overwrites it with the slot version, as in genix.
 - A write to one record makes the other records of its slot (IDs 256 apart) come back once too.
 - A record never written since the flag was turned on has no slot version, so it is read on every
   request. Re-`Put` the existing records once after enabling the flag.
+
+## 3c. Delta sync (`TypeDelta`, `Delta()`)
+
+Use it for "the records written since watermark W": genix-ui's delta cache (skill `delta-cache-api`).
+
+```go
+// schema:
+Indexes: []dynamo.Index{
+    {Type: dynamo.TypeDelta, Keys: dynamo.Keys(t.Status)},                       // the whole entity
+    {Type: dynamo.TypeDelta, Keys: dynamo.Keys(t.TeamIDs.Size(8), t.Status)},    // per team, fan-out
+},
+
+Orders.Query().Delta(watermark, 1).Exec(&out)                          // W = the client's highest upv
+Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(watermark, 1).Exec(&out)
+```
+
+- **The last Key, unless it is a ColSlice, is the sync filter column.** It is not in the row sk.
+  `Delta(W, values...)` keeps only those values on a first sync (`W = 0`) and every value on a
+  later one, so soft-deleted records reach the clients caching them.
+- **The other Keys are pinned:** `Eq` on each, or `Contains` on the ColSlice (rows per element).
+  Partition columns need their `Eq` too.
+- **Call `Delta()` last.** It picks the delta index whose pinned Keys the query pins (the most
+  specific wins, a tie fails), and adds `UpdatedVersion >= W+1`: one exact range.
+- Rows are hidden base-table rows (`pk = base pk ‖ cb id`), keys-only unless `FullCopy`. Every
+  write moves all of them, because `UpdatedVersion` changed. A slice field takes either a fan-out
+  index or a delta index, not both.
+- A record written before the index was declared has no delta row: re-`Put` existing records once.
 
 ## 4. Pitfalls
 

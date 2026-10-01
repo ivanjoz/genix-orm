@@ -16,7 +16,7 @@ type versionedItem struct {
 	StoreID        int32  `cb:"1"`
 	ID             int64  `cb:"2"`
 	Name           string `cb:"3"`
-	UpdatedVersion uint16 `cb:"4"`
+	UpdatedVersion int32  `cb:"4"`
 }
 
 type versionedItemTable struct {
@@ -24,7 +24,7 @@ type versionedItemTable struct {
 	StoreID        Col[*versionedItemTable, int32]
 	ID             Col[*versionedItemTable, int64]
 	Name           Col[*versionedItemTable, string]
-	UpdatedVersion Col[*versionedItemTable, uint16]
+	UpdatedVersion Col[*versionedItemTable, int32]
 }
 
 func (t versionedItemTable) GetSchema() Schema {
@@ -67,15 +67,6 @@ func TestSlotVersionOfTruncatesAndReservesZero(t *testing.T) {
 	}
 }
 
-func TestPrepareUpdatedVersionsZeroesTheManagedField(t *testing.T) {
-	items := NewRepo[versionedItemTable, versionedItem]()
-	record := versionedItem{StoreID: 7, ID: 1, UpdatedVersion: 99}
-	items.meta.prepareUpdatedVersions([]unsafe.Pointer{unsafe.Pointer(&record)})
-	if record.UpdatedVersion != 0 {
-		t.Fatalf("UpdatedVersion = %d after prepare, want 0", record.UpdatedVersion)
-	}
-}
-
 type badVersionedRecord struct {
 	ID             int32
 	Code           string
@@ -93,6 +84,11 @@ type unversionedRecord struct {
 	ID int32
 }
 
+type uint16VersionedRecord struct {
+	ID             int32
+	UpdatedVersion uint16
+}
+
 func TestSaveUpdatedVersionDeclarationRules(t *testing.T) {
 	tablePtr := new(badVersionedTable)
 	populateColumnNames(tablePtr)
@@ -105,9 +101,9 @@ func TestSaveUpdatedVersionDeclarationRules(t *testing.T) {
 			buildTableMeta(Schema{Entity: "bad_versioned", TableID: 56789012, Keys: Keys(tablePtr.Code), SaveUpdatedVersion: true},
 				reflect.TypeFor[badVersionedRecord]())
 		},
-		"an int32 UpdatedVersion": func() {
-			buildTableMeta(Schema{Entity: "bad_versioned", TableID: 56789012, Keys: Keys(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
-				reflect.TypeFor[badVersionedRecord]())
+		"a uint16 UpdatedVersion": func() {
+			buildTableMeta(Schema{Entity: "uint16_versioned", TableID: 67890124, Keys: Keys(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
+				reflect.TypeFor[uint16VersionedRecord]())
 		},
 		"no UpdatedVersion field": func() {
 			buildTableMeta(Schema{Entity: "unversioned", TableID: 67890123, Keys: Keys(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
@@ -158,7 +154,7 @@ func TestQueryCachedIDs(t *testing.T) {
 		if record.UpdatedVersion == 0 {
 			t.Fatalf("record %d came back without a slot version", record.ID)
 		}
-		heldVersions[i] = IDUpdatedVersion{ID: record.ID, UpdatedVersion: record.UpdatedVersion}
+		heldVersions[i] = IDUpdatedVersion{ID: record.ID, UpdatedVersion: uint16(record.UpdatedVersion)}
 	}
 
 	// Versions held and nothing written: nothing comes back.

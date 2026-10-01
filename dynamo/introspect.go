@@ -39,6 +39,7 @@ const (
 	IndexPrimary = "primary" // the base table's pk (+ shared sk range)
 	IndexGSI     = "gsi"     // a global secondary index slot (n1..n5, s1..s5)
 	IndexArray   = "array"   // a fan-out Index over a slice field: hidden rows under pk ‖ cb id
+	IndexDelta   = "delta"   // a TypeDelta Index: hidden rows, its Keys then the managed UpdatedVersion
 )
 
 // IndexInfo describes one queryable access path: the base-table primary key or
@@ -120,9 +121,13 @@ func GetSchema[T any]() TableSchema {
 		Columns:       out.Partition,
 	})
 	for _, idx := range schema.Indexes {
-		if holdsSliceColumn(idx) {
+		if idx.Type == TypeDelta || holdsSliceColumn(idx) {
+			kind := IndexArray
+			if idx.Type == TypeDelta {
+				kind = IndexDelta
+			}
 			out.Indexes = append(out.Indexes, IndexInfo{
-				Kind:          IndexArray,
+				Kind:          kind,
 				Attr:          "pk",
 				IsNumber:      true,
 				SharesSortKey: true, // the base sk follows the index Keys in the row sk

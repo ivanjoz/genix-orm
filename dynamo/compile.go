@@ -3,6 +3,7 @@ package dynamo
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"sync"
 	"unsafe"
@@ -69,6 +70,11 @@ type tableMeta struct {
 	accessors       map[string]*colAccessor // record field name -> precompiled accessor
 	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
 	updatedVersion  *updatedVersionConfig   // nil unless the schema sets SaveUpdatedVersion
+	// Managed fields (delta.go): updated is the record's integer "Updated" field (nil
+	// without one); writeVersion its UpdatedVersion, nil unless a TypeDelta index,
+	// SaveUpdatedVersion or VersionedWrites consumes it.
+	updated      *colAccessor
+	writeVersion *keyCol
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -156,17 +162,32 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		meta.partitionDigits += decimalWidth(partitionCol.bits)
 	}
 
+	if updatedAccessor := accessors[updatedFieldName]; updatedAccessor != nil && updatedAccessor.kind.isInteger() {
+		meta.updated = updatedAccessor
+	}
+	if schema.SaveUpdatedVersion || schema.VersionedWrites || slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta }) {
+		meta.writeVersion = resolveWriteVersion(recordType, accessors)
+	}
+
 	usedSlots := map[string]bool{}
-	usedArrayFields := map[string]bool{}
+	usedRowColumnIDs := map[string]bool{}
 	for _, idx := range schema.Indexes {
-		// An Index holding a ColSlice is a fan-out index: hidden base-table rows, no GSI slot.
-		if holdsSliceColumn(idx) {
-			resolved := resolveArrayIndex(recordType, accessors, idx)
-			if usedArrayFields[resolved.element.fieldName] {
-				panic(fmt.Sprintf("db: %s declares two fan-out indexes on %q: its rows are located by its cb id, so it takes one",
-					recordType.Name(), resolved.element.fieldName))
+		if idx.Type != 0 && idx.Type != TypeDelta {
+			panic(fmt.Sprintf("db: %s has an index of unknown Type %d", recordType.Name(), idx.Type))
+		}
+		// A delta index or an Index holding a ColSlice lives in hidden base-table rows, with no GSI slot.
+		if idx.Type == TypeDelta || holdsSliceColumn(idx) {
+			var resolved arrayIndexMeta
+			if idx.Type == TypeDelta {
+				resolved = compileDeltaIndex(recordType, accessors, idx, *meta.writeVersion)
+			} else {
+				resolved = resolveArrayIndex(recordType, accessors, idx)
 			}
-			usedArrayFields[resolved.element.fieldName] = true
+			if usedRowColumnIDs[resolved.columnID] {
+				panic(fmt.Sprintf("db: %s declares two hidden-rows indexes named by cb id %s: a slice field takes one, and so does the first key of a delta index",
+					recordType.Name(), resolved.columnID))
+			}
+			usedRowColumnIDs[resolved.columnID] = true
 			meta.arrayIndexes = append(meta.arrayIndexes, resolved)
 			continue
 		}

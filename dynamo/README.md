@@ -11,12 +11,13 @@ into a project's `.claude/skills/genix-dynamo-orm`.
 ## Storage model: keys + one binary blob
 
 Every item contains **only**: the key columns (`pk`, `sk`), the index columns
-(`n1`..`n5`/`s1`..`s5`) and a single binary column **`d`** holding the whole
-record serialized with [`colbin`](https://github.com/ivanjoz/colbin) (a columnar binary codec).
-Nothing else is a top-level attribute.
+(`n1`..`n5`/`s1`..`s5`), a single binary column **`d`** holding the whole
+record serialized with [`colbin`](https://github.com/ivanjoz/colbin) (a columnar binary codec),
+and on a versioned table the number **`upv`**, a copy of `UpdatedVersion` that
+`Modify`'s conditional write compares. Nothing else is a top-level attribute.
 
 ```
-{ pk, sk, n1?..n5?, s1?..s5?, d }
+{ pk, sk, n1?..n5?, s1?..s5?, d, upv? }
 ```
 
 This keeps the table schemaless — adding a record field never changes the item
@@ -289,7 +290,7 @@ holds, which is what genix-ui's cache-by-ids sends (`ids`, `cc-ids`, `cc-ver`).
 type Customer struct {
     ID             int32  `cb:"1"`
     Name           string `cb:"2"`
-    UpdatedVersion uint16 `json:"upv,omitempty" cb:"3"` // managed by the ORM
+    UpdatedVersion int32  `json:"upv,omitempty" cb:"3"` // managed by the ORM (delta.go)
 }
 
 func (t CustomerTable) GetSchema() dynamo.Schema {
@@ -309,16 +310,141 @@ changed, err := Customers.QueryCachedIDs([]dynamo.IDUpdatedVersion{{ID: 12}, {ID
   Scan ever reads it, and `DeleteRecordsAll` keeps it.
 - **Write:** `Put`/`PutMany`/`PutIfAbsent`/`Delete` write the records, then
   one UpdateItem per touched pk `ADD`s 1 to each touched slot. The record's
-  `UpdatedVersion` is zeroed before the write.
+  `UpdatedVersion` is its write sequence (see Delta sync).
 - **Read:** one GetItem of the slot versions, then one consistent BatchGetItem
   of the IDs whose client version differs (0 always differs). Returned records
-  carry the slot version, truncated to `uint16` (0 is reserved for "unknown").
+  carry the slot version in `UpdatedVersion` instead of their write sequence,
+  truncated to `uint16` (0 is reserved for "unknown"), as in genix.
 - Bumping after the write keeps it race-free: a reader that sees the new
   version reads the new record (the read is consistent); one that sees the old
   version only makes the client ask again.
 - A write refetches the whole slot (IDs 256 apart). A record not written since
   the flag was enabled has no slot version and is read on every request, until
   it is written once.
+
+## Delta sync (`delta.go`)
+
+The port of genix-orm's managed `updated` / `updated_version` columns, its
+`TypeDelta` index and `Delta()`. It answers "the records written since the
+watermark I hold", which is what genix-ui's delta cache (`GetHandler`, `?up=<upv>.<upd>`) asks.
+
+```go
+type Customer struct {
+    ID             int32  `cb:"1"`
+    Status         int8   `json:"ss" cb:"2"`
+    Updated        int32  `json:"upd" cb:"3"`           // managed: write time, SUnixTime
+    UpdatedVersion int32  `json:"upv,omitempty" cb:"4"` // managed: write sequence
+}
+
+Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Keys(t.Status)}},
+
+Customers.Query().Delta(watermark, 1).Exec(&out)  // active on a first sync, every status after
+```
+
+- **Managed fields, stamped on every Put/PutMany/PutIfAbsent.** An integer
+  field named `Updated` gets the write time as a SUnixTime, `(unix - 1e9) / 2`,
+  read from `dynamo.Now`. On a table with a `TypeDelta` index or
+  `SaveUpdatedVersion`, the `int32` field `UpdatedVersion` gets the write
+  sequence: one value per write call per base pk, from the sequence item
+  `pk = 0, sk = "<base pk>#upv"`. It never repeats, so "> watermark" misses
+  nothing and resends nothing, which a 2-second timestamp can't promise.
+- **A delta index lives in hidden rows**, like a fan-out index: `pk = base pk ‖
+  cb id`, `sk = <pinned Keys>#<UpdatedVersion>#<base sk>`. The cb id is the
+  ColSlice's, else the first Key's, else `UpdatedVersion`'s.
+  - The **last Key, unless it is a ColSlice, is the sync filter column**. It is
+    not in the row sk. `Delta(W, values...)` keeps only those values on a first
+    sync (`W = 0`), in memory. A later sync returns every value, so soft-deleted
+    records reach the clients still caching them.
+  - The **other Keys are pinned**: Delta needs an Eq on each, or the Contains
+    on its ColSlice, which fans the rows out per element.
+    `Keys(t.ModuleIDs.Size(8), t.Status)` serves
+    `Query().Contains(ModuleIDs, 3).Delta(W, 1)`.
+- **`Delta()` goes last.** It picks the delta index whose pinned Keys all have an
+  Eq or a Contains, the most specific when several fit (a tie fails), and adds
+  `UpdatedVersion >= W+1`: one exact sk range per Contains value.
+- **Every write moves every delta row** (UpdatedVersion changed): a put and a
+  delete per row, with the fan-out sync and its read-side re-check. Keys-only
+  rows read their base records with a BatchGetItem, so a first sync costs
+  about 0.5 RCU per record.
+- A record written before its table got the index has no delta row, so Delta
+  never returns it. Rewrite such records once (Put) to backfill.
+
+## Optimistic concurrency: `PutManyIfVersion`, `Modify` (`modify.go`)
+
+A write replaces the whole record (it is one blob), so two read-modify-writes of
+the same record lose one of them. These two don't:
+
+```go
+// batch: read consistently, edit, write only what nobody wrote in between
+accounts, err := Accounts.GetMany([]Account{{ID: 7}, {ID: 8}})  // consistent BatchGetItem
+for i := range accounts { accounts[i].Balance += 100 }
+lost, err := Accounts.PutManyIfVersion(accounts) // re-read, re-edit and retry these
+```
+
+- **PutManyIfVersion** writes each record with a conditional PutItem: the item's
+  `upv` must still equal the record's `UpdatedVersion` (0: no item may exist).
+  Everything else is PutMany's: one version reserved per call and base pk,
+  hidden rows diffed against the stored versions (one consistent BatchGetItem)
+  and batched, the slot versions bumped once. Only the base items are single
+  PutItems (BatchWriteItem takes no condition), run 10 at a time. It returns the
+  records that lost a race, unwritten; the caller re-reads, re-edits and retries
+  them (`ConflictBackoff(attempt)` is the pause Modify uses).
+- **GetMany** is the read before it: a consistent BatchGetItem (100 keys per
+  call), missing keys left out, any order. Each item is billed rounded up to 4 KB.
+- **GetManyForUpdate** is GetMany that also keeps the stored blobs in the
+  process **write cache** (`write_cache.go`), so the PutManyIfVersion that
+  follows diffs the hidden rows without its own stored-version read. `Modify`
+  keeps its read there too. An entry (pk#sk → `upv`, blob) is used only at the
+  exact version the write is conditioned on, which the condition then proves; a
+  record expected new (version 0) needs no read at all. Entries live 15 s, up to
+  10,000; a full cache drops expired ones, else stops taking new ones. Only
+  tables with hidden rows are cached, and plain Put/PutMany never use it (with no
+  condition, a stale entry would diff wrong rows).
+
+For one record, `Modify` runs the whole loop:
+
+```go
+Schema{..., VersionedWrites: true} // or SaveUpdatedVersion, or a TypeDelta index
+
+saved, err := Accounts.Modify(Account{ID: 7}, func(account *Account, exists bool) error {
+    account.Balance += 100 // edit the record as stored right now
+    return nil
+})
+```
+
+- **Versioned table:** `VersionedWrites`, `SaveUpdatedVersion` or a `TypeDelta`
+  index stamp the managed `int32` `UpdatedVersion` on every write and store it
+  as the item attribute `upv`. The version is reserved once per write call and
+  base pk (one atomic ADD on the sequence item, shared by every record of the
+  call), and that is enough: each write of a record still gives it a value no
+  earlier call had. A `Modify` writes one record, so it pays one ADD per record.
+  A record stored before its table was versioned has no `upv`:
+  `Modify` returns an error until it is `Put` once.
+- **Modify** reads the item consistently, runs the change, and writes it with
+  `PutManyIfVersion`, conditioned on the version it read whatever the change did
+  to `UpdatedVersion`. If another write landed in between, it reads and runs the
+  change again: up to 8 attempts with a growing pause (about 2s in all), then
+  `ErrWriteConflict`. **The change must be safe to run more than once.**
+- `exists` is false when nothing is stored: the change gets the bare key and may
+  create the record. A change that leaves the record byte-identical writes
+  nothing and moves no version. The change must not edit the Keys.
+- A lost race is still billed. A stored item with no `upv` fails with an error
+  naming it, instead of losing every attempt.
+- **Rows of a lost write:** the new hidden rows go before the conditional put.
+  On a lost race its delta rows are deleted (their sk holds a version only that
+  call reserved); its fan-out rows stay as extra rows, which reads re-check.
+  **FullCopy caveat:** a lost write may have rewritten a FullCopy row with its
+  own, never-stored record, and a Contains returns that copy until the next
+  successful write of the record. Modify always ends in one; a PutManyIfVersion
+  caller that drops a lost record instead of retrying it leaves the stale copy.
+- **Derived data:** a record computed from other records is read first, then
+  its inputs (with `Consistent()`), and every writer of those inputs recomputes
+  the derived record after its own write. The write that lands last was then
+  computed from the newest inputs. In a batch, read all the derived records,
+  then the inputs once for all of them.
+- `Query().Consistent()` reads the base table with strong consistency (2× the
+  read units), the BatchGetItem of a keys-only Contains included. A query planned
+  on a GSI fails: GSIs can't read consistently.
 
 ## Using it
 
@@ -329,6 +455,8 @@ var Products = dynamo.NewRepo[ProductTable, Product]()   // compile once, reuse
 Products.Put(&p)
 Products.PutMany(list)          // batched (25/req) with unprocessed-item retry
 written, err := Products.PutIfAbsent(&p) // false when the key already exists: one conditional PutItem
+saved, err := Products.Modify(Product{ID: "sku1"}, change) // read-modify-write, retried on a race
+lost, err := Products.PutManyIfVersion(read)               // batch: write unless written since the read
 Products.Delete(&Product{ID: "sku1"})
 
 // point read (only the Partition and Keys fields needed)
@@ -407,7 +535,8 @@ index, not the call order.
 
 `ormcheck.Run` writes one record into each of two check tables (`ormcheck_order`:
 partitioned, packed sort key, numeric/composite/string GSIs, keys-only array
-indexes; `ormcheck_product`: no partition, FullCopy array index), reads them back
+indexes; `ormcheck_product`: no partition, FullCopy array index, a keyless and a
+ColSlice delta index), reads them back
 through every access path, updates them and reads again, then wipes them. Each
 line shows the result, and the calls and capacity (RCU/WCU) the ORM spent. In
 berryapps it runs with `./deploy.sh 4` against the real table. Importing the

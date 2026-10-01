@@ -36,9 +36,10 @@ import (
 // Read path: one GetItem returns every slot version of the partition. A
 // requested ID whose client-held version still equals its slot version is not
 // read at all; the rest are read with one consistent BatchGetItem, and their
-// UpdatedVersion is stamped with the slot version (the value the client sends
-// back next time). Versions are compared truncated to uint16, so a wrap-around
-// alias (1 in 65536) is accepted, as in genix.
+// UpdatedVersion is overwritten with the slot version (the value the client sends
+// back next time): on a by-IDs read "upv" means the slot version, everywhere else
+// the record's write sequence (delta.go), as in genix. Versions are compared
+// truncated to uint16, so a wrap-around alias (1 in 65536) is accepted.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
@@ -60,14 +61,11 @@ type updatedVersionConfig struct {
 	set      func(unsafe.Pointer, int64)
 }
 
-// resolveUpdatedVersion validates SaveUpdatedVersion's requirements at compile time.
+// resolveUpdatedVersion validates SaveUpdatedVersion's requirements at compile
+// time. The UpdatedVersion field itself is validated by resolveWriteVersion.
 func resolveUpdatedVersion(recordType reflect.Type, accessors map[string]*colAccessor, keys []keyCol) *updatedVersionConfig {
 	if len(keys) != 1 || !keys[0].kind.isInteger() {
 		panic(fmt.Sprintf("db: %s uses SaveUpdatedVersion and needs exactly one integer Keys column (the ID)", recordType.Name()))
-	}
-	field, ok := recordType.FieldByName(updatedVersionFieldName)
-	if !ok || field.Type.Kind() != reflect.Uint16 {
-		panic(fmt.Sprintf("db: %s uses SaveUpdatedVersion and needs a uint16 field %q (json \"upv\")", recordType.Name(), updatedVersionFieldName))
 	}
 	return &updatedVersionConfig{idColumn: keys[0], set: accessors[updatedVersionFieldName].setI64}
 }
@@ -97,17 +95,6 @@ func slotVersionOf(slotVersionsItem map[string]types.AttributeValue, slot uint8)
 		return version
 	}
 	return 1
-}
-
-// prepareUpdatedVersions zeroes the managed UpdatedVersion before a write: a
-// stored value would be a stale slot version that a client posted back.
-func (m *tableMeta) prepareUpdatedVersions(ptrs []unsafe.Pointer) {
-	if m.updatedVersion == nil {
-		return
-	}
-	for _, ptr := range ptrs {
-		m.updatedVersion.set(ptr, 0)
-	}
 }
 
 // bumpSlotVersions ADDs 1 to the slot of every written record, in one
