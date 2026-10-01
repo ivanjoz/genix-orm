@@ -24,7 +24,7 @@ import (
 //	sk = composite(index Keys, slice → element) # base sk        (order-preserving string)
 //	d  = the record blob, only with FullCopy
 //
-// With Keys(ProductIDs.Size(32), Created.Size(32)) a row sk is
+// With Cols(ProductIDs.Size(32), Created.Size(32)) a row sk is
 // <product>#<created>#<base sk>, so Contains(ProductIDs, 5).Gt(Created, 1000) is
 // one exact sk range. The base sk closes the row sk because many records share an
 // element (two users with profile 5); it also lets a query that pins every index

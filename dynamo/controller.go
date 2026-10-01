@@ -54,6 +54,9 @@ type Controller interface {
 	// PutRecords upserts E values (from DecodeRecords or QueryRecords) through
 	// PutMany and returns them as written, autoincrement IDs assigned.
 	PutRecords(records []any) ([]any, error)
+	// RebuildGroupsAll recomputes every GroupBy counter from the records and returns
+	// how many it rewrote; an error when the entity declares no GroupBy (group_by.go).
+	RebuildGroupsAll() (int, error)
 }
 
 // NewController compiles the schema (like NewRepo) and returns it as a
@@ -74,8 +77,8 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 // It is scoped to this entity's pk ranges (its base rows and its array index
 // rows), so sibling entities (and the internal sequence counters) in the shared
 // table are untouched, and it keeps the by-IDs slot-versions items that share the
-// array range. The returned count includes array index rows. This is a
-// destructive maintenance operation — there is no undo.
+// array range. The returned count includes array index rows and GroupBy counters.
+// This is a destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	client, err := Client()
 	if err != nil {
@@ -118,8 +121,9 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 		}
 		for _, item := range res.Items {
 			// Slot versions survive a wipe: counting again from 0 could hand a
-			// recreated record a version a client still holds for the old one.
-			if isSlotVersionsPK(item["pk"].(*types.AttributeValueMemberN).Value) {
+			// recreated record a version a client still holds for the old one. The
+			// GroupBy counters sharing their pk go with the records they count.
+			if isSlotVersionsPK(item["pk"].(*types.AttributeValueMemberN).Value) && item["sk"].(*types.AttributeValueMemberS).Value == slotVersionsSK {
 				continue
 			}
 			batch = append(batch, types.WriteRequest{
@@ -167,6 +171,10 @@ func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error
 		}
 		for arrayIndex := range r.meta.arrayIndexes {
 			r.meta.arrayRowSKs(&r.meta.arrayIndexes[arrayIndex], ptr)
+		}
+		// Builds the group keys and checks every float GroupBy value fits its sum.
+		if err := r.meta.addGroupCounterDeltas(map[string]*groupCounterDelta{}, nil, ptr); err != nil {
+			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
 		}
 		records[i] = decodedRecords[i]
 	}

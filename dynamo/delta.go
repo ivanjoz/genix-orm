@@ -22,12 +22,12 @@ import (
 //     as autoincrement. Unlike a timestamp it never repeats, so a client asking
 //     for "> my watermark" misses nothing and is resent nothing.
 //
-// A delta index, {Type: TypeDelta, Keys: Keys(...)}, is a hidden-rows index
+// A delta index, {Type: TypeDelta, Keys: Cols(...)}, is a hidden-rows index
 // (array_index.go) whose row sk is <pinned Keys>#<UpdatedVersion>#<base sk>:
 //
 //   - The last Key, unless it is a ColSlice, is the sync filter column. It is not
 //     part of the row sk: Delta()'s values filter it in memory, on a first sync
-//     only. Keys(Status) is the usual shape: active records on a first sync,
+//     only. Cols(Status) is the usual shape: active records on a first sync,
 //     every status afterwards, so soft-deleted ones reach the clients caching them.
 //   - The other Keys are pinned: Delta() needs an Eq on each (a Contains on a
 //     ColSlice, which fans the rows out per element as in a fan-out index).
@@ -51,7 +51,7 @@ var Now = time.Now
 func resolveWriteVersion(recordType reflect.Type, accessors map[string]*colAccessor) *keyCol {
 	field, ok := recordType.FieldByName(updatedVersionFieldName)
 	if !ok || field.Type.Kind() != reflect.Int32 {
-		panic(fmt.Sprintf("db: %s declares a TypeDelta index, SaveUpdatedVersion or VersionedWrites and needs an int32 field %q (json \"upv\")",
+		panic(fmt.Sprintf("db: %s declares a TypeDelta index, GroupDelta, SaveUpdatedVersion or VersionedWrites and needs an int32 field %q (json \"upv\")",
 			recordType.Name(), updatedVersionFieldName))
 	}
 	return &keyCol{fieldName: updatedVersionFieldName, kind: kindInt, bits: updatedVersionBits, acc: accessors[updatedVersionFieldName]}
@@ -86,7 +86,8 @@ func compileDeltaIndex(recordType reflect.Type, accessors map[string]*colAccesso
 }
 
 // stampManagedColumns sets Updated and UpdatedVersion on every record about to be
-// written. It must run after assignAutoIDs: a partition column may be the ID.
+// written. It must run after assignAutoIDs when the ID is a partition column (the
+// version is reserved per base pk); prepareWrite runs the two in parallel otherwise.
 func (m *tableMeta) stampManagedColumns(ptrs []unsafe.Pointer) error {
 	if m.updated != nil {
 		writeTime := (Now().Unix() - 1e9) / 2

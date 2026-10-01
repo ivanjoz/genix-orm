@@ -1,6 +1,6 @@
 ---
 name: genix-dynamo-orm
-description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the managed Updated/UpdatedVersion, delta indexes (TypeDelta/Delta()), the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
+description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the managed Updated/UpdatedVersion, delta indexes (TypeDelta/Delta()), the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs), GroupBy counters (GroupBy/GroupDelta/QueryGroups/RebuildGroups). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
 ---
 
 # genix-orm/dynamo
@@ -49,13 +49,13 @@ func (t OrderTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Name:   "Orders",                     // optional label
         Entity: "sales_order",                // TableID = HashTableID(Entity) unless TableID is set; pk = TableID
-        Keys:   dynamo.Keys(t.ID.Size(32)),   // the record's key → sk. Required
+        Keys:   dynamo.Cols(t.ID.Size(32)),   // the record's key → sk. Required
         Indexes: []dynamo.Index{
-            {Slot: dynamo.N1, Keys: dynamo.Keys(t.CustomerID.Size(32))}, // N slot: exactly one integer column
-            {Slot: dynamo.S1, Keys: dynamo.Keys(t.StoreID.Size(16), t.Status)}, // S slot: string or composite
+            {Slot: dynamo.N1, Keys: dynamo.Cols(t.CustomerID.Size(32))}, // N slot: exactly one integer column
+            {Slot: dynamo.S1, Keys: dynamo.Cols(t.StoreID.Size(16), t.Status)}, // S slot: string or composite
             // Fan-out (a ColSlice in Keys, no Slot): one row per element, sk = ProductID ‖ StoreID ‖ base sk.
-            {Keys: dynamo.Keys(t.ProductIDs.Size(32), t.StoreID.Size(16))}, // keys-only rows (default)
-            // {Keys: dynamo.Keys(t.X), FullCopy: true}                     // rows also carry d: 1 read, costlier writes
+            {Keys: dynamo.Cols(t.ProductIDs.Size(32), t.StoreID.Size(16))}, // keys-only rows (default)
+            // {Keys: dynamo.Cols(t.X), FullCopy: true}                     // rows also carry d: 1 read, costlier writes
         },
         UseAutoincrement: true,               // fills an integer field named ID when 0
     }
@@ -68,11 +68,11 @@ var Orders = dynamo.NewRepo[OrderTable, Order]() // package-level: a bad schema 
 
 - **`Keys` is the record's identity.** `pk + sk` identify a record: `Get`/`Delete` take the
   `Keys` values, and a `Put` with different ones writes **another** item. The default is
-  `Keys: dynamo.Keys(t.ID...)`.
+  `Keys: dynamo.Cols(t.ID...)`.
 - **`Keys` is also the only range dimension.** GSI keys are equality only, and every GSI shares
   the base `sk` as its range key.
   - A range on a field ("orders between two dates") is only possible with that field in `Keys`
-    before the ID: `Keys(t.Created.Size(32), t.ID.Size(32))`.
+    before the ID: `Cols(t.Created.Size(32), t.ID.Size(32))`.
   - The cost is identity: `Get` then needs `Created` too, and changing `Created` is a
     `Delete` + `Put`. Only add a field when it never changes and the range is a real access path.
   - With an autoincrement ID the ID order is already the creation order, so a range on `ID` often does the job.
@@ -124,6 +124,8 @@ A violation makes `NewRepo` panic at boot:
 ```go
 err := Orders.Put(&order)              // upsert; assigns ID when autoincrement and ID == 0
 err  = Orders.PutMany(orders)          // batches of 25, retries unprocessed items
+err  = Orders.InsertMany(orders)       // PutMany for records known to be new: skips the stored-version read
+err  = Orders.AssignIDs(orders)        // reserve autoincrement IDs before writing (then InsertMany)
 ok, err := Orders.PutIfAbsent(&order)  // false when the key already exists
 err  = Orders.Delete(&Order{ID: 9})    // only Partition + Keys fields needed
 got, err := Orders.Get(Order{ID: 9})   // (nil, nil) when missing
@@ -218,7 +220,7 @@ Operators: `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, `BeginsWith`, `Contains`, 
 - Matches records holding **any** of the values: one Query per value, deduplicated. Results come
   value by value, not in sk order.
 - Every index `Keys` column **before** the slice needs an `Eq`; the ones after it take ranges.
-  With `Keys(ProductIDs, Created)`: `Contains(ProductIDs, 5).Gt(Created, t)` is one exact range.
+  With `Cols(ProductIDs, Created)`: `Contains(ProductIDs, 5).Gt(Created, t)` is one exact range.
   With every index column pinned, the base `Keys` range too: `Contains(...).Eq(Created, t).Gte(ID, x)`.
 - Only one `Contains` per query.
 - Keys-only rows take a second BatchGetItem for the records. `FullCopy: true` answers in one
@@ -231,7 +233,7 @@ Use it for "give me records [12, 87, 412], skip the ones I already have unchange
 genix-ui's cache-by-ids (`getRecordByID`, `RecordByIDText`, `GetHandler.routeByID`).
 
 ```go
-// schema: Keys(t.ID.Size(32)) and nothing else in Keys, plus
+// schema: Cols(t.ID.Size(32)) and nothing else in Keys, plus
 SaveUpdatedVersion: true,
 // record and table struct:
 UpdatedVersion int32 `json:"upv,omitempty" cb:"N"`
@@ -260,8 +262,8 @@ Use it for "the records written since watermark W": genix-ui's delta cache (skil
 ```go
 // schema:
 Indexes: []dynamo.Index{
-    {Type: dynamo.TypeDelta, Keys: dynamo.Keys(t.Status)},                       // the whole entity
-    {Type: dynamo.TypeDelta, Keys: dynamo.Keys(t.TeamIDs.Size(8), t.Status)},    // per team, fan-out
+    {Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)},                       // the whole entity
+    {Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.TeamIDs.Size(8), t.Status)},    // per team, fan-out
 },
 
 Orders.Query().Delta(watermark, 1).Exec(&out)                          // W = the client's highest upv
@@ -279,6 +281,41 @@ Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(watermark, 1).Exec(&out)
   write moves all of them, because `UpdatedVersion` changed. A slice field takes either a fan-out
   index or a delta index, not both.
 - A record written before the index was declared has no delta row: re-`Put` existing records once.
+
+## 3d. GroupBy counters (`GroupBy`, `QueryGroups`)
+
+Use it for "count and totals per group" without reading the records: one counter item per base
+partition and per distinct value of the Index Keys.
+
+```go
+// schema: on a GSI, a fan-out Index, or a slot-less Index (counters only)
+{Slot: dynamo.S1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
+    GroupBy: dynamo.Cols(t.Total, t.Weight), GroupDelta: true},
+{Keys: dynamo.Cols(t.Tags), GroupBy: dynamo.Cols(t.Total)},                 // one group per element
+{Keys: dynamo.Cols(t.CustomerID.Size(32)), GroupBy: dynamo.Cols(t.Total)},  // no GSI used
+
+groups, err := Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).
+    Eq(Orders.T.StoreID, 7).Eq(Orders.T.Channel, "web").Exec()
+groups[0].Key.Status; groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].SumFloat(Orders.T.Weight)
+Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Since(watermark).Exec()
+```
+
+- **`GroupBy` columns are integer or float `Col`s**; the count is always kept. Floats are summed as
+  `round(v * 1e6)`: exact to 6 decimals, ±9.2e12 at most (a write outside it fails).
+- **`Status == 0` counts in no group** (soft delete). A fan-out GroupBy counts the record once per
+  distinct element, with its whole values.
+- **`QueryGroups(keys...)`** picks the GroupBy with exactly those Keys, in order. It needs an `Eq` on
+  every Partition column, then `Eq` on a leading run of the Keys and one range, as `Keys` do.
+  Groups whose count fell to 0 are skipped.
+- **`GroupDelta: true`** stamps each counter with the `upv`/`upd` of the last write that touched it
+  (needs the managed `UpdatedVersion`). `Since(W)` returns only the groups changed after W, emptied
+  ones included (count 0) so the client drops them; `Since(0)` skips them.
+- **Best-effort:** the counters are ADDed after the base write, from the diff against the stored
+  version. Two plain `Put`s racing on one record, or a crash in between, drift a counter.
+  `Repo.RebuildGroups(partition...)` / `RebuildGroupsAll()` (berryapps: `fn-db rebuild-groups`)
+  recompute them. Run it too after adding a GroupBy to a table with records.
+- Every write pays one `UpdateItem` per touched group (merged over the call), and a hot group is a
+  hot item.
 
 ## 4. Pitfalls
 
@@ -301,8 +338,8 @@ Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(watermark, 1).Exec(&out)
   write diffs both versions with the new shape, so the old-shape rows stay and keys-only rows are
   not rewritten.
 - A field referenced by a **GSI or `Keys`** must be set on every write. A zero value is still a key.
-- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows. It is destructive and
-  there is no undo. It keeps the slot-versions items.
+- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows and its GroupBy counters.
+  It is destructive and there is no undo. It keeps the slot-versions items.
 
 ## 5. Checking your work
 

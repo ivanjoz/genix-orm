@@ -31,8 +31,8 @@ func (t versionedItemTable) GetSchema() Schema {
 	return Schema{
 		Entity:             "versioned_item",
 		TableID:            45678901,
-		Partition:          Keys(t.StoreID.Size(16)),
-		Keys:               Keys(t.ID.Size(48)),
+		Partition:          Cols(t.StoreID.Size(16)),
+		Keys:               Cols(t.ID.Size(48)),
 		SaveUpdatedVersion: true,
 	}
 }
@@ -94,19 +94,19 @@ func TestSaveUpdatedVersionDeclarationRules(t *testing.T) {
 	populateColumnNames(tablePtr)
 	for name, build := range map[string]func(){
 		"two Keys columns": func() {
-			buildTableMeta(Schema{Entity: "bad_versioned", TableID: 56789012, Keys: Keys(tablePtr.ID.Size(32), tablePtr.Code), SaveUpdatedVersion: true},
+			buildTableMeta(Schema{Entity: "bad_versioned", TableID: 56789012, Keys: Cols(tablePtr.ID.Size(32), tablePtr.Code), SaveUpdatedVersion: true},
 				reflect.TypeFor[badVersionedRecord]())
 		},
 		"a string key": func() {
-			buildTableMeta(Schema{Entity: "bad_versioned", TableID: 56789012, Keys: Keys(tablePtr.Code), SaveUpdatedVersion: true},
+			buildTableMeta(Schema{Entity: "bad_versioned", TableID: 56789012, Keys: Cols(tablePtr.Code), SaveUpdatedVersion: true},
 				reflect.TypeFor[badVersionedRecord]())
 		},
 		"a uint16 UpdatedVersion": func() {
-			buildTableMeta(Schema{Entity: "uint16_versioned", TableID: 67890124, Keys: Keys(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
+			buildTableMeta(Schema{Entity: "uint16_versioned", TableID: 67890124, Keys: Cols(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
 				reflect.TypeFor[uint16VersionedRecord]())
 		},
 		"no UpdatedVersion field": func() {
-			buildTableMeta(Schema{Entity: "unversioned", TableID: 67890123, Keys: Keys(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
+			buildTableMeta(Schema{Entity: "unversioned", TableID: 67890123, Keys: Cols(tablePtr.ID.Size(32)), SaveUpdatedVersion: true},
 				reflect.TypeFor[unversionedRecord]())
 		},
 	} {

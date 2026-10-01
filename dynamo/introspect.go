@@ -136,6 +136,10 @@ func GetSchema[T any]() TableSchema {
 			})
 			continue
 		}
+		// A slot-less GroupBy keeps counters only: it is no access path to the records.
+		if idx.Slot.attr == "" {
+			continue
+		}
 		out.Indexes = append(out.Indexes, IndexInfo{
 			Kind:          IndexGSI,
 			Name:          idx.Slot.index,

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -42,8 +41,6 @@ const (
 	// versionColumn is the item attribute holding UpdatedVersion on a versioned table.
 	versionColumn     = "upv"
 	modifyMaxAttempts = 8
-	// conditionalPutParallelism bounds the concurrent PutItem calls of one PutManyIfVersion.
-	conditionalPutParallelism = 10
 )
 
 // ErrWriteConflict is what Modify returns when other writes kept landing between
@@ -82,10 +79,7 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 		ptrs[i] = unsafe.Pointer(&records[i])
 		expectedVersions[i] = r.meta.writeVersion.acc.getI64(ptrs[i])
 	}
-	if err := r.meta.assignAutoIDs(ptrs); err != nil {
-		return nil, err
-	}
-	if err := r.meta.stampManagedColumns(ptrs); err != nil {
+	if _, err := r.meta.prepareWrite(ptrs); err != nil {
 		return nil, err
 	}
 	storedByKey, err := r.storedVersionsForWrite(client, ptrs, expectedVersions)
@@ -95,16 +89,23 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 
 	items := make([]map[string]types.AttributeValue, len(records))
 	rowDeletesByRecord := make([][]types.WriteRequest, len(records))
+	// Per record, so only the records that win their conditional write move the counters.
+	groupDeltasByRecord := make([]map[string]*groupCounterDelta, len(records))
 	var rowPuts []types.WriteRequest
 	for i := range records {
 		if items[i], err = r.meta.marshalItem(ptrs[i], &records[i]); err != nil {
+			return nil, err
+		}
+		storedPtr := storedByKey[r.meta.recordKey(ptrs[i])]
+		groupDeltasByRecord[i] = map[string]*groupCounterDelta{}
+		if err := r.meta.addGroupCounterDeltas(groupDeltasByRecord[i], storedPtr, ptrs[i]); err != nil {
 			return nil, err
 		}
 		if len(r.meta.arrayIndexes) == 0 {
 			continue
 		}
 		blob := items[i][dataColumn].(*types.AttributeValueMemberB).Value
-		puts, deletes := r.meta.arrayIndexWrites(storedByKey[r.meta.recordKey(ptrs[i])], ptrs[i], blob)
+		puts, deletes := r.meta.arrayIndexWrites(storedPtr, ptrs[i], blob)
 		rowPuts = append(rowPuts, puts...)
 		rowDeletesByRecord[i] = deletes
 	}
@@ -116,25 +117,18 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	}
 
 	isWritten := make([]bool, len(records))
-	putErrors := make([]error, len(records))
-	parallelSlots := make(chan struct{}, conditionalPutParallelism)
-	var pendingPuts sync.WaitGroup
-	for i := range records {
-		pendingPuts.Add(1)
-		parallelSlots <- struct{}{}
-		go func(recordIndex int) {
-			defer func() { <-parallelSlots; pendingPuts.Done() }()
-			isWritten[recordIndex], putErrors[recordIndex] = r.putItemIfVersion(client, items[recordIndex], expectedVersions[recordIndex])
-		}(i)
-	}
-	pendingPuts.Wait()
-	if err := errors.Join(putErrors...); err != nil {
+	err = runInParallel(len(records), func(recordIndex int) (putErr error) {
+		isWritten[recordIndex], putErr = r.putItemIfVersion(client, items[recordIndex], expectedVersions[recordIndex])
+		return putErr
+	})
+	if err != nil {
 		return nil, err
 	}
 
 	var lostRecords []E
 	var writtenPtrs []unsafe.Pointer
 	var staleRowDeletes []types.WriteRequest
+	groupDeltas := map[string]*groupCounterDelta{}
 	for i := range records {
 		if !isWritten[i] {
 			lostRecords = append(lostRecords, records[i])
@@ -143,9 +137,13 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 		}
 		writtenPtrs = append(writtenPtrs, ptrs[i])
 		staleRowDeletes = append(staleRowDeletes, rowDeletesByRecord[i]...)
+		mergeGroupCounterDeltas(groupDeltas, groupDeltasByRecord[i])
 		refreshStoredItem(items[i], r.meta.writeVersion.acc.getI64(ptrs[i]))
 	}
 	if err := r.batchWriteAll(client, staleRowDeletes); err != nil {
+		return nil, err
+	}
+	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return nil, err
 	}
 	return lostRecords, r.meta.bumpSlotVersions(client, writtenPtrs)
@@ -175,9 +173,9 @@ func (m *tableMeta) deltaRowDeletes(lostPtr unsafe.Pointer) []types.WriteRequest
 // one whose blob the write cache holds at its expected version is decoded from
 // there: in both cases the write's condition proves the shortcut, since it only
 // lands if the stored item is exactly that. Only the rest is read. Nil without
-// hidden rows.
+// hidden rows or GroupBy.
 func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsafe.Pointer, expectedVersions []int64) (map[string]unsafe.Pointer, error) {
-	if len(r.meta.arrayIndexes) == 0 {
+	if !r.meta.readsStoredVersion() {
 		return nil, nil
 	}
 	storedByKey := map[string]unsafe.Pointer{}
@@ -269,7 +267,7 @@ func (r *Repo[T, E]) Modify(key E, change func(record *E, exists bool) error) (*
 		}
 		record, exists := key, len(out.Item) > 0
 		// The write below diffs its hidden rows against this read, not a second one.
-		if exists && len(r.meta.arrayIndexes) > 0 {
+		if exists && r.meta.readsStoredVersion() {
 			rememberStoredItems([]map[string]types.AttributeValue{out.Item})
 		}
 		storedVersion := int64(0)

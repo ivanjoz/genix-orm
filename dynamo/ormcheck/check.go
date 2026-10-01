@@ -39,12 +39,12 @@ func Run(output io.Writer) error {
 
 	order := CheckOrder{
 		StoreID: checkStoreID, Created: 1_000, ID: 1, CustomerID: 55, Channel: "web", Status: 2,
-		Code: "ORD-0001", ProductIDs: []int32{10, 20, 30}, Tags: []string{"gift", "express"}, Total: 4_500,
+		Code: "ORD-0001", ProductIDs: []int32{10, 20, 30}, Tags: []string{"gift", "express"}, Total: 4_500, Weight: 1.25,
 	}
 	product := CheckProduct{ID: 5, Brand: "acme", Price: 1_299, Name: "Widget", CategoryIDs: []int16{3, 4}, Status: 1, TeamIDs: []int16{1, 2}}
 
 	runner.section("Writes: a Put first reads the stored version (consistent) to diff its array rows")
-	if err := runner.write("Put order: base + 3 ProductIDs rows + 2 Tags rows (keys-only)", func() error { return CheckOrders.Put(&order) }); err != nil {
+	if err := runner.write("Put order: base + 3 ProductIDs + 2 Tags rows, 4 GroupBy counters", func() error { return CheckOrders.Put(&order) }); err != nil {
 		return err
 	}
 	if err := runner.write("Put product: base + 2 CategoryIDs rows (FullCopy) + 1 + 2 TeamIDs delta rows", func() error { return CheckProducts.Put(&product) }); err != nil {
@@ -142,6 +142,10 @@ func Run(output io.Writer) error {
 	runner.expect("Delta: since the first version (moved rows)", []string{"5 Widget v2"}, queryProducts(CheckProducts.Query().Delta(firstVersion, 1)))
 	runner.expect("Delta + Contains: TeamIDs contains 1, since the first version", []string{"5 Widget v2"}, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 1).Delta(firstVersion, 1)))
 
+	if err := runGroupByChecks(runner, &order); err != nil {
+		return err
+	}
+
 	// Modify writes, so each check runs once: a retry would race against its own earlier write.
 	runner.section("Modify: a conditional read-modify-write that runs the change again when another write lands")
 	runner.expectOnce("Modify product: a Put lands inside the change; both edits survive", []string{"2 runs, Widget v2 modified, price 1500"}, func() ([]string, error) {
@@ -190,7 +194,7 @@ func Run(output io.Writer) error {
 
 	// DeleteRecordsAll is not repeatable (a second run deletes nothing), so it is checked once.
 	runner.section("Cleanup: the row counts prove no stale array rows were left behind")
-	runner.expectOnce("DeleteRecordsAll orders: base + 3 ProductIDs + 2 Tags rows", []string{"6"}, func() ([]string, error) {
+	runner.expectOnce("DeleteRecordsAll orders: base + 3 ProductIDs + 2 Tags rows + 6 counters", []string{"12"}, func() ([]string, error) {
 		deleted, err := CheckOrders.DeleteRecordsAll()
 		return []string{strconv.Itoa(deleted)}, err
 	})
@@ -287,6 +291,92 @@ func (runner *checkRunner) runCheck(name string, want []string, maxAttempts int,
 	fmt.Fprintln(runner.output, line)
 	if !passed {
 		fmt.Fprintf(runner.output, "      want [%s]\n", strings.Join(want, ", "))
+	}
+}
+
+// runGroupByChecks follows the order counters through an update, a second order that joins, moves,
+// is soft-deleted and deleted, and ends by proving the live counters equal a rebuild from the records.
+func runGroupByChecks(runner *checkRunner, order *CheckOrder) error {
+	orders := CheckOrders.T
+	byChannelStatus := func() *dynamo.GroupQuery[CheckOrder] {
+		return CheckOrders.QueryGroups(orders.Channel, orders.Status).Eq(orders.StoreID, checkStoreID)
+	}
+	byTag := func() *dynamo.GroupQuery[CheckOrder] {
+		return CheckOrders.QueryGroups(orders.Tags).Eq(orders.StoreID, checkStoreID)
+	}
+	byCustomer := func() *dynamo.GroupQuery[CheckOrder] {
+		return CheckOrders.QueryGroups(orders.CustomerID).Eq(orders.StoreID, checkStoreID)
+	}
+
+	runner.section("GroupBy counters: count and sums per group, ADDed after every write (order 1 Total is now 5200)")
+	runner.expect("Channel+Status groups", []string{"web/2 c1 total 5200 weight 1.25"}, queryGroups(byChannelStatus()))
+	runner.expect("Channel+Status: Channel = web, Status = 2 (exact sk)", []string{"web/2 c1 total 5200 weight 1.25"}, queryGroups(byChannelStatus().Eq(orders.Channel, "web").Eq(orders.Status, int8(2))))
+	runner.expect("Channel+Status: Channel = web, Status < 2", nil, queryGroups(byChannelStatus().Eq(orders.Channel, "web").Lt(orders.Status, int8(2))))
+	runner.expect("Fan-out: one group per Tags element", []string{"express c1 total 5200", "gift c1 total 5200"}, queryGroups(byTag()))
+	runner.expect("Fan-out: Tags = gift", []string{"gift c1 total 5200"}, queryGroups(byTag().Eq(orders.Tags, "gift")))
+	runner.expect("Slot-less: per CustomerID, float sum", []string{"55 c1 weight 1.25"}, queryGroups(byCustomer()))
+	runner.expect("Since: the order's own version", nil, queryGroups(byChannelStatus().Since(order.UpdatedVersion)))
+	runner.expect("Since: first sync", []string{"web/2 c1 total 5200 weight 1.25"}, queryGroups(byChannelStatus().Since(0)))
+	runner.expectRejected("Since on a GroupBy without GroupDelta", queryGroups(byTag().Since(0)))
+
+	secondOrder := CheckOrder{
+		StoreID: checkStoreID, Created: 1_001, ID: 2, CustomerID: 56, Channel: "web", Status: 2,
+		Code: "ORD-0002", ProductIDs: []int32{10}, Tags: []string{"gift"}, Total: 300, Weight: 0.5,
+	}
+	if err := runner.write("Put order 2: joins web/2 and gift", func() error { return CheckOrders.Put(&secondOrder) }); err != nil {
+		return err
+	}
+	runner.expect("Channel+Status: web/2 holds both orders", []string{"web/2 c2 total 5500 weight 1.75"}, queryGroups(byChannelStatus()))
+	runner.expect("Fan-out: gift holds both orders", []string{"express c1 total 5200", "gift c2 total 5500"}, queryGroups(byTag()))
+
+	secondOrder.Status = 3
+	if err := runner.write("Put order 2: Status 2 -> 3 (leaves web/2, joins web/3)", func() error { return CheckOrders.Put(&secondOrder) }); err != nil {
+		return err
+	}
+	runner.expect("Channel+Status: the order moved", []string{"web/2 c1 total 5200 weight 1.25", "web/3 c1 total 300 weight 0.5"}, queryGroups(byChannelStatus()))
+
+	versionBeforeSoftDelete := secondOrder.UpdatedVersion
+	secondOrder.Status = 0
+	if err := runner.write("Put order 2: Status 0 (soft delete: leaves every group)", func() error { return CheckOrders.Put(&secondOrder) }); err != nil {
+		return err
+	}
+	runner.expect("Channel+Status: the emptied web/3 is left out", []string{"web/2 c1 total 5200 weight 1.25"}, queryGroups(byChannelStatus()))
+	runner.expect("Since: the emptied group still reaches a later sync", []string{"web/3 c0 total 0 weight 0"}, queryGroups(byChannelStatus().Since(versionBeforeSoftDelete)))
+	runner.expect("Fan-out: gift is back to order 1", []string{"express c1 total 5200", "gift c1 total 5200"}, queryGroups(byTag()))
+	runner.expect("Slot-less: customer 56 emptied", []string{"55 c1 weight 1.25"}, queryGroups(byCustomer()))
+
+	if err := runner.write("Delete order 2: it counted in no group anymore", func() error { return CheckOrders.Delete(&secondOrder) }); err != nil {
+		return err
+	}
+	// A rebuild Puts only the counters that differ from the records: 0 proves every ADD above was exact.
+	runner.expectOnce("RebuildGroups StoreID 7: counters rewritten", []string{"0"}, func() ([]string, error) {
+		rewritten, err := CheckOrders.RebuildGroups(checkStoreID)
+		return []string{strconv.Itoa(rewritten)}, err
+	})
+	runner.expectOnce("RebuildGroupsAll: counters rewritten", []string{"0"}, func() ([]string, error) {
+		rewritten, err := CheckOrders.RebuildGroupsAll()
+		return []string{strconv.Itoa(rewritten)}, err
+	})
+	return nil
+}
+
+// queryGroups labels each group by its Keys, count and sums, whichever GroupBy it belongs to.
+func queryGroups(query *dynamo.GroupQuery[CheckOrder]) func() ([]string, error) {
+	orders := CheckOrders.T
+	return func() ([]string, error) {
+		groups, err := query.Exec()
+		labels := make([]string, len(groups))
+		for i, group := range groups {
+			switch {
+			case group.Key.Channel != "":
+				labels[i] = fmt.Sprintf("%s/%d c%d total %d weight %g", group.Key.Channel, group.Key.Status, group.Count, group.Sum(orders.Total), group.SumFloat(orders.Weight))
+			case len(group.Key.Tags) > 0:
+				labels[i] = fmt.Sprintf("%s c%d total %d", group.Key.Tags[0], group.Count, group.Sum(orders.Total))
+			default:
+				labels[i] = fmt.Sprintf("%d c%d weight %g", group.Key.CustomerID, group.Count, group.SumFloat(orders.Weight))
+			}
+		}
+		return labels, err
 	}
 }
 

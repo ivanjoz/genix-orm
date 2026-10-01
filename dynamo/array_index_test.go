@@ -270,11 +270,11 @@ func (t fanOutOrderTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "fan_out_order",
 		TableID:   23456789,
-		Partition: Keys(t.StoreID.Size(16)),
-		Keys:      Keys(t.ID.Size(32)),
+		Partition: Cols(t.StoreID.Size(16)),
+		Keys:      Cols(t.ID.Size(32)),
 		Indexes: []Index{
-			{Keys: Keys(t.ProductIDs.Size(32), t.Updated.Size(32))}, // slice first, range on Updated
-			{Keys: Keys(t.Channel, t.Tags)},                         // slice after a scalar
+			{Keys: Cols(t.ProductIDs.Size(32), t.Updated.Size(32))}, // slice first, range on Updated
+			{Keys: Cols(t.Channel, t.Tags)},                         // slice after a scalar
 		},
 	}
 }
@@ -377,10 +377,10 @@ type badFanOutTable struct {
 
 func TestFanOutIndexDeclarationRules(t *testing.T) {
 	for name, index := range map[string]func(t badFanOutTable) Index{
-		"a slice with a Slot": func(t badFanOutTable) Index { return Index{Slot: S1, Keys: Keys(t.TagIDs.Size(32))} },
-		"two slices":          func(t badFanOutTable) Index { return Index{Keys: Keys(t.TagIDs.Size(32), t.Other.Size(32))} },
-		"FullCopy on a GSI":   func(t badFanOutTable) Index { return Index{Slot: N1, Keys: Keys(t.Price.Size(32)), FullCopy: true} },
-		"no Slot, no slice":   func(t badFanOutTable) Index { return Index{Keys: Keys(t.Price.Size(32))} },
+		"a slice with a Slot": func(t badFanOutTable) Index { return Index{Slot: S1, Keys: Cols(t.TagIDs.Size(32))} },
+		"two slices":          func(t badFanOutTable) Index { return Index{Keys: Cols(t.TagIDs.Size(32), t.Other.Size(32))} },
+		"FullCopy on a GSI":   func(t badFanOutTable) Index { return Index{Slot: N1, Keys: Cols(t.Price.Size(32)), FullCopy: true} },
+		"no Slot, no slice":   func(t badFanOutTable) Index { return Index{Keys: Cols(t.Price.Size(32))} },
 	} {
 		func() {
 			defer func() {
@@ -390,7 +390,7 @@ func TestFanOutIndexDeclarationRules(t *testing.T) {
 			}()
 			tablePtr := new(badFanOutTable)
 			populateColumnNames(tablePtr)
-			schema := Schema{Entity: "bad_fan_out", TableID: 34567890, Keys: Keys(tablePtr.ID.Size(32)), Indexes: []Index{index(*tablePtr)}}
+			schema := Schema{Entity: "bad_fan_out", TableID: 34567890, Keys: Cols(tablePtr.ID.Size(32)), Indexes: []Index{index(*tablePtr)}}
 			buildTableMeta(schema, reflect.TypeFor[badFanOutRecord]())
 		}()
 	}
@@ -410,7 +410,7 @@ type mismatchedSliceTable struct {
 }
 
 func (t mismatchedSliceTable) GetSchema() Schema {
-	return Schema{Entity: "mismatched_slice", Keys: Keys(t.ID.Size(32)), Indexes: []Index{{Keys: Keys(t.TagIDs.Size(32))}}}
+	return Schema{Entity: "mismatched_slice", Keys: Cols(t.ID.Size(32)), Indexes: []Index{{Keys: Cols(t.TagIDs.Size(32))}}}
 }
 
 func TestColSliceElementTypeMustMatchTheField(t *testing.T) {
@@ -435,7 +435,7 @@ type clashingTable struct {
 
 // Same explicit TableID as ProductTable, different entity.
 func (t clashingTable) GetSchema() Schema {
-	return Schema{Entity: "clash", TableID: 12345678, Keys: Keys(t.ID.Size(32))}
+	return Schema{Entity: "clash", TableID: 12345678, Keys: Cols(t.ID.Size(32))}
 }
 
 func TestTableIDCollisionPanics(t *testing.T) {

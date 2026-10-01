@@ -114,11 +114,11 @@ type ProductTable struct {
 func (t ProductTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Entity: "prod",                                       // TableID = HashTableID("prod"), pk = TableID
-        Keys:   dynamo.Keys(t.ID),                            // -> sk: the record's key
+        Keys:   dynamo.Cols(t.ID),                            // -> sk: the record's key
         Indexes: []dynamo.Index{
-            {Slot: dynamo.N1, Keys: dynamo.Keys(t.CategoryID.Size(16))}, // numeric GSI
-            {Slot: dynamo.S1, Keys: dynamo.Keys(t.Brand)},               // string GSI
-            {Keys: dynamo.Keys(t.TagIDs.Size(32))},                      // fan-out: Contains(TagIDs, ...)
+            {Slot: dynamo.N1, Keys: dynamo.Cols(t.CategoryID.Size(16))}, // numeric GSI
+            {Slot: dynamo.S1, Keys: dynamo.Cols(t.Brand)},               // string GSI
+            {Keys: dynamo.Cols(t.TagIDs.Size(32))},                      // fan-out: Contains(TagIDs, ...)
         },
     }
 }
@@ -142,9 +142,9 @@ with different ones writes another item. The `sk` is also the **only** range and
 order dimension: GSI keys are equality only, and every GSI shares the base `sk`
 as its range key. So a key column is chosen for two reasons at once:
 
-- **Identity** — the usual case is `Keys: dynamo.Keys(t.ID)`.
+- **Identity** — the usual case is `Keys: dynamo.Cols(t.ID)`.
 - **Ranges** — a range on a field (`Created` between two dates) is only possible
-  when that field is in `Keys`, before the ID: `Keys(t.Created.Size(32), t.ID)`.
+  when that field is in `Keys`, before the ID: `Cols(t.Created.Size(32), t.ID)`.
   The cost is identity: a `Get` then needs `Created` as well, and changing
   `Created` means `Delete` + `Put`. Put a field in `Keys` only when it never
   changes and its range query is a real access path.
@@ -157,8 +157,8 @@ not a query one. `Contains` needs an equality on every Partition column.
 
 ```go
 // orders: always read per store, listed by date
-Partition: dynamo.Keys(t.StoreID.Size(16)),               // pk = TableID ‖ StoreID (5 digits)
-Keys:      dynamo.Keys(t.Created.Size(32), t.ID.Size(24)), // sk = enc(Created)#enc(ID)
+Partition: dynamo.Cols(t.StoreID.Size(16)),               // pk = TableID ‖ StoreID (5 digits)
+Keys:      dynamo.Cols(t.Created.Size(32), t.ID.Size(24)), // sk = enc(Created)#enc(ID)
 ```
 
 ## Fan-out indexes: query a slice by element (`array_index.go`)
@@ -176,14 +176,14 @@ d  = the record blob, only with FullCopy: true
 
 ```go
 // orders of a store holding product 5, updated after 10000: one exact sk range
-Indexes: []dynamo.Index{{Keys: dynamo.Keys(t.ProductIDs.Size(32), t.Updated.Size(32))}},
+Indexes: []dynamo.Index{{Keys: dynamo.Cols(t.ProductIDs.Size(32), t.Updated.Size(32))}},
 Orders.Query().Eq(Orders.T.StoreID, 7).Contains(Orders.T.ProductIDs, 5).Gt(Orders.T.Updated, 10000).Exec(&out)
 Orders.Query().Eq(Orders.T.StoreID, 7).Eq(Orders.T.ProductIDs, 5).Exec(&out) // Eq on a ColSlice = Contains of one value
 ```
 
 - **Declaration:** an `Index` with no `Slot` and exactly one `ColSlice` among its
-  `Keys`, anywhere in the list (`Keys(ProductIDs, Updated)` or
-  `Keys(Channel, Tags)`). The handle is a `ColSlice[T, E]` with `E` the
+  `Keys`, anywhere in the list (`Cols(ProductIDs, Updated)` or
+  `Cols(Channel, Tags)`). The handle is a `ColSlice[T, E]` with `E` the
   **element** type (as in genix-orm/db), checked against the record field.
   Elements are integers declaring `.Size(bits)`, or strings, and the field must
   carry a `cb:"N"` tag (1..999): that stable id, not the Go name, names its rows,
@@ -199,7 +199,7 @@ Orders.Query().Eq(Orders.T.StoreID, 7).Eq(Orders.T.ProductIDs, 5).Exec(&out) // 
 - **Changing an index's `Keys`** changes the row sk of existing data, and there
   is no rebuild yet. Re-putting the records does not fix it: a write diffs both
   versions with the new shape, so it neither rewrites keys-only rows nor deletes
-  the old-shape ones. `Keys(Slice)` alone keeps the pre-`Index` (`ArrayIndexes`)
+  the old-shape ones. `Cols(Slice)` alone keeps the pre-`Index` (`ArrayIndexes`)
   row format byte for byte.
 - **A scalar `Keys` column that changes** (e.g. `Updated`) moves every element
   row on each write that changes it: a delete and a put per element. Prefer
@@ -239,7 +239,7 @@ type Invoice struct {
 func (t InvoiceTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Entity:                     "inv",
-        Keys:                       dynamo.Keys(t.ID.Size(48)),
+        Keys:                       dynamo.Cols(t.ID.Size(48)),
         UseAutoincrement:           true,   // fill ID on Put/PutMany when zero
         AutoincrementRandomPadding: 3,       // low 3 digits are random
     }
@@ -296,7 +296,7 @@ type Customer struct {
 func (t CustomerTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
         Entity:             "cust",
-        Keys:               dynamo.Keys(t.ID.Size(32)), // exactly one integer column
+        Keys:               dynamo.Cols(t.ID.Size(32)), // exactly one integer column
         SaveUpdatedVersion: true,
     }
 }
@@ -336,7 +336,7 @@ type Customer struct {
     UpdatedVersion int32  `json:"upv,omitempty" cb:"4"` // managed: write sequence
 }
 
-Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Keys(t.Status)}},
+Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)}},
 
 Customers.Query().Delta(watermark, 1).Exec(&out)  // active on a first sync, every status after
 ```
@@ -357,7 +357,7 @@ Customers.Query().Delta(watermark, 1).Exec(&out)  // active on a first sync, eve
     records reach the clients still caching them.
   - The **other Keys are pinned**: Delta needs an Eq on each, or the Contains
     on its ColSlice, which fans the rows out per element.
-    `Keys(t.ModuleIDs.Size(8), t.Status)` serves
+    `Cols(t.ModuleIDs.Size(8), t.Status)` serves
     `Query().Contains(ModuleIDs, 3).Delta(W, 1)`.
 - **`Delta()` goes last.** It picks the delta index whose pinned Keys all have an
   Eq or a Contains, the most specific when several fit (a tie fails), and adds
@@ -368,6 +368,54 @@ Customers.Query().Delta(watermark, 1).Exec(&out)  // active on a first sync, eve
   about 0.5 RCU per record.
 - A record written before its table got the index has no delta row, so Delta
   never returns it. Rewrite such records once (Put) to backfill.
+
+## GroupBy counters (`group_by.go`)
+
+An Index declaring `GroupBy` keeps, per base partition and per distinct value of
+its Keys (the group), one counter: the record count and the sum of each GroupBy
+column. A grouped read is one Query over the counters, never over the records.
+
+```go
+{Slot: dynamo.S1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
+    GroupBy: dynamo.Cols(t.Total, t.Weight), GroupDelta: true},
+{Keys: dynamo.Cols(t.Tags), GroupBy: dynamo.Cols(t.Total)},                // per element
+{Keys: dynamo.Cols(t.CustomerID.Size(32)), GroupBy: dynamo.Cols(t.Total)}, // counters only
+
+groups, err := Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Exec()
+groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].SumFloat(Orders.T.Weight)
+```
+
+```text
+pk   = base pk ‖ 000                      (shared with the slot-versions item, sk "v")
+sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
+c    = record count            sNNN = sum of the column with cb id NNN
+d    = a record holding only the group Keys (Group.Key)
+upv, upd = the last write that touched it (GroupDelta only)
+```
+
+- **Diff on write.** Every write already reads the stored version. The groups
+  of the stored and the written version are diffed: a group in both moves its
+  sums by `new - old`, a group only written gains the record (`c +1`), a group
+  only stored loses it (`c -1`). The deltas are merged per counter over the call
+  and ADDed after the base items land, one UpdateItem per counter, 10 in parallel
+  (each touches its own item and an ADD commutes). A record with
+  `Status == 0` counts in no group, so a soft delete leaves them all.
+- **Floats** are summed as `int64(round(v * 1e6))`, so adding and subtracting
+  the same value is exact. A value outside ±9.2e12 fails the write.
+- **Counters are never deleted.** An emptied group stays with `c = 0`: plain
+  reads skip it, and `Since(W)` on a `GroupDelta` returns it, so a client drops
+  the group. `Since(0)` skips it too.
+- **Best-effort, rebuilt from the records.** No transaction ties the ADD to the
+  base write: two plain Puts racing on one record, a crash between the two, or a
+  retried ADD drift a counter. `PutManyIfVersion`/`Modify` winners are exact,
+  because their condition proves the stored read. `RebuildGroups(partition...)`
+  and `RebuildGroupsAll()` recompute the counters, rewrite only those that
+  differ and zero the ones no record produces. On a `GroupDelta` the rewritten
+  ones get a freshly reserved version. They are the backfill after adding a
+  GroupBy, a column or changing its Keys.
+- A `GroupDelta` counter's `upv` has `Delta()`'s window: a write reserving 9 can
+  land after one reserving 10, so a client synced at 10 misses it until the
+  group is written again.
 
 ## Optimistic concurrency: `PutManyIfVersion`, `Modify` (`modify.go`)
 
@@ -454,6 +502,8 @@ var Products = dynamo.NewRepo[ProductTable, Product]()   // compile once, reuse
 // writes
 Products.Put(&p)
 Products.PutMany(list)          // batched (25/req) with unprocessed-item retry
+Products.InsertMany(list)       // PutMany for records known to be new: no stored-version read
+err := Orders.AssignIDs(orders) // reserve the autoincrement IDs now, write later with InsertMany
 written, err := Products.PutIfAbsent(&p) // false when the key already exists: one conditional PutItem
 saved, err := Products.Modify(Product{ID: "sku1"}, change) // read-modify-write, retried on a race
 lost, err := Products.PutManyIfVersion(read)               // batch: write unless written since the read

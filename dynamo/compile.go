@@ -67,6 +67,7 @@ type tableMeta struct {
 	keys            []keyCol
 	indexes         []indexMeta
 	arrayIndexes    []arrayIndexMeta
+	groupIndexes    []groupIndexMeta        // the Indexes declaring GroupBy (group_by.go)
 	accessors       map[string]*colAccessor // record field name -> precompiled accessor
 	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
 	updatedVersion  *updatedVersionConfig   // nil unless the schema sets SaveUpdatedVersion
@@ -75,6 +76,15 @@ type tableMeta struct {
 	// SaveUpdatedVersion or VersionedWrites consumes it.
 	updated      *colAccessor
 	writeVersion *keyCol
+	// status is the record's integer "Status" field (nil without one): 0 marks a
+	// soft-deleted record, which counts in no GroupBy group.
+	status *colAccessor
+}
+
+// readsStoredVersion reports whether a write needs the record as stored first: to
+// diff its hidden rows or its GroupBy counters.
+func (m *tableMeta) readsStoredVersion() bool {
+	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -165,15 +175,30 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	if updatedAccessor := accessors[updatedFieldName]; updatedAccessor != nil && updatedAccessor.kind.isInteger() {
 		meta.updated = updatedAccessor
 	}
-	if schema.SaveUpdatedVersion || schema.VersionedWrites || slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta }) {
+	if statusAccessor := accessors[statusFieldName]; statusAccessor != nil && statusAccessor.kind.isInteger() {
+		meta.status = statusAccessor
+	}
+	if schema.SaveUpdatedVersion || schema.VersionedWrites || slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta || idx.GroupDelta }) {
 		meta.writeVersion = resolveWriteVersion(recordType, accessors)
 	}
 
 	usedSlots := map[string]bool{}
 	usedRowColumnIDs := map[string]bool{}
+	usedGroupTags := map[string]bool{}
 	for _, idx := range schema.Indexes {
 		if idx.Type != 0 && idx.Type != TypeDelta {
 			panic(fmt.Sprintf("db: %s has an index of unknown Type %d", recordType.Name(), idx.Type))
+		}
+		if idx.GroupDelta && len(idx.GroupBy) == 0 {
+			panic(fmt.Sprintf("db: %s sets GroupDelta on an index without GroupBy columns", recordType.Name()))
+		}
+		if len(idx.GroupBy) > 0 {
+			groupIndex := compileGroupIndex(recordType, accessors, idx)
+			if usedGroupTags[groupIndex.tag] {
+				panic(fmt.Sprintf("db: %s declares two GroupBy on the same Keys", recordType.Name()))
+			}
+			usedGroupTags[groupIndex.tag] = true
+			meta.groupIndexes = append(meta.groupIndexes, groupIndex)
 		}
 		// A delta index or an Index holding a ColSlice lives in hidden base-table rows, with no GSI slot.
 		if idx.Type == TypeDelta || holdsSliceColumn(idx) {
@@ -192,7 +217,10 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 			continue
 		}
 		if idx.Slot.attr == "" {
-			panic(fmt.Sprintf("db: %s has an index with no Slot (only an Index holding a ColSlice goes without one)", recordType.Name()))
+			if len(idx.GroupBy) > 0 {
+				continue // a GroupBy alone: counters, no GSI
+			}
+			panic(fmt.Sprintf("db: %s has an index with no Slot (only an Index holding a ColSlice or a GroupBy goes without one)", recordType.Name()))
 		}
 		if idx.FullCopy {
 			panic(fmt.Sprintf("db: %s index %s sets FullCopy, which only applies to an Index holding a ColSlice", recordType.Name(), idx.Slot.attr))
@@ -214,8 +242,8 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	}
 
 	pkDigits := len(meta.tableID) + meta.partitionDigits
-	// Fan-out rows and the slot-versions item both append 3 digits to the base pk.
-	if len(meta.arrayIndexes) > 0 || schema.SaveUpdatedVersion {
+	// Fan-out rows, the slot-versions item and the GroupBy counters append 3 digits to the base pk.
+	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || schema.SaveUpdatedVersion {
 		pkDigits += arrayIndexColumnIDDigits
 	}
 	if pkDigits > maxNumericKeyDigits {
@@ -272,13 +300,13 @@ func resolveAutoincrement(schema Schema, recordType reflect.Type, accessors map[
 	}
 }
 
-// assignAutoIDs reserves and assigns IDs for the records whose ID is still zero.
-// It reserves the whole batch in one atomic sequence bump, then lays each
-// reserved value (+ random low digits) into its record. A no-op when the entity
-// has no autoincrement or every record already carries an ID.
-func (m *tableMeta) assignAutoIDs(ptrs []unsafe.Pointer) error {
+// assignAutoIDs reserves and assigns IDs for the records whose ID is still zero,
+// and returns those records. It reserves the whole batch in one atomic sequence
+// bump, then lays each reserved value (+ random low digits) into its record. A
+// no-op when the entity has no autoincrement or every record already carries an ID.
+func (m *tableMeta) assignAutoIDs(ptrs []unsafe.Pointer) ([]unsafe.Pointer, error) {
 	if m.autoinc == nil {
-		return nil
+		return nil, nil
 	}
 	var need []unsafe.Pointer
 	for _, p := range ptrs {
@@ -287,16 +315,51 @@ func (m *tableMeta) assignAutoIDs(ptrs []unsafe.Pointer) error {
 		}
 	}
 	if len(need) == 0 {
-		return nil
+		return nil, nil
 	}
 	base, err := reserveSequence(m.autoinc.seqName, len(need))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for i, p := range need {
 		m.autoinc.set(p, m.autoinc.composeID(base+int64(i), m.autoinc.randDigits()))
 	}
-	return nil
+	return need, nil
+}
+
+// prepareWrite assigns the autoincrement IDs and stamps the managed columns, and
+// returns the records whose ID it assigned: a freshly reserved ID can't be stored
+// yet, so those records need no stored-version read. Each step reserves a value of
+// its own sequence item. The version is reserved per base pk, so the steps depend
+// on each other only when the ID is a Partition column; otherwise they run in
+// parallel and the write pays one round trip for both.
+func (m *tableMeta) prepareWrite(ptrs []unsafe.Pointer) (map[unsafe.Pointer]bool, error) {
+	var assignedPtrs []unsafe.Pointer
+	assignIDs := func() (err error) {
+		assignedPtrs, err = m.assignAutoIDs(ptrs)
+		return err
+	}
+	var err error
+	if slices.ContainsFunc(m.partition, func(column keyCol) bool { return column.fieldName == autoincFieldName }) {
+		if err = assignIDs(); err == nil {
+			err = m.stampManagedColumns(ptrs)
+		}
+	} else {
+		err = runInParallel(2, func(step int) error {
+			if step == 0 {
+				return assignIDs()
+			}
+			return m.stampManagedColumns(ptrs)
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	isAssigned := make(map[unsafe.Pointer]bool, len(assignedPtrs))
+	for _, assignedPtr := range assignedPtrs {
+		isAssigned[assignedPtr] = true
+	}
+	return isAssigned, nil
 }
 
 // buildAccessors precompiles one xunsafe accessor per exported record field.

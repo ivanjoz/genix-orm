@@ -33,11 +33,11 @@ import (
 //	func (t ProductTable) GetSchema() db.Schema {
 //	    return db.Schema{
 //	        Entity: "prod",                                  // pk = TableID (no Partition)
-//	        Keys:   db.Keys(t.ID),                           // -> sk: the record's key
+//	        Keys:   db.Cols(t.ID),                           // -> sk: the record's key
 //	        Indexes: []db.Index{
-//	            {Slot: db.N1, Keys: db.Keys(t.Price.Size(40))},          // numeric GSI
-//	            {Slot: db.S1, Keys: db.Keys(t.Brand)},                   // string GSI
-//	            {Keys: db.Keys(t.TagIDs.Size(32), t.Created.Size(48))}, // fan-out: Contains(TagIDs, ...)
+//	            {Slot: db.N1, Keys: db.Cols(t.Price.Size(40))},          // numeric GSI
+//	            {Slot: db.S1, Keys: db.Cols(t.Brand)},                   // string GSI
+//	            {Keys: db.Cols(t.TagIDs.Size(32), t.Created.Size(48))}, // fan-out: Contains(TagIDs, ...)
 //	        },
 //	    }
 //	}
@@ -73,8 +73,9 @@ type Coln interface {
 	col() colMeta
 }
 
-// Keys is sugar for a []Coln literal.
-func Keys(cols ...Coln) []Coln { return cols }
+// Cols is sugar for a []Coln literal, for any schema field that takes columns: Partition, Keys,
+// Index.Keys. The field, not the helper, says what the columns are for.
+func Cols(cols ...Coln) []Coln { return cols }
 
 // Col is a statically-typed column handle. T is the table struct type, E is the
 // column's Go value type (string, int64, ...), exactly like genix's Col[T,E].
@@ -303,7 +304,7 @@ var (
 //     out into one hidden base-table row per distinct element, whose sk is the
 //     Keys with the slice replaced by that element. Contains (or Eq) on the slice
 //     queries them; every Keys column before the slice needs an Eq, and the ones
-//     after it take ranges: Keys(ProductIDs.Size(32), Created.Size(32)) serves
+//     after it take ranges: Cols(ProductIDs.Size(32), Created.Size(32)) serves
 //     Contains(ProductIDs, 5).Gt(Created, 1000). The slice field must carry a
 //     `cb:"N"` tag (1..999): that stable id, not the Go name, locates its rows,
 //     so a slice field takes one fan-out index. The rows are kept in sync by
@@ -320,6 +321,15 @@ type Index struct {
 	// element row, so Contains reads it in one Query. Without it a row holds only
 	// keys, and Contains reads the base records in a second BatchGetItem.
 	FullCopy bool
+	// GroupBy lists integer or float columns: the ORM keeps, per base partition and
+	// per distinct value of Keys, a counter with the record count and the sum of
+	// each column, read with Repo.QueryGroups (group_by.go). Not on a TypeDelta
+	// index. An Index with a GroupBy may go without a Slot: counters only.
+	GroupBy []Coln
+	// GroupDelta (with GroupBy) also stamps each counter with the UpdatedVersion of
+	// the last write that touched it, so QueryGroups().Since() reads only changed
+	// groups. It needs the managed UpdatedVersion field (delta.go).
+	GroupDelta bool
 }
 
 // holdsSliceColumn reports whether the index is a fan-out index: one of its Keys is a ColSlice.

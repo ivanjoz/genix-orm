@@ -504,7 +504,7 @@ func (q *QueryBuilder[E]) plan(arrayIndex *arrayIndexMeta, element any) (*queryP
 	if hasElement {
 		byField[arrayIndex.element.fieldName] = predicate{field: arrayIndex.element.fieldName, op: opEq, v1: element}
 	}
-	usedKeysFields, err := q.resolveKeys(byField, plan, sortColumns)
+	usedKeysFields, err := resolveKeys(byField, plan, sortColumns)
 	if err != nil {
 		return nil, err
 	}
@@ -622,8 +622,9 @@ func (q *QueryBuilder[E]) resolvePartition(byField map[string]predicate, plan *q
 }
 
 // resolveKeys builds the sk key condition from predicates on sortColumns, the
-// columns the sk is composed of: the Keys, or a fan-out row's index Keys + Keys.
-func (q *QueryBuilder[E]) resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []keyCol) (map[string]bool, error) {
+// columns the sk is composed of: the Keys, a fan-out row's index Keys + Keys, or a
+// GroupBy counter's tag + group Keys (group_by.go).
+func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []keyCol) (map[string]bool, error) {
 	used := map[string]bool{}
 
 	// Longest leading run of sort columns constrained by equality.

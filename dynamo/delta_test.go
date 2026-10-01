@@ -32,10 +32,10 @@ func (t deltaMemberTable) GetSchema() Schema {
 	return Schema{
 		Entity:  "delta_member",
 		TableID: 78901234,
-		Keys:    Keys(t.ID.Size(30)),
+		Keys:    Cols(t.ID.Size(30)),
 		Indexes: []Index{
-			{Type: TypeDelta, Keys: Keys(t.Status)},
-			{Type: TypeDelta, Keys: Keys(t.TeamIDs.Size(8), t.Status)},
+			{Type: TypeDelta, Keys: Cols(t.Status)},
+			{Type: TypeDelta, Keys: Cols(t.TeamIDs.Size(8), t.Status)},
 		},
 	}
 }
@@ -46,12 +46,12 @@ func TestDeltaIndexesCompileWithTheManagedVersionLast(t *testing.T) {
 	members := NewRepo[deltaMemberTable, deltaMember]()
 	keyless, byTeam := members.meta.arrayIndexes[0], members.meta.arrayIndexes[1]
 
-	// Keys(Status): Status is the sync filter, so the row sk is only the version.
+	// Cols(Status): Status is the sync filter, so the row sk is only the version.
 	if keyless.columnID != "005" || keyless.elementPosition != -1 || keyless.syncFilterField != "Status" ||
 		len(keyless.keys) != 1 || keyless.keys[0].fieldName != "UpdatedVersion" {
 		t.Fatalf("keyless delta = %+v", keyless)
 	}
-	// Keys(TeamIDs, Status): rows per team, named by the slice's cb id.
+	// Cols(TeamIDs, Status): rows per team, named by the slice's cb id.
 	if byTeam.columnID != "002" || byTeam.elementPosition != 0 || byTeam.syncFilterField != "Status" ||
 		len(byTeam.keys) != 2 || byTeam.keys[1].fieldName != "UpdatedVersion" {
 		t.Fatalf("team delta = %+v", byTeam)
@@ -176,8 +176,8 @@ type deltaWithoutVersionTable struct {
 }
 
 func (t deltaWithoutVersionTable) GetSchema() Schema {
-	return Schema{Entity: "delta_without_version", TableID: 78901235, Keys: Keys(t.ID.Size(30)),
-		Indexes: []Index{{Type: TypeDelta, Keys: Keys(t.Status)}}}
+	return Schema{Entity: "delta_without_version", TableID: 78901235, Keys: Cols(t.ID.Size(30)),
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(t.Status)}}}
 }
 
 func TestDeltaIndexNeedsTheManagedVersionField(t *testing.T) {

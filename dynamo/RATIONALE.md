@@ -1,5 +1,31 @@
 # RATIONALE — dynamo
 
+## Write latency: parallel counters, one-trip reservations, no read for new records
+**Context** — A berryapps sale (header + 5 lines, 4–5 GroupBys per table) made ~37 DynamoDB calls in sequence: 6.4 s from a laptop at 173 ms per call, and ~60% of them were counter UpdateItems sent one by one.
+**Decision** —
+- `applyGroupCounterDeltas` builds every UpdateItem first (reserving delete versions in that sequential loop) and sends them through `runInParallel`, at most `writeParallelism = 10` at a time. `PutManyIfVersion`'s conditional puts share the helper.
+- `prepareWrite` runs the autoincrement and the `UpdatedVersion` reservations in parallel, except when the ID is a Partition column (the version is reserved per base pk).
+- `PutMany` skips the stored-version read of records whose ID it has just assigned. `InsertMany` skips it for every record, and `AssignIDs` reserves the IDs ahead, so a caller can key child records by them and write parent and children together.
+**Rationale** — 10 matches the AWS SDK's 10 idle connections per host, so a parallel step reuses warm connections. The ADDs commute and each touches its own item, and they still run after the base items, so ordering and crash safety are unchanged. Parallelism does not change WCU or the per-item 1,000 WCU/s ceiling of hot counters. Cost: `InsertMany` on a record that was in fact stored leaves its old hidden rows and counts it twice in its groups until `RebuildGroups`. Measured in berryapps: a 5-line sale went from 6.4 s to 1.8 s locally (~37 → ~10 sequential calls).
+
+## GroupBy counters: implementation choices beyond GROUP_BY_PLAN.md
+**Context** — The plan (answered Q1–Q9, F1–F5) fixed the storage, the diff rules, best-effort ADDs, never-deleted counters, 1e6 float scaling and the GroupDelta flag. Several details were left to the implementation.
+**Decision** —
+- `Group.Key` is decoded from a colbin blob `d` stored on each counter (`SET d = if_not_exists(d, :d)`): a record holding only the group Keys, its slice set to the one element on a fan-out GroupBy.
+- A `Delete` on a `GroupDelta` table reserves one fresh `UpdatedVersion` per base pk for the counters it decrements, because a delete stamps no version on any record.
+- Counter `upd` is the write time taken when the counters are applied, not the record's `Updated` field.
+- `QueryGroups` reuses the query planner's sk builder: `resolveKeys` became a plain function, and the GroupBy tag is pinned as a synthetic first sort column. The strict `<` case drops the one sk equal to the BETWEEN's upper bound, instead of decoding the record to filter it.
+- A slot-less GroupBy is left out of `Schema()` introspection. It is no access path to records, and the Database viewer would otherwise treat it as a GSI with no name.
+- `DeleteRecordsAll` now also deletes counters, which share the bookkeeping pk with the slot-versions item. Only sk `"v"` is kept.
+- `DecodeRecords` (fn-db's validation) also builds the group keys and checks the float ranges.
+- `fn-db rebuild-groups` requires `"apply": true`, like every fn-db write, and does nothing without it (no dry-run diff).
+
+**Rationale** —
+- The key blob avoids decoding sk parts back into typed fields (there is no string setter on the accessors). Its cost is a few bytes per counter.
+- Without a fresh version, a delete's decrement would carry version 0 and never reach a `Since(W)` client.
+- Sequential updates keep the write path short. The cost is latency for a call touching many groups (fan-out GroupBys), which a bounded parallel loop can fix later.
+- Reusing `resolveKeys` gives group reads the exact range semantics records have, with no second implementation.
+
 ## Operation log: always-installed middleware, entity from the TableID, approximate item size
 **Context** — `LogOperations` was asked for as a flag that prints one line per DynamoDB call with its records, size and RCU/WCU. Where the size comes from, how the line names the table, and when the flag can be set were left open.
 **Decision** — `Client()` always installs the `dynamoOperationLog` middleware (`operation_log.go`), and the middleware reads `LogOperations` on every call. When the flag is off it passes the call straight through. When it is on, it sets `ReturnConsumedCapacity: TOTAL` and prints the line with the standard `log` package, failed calls included. The entity comes from the first 8 digits of the call's pk (`:pk` for a Query, `:lo` for a Scan), looked up in `entityByTableID`. Sequence rows log as `sequence:<entity>`. Size is the approximate DynamoDB item size (attribute names + values, numbers ≈ digits/2 + 1) of the items written, or of the items returned on reads. UpdateItem and DeleteItem only carry a key, so for them it is the request's key + values.

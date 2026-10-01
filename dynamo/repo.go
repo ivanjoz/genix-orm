@@ -54,14 +54,16 @@ func (r *Repo[T, E]) Put(record *E) error {
 // Autoincrement IDs are assigned as in Put.
 func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	ptr := unsafe.Pointer(record)
-	if err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
-		return false, err
-	}
-	if err := r.meta.stampManagedColumns([]unsafe.Pointer{ptr}); err != nil {
+	if _, err := r.meta.prepareWrite([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
 	item, err := r.meta.marshalItem(ptr, record)
 	if err != nil {
+		return false, err
+	}
+	// A record put only when absent has no stored version: it joins its groups.
+	groupDeltas := map[string]*groupCounterDelta{}
+	if err := r.meta.addGroupCounterDeltas(groupDeltas, nil, ptr); err != nil {
 		return false, err
 	}
 	client, err := Client()
@@ -86,6 +88,9 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.batchWriteAll(client, arrayRowPuts); err != nil {
 		return true, err
 	}
+	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
+		return true, err
+	}
 	return true, r.meta.bumpSlotVersions(client, []unsafe.Pointer{ptr})
 }
 
@@ -94,9 +99,31 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 // in a single sequence reservation before the batch is written, and the managed
 // Updated / UpdatedVersion are stamped (delta.go). With array or delta indexes it
 // first reads the stored versions and writes in three passes: new rows, then the
-// base items, then stale rows (see array_index.go). With SaveUpdatedVersion the
-// touched slot versions are bumped last.
-func (r *Repo[T, E]) PutMany(records []E) error {
+// base items, then stale rows (see array_index.go). GroupBy counters are ADDed
+// after that (group_by.go), and with SaveUpdatedVersion the touched slot versions
+// are bumped last. A record whose ID this call assigned is new by construction, so
+// its stored version is not read.
+func (r *Repo[T, E]) PutMany(records []E) error { return r.putMany(records, false) }
+
+// InsertMany is PutMany for records the caller knows are not stored yet, such as
+// rows keyed by an ID reserved in the same operation (AssignIDs): it skips the read
+// of the stored versions, one round trip. A record that was in fact stored keeps
+// its old hidden rows and counts twice in its GroupBy groups until RebuildGroups.
+func (r *Repo[T, E]) InsertMany(records []E) error { return r.putMany(records, true) }
+
+// AssignIDs reserves and sets the autoincrement ID of every record whose ID is
+// still zero, as Put would, so related records can be keyed by it before anything
+// is written. Write the records with InsertMany: their IDs are new.
+func (r *Repo[T, E]) AssignIDs(records []E) error {
+	ptrs := make([]unsafe.Pointer, len(records))
+	for i := range records {
+		ptrs[i] = unsafe.Pointer(&records[i])
+	}
+	_, err := r.meta.assignAutoIDs(ptrs)
+	return err
+}
+
+func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	client, err := Client()
 	if err != nil {
 		return err
@@ -105,30 +132,39 @@ func (r *Repo[T, E]) PutMany(records []E) error {
 	for i := range records {
 		ptrs[i] = unsafe.Pointer(&records[i])
 	}
-	if err := r.meta.assignAutoIDs(ptrs); err != nil {
+	isAssignedNow, err := r.meta.prepareWrite(ptrs)
+	if err != nil {
 		return err
 	}
-	if err := r.meta.stampManagedColumns(ptrs); err != nil {
-		return err
+	var possiblyStoredPtrs []unsafe.Pointer
+	for _, ptr := range ptrs {
+		if !areAllNew && !isAssignedNow[ptr] {
+			possiblyStoredPtrs = append(possiblyStoredPtrs, ptr)
+		}
 	}
-	storedByKey, err := r.storedVersions(client, ptrs)
+	storedByKey, err := r.storedVersions(client, possiblyStoredPtrs)
 	if err != nil {
 		return err
 	}
 
 	baseWrites := make([]types.WriteRequest, 0, len(records))
 	var arrayRowPuts, arrayRowDeletes []types.WriteRequest
+	groupDeltas := map[string]*groupCounterDelta{}
 	for i := range records {
 		item, err := r.meta.marshalItem(ptrs[i], &records[i])
 		if err != nil {
 			return err
 		}
 		baseWrites = append(baseWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: item}})
+		storedPtr := storedByKey[r.meta.recordKey(ptrs[i])]
+		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, ptrs[i]); err != nil {
+			return err
+		}
 		if len(r.meta.arrayIndexes) == 0 {
 			continue
 		}
 		blob := item[dataColumn].(*types.AttributeValueMemberB).Value
-		puts, deletes := r.meta.arrayIndexWrites(storedByKey[r.meta.recordKey(ptrs[i])], ptrs[i], blob)
+		puts, deletes := r.meta.arrayIndexWrites(storedPtr, ptrs[i], blob)
 		arrayRowPuts = append(arrayRowPuts, puts...)
 		arrayRowDeletes = append(arrayRowDeletes, deletes...)
 	}
@@ -138,13 +174,16 @@ func (r *Repo[T, E]) PutMany(records []E) error {
 			return err
 		}
 	}
+	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
+		return err
+	}
 	return r.meta.bumpSlotVersions(client, ptrs)
 }
 
 // storedVersions reads (consistently) the stored version of each record, keyed
-// by recordKey, so its array index rows can be diffed. Nil without array indexes.
+// by recordKey, so its hidden rows and GroupBy counters can be diffed. Nil without them.
 func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]unsafe.Pointer, error) {
-	if len(r.meta.arrayIndexes) == 0 {
+	if !r.meta.readsStoredVersion() {
 		return nil, nil
 	}
 	keys := make([]map[string]types.AttributeValue, len(ptrs))
@@ -214,8 +253,12 @@ func (r *Repo[T, E]) Delete(record *E) error {
 		return err
 	}
 	var arrayRowDeletes []types.WriteRequest
+	groupDeltas := map[string]*groupCounterDelta{}
 	if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
 		_, arrayRowDeletes = r.meta.arrayIndexWrites(storedPtr, nil, nil)
+		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, nil); err != nil {
+			return err
+		}
 	}
 	_, err = client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName()),
@@ -225,6 +268,9 @@ func (r *Repo[T, E]) Delete(record *E) error {
 		return err
 	}
 	if err := r.batchWriteAll(client, arrayRowDeletes); err != nil {
+		return err
+	}
+	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
 	}
 	return r.meta.bumpSlotVersions(client, []unsafe.Pointer{ptr})
@@ -286,8 +332,8 @@ func (r *Repo[T, E]) getMany(keys []E, rememberForUpdate bool) ([]E, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Without hidden rows a write diffs nothing, so there is nothing worth keeping.
-	if rememberForUpdate && len(r.meta.arrayIndexes) > 0 {
+	// Without hidden rows or GroupBy a write diffs nothing, so there is nothing worth keeping.
+	if rememberForUpdate && r.meta.readsStoredVersion() {
 		rememberStoredItems(items)
 	}
 	records := make([]E, len(items))

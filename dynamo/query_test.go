@@ -42,13 +42,13 @@ func (t ProductTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "prod",
 		TableID:   12345678,
-		Partition: Keys(t.CategoryID.Size(16)),
-		Keys:      Keys(t.Created.Size(48), t.ID),
+		Partition: Cols(t.CategoryID.Size(16)),
+		Keys:      Cols(t.Created.Size(48), t.ID),
 		Indexes: []Index{
-			{Slot: N1, Keys: Keys(t.Price.Size(40))}, // numeric GSI
-			{Slot: S1, Keys: Keys(t.Brand)},          // string GSI
-			{Keys: Keys(t.TagIDs.Size(32))},          // fan-out, keys-only
-			{Keys: Keys(t.Labels), FullCopy: true},   // fan-out, FullCopy
+			{Slot: N1, Keys: Cols(t.Price.Size(40))}, // numeric GSI
+			{Slot: S1, Keys: Cols(t.Brand)},          // string GSI
+			{Keys: Cols(t.TagIDs.Size(32))},          // fan-out, keys-only
+			{Keys: Cols(t.Labels), FullCopy: true},   // fan-out, FullCopy
 		},
 	}
 }
@@ -246,7 +246,7 @@ type accountTable struct {
 }
 
 func (t accountTable) GetSchema() Schema {
-	return Schema{Entity: "account", Keys: Keys(t.ID.Size(32)), Indexes: []Index{{Slot: S1, Keys: Keys(t.Username)}}}
+	return Schema{Entity: "account", Keys: Cols(t.ID.Size(32)), Indexes: []Index{{Slot: S1, Keys: Cols(t.Username)}}}
 }
 
 func TestNoPartitionEntityUsesItsGSI(t *testing.T) {
@@ -319,8 +319,8 @@ type widthsTable struct {
 func (t widthsTable) GetSchema() Schema {
 	return Schema{
 		Entity:    "w",
-		Partition: Keys(t.PK.Size(8)),
-		Keys:      Keys(t.A8.Size(8), t.A16.Size(16), t.A32.Size(32), t.A64.Size(64), t.U32.Size(32)),
+		Partition: Cols(t.PK.Size(8)),
+		Keys:      Cols(t.A8.Size(8), t.A16.Size(16), t.A32.Size(32), t.A64.Size(64), t.U32.Size(32)),
 	}
 }
 

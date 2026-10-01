@@ -23,7 +23,7 @@ type versionedSecretTable struct {
 }
 
 func (t versionedSecretTable) GetSchema() Schema {
-	return Schema{Entity: "versioned_secret", TableID: 78901240, Keys: Keys(t.ID.Size(30)), VersionedWrites: true}
+	return Schema{Entity: "versioned_secret", TableID: 78901240, Keys: Cols(t.ID.Size(30)), VersionedWrites: true}
 }
 
 type plainNote struct {
@@ -38,7 +38,7 @@ type plainNoteTable struct {
 }
 
 func (t plainNoteTable) GetSchema() Schema {
-	return Schema{Entity: "plain_note", TableID: 78901241, Keys: Keys(t.ID.Size(30))}
+	return Schema{Entity: "plain_note", TableID: 78901241, Keys: Cols(t.ID.Size(30))}
 }
 
 // A versioned item carries UpdatedVersion outside the blob, where a condition can compare it.
