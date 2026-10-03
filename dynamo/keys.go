@@ -9,10 +9,10 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // Deriving physical key attributes from a record.
 //
-//	pk  = TableID ‖ decimal(partition columns)          (DynamoDB number)
-//	sk  = composite(Keys columns)                       (order-preserving string)
-//	nN  = TableID ‖ decimal(the one slot column)        (DynamoDB number)
-//	sN  = "<TableID>#" + composite(string-slot columns) (order-preserving string)
+//	pk  = TableID ‖ decimal(partition columns)                 (DynamoDB number)
+//	sk  = composite(Keys columns)                              (order-preserving string)
+//	hN  = TableID ‖ decimal(index partition columns)           (DynamoDB number)
+//	rN  = composite(index Keys, then the base Keys left out)   (order-preserving string)
 //
 // Array index rows (array_index.go) use pk ‖ the column's cb id as their pk.
 //
@@ -48,28 +48,21 @@ func (m *tableMeta) numericKey(values []uint64, cols []keyCol) string {
 	return b.String()
 }
 
-// pkValue builds the base-table partition key (a DynamoDB number).
-func (m *tableMeta) pkValue(ptr unsafe.Pointer) string {
-	values := make([]uint64, len(m.partition))
-	for i, kc := range m.partition {
+// partitionValue builds a hash key (a DynamoDB number) from a record: TableID ‖ the partition columns.
+func (m *tableMeta) partitionValue(ptr unsafe.Pointer, partition []keyCol) string {
+	values := make([]uint64, len(partition))
+	for i, kc := range partition {
 		values[i] = kc.acc.getU64(ptr)
 	}
-	return m.numericKey(values, m.partition)
+	return m.numericKey(values, partition)
 }
+
+// pkValue builds the base-table partition key.
+func (m *tableMeta) pkValue(ptr unsafe.Pointer) string { return m.partitionValue(ptr, m.partition) }
 
 // skValue builds the base-table sort key.
 func (m *tableMeta) skValue(ptr unsafe.Pointer) string {
 	return buildCompositeKey(m.keyPartsFor(ptr, m.keys))
-}
-
-// slotValue builds one index slot's stored value: a decimal number string for
-// numeric slots, the TableID-prefixed composite for string slots.
-func (m *tableMeta) slotValue(ptr unsafe.Pointer, idx indexMeta) string {
-	if idx.slot.isNumber {
-		return m.numericKey([]uint64{idx.keys[0].acc.getU64(ptr)}, idx.keys)
-	}
-	parts := append([]keyPart{stringPart(m.tableID)}, m.keyPartsFor(ptr, idx.keys)...)
-	return buildCompositeKey(parts)
 }
 
 // partitionRange is the [lo, hi] span of every pk this entity can produce with

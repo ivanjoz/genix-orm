@@ -114,7 +114,8 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 		item[versionColumn] = &types.AttributeValueMemberN{Value: strconv.FormatInt(m.writeVersion.acc.getI64(ptr), 10)}
 	}
 	for _, idx := range m.indexes {
-		item[idx.slot.attr] = attributeForSlot(m.slotValue(ptr, idx), idx.slot.isNumber)
+		item[idx.slot.hashAttr] = &types.AttributeValueMemberN{Value: m.partitionValue(ptr, idx.partition)}
+		item[idx.slot.rangeAttr] = &types.AttributeValueMemberS{Value: buildCompositeKey(m.keyPartsFor(ptr, idx.sortColumns))}
 	}
 	return item, nil
 }
@@ -129,13 +130,6 @@ func (m *tableMeta) unmarshalItem(item map[string]types.AttributeValue, dst any)
 		return fmt.Errorf("db: colbin unmarshaling %s: %w", m.recordType.Name(), err)
 	}
 	return nil
-}
-
-func attributeForSlot(v string, isNumber bool) types.AttributeValue {
-	if isNumber {
-		return &types.AttributeValueMemberN{Value: v}
-	}
-	return &types.AttributeValueMemberS{Value: v}
 }
 
 // keyOnly builds just the {pk, sk} key map for Get/Delete.

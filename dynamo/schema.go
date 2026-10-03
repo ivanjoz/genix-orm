@@ -35,8 +35,8 @@ import (
 //	        Entity: "prod",                                  // pk = TableID (no Partition)
 //	        Keys:   db.Cols(t.ID),                           // -> sk: the record's key
 //	        Indexes: []db.Index{
-//	            {Slot: db.N1, Keys: db.Cols(t.Price.Size(40))},          // numeric GSI
-//	            {Slot: db.S1, Keys: db.Cols(t.Brand)},                   // string GSI
+//	            {Slot: db.G1, Keys: db.Cols(t.Brand, t.Price.Size(40))}, // GSI sorted by Brand, Price
+//	            {Slot: db.G2, Keys: db.Cols(t.Created.Size(48))},       // GSI sorted by Created
 //	            {Keys: db.Cols(t.TagIDs.Size(32), t.Created.Size(48))}, // fan-out: Contains(TagIDs, ...)
 //	        },
 //	    }
@@ -228,13 +228,12 @@ type Schema struct {
 	Partition []Coln
 	// Keys are the record's key inside its partition: they build the base table
 	// sk, so pk + sk identify the record (Get/Delete take them, and a Put with
-	// other values writes another item). Because the physical table shares one
-	// sk across the base table and every GSI, Keys are also the only range/order
-	// dimension, for base and index queries alike. Numeric Keys columns must
-	// declare .Size(bits).
+	// other values writes another item). They are also the base table's range
+	// and order dimension; a GSI ranges on its own Keys first. Numeric Keys
+	// columns must declare .Size(bits).
 	Keys []Coln
-	// Indexes are the secondary access paths: GSI slots (N1..N5, S1..S5) and
-	// fan-out indexes over a slice field (see Index).
+	// Indexes are the secondary access paths: GSI slots (G1..G10), fan-out
+	// indexes over a slice field, delta indexes and GroupBy counters (see Index).
 	Indexes []Index
 
 	// UseAutoincrement makes the ORM assign the record's integer "ID" field
@@ -271,33 +270,43 @@ type Schema struct {
 // client's watermark" as one exact sk range.
 const TypeDelta int8 = 10
 
-// Slot identifies one of the ten physical GSI attributes.
+// Slot identifies one of the ten physical GSIs. Each has its own hash attribute
+// hN (a number: TableID ‖ the index Partition columns) and range attribute rN (a
+// string: composite of the index Keys, then the base Keys not among them).
 type Slot struct {
-	attr     string // "n1".."n5", "s1".."s5"
-	index    string // GSI name, e.g. "gsi-n1"
-	isNumber bool
+	hashAttr  string // "h1".."h10"
+	rangeAttr string // "r1".."r10"
+	index     string // GSI name, "gsi-1".."gsi-10"
 }
 
+// Index is the GSI name; HashAttr and RangeAttr its key attributes. The table
+// definition (which the ORM never creates) builds the GSIs from them.
+func (s Slot) Index() string     { return s.index }
+func (s Slot) HashAttr() string  { return s.hashAttr }
+func (s Slot) RangeAttr() string { return s.rangeAttr }
+
 var (
-	// N1..N5 are the numeric GSI slots (a single integer column, stored as a
-	// native DynamoDB number — natively range-ordered).
-	N1 = Slot{attr: "n1", index: "gsi-n1", isNumber: true}
-	N2 = Slot{attr: "n2", index: "gsi-n2", isNumber: true}
-	N3 = Slot{attr: "n3", index: "gsi-n3", isNumber: true}
-	N4 = Slot{attr: "n4", index: "gsi-n4", isNumber: true}
-	N5 = Slot{attr: "n5", index: "gsi-n5", isNumber: true}
-	// S1..S5 are the string GSI slots (one column or a composite of several;
-	// numeric components are order-preserving Base64 via .Size(bits)).
-	S1 = Slot{attr: "s1", index: "gsi-s1"}
-	S2 = Slot{attr: "s2", index: "gsi-s2"}
-	S3 = Slot{attr: "s3", index: "gsi-s3"}
-	S4 = Slot{attr: "s4", index: "gsi-s4"}
-	S5 = Slot{attr: "s5", index: "gsi-s5"}
+	G1  = Slot{hashAttr: "h1", rangeAttr: "r1", index: "gsi-1"}
+	G2  = Slot{hashAttr: "h2", rangeAttr: "r2", index: "gsi-2"}
+	G3  = Slot{hashAttr: "h3", rangeAttr: "r3", index: "gsi-3"}
+	G4  = Slot{hashAttr: "h4", rangeAttr: "r4", index: "gsi-4"}
+	G5  = Slot{hashAttr: "h5", rangeAttr: "r5", index: "gsi-5"}
+	G6  = Slot{hashAttr: "h6", rangeAttr: "r6", index: "gsi-6"}
+	G7  = Slot{hashAttr: "h7", rangeAttr: "r7", index: "gsi-7"}
+	G8  = Slot{hashAttr: "h8", rangeAttr: "r8", index: "gsi-8"}
+	G9  = Slot{hashAttr: "h9", rangeAttr: "r9", index: "gsi-9"}
+	G10 = Slot{hashAttr: "h10", rangeAttr: "r10", index: "gsi-10"}
+	// Slots lists the ten GSIs of the physical table.
+	Slots = []Slot{G1, G2, G3, G4, G5, G6, G7, G8, G9, G10}
 )
 
 // Index is one secondary access path, of one of two shapes:
 //
-//   - A GSI: Slot is set and Keys are scalar columns mapped onto that slot.
+//   - A GSI: Slot is set. Keys are its sort key, ranged like the base Keys: an
+//     Eq on a leading run of them, then one range. The base Keys not among them
+//     follow, so the range is unique, ordered and still ranges on the base Keys
+//     after the index Keys are pinned. Partition (integers, optional) is its hash
+//     key and needs an Eq; it defaults to the entity's Partition.
 //   - A fan-out index: exactly one of the Keys is a ColSlice (of integers
 //     declaring .Size(bits), or of strings), anywhere in the list, and Slot is
 //     left empty. DynamoDB cannot index inside a list, so the record is fanned
@@ -316,7 +325,10 @@ type Index struct {
 	// Type is 0, or TypeDelta for a delta index.
 	Type int8
 	Slot Slot
-	Keys []Coln
+	// Partition (GSIs only) overrides the entity's Partition as the GSI hash key:
+	// spread a hot index, or partition it unlike the base table.
+	Partition []Coln
+	Keys      []Coln
 	// FullCopy (fan-out indexes only) stores the whole record blob on every
 	// element row, so Contains reads it in one Query. Without it a row holds only
 	// keys, and Contains reads the base records in a second BatchGetItem.

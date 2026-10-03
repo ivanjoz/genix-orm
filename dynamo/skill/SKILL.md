@@ -8,7 +8,7 @@ description: How to declare tables, design keys, write and query records with th
 A statically typed single-table DynamoDB ORM. Every entity shares one physical table:
 
 ```
-{ pk (Number), sk (String), n1..n5 (Number GSIs), s1..s5 (String GSIs), d (colbin blob of the whole record) }
+{ pk (Number), sk (String), h1/r1..h10/r10 (GSI hash Number / range String), d (colbin blob of the whole record) }
 ```
 
 DynamoDB can only use the **key attributes**. Every field lives inside `d`, so a field that is
@@ -19,7 +19,7 @@ The full reference is `README.md` next to this skill, and the design decisions a
 `RATIONALE.md`. Read the README before designing a non-trivial key.
 
 > **A project may wrap the ORM.** In berryapps, modules import `"app/db"` (aliases: `db.Schema`,
-> `db.Col`, `db.ColSlice`, `db.Keys`, `db.N1`…, `db.NewRepo`) and never
+> `db.Col`, `db.ColSlice`, `db.Keys`, `db.G1`…, `db.NewRepo`) and never
 > `github.com/ivanjoz/genix-orm/dynamo` directly. Tables live in `backend/<module>/types/`.
 > The examples below use `dynamo.`; in berryapps, write `db.` instead.
 
@@ -51,8 +51,9 @@ func (t OrderTable) GetSchema() dynamo.Schema {
         Entity: "sales_order",                // TableID = HashTableID(Entity) unless TableID is set; pk = TableID
         Keys:   dynamo.Cols(t.ID.Size(32)),   // the record's key → sk. Required
         Indexes: []dynamo.Index{
-            {Slot: dynamo.N1, Keys: dynamo.Cols(t.CustomerID.Size(32))}, // N slot: exactly one integer column
-            {Slot: dynamo.S1, Keys: dynamo.Cols(t.StoreID.Size(16), t.Status)}, // S slot: string or composite
+            // GSIs: Keys are the GSI's sort key (then the base Keys), ranged like sk.
+            {Slot: dynamo.G1, Keys: dynamo.Cols(t.CustomerID.Size(32))},          // a customer's orders, by ID
+            {Slot: dynamo.G2, Keys: dynamo.Cols(t.StoreID.Size(16), t.Status)},   // Eq(StoreID), then Status ranges
             // Fan-out (a ColSlice in Keys, no Slot): one row per element, sk = ProductID ‖ StoreID ‖ base sk.
             {Keys: dynamo.Cols(t.ProductIDs.Size(32), t.StoreID.Size(16))}, // keys-only rows (default)
             // {Keys: dynamo.Cols(t.X), FullCopy: true}                     // rows also carry d: 1 read, costlier writes
@@ -69,13 +70,20 @@ var Orders = dynamo.NewRepo[OrderTable, Order]() // package-level: a bad schema 
 - **`Keys` is the record's identity.** `pk + sk` identify a record: `Get`/`Delete` take the
   `Keys` values, and a `Put` with different ones writes **another** item. The default is
   `Keys: dynamo.Cols(t.ID...)`.
-- **`Keys` is also the only range dimension.** GSI keys are equality only, and every GSI shares
-  the base `sk` as its range key.
-  - A range on a field ("orders between two dates") is only possible with that field in `Keys`
-    before the ID: `Cols(t.Created.Size(32), t.ID.Size(32))`.
+- **`Keys` is also the base table's range dimension.** A range through the base table ("orders
+  between two dates") needs that field in `Keys` before the ID: `Cols(t.Created.Size(32), t.ID.Size(32))`.
   - The cost is identity: `Get` then needs `Created` too, and changing `Created` is a
     `Delete` + `Put`. Only add a field when it never changes and the range is a real access path.
   - With an autoincrement ID the ID order is already the creation order, so a range on `ID` often does the job.
+- **A GSI is a second sorted copy.** Its `Keys` are its sort key, followed by the base `Keys` they
+  leave out, and take an `Eq` on a leading run then one range, exactly like `sk`. So one GSI covers
+  every prefix: `{Slot: G1, Keys: Cols(t.ClientID.Size(32), t.Fecha.Size(16))}` serves
+  `Eq(ClientID)`, `Eq(ClientID).Between(Fecha)` and `Between(ClientID)`. Write the columns you
+  range on explicitly, even when they are base Keys.
+  - Its hash is the entity's `Partition` (an `Eq` on each column, like the base table). An Index may
+    declare its own `Partition` (integers): to spread a hot index, or to read across the entity's
+    partitions — `{Slot: G1, Partition: Cols(t.CustomerID.Size(32)), Keys: Cols(t.Created.Size(32))}`.
+  - Put a GroupBy on the same Index to also get counters over those Keys (section 3d).
 - **`Partition` is optional.** Without it, pk = the TableID and the whole entity is one pk. That
   is the usual case: users, profiles and items in berryapps have no partition.
   - Add one only for a large entity that is always read per tenant, store or slot. It spreads the
@@ -91,8 +99,9 @@ A violation makes `NewRepo` panic at boot:
 - Every **integer key column** (Partition, Keys, GSI, fan-out element) declares `.Size(bits)`.
   Values `>= 2^bits` and negative values panic when written.
 - The pk (`TableID ‖ zero-padded partition decimals`) must fit in 38 digits.
-- **N slots** take exactly one integer column. **S slots** take a string or a composite of several
-  columns. Each slot is used once per table. A table has 10 slots at most: N1..N5 and S1..S5.
+- **GSI slots** `G1`..`G10` take one column or a composite of several as `Keys`, and an optional
+  integer `Partition`. Each slot is used once per table. An unused slot costs nothing; each used
+  one costs a GSI write per record write.
 - **String key parts must not contain `#`,** the composite separator. Validate or normalize user
   input that goes into a key.
 - **Fan-out indexes** (an `Index` whose `Keys` hold a `ColSlice`):
@@ -171,9 +180,10 @@ err := Orders.Query().
     Desc().Limit(50).
     Exec(&out)
 
-Orders.Query().Eq(Orders.T.CustomerID, int32(77)).Exec(&out)                                 // gsi-n1
-Orders.Query().Eq(Orders.T.StoreID, int32(3)).Eq(Orders.T.Status, "paid").Exec(&out)         // gsi-s1 (full key)
-Orders.Query().Eq(Orders.T.CustomerID, int32(77)).Gte(Orders.T.ID, int32(1000)).Exec(&out)   // gsi-n1 + shared sk
+Orders.Query().Eq(Orders.T.CustomerID, int32(77)).Exec(&out)                                 // gsi-1
+Orders.Query().Eq(Orders.T.CustomerID, int32(77)).Gte(Orders.T.ID, int32(1000)).Exec(&out)   // gsi-1, then the base Keys
+Orders.Query().Eq(Orders.T.StoreID, int32(3)).Eq(Orders.T.Status, "paid").Exec(&out)         // gsi-2
+Orders.Query().Eq(Orders.T.StoreID, int32(3)).BeginsWith(Orders.T.Status, "pa").Exec(&out)   // gsi-2, ranged
 Orders.Query().Contains(Orders.T.ProductIDs, 5, 8).Exec(&out)                                // fan-out index
 Orders.Query().Eq(Orders.T.ProductIDs, 5).Gte(Orders.T.StoreID, int32(3)).Exec(&out)          // Eq on a ColSlice = Contains
 found, err := Orders.Query().Eq(Orders.T.CustomerID, int32(77)).First(&order)
@@ -184,27 +194,24 @@ Operators: `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, `BeginsWith`, `Contains`, 
 
 **How the planner picks the index:**
 
-1. **Partition source, one of:**
+1. **Access path:**
    - `Contains` (or `Eq` on a `ColSlice`) → that fan-out index. It needs `Eq` on every
      Partition column.
-   - `Eq` on every Partition column (entity with a Partition) → the base table.
-   - Otherwise, `Eq` on **every** key column of a GSI → the first such GSI, in declaration
-     order. A partial GSI key is not usable, and a range on a GSI key column is not possible:
-     GSI keys are equality only.
-   - No GSI match on an entity without Partition → its whole pk (the TableID).
-   - Nothing matches → error `no usable partition`.
-2. **Keys condition:**
-   - The leading `Keys` columns can take `Eq`, then **one** range or `BeginsWith` on the next column.
-   - The sk is shared by the base table and every GSI, so `Keys` predicates narrow any of them.
-   - A fan-out row sk is the index `Keys` (the element pins the slice like an `Eq`) followed by
-     the `Keys`, and the same rule applies over that whole list.
+   - Otherwise the base table and every GSI are candidates. One is usable when each of its
+     partition columns (the entity's, or the Index's own) has an `Eq`; an entity without
+     Partition always is. The usable one that serves the **most predicates** wins; a tie goes to
+     the base table, then to the GSIs in declaration order.
+   - Nothing usable → error `no usable partition`.
+2. **Range condition**, on the chosen path's range columns (the `Keys` for the base table; the
+   index Keys then the base Keys for a GSI; the index Keys, element pinned, then the `Keys` for a
+   fan-out row): an `Eq` on a leading run, then **one** range or `BeginsWith` on the next column.
 3. **Everything else is a non-key predicate.**
 
 ### `Query()` vs `QueryScan()`
 
 - **`Query()` is strict.** A non-key predicate fails with
   `Query() cannot filter <field> through an index: use QueryScan()`. That includes a predicate
-  on a `Keys` column after the range column, or on a GSI column when another source was chosen.
+  on a range column after the ranged one, or on a column the chosen path does not hold.
   Prefer `Query()`: every row it reads is a result.
 - **`QueryScan()`** runs the same index read, then filters the decoded records in memory.
   - It pays for every row the index range holds, so narrow the index first.
@@ -288,8 +295,8 @@ Use it for "count and totals per group" without reading the records: one counter
 partition and per distinct value of the Index Keys.
 
 ```go
-// schema: on a GSI, a fan-out Index, or a slot-less Index (counters only)
-{Slot: dynamo.S1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
+// schema: on a GSI (counters over its Keys), a fan-out Index, or a slot-less Index (counters only)
+{Slot: dynamo.G1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
     GroupBy: dynamo.Cols(t.Total, t.Weight), GroupDelta: true},
 {Keys: dynamo.Cols(t.Tags), GroupBy: dynamo.Cols(t.Total)},                 // one group per element
 {Keys: dynamo.Cols(t.CustomerID.Size(32)), GroupBy: dynamo.Cols(t.Total)},  // no GSI used
@@ -313,7 +320,8 @@ Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Si
 - **Best-effort:** the counters are ADDed after the base write, from the diff against the stored
   version. Two plain `Put`s racing on one record, or a crash in between, drift a counter.
   `Repo.RebuildGroups(partition...)` / `RebuildGroupsAll()` (berryapps: `fn-db rebuild-groups`)
-  recompute them. Run it too after adding a GroupBy to a table with records.
+  recompute them. Run it too after adding a GroupBy to a table with records, and after removing one:
+  the rebuild deletes the counters of a GroupBy no longer declared.
 - Every write pays one `UpdateItem` per touched group (merged over the call), and a hot group is a
   hot item.
 
@@ -321,13 +329,11 @@ Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Si
 
 - **Put a two-sided range in one `Between`, never `Gte(f, a).Lte(f, b)`.** The planner keeps one
   predicate per field, so the other one is silently dropped. Use one predicate per field.
-- **Index precedence is fixed, not "most specific wins":**
-  - With a Partition, `Eq` on every Partition column always takes the base table. A GSI that
-    repeats the partition columns is then never used, and its other columns become non-key
-    predicates.
-  - Otherwise the **first declared** GSI whose key is fully matched wins. With
-    `N1 = CustomerID` and `S2 = CustomerID + Status`, `Eq(CustomerID).Eq(Status)` picks N1.
-    Declare the more specific index first.
+- **The path serving the most predicates wins, counting only an `Eq` run plus one range.**
+  `(ClientID)` and `(ClientID, Fecha)` on one entity are redundant: the second covers the first.
+  On a tie the base table wins, then the first declared GSI.
+- **Indexes on transactional records carry the date.** A GroupBy or GSI keyed by a column alone
+  (all time) never closes: a longer period is the range of its days, `Fecha > 0` its whole history.
 - GSI queries and `Get` are **eventually consistent**. A read right after a write may miss it.
   Fan-out sync reads use consistent reads internally.
 - **A `Size(bits)` is part of the stored key.** Changing it, changing the `Keys`/`Partition`

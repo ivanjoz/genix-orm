@@ -1,5 +1,15 @@
 # RATIONALE — dynamo
 
+## Sorted GSIs: details beyond "Keys are the sort key"
+**Context** — The GSIs moved from `nN`/`sN` hash + shared `sk` range to ten `hN` (hash, TableID ‖ partition) + `rN` (range) slots, with an optional per-Index `Partition`. How the range is built, how the planner chooses among paths, and what happens to old data were left open.
+**Decision** —
+- `rN` is the index Keys followed by the base Keys they leave out. Every range value is unique and totally ordered, and a GSI on `(ClientID)` still ranges on the base Keys once ClientID is pinned, as the old shared-`sk` GSIs did.
+- The planner tries the base table and every GSI whose partition columns all have an `Eq`, and keeps the one whose key condition serves the most predicates. A tie goes to the base table (it can read consistently), then to the declared order. This replaces "the base table wins whenever its partition matches", which hid a GSI repeating the partition.
+- `Index.Partition` takes integers only (the hash is a number, like `pk`), and a GSI of a partitioned entity cannot drop the partition: there is no "whole entity" option until a schema needs one.
+- `RebuildGroups` deletes the counters whose tag no declared GroupBy has, instead of zeroing them: no query can read them, and that is the cleanup after removing a GroupBy.
+- berryapps' `db.SyncTableIndexes` deletes the GSIs no slot names before creating the missing ones, one `UpdateTable` at a time, waiting for each.
+**Rationale** — Appending the base Keys costs a few bytes per GSI item and keeps every old access path expressible. Scoring by served predicates is what makes "fewer, wider indexes" work: `(ClientID, Fecha)` serves `Eq(ClientID)` without a second index. Deleting the old GSIs first keeps the table under the 20-GSI quota during the swap; the cost is that the app's queries fail until the new GSIs are ACTIVE.
+
 ## Write latency: parallel counters, one-trip reservations, no read for new records
 **Context** — A berryapps sale (header + 5 lines, 4–5 GroupBys per table) made ~37 DynamoDB calls in sequence: 6.4 s from a laptop at 173 ms per call, and ~60% of them were counter UpdateItems sent one by one.
 **Decision** —

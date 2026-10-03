@@ -3,6 +3,7 @@ package dynamo
 import (
 	"fmt"
 	"reflect"
+	"slices"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -30,31 +31,29 @@ type ColumnInfo struct {
 	Type  string `json:"type"`  // value type: "string","int","uint","float","bool","other"
 	Size  int8   `json:"size,omitempty"`
 	// Size is the declared bit size (.Size(bits)) of this column when it is an
-	// integer packed into a composite string key (sort key or a string GSI); the
-	// key holds ceil(Size/6) Base64 chars. Zero for strings and native-number slots.
+	// integer packed into a composite string key (a sort key or a GSI range); the
+	// key holds ceil(Size/6) Base64 chars. Partition columns take its decimal width.
 }
 
 // IndexKind classifies an access path in a serialized schema.
 const (
-	IndexPrimary = "primary" // the base table's pk (+ shared sk range)
-	IndexGSI     = "gsi"     // a global secondary index slot (n1..n5, s1..s5)
+	IndexPrimary = "primary" // the base table: pk + sk
+	IndexGSI     = "gsi"     // a global secondary index slot (gsi-1..gsi-10): hN + rN
 	IndexArray   = "array"   // a fan-out Index over a slice field: hidden rows under pk ‖ cb id
 	IndexDelta   = "delta"   // a TypeDelta Index: hidden rows, its Keys then the managed UpdatedVersion
 )
 
-// IndexInfo describes one queryable access path: the base-table primary key or
-// a GSI slot. In this store every GSI shares the base table's sort key as its
-// range dimension, so Keys on TableSchema applies to the primary key and to
-// every GSI alike (SharesSortKey is always true for a GSI here, and is exposed
-// so the frontend can say so explicitly).
+// IndexInfo describes one access path: a hash (a number, TableID ‖ Partition,
+// each needing an equality) and a sorted range over RangeColumns (an equality on
+// a leading run of them, then one range).
 type IndexInfo struct {
-	Kind          string       `json:"kind"`               // IndexPrimary | IndexGSI | IndexArray
-	Name          string       `json:"name"`               // GSI name ("gsi-n1"...) or "" for the primary key and array indexes
-	Attr          string       `json:"attr"`               // partition attribute: "pk", "n1".."n5" or "s1".."s5"
-	IsNumber      bool         `json:"isNumber"`           // numeric partition attribute (pk, n1..n5) vs string
-	SharesSortKey bool         `json:"sharesSortKey"`      // uses the table's shared sk as its range key
-	Columns       []ColumnInfo `json:"columns"`            // the index's key columns, in order
-	FullCopy      bool         `json:"fullCopy,omitempty"` // fan-out rows carry the record blob
+	Kind         string       `json:"kind"`               // IndexPrimary | IndexGSI | IndexArray | IndexDelta
+	Name         string       `json:"name"`               // GSI name ("gsi-1"...) or "" for the base table and its hidden rows
+	HashAttr     string       `json:"hashAttr"`           // "pk" or "h1".."h10"
+	RangeAttr    string       `json:"rangeAttr"`          // "sk" or "r1".."r10"
+	Partition    []ColumnInfo `json:"partition"`          // the hash columns after the TableID
+	RangeColumns []ColumnInfo `json:"rangeColumns"`       // the range columns, in order
+	FullCopy     bool         `json:"fullCopy,omitempty"` // fan-out rows carry the record blob
 }
 
 // TableSchema is the JSON-serializable description of one entity's schema.
@@ -65,7 +64,7 @@ type TableSchema struct {
 	TableID   int32        `json:"tableID"`   // the 8-digit prefix of every key of this entity
 	TableName string       `json:"tableName"` // physical DynamoDB table (shared by all entities)
 	Partition []ColumnInfo `json:"partition"` // base-table pk columns (after the TableID)
-	Keys      []ColumnInfo `json:"keys"`      // sk columns: the record's key, shared as range by every GSI
+	Keys      []ColumnInfo `json:"keys"`      // sk columns: the record's key
 	Indexes   []IndexInfo  `json:"indexes"`   // access paths: the primary key first, then the GSIs
 	// Fields is every column of the table struct in declaration order — the whole
 	// record shape, key columns included — so a visualizer can lay out its columns
@@ -114,11 +113,11 @@ func GetSchema[T any]() TableSchema {
 	// The primary key is an access path too — list it first so a visualizer can
 	// render all lookups uniformly.
 	out.Indexes = append(out.Indexes, IndexInfo{
-		Kind:          IndexPrimary,
-		Attr:          "pk",
-		IsNumber:      true,
-		SharesSortKey: true,
-		Columns:       out.Partition,
+		Kind:         IndexPrimary,
+		HashAttr:     "pk",
+		RangeAttr:    "sk",
+		Partition:    out.Partition,
+		RangeColumns: out.Keys,
 	})
 	for _, idx := range schema.Indexes {
 		if idx.Type == TypeDelta || holdsSliceColumn(idx) {
@@ -127,29 +126,43 @@ func GetSchema[T any]() TableSchema {
 				kind = IndexDelta
 			}
 			out.Indexes = append(out.Indexes, IndexInfo{
-				Kind:          kind,
-				Attr:          "pk",
-				IsNumber:      true,
-				SharesSortKey: true, // the base sk follows the index Keys in the row sk
-				Columns:       describeCols(idx.Keys),
-				FullCopy:      idx.FullCopy,
+				Kind:         kind,
+				HashAttr:     "pk",
+				RangeAttr:    "sk",
+				Partition:    out.Partition,
+				RangeColumns: append(describeCols(idx.Keys), out.Keys...), // the row sk: index Keys, then base Keys
+				FullCopy:     idx.FullCopy,
 			})
 			continue
 		}
 		// A slot-less GroupBy keeps counters only: it is no access path to the records.
-		if idx.Slot.attr == "" {
+		if idx.Slot.index == "" {
 			continue
 		}
+		gsiPartition := out.Partition
+		if len(idx.Partition) > 0 {
+			gsiPartition = describeCols(idx.Partition)
+		}
 		out.Indexes = append(out.Indexes, IndexInfo{
-			Kind:          IndexGSI,
-			Name:          idx.Slot.index,
-			Attr:          idx.Slot.attr,
-			IsNumber:      idx.Slot.isNumber,
-			SharesSortKey: true,
-			Columns:       describeCols(idx.Keys),
+			Kind:         IndexGSI,
+			Name:         idx.Slot.index,
+			HashAttr:     idx.Slot.hashAttr,
+			RangeAttr:    idx.Slot.rangeAttr,
+			Partition:    gsiPartition,
+			RangeColumns: appendMissingColumns(describeCols(idx.Keys), out.Keys),
 		})
 	}
 	return out
+}
+
+// appendMissingColumns appends the base Keys a GSI's Keys leave out: they close its range (compileGSI).
+func appendMissingColumns(columns []ColumnInfo, baseKeys []ColumnInfo) []ColumnInfo {
+	for _, baseKey := range baseKeys {
+		if !slices.ContainsFunc(columns, func(column ColumnInfo) bool { return column.Field == baseKey.Field }) {
+			columns = append(columns, baseKey)
+		}
+	}
+	return columns
 }
 
 // Schema returns this repo's serializable schema — the method form of

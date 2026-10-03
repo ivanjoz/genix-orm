@@ -503,7 +503,7 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 	// The tag is pinned as the first sort column, so the read stays inside this GroupBy's counters.
 	sortColumns := append([]keyCol{{fieldName: groupTagKeyField, kind: kindString}}, q.groupIndex.keys...)
 	byField[groupTagKeyField] = predicate{field: groupTagKeyField, op: opEq, v1: q.groupIndex.tag}
-	usedFields, err := resolveKeys(byField, plan, sortColumns)
+	usedFields, err := resolveKeys(byField, plan, sortColumns, "sk")
 	if err != nil {
 		return nil, err
 	}
@@ -678,7 +678,8 @@ func (r *Repo[T, E]) RebuildGroupsAll() (int, error) {
 
 // rebuildPartitionGroups computes the counters of one partition from its records,
 // compares them with the stored ones and Puts only those that differ: a stored
-// counter no record produces anymore is zeroed, never deleted. Every rewritten
+// counter no record produces anymore is zeroed, and one of a GroupBy no longer
+// declared is deleted. Every rewritten
 // counter of a GroupDelta gets one version freshly reserved for the partition, so
 // clients past their watermark still refetch the corrected groups.
 func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK string, records []E) (int, error) {
@@ -730,7 +731,7 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		return nil
 	}
 
-	var counterPuts []types.WriteRequest
+	var counterWrites []types.WriteRequest
 	for _, expected := range expectedDeltas {
 		storedCounter := storedCounterBySK[expected.sk]
 		delete(storedCounterBySK, expected.sk)
@@ -750,10 +751,18 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		if err := stampVersion(counter, expected.groupIndex); err != nil {
 			return 0, err
 		}
-		counterPuts = append(counterPuts, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
+		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
 	}
-	// What is left was produced by no record: an emptied group, or a GroupBy that changed its Keys.
+	// What is left was produced by no record: an emptied group, or a GroupBy that changed its Keys or
+	// was removed. A counter of an undeclared GroupBy is deleted: no query can read it anymore. An
+	// emptied group of a declared one is zeroed, so Since(W) still tells the clients to drop it.
 	for groupSK, storedCounter := range storedCounterBySK {
+		groupIndex := m.groupIndexOfSK(groupSK)
+		if groupIndex == nil {
+			counterDelete := &types.DeleteRequest{Key: itemKey(counterPK, groupSK)}
+			counterWrites = append(counterWrites, types.WriteRequest{DeleteRequest: counterDelete})
+			continue
+		}
 		if numberAttrValue(storedCounter, groupCountAttr) == 0 && !holdsNonZeroSum(storedCounter) {
 			continue
 		}
@@ -762,12 +771,12 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		if keyBlob, hasKey := storedCounter[dataColumn]; hasKey {
 			counter[dataColumn] = keyBlob
 		}
-		if err := stampVersion(counter, m.groupIndexOfSK(groupSK)); err != nil {
+		if err := stampVersion(counter, groupIndex); err != nil {
 			return 0, err
 		}
-		counterPuts = append(counterPuts, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
+		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
 	}
-	return len(counterPuts), r.batchWriteAll(client, counterPuts)
+	return len(counterWrites), r.batchWriteAll(client, counterWrites)
 }
 
 // storedCounterMatches reports whether a stored counter already holds the expected count and sums.

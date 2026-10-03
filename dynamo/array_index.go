@@ -83,9 +83,9 @@ func cbColumnID(recordType reflect.Type, fieldName string) string {
 // it returns elementPosition -1 and no columnID: only a delta index goes without
 // one, and it picks its own.
 func resolveArrayIndex(recordType reflect.Type, accessors map[string]*colAccessor, index Index) arrayIndexMeta {
-	if index.Slot.attr != "" {
+	if index.Slot.index != "" {
 		panic(fmt.Sprintf("db: %s index %s holds a ColSlice or is a delta index: it lives in the base table and takes no Slot",
-			recordType.Name(), index.Slot.attr))
+			recordType.Name(), index.Slot.index))
 	}
 	elementPosition := -1
 	for i, column := range index.Keys {

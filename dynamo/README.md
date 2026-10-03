@@ -11,13 +11,13 @@ into a project's `.claude/skills/genix-dynamo-orm`.
 ## Storage model: keys + one binary blob
 
 Every item contains **only**: the key columns (`pk`, `sk`), the index columns
-(`n1`..`n5`/`s1`..`s5`), a single binary column **`d`** holding the whole
+(`h1`/`r1`..`h10`/`r10`), a single binary column **`d`** holding the whole
 record serialized with [`colbin`](https://github.com/ivanjoz/colbin) (a columnar binary codec),
 and on a versioned table the number **`upv`**, a copy of `UpdatedVersion` that
 `Modify`'s conditional write compares. Nothing else is a top-level attribute.
 
 ```
-{ pk, sk, n1?..n5?, s1?..s5?, d, upv? }
+{ pk, sk, h1?/r1?..h10?/r10?, d, upv? }
 ```
 
 This keeps the table schemaless — adding a record field never changes the item
@@ -27,17 +27,18 @@ non-key field is applied **in memory after decode** (see the planner below).
 
 ## The physical table it targets
 
-One table, created by the application (the ORM never creates tables): base key
-`pk` (**Number**) + `sk` (String) and ten **sparse GSIs** that all share `sk` as
-their range key:
+One table, created by the application (the ORM never creates tables; `Slots`
+lists the GSIs to declare): base key `pk` (**Number**) + `sk` (String) and ten
+**sparse GSIs**, each with its own hash and range attribute:
 
-| Slot         | Attribute    | Type   |
-| ------------ | ------------ | ------ |
-| `N1`..`N5`   | `n1`..`n5`   | Number |
-| `S1`..`S5`   | `s1`..`s5`   | String |
+| Slot          | GSI                    | Hash (Number)  | Range (String) |
+| ------------- | ---------------------- | -------------- | -------------- |
+| `G1`..`G10`   | `gsi-1`..`gsi-10`      | `h1`..`h10`    | `r1`..`r10`    |
 
 Sparse means an item only enters a GSI when its schema fills that slot, so
-unused slots cost nothing.
+unused slots cost nothing (on-demand billing: no writes, no storage). Every GSI
+projects the whole item, so each write of a record pays one GSI write per slot
+its entity declares.
 
 ## Table IDs: every key starts with 8 digits
 
@@ -46,10 +47,12 @@ or `HashTableID(Entity)` (FNV-1a 32 folded into that range) when left at 0. It i
 the prefix of every key the entity writes:
 
 ```
-pk = TableID ‖ partition columns, zero-padded decimals     (Number)
-nN = TableID ‖ the slot column, zero-padded decimal        (Number)
-sN = "<TableID>#" + composite(slot columns)                (String)
+pk = TableID ‖ partition columns, zero-padded decimals          (Number)
+hN = TableID ‖ index partition columns, zero-padded decimals    (Number)
 ```
+
+The range keys (`sk`, `rN`) carry no TableID: they are always read under a hash
+that does.
 
 Each integer column is padded to the decimal width of its `Size(bits)`
 (`Size(16)` → 5 digits, `Size(32)` → 10), so `pk = TableID * 10^w + partition`.
@@ -116,9 +119,9 @@ func (t ProductTable) GetSchema() dynamo.Schema {
         Entity: "prod",                                       // TableID = HashTableID("prod"), pk = TableID
         Keys:   dynamo.Cols(t.ID),                            // -> sk: the record's key
         Indexes: []dynamo.Index{
-            {Slot: dynamo.N1, Keys: dynamo.Cols(t.CategoryID.Size(16))}, // numeric GSI
-            {Slot: dynamo.S1, Keys: dynamo.Cols(t.Brand)},               // string GSI
-            {Keys: dynamo.Cols(t.TagIDs.Size(32))},                      // fan-out: Contains(TagIDs, ...)
+            {Slot: dynamo.G1, Keys: dynamo.Cols(t.CategoryID.Size(16), t.Price.Size(40))}, // sorted by category, price
+            {Slot: dynamo.G2, Keys: dynamo.Cols(t.Brand)},                                // sorted by brand
+            {Keys: dynamo.Cols(t.TagIDs.Size(32))},                                       // fan-out: Contains(TagIDs, ...)
         },
     }
 }
@@ -130,24 +133,41 @@ of the whole record):
 ```
 pk = 12345678                                    (number: no Partition, the TableID alone)
 sk = ID                                          (Keys, order-preserving composite)
-n1 = 12345678 ‖ CategoryID as 5 digits           (number: 1234567800007)
-s1 = "12345678#" + Brand
+h1 = 12345678                                    (number: the GSI's partition, the entity's by default)
+r1 = CategoryID#Price#ID                         (its Keys, then the base Keys left out)
+h2 = 12345678
+r2 = Brand#ID
 d  = colbin.Marshal(product)                     (binary)
 ```
 
-### `Keys` is the record's identity, and its only range
+### `Keys` is the record's identity and its base range
 
 `pk + sk` identify a record: `Get`/`Delete` take the `Keys` values, and a `Put`
-with different ones writes another item. The `sk` is also the **only** range and
-order dimension: GSI keys are equality only, and every GSI shares the base `sk`
-as its range key. So a key column is chosen for two reasons at once:
+with different ones writes another item. The `sk` is also the base table's range
+and order dimension. So a key column is chosen for two reasons at once:
 
 - **Identity** — the usual case is `Keys: dynamo.Cols(t.ID)`.
-- **Ranges** — a range on a field (`Created` between two dates) is only possible
-  when that field is in `Keys`, before the ID: `Cols(t.Created.Size(32), t.ID)`.
+- **Ranges** — a range on a field (`Created` between two dates) through the base
+  table needs that field in `Keys`, before the ID: `Cols(t.Created.Size(32), t.ID)`.
   The cost is identity: a `Get` then needs `Created` as well, and changing
-  `Created` means `Delete` + `Put`. Put a field in `Keys` only when it never
-  changes and its range query is a real access path.
+  `Created` means `Delete` + `Put`. A GSI gives any other column a range without
+  touching the identity.
+
+### A GSI is a second sorted copy
+
+A slot `Index` is the record sorted another way: its `Keys` are the GSI range,
+followed by the base `Keys` they leave out (so every range value is unique and
+the order is total). It serves an `Eq` on a leading run of those columns and then
+one range, exactly like `sk`. One GSI therefore covers every prefix of its Keys:
+`(ClientID, Fecha)` answers `Eq(ClientID)`, `Eq(ClientID).Between(Fecha)` and
+`Between(ClientID)`.
+
+Its hash is the entity's `Partition` (an `Eq` on each column), unless the Index
+declares a `Partition` of its own (integers, like the base one): spread a hot
+index, or partition it unlike the base table —
+`{Slot: G1, Partition: Cols(t.CustomerID.Size(32)), Keys: Cols(t.Created.Size(32))}`
+reads one customer across every store. Without any partition the whole entity
+shares one hash: the same throughput ceiling as its base table.
 
 `Partition` is optional; without it the whole entity is one pk (the TableID).
 Declare one for a large entity that is always read per tenant/store/slot, so its
@@ -222,7 +242,7 @@ Orders.Query().Eq(Orders.T.StoreID, 7).Eq(Orders.T.ProductIDs, 5).Exec(&out) // 
   that record.
 
 A row pk is 3 digits longer than any base pk of its table, so they never meet,
-and rows carry no `nN`/`sN`, so they never show in a GSI query.
+and rows carry no `hN`/`rN`, so they never show in a GSI query.
 
 ## Auto-increment IDs (`sequence.go`)
 
@@ -376,7 +396,7 @@ its Keys (the group), one counter: the record count and the sum of each GroupBy
 column. A grouped read is one Query over the counters, never over the records.
 
 ```go
-{Slot: dynamo.S1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
+{Slot: dynamo.G1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
     GroupBy: dynamo.Cols(t.Total, t.Weight), GroupDelta: true},
 {Keys: dynamo.Cols(t.Tags), GroupBy: dynamo.Cols(t.Total)},                // per element
 {Keys: dynamo.Cols(t.CustomerID.Size(32)), GroupBy: dynamo.Cols(t.Total)}, // counters only
@@ -404,15 +424,17 @@ upv, upd = the last write that touched it (GroupDelta only)
   the same value is exact. A value outside ±9.2e12 fails the write.
 - **Counters are never deleted.** An emptied group stays with `c = 0`: plain
   reads skip it, and `Since(W)` on a `GroupDelta` returns it, so a client drops
-  the group. `Since(0)` skips it too.
+  the group. `Since(0)` skips it too. Only a rebuild deletes counters: those of
+  a GroupBy no longer declared.
 - **Best-effort, rebuilt from the records.** No transaction ties the ADD to the
   base write: two plain Puts racing on one record, a crash between the two, or a
   retried ADD drift a counter. `PutManyIfVersion`/`Modify` winners are exact,
   because their condition proves the stored read. `RebuildGroups(partition...)`
   and `RebuildGroupsAll()` recompute the counters, rewrite only those that
-  differ and zero the ones no record produces. On a `GroupDelta` the rewritten
-  ones get a freshly reserved version. They are the backfill after adding a
-  GroupBy, a column or changing its Keys.
+  differ, zero the ones no record produces and delete those of a GroupBy no
+  longer declared. On a `GroupDelta` the rewritten ones get a freshly reserved
+  version. They are the backfill after adding a GroupBy, a column or changing
+  its Keys, and the cleanup after removing one.
 - A `GroupDelta` counter's `upv` has `Delta()`'s window: a write reserving 9 can
   land after one reserving 10, so a client synced at 10 misses it until the
   group is written again.
@@ -527,10 +549,10 @@ err := Products.Query().
     Desc().Limit(50).
     Exec(&out)
 
-// query a GSI: an equality on a full index key routes to that slot, and the
-// shared sk still narrows it
-Products.Query().Eq(Products.T.CategoryID, int32(7)).Exec(&out)                          // gsi-n1
-Products.Query().Eq(Products.T.Brand, "acme").BeginsWith(Products.T.ID, "sku").Exec(&out) // gsi-s1
+// query a GSI: an Eq prefix and one range on its Keys, then on the base Keys
+Products.Query().Eq(Products.T.CategoryID, int32(7)).Exec(&out)                                    // gsi-1
+Products.Query().Eq(Products.T.CategoryID, int32(7)).Between(Products.T.Price, 100, 900).Exec(&out) // gsi-1
+Products.Query().Eq(Products.T.Brand, "acme").BeginsWith(Products.T.ID, "sku").Exec(&out)           // gsi-2
 
 // query a fan-out index: records whose TagIDs hold 3 or 9
 Products.Query().Contains(Products.T.TagIDs, 3, 9).Exec(&out)
@@ -555,25 +577,24 @@ index, not the call order.
 
 ### How a query is planned (`query.go`)
 
-1. **Partition source** — a `Contains` targets its fan-out rows (and needs
-   `=` on every `Partition` column). Otherwise, if the entity has `Partition`
-   columns and all of them have an `=`, use the base table (`pk`); else the first
-   GSI whose key columns all have `=`; else the base table, when it is available
-   (an entity without `Partition` always is: its pk is the TableID alone). So a
-   no-partition entity still routes an `=` on a GSI key to that GSI instead of
-   reading the whole entity.
-2. **Keys condition** — predicates on the `Keys` columns become the shared `sk`
-   key condition (`=`, `begins_with`, range, `between`). On fan-out rows the
-   sort columns are the index `Keys` (the element pins the slice like an `=`)
-   followed by the `Keys`. What the key
-   condition can't express exactly (a strict `<` under an equality prefix) is
-   kept as a key filter, checked in memory — still a key predicate, so `Query()`
-   allows it.
+1. **Access path** — a `Contains` (or `Delta`) targets its fan-out rows (and
+   needs `=` on every `Partition` column). Otherwise every path is a hash and a
+   sorted range: the base table (`pk` + `sk` over the `Keys`) and each GSI (`hN`
+   + `rN` over its Keys, then the base Keys). A path is usable when each of its
+   partition columns has an `=`; the usable one whose key condition serves the
+   most predicates wins, and a tie goes to the base table, then to the GSIs in
+   declared order.
+2. **Range condition** — an `=` on a leading run of the range columns, then one
+   `=`, `begins_with`, range or `between`. On fan-out rows the sort columns are
+   the index `Keys` (the element pins the slice like an `=`) followed by the
+   `Keys`. What the key condition can't express exactly (a strict `<` under an
+   equality prefix) is kept as a key filter, checked in memory — still a key
+   predicate, so `Query()` allows it.
 3. **Leftovers** — predicates on non-key fields (which live inside `d`) are
    rejected by `Query()` and evaluated **in memory** by `QueryScan()`.
 
-> Because the physical table shares one `sk` across the base table and all GSIs,
-> the sort/range dimension is uniform. Every range is exact at any position of a
+> Every range key (`sk`, `rN`, a fan-out row's sk) is a composite built the same
+> way, so the range rules are uniform. Every range is exact at any position of a
 > composite sort key: the rows whose ranged column equals `v` sort in `[v, v$)`
 > (`$` is the byte after the `#` separator), so `<= v` is `< v$`, `> v` is
 > `>= v$` and `BETWEEN a AND b` is `BETWEEN a AND b$`. After an equality prefix a
@@ -584,7 +605,7 @@ index, not the call order.
 ## Live check (`ormcheck/`)
 
 `ormcheck.Run` writes one record into each of two check tables (`ormcheck_order`:
-partitioned, packed sort key, numeric/composite/string GSIs, keys-only array
+partitioned, packed sort key, sorted GSIs (one with its own partition), keys-only array
 indexes; `ormcheck_product`: no partition, FullCopy array index, a keyless and a
 ColSlice delta index), reads them back
 through every access path, updates them and reads again, then wipes them. Each
@@ -627,10 +648,10 @@ json.NewEncoder(w).Encode(schema)
     { "field": "ID", "attr": "ID", "type": "string" }
   ],
   "indexes": [
-    { "kind": "primary", "attr": "pk", "isNumber": true, "sharesSortKey": true, "columns": [ /* pk cols */ ] },
-    { "kind": "array", "attr": "pk", "isNumber": true, "sharesSortKey": true, "columns": [ /* TagIDs */ ] },
-    { "kind": "gsi", "name": "gsi-n1", "attr": "n1", "isNumber": true,  "sharesSortKey": true, "columns": [ /* CategoryID */ ] },
-    { "kind": "gsi", "name": "gsi-s1", "attr": "s1", "isNumber": false, "sharesSortKey": true, "columns": [ /* Brand */ ] }
+    { "kind": "primary", "hashAttr": "pk", "rangeAttr": "sk", "partition": [], "rangeColumns": [ /* ID */ ] },
+    { "kind": "array", "hashAttr": "pk", "rangeAttr": "sk", "partition": [], "rangeColumns": [ /* TagIDs, ID */ ] },
+    { "kind": "gsi", "name": "gsi-1", "hashAttr": "h1", "rangeAttr": "r1", "partition": [], "rangeColumns": [ /* CategoryID, Price, ID */ ] },
+    { "kind": "gsi", "name": "gsi-2", "hashAttr": "h2", "rangeAttr": "r2", "partition": [], "rangeColumns": [ /* Brand, ID */ ] }
   ],
   "fields": [                   // every table struct column, in declaration order
     { "field": "ID", "attr": "ID", "type": "string" },
@@ -639,10 +660,10 @@ json.NewEncoder(w).Encode(schema)
 }
 ```
 
-Every GSI shares the base table's `sk` as its range key (`sharesSortKey`), so
-the top-level `keys` applies to the primary key and every index alike. It's a
-cold path that reads the table struct's `GetSchema()` directly — no accessors,
-no `metaCache` — so it needs only the table type, not the record type.
+Each access path lists its hash columns (`partition`, an equality each) and its
+range columns (`rangeColumns`, in order). It's a cold path that reads the table
+struct's `GetSchema()` directly — no accessors, no `metaCache` — so it needs only
+the table type, not the record type.
 
 ## Controllers: uniform entity operations (`controller.go`)
 

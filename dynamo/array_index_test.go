@@ -377,10 +377,14 @@ type badFanOutTable struct {
 
 func TestFanOutIndexDeclarationRules(t *testing.T) {
 	for name, index := range map[string]func(t badFanOutTable) Index{
-		"a slice with a Slot": func(t badFanOutTable) Index { return Index{Slot: S1, Keys: Cols(t.TagIDs.Size(32))} },
+		"a slice with a Slot": func(t badFanOutTable) Index { return Index{Slot: G1, Keys: Cols(t.TagIDs.Size(32))} },
 		"two slices":          func(t badFanOutTable) Index { return Index{Keys: Cols(t.TagIDs.Size(32), t.Other.Size(32))} },
-		"FullCopy on a GSI":   func(t badFanOutTable) Index { return Index{Slot: N1, Keys: Cols(t.Price.Size(32)), FullCopy: true} },
+		"FullCopy on a GSI":   func(t badFanOutTable) Index { return Index{Slot: G1, Keys: Cols(t.Price.Size(32)), FullCopy: true} },
 		"no Slot, no slice":   func(t badFanOutTable) Index { return Index{Keys: Cols(t.Price.Size(32))} },
+		"a Partition on a fan-out": func(t badFanOutTable) Index {
+			return Index{Partition: Cols(t.Price.Size(32)), Keys: Cols(t.TagIDs.Size(32))}
+		},
+		"a GSI without Keys": func(t badFanOutTable) Index { return Index{Slot: G1, Partition: Cols(t.Price.Size(32))} },
 	} {
 		func() {
 			defer func() {

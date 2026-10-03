@@ -45,10 +45,11 @@ func (t ProductTable) GetSchema() Schema {
 		Partition: Cols(t.CategoryID.Size(16)),
 		Keys:      Cols(t.Created.Size(48), t.ID),
 		Indexes: []Index{
-			{Slot: N1, Keys: Cols(t.Price.Size(40))}, // numeric GSI
-			{Slot: S1, Keys: Cols(t.Brand)},          // string GSI
-			{Keys: Cols(t.TagIDs.Size(32))},          // fan-out, keys-only
-			{Keys: Cols(t.Labels), FullCopy: true},   // fan-out, FullCopy
+			{Slot: G1, Keys: Cols(t.Price.Size(40))},                                      // under the CategoryID, sorted by Price
+			{Slot: G2, Keys: Cols(t.Brand)},                                               // under the CategoryID, sorted by Brand
+			{Slot: G3, Partition: Cols(t.Stock.Size(32)), Keys: Cols(t.Created.Size(48))}, // its own partition
+			{Keys: Cols(t.TagIDs.Size(32))},                                               // fan-out, keys-only
+			{Keys: Cols(t.Labels), FullCopy: true},                                        // fan-out, FullCopy
 		},
 	}
 }
@@ -107,19 +108,29 @@ func TestMarshalItemDerivesKeys(t *testing.T) {
 	if got := s(item["sk"]); got != wantSK {
 		t.Fatalf("sk = %q want %q", got, wantSK)
 	}
-	// n1 = TableID ‖ Price padded to Size(40)'s 13 decimal digits.
-	if got := s(item["n1"]); got != productTableID+"0000000001299" {
-		t.Fatalf("n1 = %q", got)
+	// A GSI hash defaults to the entity's partition; its range is its Keys, then the base Keys left out.
+	if _, isNumber := item["h1"].(*types.AttributeValueMemberN); !isNumber || s(item["h1"]) != productTableID+"00007" {
+		t.Fatalf("h1 = %#v", item["h1"])
 	}
-	if got := s(item["s1"]); got != productTableID+"#acme" {
-		t.Fatalf("s1 = %q", got)
+	if got, want := s(item["r1"]), EncodeOrderedUint(1299, 7)+"#"+wantSK; got != want {
+		t.Fatalf("r1 = %q want %q", got, want)
+	}
+	if got, want := s(item["r2"]), "acme#"+wantSK; got != want {
+		t.Fatalf("r2 = %q want %q", got, want)
+	}
+	// G3 declares its own partition (Stock, Size(32) = 10 digits), and its Keys already hold Created.
+	if got := s(item["h3"]); got != productTableID+"0000000000" {
+		t.Fatalf("h3 = %q", got)
+	}
+	if got := s(item["r3"]); got != wantSK {
+		t.Fatalf("r3 = %q want %q", got, wantSK)
 	}
 	// The whole record lives in the binary column "d"; nothing else leaks.
 	blob, ok := item["d"].(*types.AttributeValueMemberB)
 	if !ok || len(blob.Value) == 0 {
 		t.Fatalf("expected non-empty binary column d, got %T", item["d"])
 	}
-	allowed := map[string]bool{"pk": true, "sk": true, "n1": true, "s1": true, "d": true}
+	allowed := map[string]bool{"pk": true, "sk": true, "h1": true, "r1": true, "h2": true, "r2": true, "h3": true, "r3": true, "d": true}
 	for k := range item {
 		if !allowed[k] {
 			t.Fatalf("unexpected attribute %q in item (only keys/index/d allowed)", k)
@@ -201,25 +212,53 @@ func TestPlanRangeOnANonLastSortColumn(t *testing.T) {
 	}
 }
 
-func TestPlanNumericGSI(t *testing.T) {
+// TestPlanGSIRangesOnItsKeys: a GSI's Keys are its sort key, so they take an Eq
+// prefix and a range like the base Keys, under the GSI's own hash.
+func TestPlanGSIRangesOnItsKeys(t *testing.T) {
 	r := newProducts(t)
-	plan := onlyPlan(t, r.Query().Eq(r.T.Price, int64(1299)))
-	if plan.indexName != "gsi-n1" {
-		t.Fatalf("expected gsi-n1, got %q", plan.indexName)
-	}
-	if s(plan.values[":pk"]) != productTableID+"0000000001299" {
-		t.Fatalf("pk value = %q", s(plan.values[":pk"]))
+	price1299 := EncodeOrderedUint(1299, 7)
+	for _, testCase := range []struct {
+		query       *QueryBuilder[Product]
+		wantIndex   string
+		wantKeyCond string
+		wantValues  map[string]string
+	}{
+		{r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Price, int64(1299)), "gsi-1",
+			"#pk = :pk AND begins_with(#sk, :sk)", map[string]string{":pk": productTableID + "00007", ":sk": price1299 + "#"}},
+		{r.Query().Eq(r.T.CategoryID, int32(7)).Between(r.T.Price, int64(1000), int64(1299)), "gsi-1",
+			"#pk = :pk AND #sk BETWEEN :lo AND :hi", map[string]string{":lo": EncodeOrderedUint(1000, 7), ":hi": price1299 + "$"}},
+		{r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Price, int64(1299)).Gte(r.T.Created, int64(5)), "gsi-1",
+			"#pk = :pk AND #sk BETWEEN :lo AND :hi", map[string]string{":lo": price1299 + "#" + EncodeOrderedUint(5, 8)}},
+		{r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Brand, "acme"), "gsi-2",
+			"#pk = :pk AND begins_with(#sk, :sk)", map[string]string{":sk": "acme#"}},
+		{r.Query().Eq(r.T.Stock, int32(4)).Gt(r.T.Created, int64(5)), "gsi-3",
+			"#pk = :pk AND #sk >= :sk", map[string]string{":pk": productTableID + "0000000004", ":sk": EncodeOrderedUint(5, 8) + "$"}},
+	} {
+		plan := onlyPlan(t, testCase.query)
+		if plan.indexName != testCase.wantIndex || plan.keyCond != testCase.wantKeyCond {
+			t.Fatalf("plan = %q %q, want %q %q", plan.indexName, plan.keyCond, testCase.wantIndex, testCase.wantKeyCond)
+		}
+		slot := Slots[testCase.wantIndex[len("gsi-")]-'1']
+		if plan.names["#pk"] != slot.hashAttr || plan.names["#sk"] != slot.rangeAttr {
+			t.Fatalf("%s names = %v", testCase.wantIndex, plan.names)
+		}
+		for name, want := range testCase.wantValues {
+			if got := s(plan.values[name]); got != want {
+				t.Fatalf("%s: %s = %q, want %q", testCase.wantKeyCond, name, got, want)
+			}
+		}
 	}
 }
 
-func TestPlanStringGSI(t *testing.T) {
+// TestPlanPicksThePathServingMostPredicates: the base table serves CategoryID +
+// Created, gsi-1 only CategoryID, so the base table wins; with Price it is gsi-1.
+func TestPlanPicksThePathServingMostPredicates(t *testing.T) {
 	r := newProducts(t)
-	plan := onlyPlan(t, r.Query().Eq(r.T.Brand, "acme"))
-	if plan.indexName != "gsi-s1" {
-		t.Fatalf("expected gsi-s1, got %q", plan.indexName)
+	if plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Gt(r.T.Created, int64(5))); plan.indexName != "" {
+		t.Fatalf("expected the base table, got %q", plan.indexName)
 	}
-	if s(plan.values[":pk"]) != productTableID+"#acme" {
-		t.Fatalf("pk value = %q", s(plan.values[":pk"]))
+	if plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7))); plan.indexName != "" {
+		t.Fatalf("a tie goes to the base table, got %q", plan.indexName)
 	}
 }
 
@@ -246,14 +285,14 @@ type accountTable struct {
 }
 
 func (t accountTable) GetSchema() Schema {
-	return Schema{Entity: "account", Keys: Cols(t.ID.Size(32)), Indexes: []Index{{Slot: S1, Keys: Cols(t.Username)}}}
+	return Schema{Entity: "account", Keys: Cols(t.ID.Size(32)), Indexes: []Index{{Slot: G1, Keys: Cols(t.Username)}}}
 }
 
 func TestNoPartitionEntityUsesItsGSI(t *testing.T) {
 	accounts := NewRepo[accountTable, account]()
 	plan := onlyPlan(t, accounts.Query().Eq(accounts.T.Username, "ana"))
-	if plan.indexName != "gsi-s1" {
-		t.Fatalf("expected gsi-s1, got %q (the whole-entity pk shadowed the GSI)", plan.indexName)
+	if plan.indexName != "gsi-1" {
+		t.Fatalf("expected gsi-1, got %q (the whole-entity pk shadowed the GSI)", plan.indexName)
 	}
 	if plan := onlyPlan(t, accounts.Query()); plan.indexName != "" {
 		t.Fatalf("without predicates the whole entity is the base pk, got %q", plan.indexName)
@@ -264,7 +303,8 @@ func TestStrictQueryRejectsWhatNoKeyServes(t *testing.T) {
 	r := newProducts(t)
 	for name, query := range map[string]*QueryBuilder[Product]{
 		"a non-key field":             r.Query().Eq(r.T.CategoryID, int32(7)).Gte(r.T.Stock, int32(5)),
-		"a range on a GSI hash":       r.Query().Eq(r.T.CategoryID, int32(7)).Gt(r.T.Price, int64(10)),
+		"a range on a GSI hash":       r.Query().Gt(r.T.Stock, int32(4)).Eq(r.T.Created, int64(5)),
+		"a GSI without its partition": r.Query().Eq(r.T.Price, int64(1299)),
 		"a Keys column after a gap":   r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.ID, "sku1"),
 		"a filter beside a Contains":  r.Query().Eq(r.T.CategoryID, int32(7)).Contains(r.T.TagIDs, 3).Eq(r.T.Name, "x"),
 		"no index at all (QueryScan)": r.QueryScan().Gte(r.T.Stock, int32(5)),

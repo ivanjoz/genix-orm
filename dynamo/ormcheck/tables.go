@@ -47,10 +47,12 @@ func (table CheckOrderTable) GetSchema() dynamo.Schema {
 		// The packed integer sort key: Created then ID, each order-preserving Base64.
 		Keys: dynamo.Cols(table.Created.Size(32), table.ID.Size(24)),
 		Indexes: []dynamo.Index{
-			{Slot: dynamo.N1, Keys: dynamo.Cols(table.CustomerID.Size(32))}, // numeric GSI
-			// Composite string GSI, with delta counters: count, sum(Total), sum(Weight) per Channel+Status.
-			{Slot: dynamo.S1, Keys: dynamo.Cols(table.Channel, table.Status.Size(8)), GroupBy: dynamo.Cols(table.Total, table.Weight), GroupDelta: true},
-			{Slot: dynamo.S2, Keys: dynamo.Cols(table.Code)}, // single string GSI
+			// A GSI with its own partition: one customer across every store, ranged on Created.
+			{Slot: dynamo.G1, Partition: dynamo.Cols(table.CustomerID.Size(32)), Keys: dynamo.Cols(table.Created.Size(32))},
+			// A GSI under the store sorted by Channel+Status, with delta counters: count, sum(Total),
+			// sum(Weight) per Channel+Status.
+			{Slot: dynamo.G2, Keys: dynamo.Cols(table.Channel, table.Status.Size(8)), GroupBy: dynamo.Cols(table.Total, table.Weight), GroupDelta: true},
+			{Slot: dynamo.G3, Keys: dynamo.Cols(table.Code)}, // a string lookup under the store
 			// Fan-out: row sk = ProductID ‖ Created ‖ base sk, so a product ranges on Created.
 			{Keys: dynamo.Cols(table.ProductIDs.Size(32), table.Created.Size(32))},
 			{Keys: dynamo.Cols(table.Tags), GroupBy: dynamo.Cols(table.Total)},                 // fan-out on the element alone, counted per tag
@@ -95,8 +97,8 @@ func (table CheckProductTable) GetSchema() dynamo.Schema {
 		Entity: "ormcheck_product",
 		Keys:   dynamo.Cols(table.ID.Size(24)),
 		Indexes: []dynamo.Index{
-			{Slot: dynamo.N1, Keys: dynamo.Cols(table.Price.Size(32))},
-			{Slot: dynamo.S1, Keys: dynamo.Cols(table.Brand)},
+			{Slot: dynamo.G1, Keys: dynamo.Cols(table.Price.Size(32))},
+			{Slot: dynamo.G2, Keys: dynamo.Cols(table.Brand)},
 			{Keys: dynamo.Cols(table.CategoryIDs.Size(16)), FullCopy: true},
 			{Type: dynamo.TypeDelta, Keys: dynamo.Cols(table.Status)},
 			{Type: dynamo.TypeDelta, Keys: dynamo.Cols(table.TeamIDs.Size(8), table.Status)},

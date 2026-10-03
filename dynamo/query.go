@@ -3,6 +3,7 @@ package dynamo
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 	"strconv"
 	"strings"
@@ -18,12 +19,13 @@ import (
 //
 // Predicates are collected fluently, then planned against the physical schema:
 //
-//   - A partition source is chosen from the equality predicates: the base table
-//     (all Partition columns have "=") or a GSI slot (all of its key columns
-//     have "="). Base table wins when both are available.
-//   - Predicates on the Keys columns become the shared sk key condition
-//     (=, begins_with, range, between). Because the physical table shares one sk
-//     across the base table and every GSI, the sort dimension is uniform.
+//   - Every access path is a hash (a number: TableID ‖ partition columns, each
+//     needing "=") and a sorted range (a composite string): the base table is
+//     pk + sk(Keys); a GSI is hN + rN(its Keys, then the base Keys left out).
+//   - On the range, an "=" on a leading run of its columns and then one range
+//     (=, begins_with, range, between) become the key condition. The usable path
+//     serving the most predicates wins; on a tie, the base table, then the GSIs
+//     in declared order.
 //   - Any remaining predicates are on fields that live inside the "d" blob (or on
 //     key columns in a shape the key condition cannot express), which DynamoDB
 //     cannot see. Query rejects them; QueryScan evaluates them in memory after
@@ -67,16 +69,13 @@ type predicate struct {
 // It is deliberately STRICT about what is queryable, because DynamoDB only
 // supports the physical access paths this store declares:
 //
-//   - The predicate set MUST resolve to a partition source: either an equality on
-//     every base-table Partition column, or an equality on every key column of one
-//     GSI. Otherwise it errors ("no usable partition") — this covers a missing
-//     index or a partial (missing-column) index combination.
-//   - Only the shared sort key supports ranges (>, >=, <, <=, between,
-//     begins_with). A range on a hash column (the base pk or a numeric GSI, which
-//     store a single value, not an order-preserving concatenation) or a filter on
-//     a non-indexed field is rejected: such predicates would fall to the in-memory
-//     post-filter, and QueryRecords refuses to run a query that isn't fully served
-//     by an index.
+//   - The predicate set MUST resolve to an access path: an equality on every
+//     Partition column of the base table or of one GSI. Otherwise it errors ("no
+//     usable partition").
+//   - Only a range key supports ranges (>, >=, <, <=, between, begins_with). A
+//     range on a hash column or a filter on a non-indexed field is rejected: such
+//     predicates would fall to the in-memory post-filter, and QueryRecords
+//     refuses to run a query that isn't fully served by an index.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // queryRecordsMaxLimit caps how many records a dynamic query returns.
@@ -481,47 +480,29 @@ func (q *QueryBuilder[E]) plan(arrayIndex *arrayIndexMeta, element any) (*queryP
 		byField[p.field] = p
 	}
 
-	plan := &queryPlan{
-		names:      map[string]string{},
-		values:     map[string]types.AttributeValue{},
-		arrayIndex: arrayIndex,
-	}
-
-	// 1. Choose the partition source.
-	usedPartitionFields, err := q.resolvePartition(byField, plan)
-	if err != nil {
-		return nil, err
-	}
-
-	// 2. Build the sk condition from sort-column predicates. A fan-out row sk is
-	// the index Keys then the base Keys, and the element pins the slice column
-	// like an equality.
-	sortColumns := q.meta.keys
-	hasElement := arrayIndex != nil && arrayIndex.elementPosition >= 0
+	// 1. The key condition: the fan-out rows of a Contains or a Delta, else the
+	// access path (base table or GSI) that serves the most predicates.
+	var plan *queryPlan
+	var usedFields map[string]bool
+	var err error
 	if arrayIndex != nil {
-		sortColumns = append(append([]keyCol(nil), arrayIndex.keys...), q.meta.keys...)
+		plan, usedFields, err = q.planArrayRows(byField, arrayIndex, element)
+	} else {
+		plan, usedFields, err = q.planBestAccessPath(byField)
 	}
-	if hasElement {
-		byField[arrayIndex.element.fieldName] = predicate{field: arrayIndex.element.fieldName, op: opEq, v1: element}
-	}
-	usedKeysFields, err := resolveKeys(byField, plan, sortColumns)
 	if err != nil {
 		return nil, err
-	}
-	if hasElement && !usedKeysFields[arrayIndex.element.fieldName] {
-		return nil, fmt.Errorf("db: Contains on %s.%s needs an Eq on every index Keys column before it",
-			q.meta.recordType.Name(), arrayIndex.element.fieldName)
 	}
 	// Delta's first-sync filter is not a user filter, so even a strict Query takes it.
 	if q.syncFilter != nil {
 		plan.keyFilter = append(plan.keyFilter, *q.syncFilter)
 	}
 
-	// 3. Remaining predicates no key serves: a QueryScan evaluates them in memory
+	// 2. Remaining predicates no key serves: a QueryScan evaluates them in memory
 	// after decode, a strict Query rejects them.
 	var unindexedFields []string
 	for _, p := range q.preds {
-		if usedPartitionFields[p.field] || usedKeysFields[p.field] {
+		if usedFields[p.field] {
 			continue
 		}
 		if _, ok := q.meta.accessors[p.field]; !ok {
@@ -538,93 +519,109 @@ func (q *QueryBuilder[E]) plan(arrayIndex *arrayIndexMeta, element any) (*queryP
 	return plan, nil
 }
 
-// resolvePartition picks the base table or a GSI slot and appends its key
-// condition; it returns the set of fields it consumed.
-func (q *QueryBuilder[E]) resolvePartition(byField map[string]predicate, plan *queryPlan) (map[string]bool, error) {
-	m := q.meta
-	used := map[string]bool{}
-
-	// Base table: every partition column must have an equality predicate.
-	baseOK := true
-	for _, kc := range m.partition {
-		if p, ok := byField[kc.fieldName]; !ok || p.op != opEq {
-			baseOK = false
-			break
+// pinPartition reads the Eq values of every partition column, and reports false
+// when one lacks an Eq. It marks the columns it consumed in used.
+func pinPartition(byField map[string]predicate, partition []keyCol, used map[string]bool) ([]uint64, bool) {
+	values := make([]uint64, len(partition))
+	for i, kc := range partition {
+		p, ok := byField[kc.fieldName]
+		if !ok || p.op != opEq {
+			return nil, false
 		}
+		values[i] = uint64(valueToInt64(p.v1, kc.fieldName))
+		used[kc.fieldName] = true
 	}
-	useBaseTable := func() (map[string]bool, error) {
-		partitionValues := make([]uint64, len(m.partition))
-		for i, kc := range m.partition {
-			partitionValues[i] = uint64(valueToInt64(byField[kc.fieldName].v1, kc.fieldName))
-			used[kc.fieldName] = true
-		}
-		pk := m.numericKey(partitionValues, m.partition)
-		if plan.arrayIndex != nil {
-			plan.basePK = pk
-			pk += plan.arrayIndex.columnID
-		}
-		plan.names["#pk"] = "pk"
-		plan.values[":pk"] = &types.AttributeValueMemberN{Value: pk}
-		plan.keyCond = "#pk = :pk"
-		return used, nil
-	}
-	// Array rows live under the base pk, so a Contains always takes it.
-	if plan.arrayIndex != nil {
-		if !baseOK {
-			return nil, fmt.Errorf("db: Contains on %s.%s needs an equality on every Partition column",
-				m.recordType.Name(), plan.arrayIndex.element.fieldName)
-		}
-		return useBaseTable()
-	}
-	// The base table wins when its partition equalities match. Without Partition
-	// columns it always "matches" (the whole entity is one pk), so a GSI with a
-	// full equality is tried first and the whole entity is the fallback.
-	if baseOK && len(m.partition) > 0 {
-		return useBaseTable()
-	}
-
-	// Otherwise try each GSI slot whose key columns all have equality predicates.
-	for _, idx := range m.indexes {
-		ok := true
-		for _, kc := range idx.keys {
-			if p, has := byField[kc.fieldName]; !has || p.op != opEq {
-				ok = false
-				break
-			}
-		}
-		if !ok {
-			continue
-		}
-		plan.indexName = idx.slot.index
-		plan.names["#pk"] = idx.slot.attr
-		if idx.slot.isNumber {
-			kc := idx.keys[0]
-			plan.values[":pk"] = &types.AttributeValueMemberN{
-				Value: m.numericKey([]uint64{uint64(valueToInt64(byField[kc.fieldName].v1, kc.fieldName))}, idx.keys),
-			}
-			used[kc.fieldName] = true
-		} else {
-			parts := []keyPart{stringPart(m.tableID)}
-			for _, kc := range idx.keys {
-				parts = append(parts, keyPartFromValue(kc, byField[kc.fieldName].v1))
-				used[kc.fieldName] = true
-			}
-			plan.values[":pk"] = &types.AttributeValueMemberS{Value: buildCompositeKey(parts)}
-		}
-		plan.keyCond = "#pk = :pk"
-		return used, nil
-	}
-	if baseOK {
-		return useBaseTable()
-	}
-
-	return nil, fmt.Errorf("db: query on %s has no usable partition: give an equality on the Partition column(s) or on a full index key", m.recordType.Name())
+	return values, true
 }
 
-// resolveKeys builds the sk key condition from predicates on sortColumns, the
-// columns the sk is composed of: the Keys, a fan-out row's index Keys + Keys, or a
-// GroupBy counter's tag + group Keys (group_by.go).
-func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []keyCol) (map[string]bool, error) {
+// planArrayRows targets the fan-out (or delta) rows of arrayIndex: they live
+// under the base pk ‖ the index cb id, and their sk is the index Keys then the
+// base Keys. A Contains element pins the slice column like an Eq.
+func (q *QueryBuilder[E]) planArrayRows(byField map[string]predicate, arrayIndex *arrayIndexMeta, element any) (*queryPlan, map[string]bool, error) {
+	m := q.meta
+	used := map[string]bool{}
+	partitionValues, pinned := pinPartition(byField, m.partition, used)
+	if !pinned {
+		return nil, nil, fmt.Errorf("db: Contains or Delta on %s needs an equality on every Partition column", m.recordType.Name())
+	}
+	plan := &queryPlan{names: map[string]string{"#pk": "pk"}, values: map[string]types.AttributeValue{}, keyCond: "#pk = :pk", arrayIndex: arrayIndex}
+	plan.basePK = m.numericKey(partitionValues, m.partition)
+	plan.values[":pk"] = &types.AttributeValueMemberN{Value: plan.basePK + arrayIndex.columnID}
+
+	sortColumns := append(append([]keyCol(nil), arrayIndex.keys...), m.keys...)
+	hasElement := arrayIndex.elementPosition >= 0
+	if hasElement {
+		byField[arrayIndex.element.fieldName] = predicate{field: arrayIndex.element.fieldName, op: opEq, v1: element}
+	}
+	usedKeys, err := resolveKeys(byField, plan, sortColumns, "sk")
+	if err != nil {
+		return nil, nil, err
+	}
+	if hasElement && !usedKeys[arrayIndex.element.fieldName] {
+		return nil, nil, fmt.Errorf("db: Contains on %s.%s needs an Eq on every index Keys column before it",
+			m.recordType.Name(), arrayIndex.element.fieldName)
+	}
+	maps.Copy(used, usedKeys)
+	return plan, used, nil
+}
+
+// planBestAccessPath tries the base table, then every GSI in declared order: a
+// path is usable when its partition columns all have an Eq, and the one whose
+// key condition serves the most predicates wins (the earlier on a tie, so the
+// base table before any GSI).
+func (q *QueryBuilder[E]) planBestAccessPath(byField map[string]predicate) (*queryPlan, map[string]bool, error) {
+	m := q.meta
+	type accessPath struct {
+		gsi         *indexMeta // nil: the base table
+		partition   []keyCol
+		sortColumns []keyCol
+	}
+	paths := []accessPath{{partition: m.partition, sortColumns: m.keys}}
+	for i := range m.indexes {
+		paths = append(paths, accessPath{gsi: &m.indexes[i], partition: m.indexes[i].partition, sortColumns: m.indexes[i].sortColumns})
+	}
+
+	var bestPlan *queryPlan
+	var bestUsed map[string]bool
+	var keysErr error
+	for _, path := range paths {
+		used := map[string]bool{}
+		partitionValues, pinned := pinPartition(byField, path.partition, used)
+		if !pinned {
+			continue
+		}
+		hashAttr, rangeAttr := "pk", "sk"
+		plan := &queryPlan{names: map[string]string{}, values: map[string]types.AttributeValue{}, keyCond: "#pk = :pk"}
+		if path.gsi != nil {
+			hashAttr, rangeAttr = path.gsi.slot.hashAttr, path.gsi.slot.rangeAttr
+			plan.indexName = path.gsi.slot.index
+		}
+		plan.names["#pk"] = hashAttr
+		plan.values[":pk"] = &types.AttributeValueMemberN{Value: m.numericKey(partitionValues, path.partition)}
+		usedKeys, err := resolveKeys(byField, plan, path.sortColumns, rangeAttr)
+		if err != nil {
+			keysErr = err
+			continue
+		}
+		maps.Copy(used, usedKeys)
+		if bestPlan == nil || len(used) > len(bestUsed) {
+			bestPlan, bestUsed = plan, used
+		}
+	}
+	if bestPlan != nil {
+		return bestPlan, bestUsed, nil
+	}
+	if keysErr != nil {
+		return nil, nil, keysErr
+	}
+	return nil, nil, fmt.Errorf("db: query on %s has no usable partition: give an equality on the Partition column(s) of the table or of an index", m.recordType.Name())
+}
+
+// resolveKeys builds the range key condition (on rangeAttr: "sk", or a GSI's rN)
+// from predicates on sortColumns, the columns that range is composed of: the
+// Keys, a GSI's sort columns, a fan-out row's index Keys + Keys, or a GroupBy
+// counter's tag + group Keys (group_by.go).
+func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []keyCol, rangeAttr string) (map[string]bool, error) {
 	used := map[string]bool{}
 
 	// Longest leading run of sort columns constrained by equality.
@@ -647,7 +644,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 
 	// Case A: all sort columns pinned by equality → sk = <exact>.
 	if i == len(sortColumns) {
-		plan.names["#sk"] = "sk"
+		plan.names["#sk"] = rangeAttr
 		plan.values[":sk"] = &types.AttributeValueMemberS{Value: buildCompositeKey(prefix)}
 		plan.keyCond += " AND #sk = :sk"
 		return used, nil
@@ -656,7 +653,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 	// Case B: a range / begins_with on the next sort column.
 	next := sortColumns[i]
 	if p, ok := byField[next.fieldName]; ok {
-		plan.names["#sk"] = "sk"
+		plan.names["#sk"] = rangeAttr
 		used[next.fieldName] = true
 		// Every sk whose next column equals v sorts in [v, v$): v itself when that column is the
 		// last one, v#<suffix> otherwise. So "<= v" is "< v$" and "> v" is ">= v$", which keeps
@@ -711,7 +708,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 	// Case C: only a leading equality prefix, nothing on the next column →
 	// begins_with on the prefix boundary.
 	if len(prefix) > 0 {
-		plan.names["#sk"] = "sk"
+		plan.names["#sk"] = rangeAttr
 		plan.values[":sk"] = &types.AttributeValueMemberS{Value: buildCompositeKey(prefix) + keySeparator}
 		plan.keyCond += " AND begins_with(#sk, :sk)"
 	}

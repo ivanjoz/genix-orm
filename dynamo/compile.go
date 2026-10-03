@@ -48,10 +48,12 @@ type keyCol struct {
 	acc       *colAccessor
 }
 
-// indexMeta is a resolved GSI mapping.
+// indexMeta is a resolved GSI: its hash is TableID ‖ partition, its range the
+// composite of sortColumns (the index Keys, then the base Keys not among them).
 type indexMeta struct {
-	slot Slot
-	keys []keyCol
+	slot        Slot
+	partition   []keyCol
+	sortColumns []keyCol
 }
 
 // tableMeta is the compiled, immutable descriptor for an entity. The whole
@@ -189,6 +191,9 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		if idx.Type != 0 && idx.Type != TypeDelta {
 			panic(fmt.Sprintf("db: %s has an index of unknown Type %d", recordType.Name(), idx.Type))
 		}
+		if len(idx.Partition) > 0 && idx.Slot.index == "" {
+			panic(fmt.Sprintf("db: %s declares a Partition on an index with no Slot: only a GSI takes one", recordType.Name()))
+		}
 		if idx.GroupDelta && len(idx.GroupBy) == 0 {
 			panic(fmt.Sprintf("db: %s sets GroupDelta on an index without GroupBy columns", recordType.Name()))
 		}
@@ -216,29 +221,20 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 			meta.arrayIndexes = append(meta.arrayIndexes, resolved)
 			continue
 		}
-		if idx.Slot.attr == "" {
+		if idx.Slot.index == "" {
 			if len(idx.GroupBy) > 0 {
 				continue // a GroupBy alone: counters, no GSI
 			}
 			panic(fmt.Sprintf("db: %s has an index with no Slot (only an Index holding a ColSlice or a GroupBy goes without one)", recordType.Name()))
 		}
 		if idx.FullCopy {
-			panic(fmt.Sprintf("db: %s index %s sets FullCopy, which only applies to an Index holding a ColSlice", recordType.Name(), idx.Slot.attr))
+			panic(fmt.Sprintf("db: %s index %s sets FullCopy, which only applies to an Index holding a ColSlice", recordType.Name(), idx.Slot.index))
 		}
-		if usedSlots[idx.Slot.attr] {
-			panic(fmt.Sprintf("db: %s reuses slot %s", recordType.Name(), idx.Slot.attr))
+		if usedSlots[idx.Slot.index] {
+			panic(fmt.Sprintf("db: %s reuses slot %s", recordType.Name(), idx.Slot.index))
 		}
-		usedSlots[idx.Slot.attr] = true
-
-		keys := resolveKeyCols(recordType, accessors, idx.Keys)
-		if idx.Slot.isNumber {
-			// Numeric GSI slots store one DynamoDB number: TableID ‖ the column.
-			if len(keys) != 1 || !keys[0].kind.isInteger() {
-				panic(fmt.Sprintf("db: %s numeric slot %s requires exactly one integer key column",
-					recordType.Name(), idx.Slot.attr))
-			}
-		}
-		meta.indexes = append(meta.indexes, indexMeta{slot: idx.Slot, keys: keys})
+		usedSlots[idx.Slot.index] = true
+		meta.indexes = append(meta.indexes, compileGSI(recordType, accessors, idx, meta))
 	}
 
 	pkDigits := len(meta.tableID) + meta.partitionDigits
@@ -259,6 +255,39 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	}
 
 	return meta
+}
+
+// compileGSI resolves a slot Index. Its hash is the index Partition, or the
+// entity's when it declares none. Its range is the index Keys followed by the
+// base Keys they leave out: that keeps every range value unique and ordered, and
+// a GSI on (ClientID) still ranges on the base Keys once ClientID is pinned.
+func compileGSI(recordType reflect.Type, accessors map[string]*colAccessor, idx Index, meta *tableMeta) indexMeta {
+	if len(idx.Keys) == 0 {
+		panic(fmt.Sprintf("db: %s index %s declares no Keys", recordType.Name(), idx.Slot.index))
+	}
+	gsi := indexMeta{slot: idx.Slot, partition: meta.partition}
+	if len(idx.Partition) > 0 {
+		gsi.partition = resolveKeyCols(recordType, accessors, idx.Partition)
+		hashDigits := len(meta.tableID)
+		for _, partitionCol := range gsi.partition {
+			if !partitionCol.kind.isInteger() {
+				panic(fmt.Sprintf("db: %s index %s partition column %q must be an integer: the GSI hash is a number",
+					recordType.Name(), idx.Slot.index, partitionCol.fieldName))
+			}
+			hashDigits += decimalWidth(partitionCol.bits)
+		}
+		if hashDigits > maxNumericKeyDigits {
+			panic(fmt.Sprintf("db: %s index %s hash takes %d digits, over DynamoDB's %d: shrink the partition Size(bits)",
+				recordType.Name(), idx.Slot.index, hashDigits, maxNumericKeyDigits))
+		}
+	}
+	gsi.sortColumns = resolveKeyCols(recordType, accessors, idx.Keys)
+	for _, baseKey := range meta.keys {
+		if !slices.ContainsFunc(gsi.sortColumns, func(column keyCol) bool { return column.fieldName == baseKey.fieldName }) {
+			gsi.sortColumns = append(gsi.sortColumns, baseKey)
+		}
+	}
+	return gsi
 }
 
 // resolveTableID returns the schema's explicit TableID, or HashTableID(Entity) when it is 0.

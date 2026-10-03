@@ -44,7 +44,7 @@ func (t groupSaleTable) GetSchema() Schema {
 		Partition: Cols(t.StoreID.Size(16)),
 		Keys:      Cols(t.ID.Size(30)),
 		Indexes: []Index{
-			{Slot: S1, Keys: Cols(t.Channel, t.Status.Size(8)), GroupBy: Cols(t.Total, t.Weight), GroupDelta: true},
+			{Slot: G1, Keys: Cols(t.Channel, t.Status.Size(8)), GroupBy: Cols(t.Total, t.Weight), GroupDelta: true},
 			{Keys: Cols(t.ProductIDs.Size(16)), GroupBy: Cols(t.Total)},
 			{Keys: Cols(t.Channel), GroupBy: Cols(t.Total)},
 		},
@@ -288,7 +288,7 @@ type badGroupTable struct {
 func TestGroupByDeclarationRules(t *testing.T) {
 	for name, indexes := range map[string]func(t badGroupTable) []Index{
 		"GroupDelta without GroupBy": func(t badGroupTable) []Index {
-			return []Index{{Slot: S1, Keys: Cols(t.Channel), GroupDelta: true}}
+			return []Index{{Slot: G1, Keys: Cols(t.Channel), GroupDelta: true}}
 		},
 		"GroupDelta without UpdatedVersion": func(t badGroupTable) []Index {
 			return []Index{{Keys: Cols(t.Channel), GroupBy: Cols(t.Total), GroupDelta: true}}
@@ -306,7 +306,7 @@ func TestGroupByDeclarationRules(t *testing.T) {
 			return []Index{{Keys: Cols(t.Channel), GroupBy: Cols(t.Total, t.Total)}}
 		},
 		"two GroupBy on the same Keys": func(t badGroupTable) []Index {
-			return []Index{{Keys: Cols(t.Channel), GroupBy: Cols(t.Total)}, {Slot: S1, Keys: Cols(t.Channel), GroupBy: Cols(t.ID)}}
+			return []Index{{Keys: Cols(t.Channel), GroupBy: Cols(t.Total)}, {Slot: G1, Keys: Cols(t.Channel), GroupBy: Cols(t.ID)}}
 		},
 	} {
 		func() {
