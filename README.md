@@ -251,8 +251,9 @@ hits, err = db.SearchText(&products, empresaID, "polo rojo", 20, 0)   // also re
 - A write sends one batch per partition, and only when it changed an indexed column or the status.
   `Manual: true` turns the sync off.
 - The controller rebuilds, compacts or empties a partition's index: `ReindexTextSearch`,
-  `CompactTextSearch` and `DropTextSearch`. A reindex reads the table, so it is also how an index is
-  created for existing data.
+  `CompactTextSearch` and `DropTextSearch`; `ReindexTextSearchAll` rebuilds every partition that has
+  records. A reindex reads the table, so it is also how an index is created for existing data, and
+  writes that land while it runs are kept.
 - The key must be a single numeric column whose values fit int32.
 
 ---

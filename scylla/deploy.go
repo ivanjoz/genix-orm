@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
@@ -523,6 +524,47 @@ func (e *ScyllaController[T, E]) ReindexTextSearch(partValue int32) error {
 	return e.withTextSearch(partValue, "ReindexTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
 		return backend.Rebuild(context.Background(), table, partition, textSearchSource(&e.Table, int64(partValue)))
 	})
+}
+
+// ReindexTextSearchAll rebuilds the text index of every partition that has records, one at a time.
+// It does not drop the index of a partition left with none: DropTextSearch does that.
+func (e *ScyllaController[T, E]) ReindexTextSearchAll() error {
+	if e.Table.textSearchIndex == nil {
+		return nil
+	}
+	partValues, err := scanPartitionValues(&e.Table)
+	if err != nil {
+		return Err("ReindexTextSearchAll failed to list the partitions of", e.Table.Name, ":", err)
+	}
+	for _, partValue := range partValues {
+		if err := e.ReindexTextSearch(partValue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanPartitionValues lists the partition values that have records. Text search partitions are
+// int32, which configureTextSearchIndex enforces for int columns at use: a value out of range
+// fails here instead of indexing under a wrapped number.
+func scanPartitionValues(scyllaTable *ScyllaTable) ([]int32, error) {
+	queryString := fmt.Sprintf("SELECT DISTINCT %v FROM %v", scyllaTable.PartKey.GetName(), scyllaTable.GetFullName())
+	iter := getScyllaConnection().Query(queryString).Iter()
+
+	var partValues []int32
+	var partValue int64
+	for iter.Scan(&partValue) {
+		if partValue < math.MinInt32 || partValue > math.MaxInt32 {
+			iter.Close()
+			return nil, fmt.Errorf("partition %v does not fit int32", partValue)
+		}
+		partValues = append(partValues, int32(partValue))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	slices.Sort(partValues)
+	return partValues, nil
 }
 
 // CompactTextSearch folds the partition's pending index writes, for backends with a write log.

@@ -100,12 +100,14 @@ type Controller interface {
 	ResetCounter(partValue any) error
 	DeleteViewsAndIndexes() error
 
-	// The three below maintain the text index of a table that declares TextSearch; on any other
+	// The four below maintain the text index of a table that declares TextSearch; on any other
 	// table they do nothing.
 
 	// ReindexTextSearch rebuilds one partition's index from the table's active records. Writes
 	// that land while it runs are kept.
 	ReindexTextSearch(partValue int32) error
+	// ReindexTextSearchAll runs ReindexTextSearch on every partition that has records.
+	ReindexTextSearchAll() error
 	// CompactTextSearch folds the partition's pending index writes, for backends with a write log.
 	CompactTextSearch(partValue int32) error
 	// DropTextSearch empties the partition's index.
