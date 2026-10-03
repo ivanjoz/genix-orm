@@ -188,7 +188,7 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	usedRowColumnIDs := map[string]bool{}
 	usedGroupTags := map[string]bool{}
 	for _, idx := range schema.Indexes {
-		if idx.Type != 0 && idx.Type != TypeDelta {
+		if idx.Type != 0 && idx.Type != TypeDelta && idx.Type != TypeLocal {
 			panic(fmt.Sprintf("db: %s has an index of unknown Type %d", recordType.Name(), idx.Type))
 		}
 		if len(idx.Partition) > 0 && idx.Slot.index == "" {
@@ -197,7 +197,7 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		if idx.GroupDelta && len(idx.GroupBy) == 0 {
 			panic(fmt.Sprintf("db: %s sets GroupDelta on an index without GroupBy columns", recordType.Name()))
 		}
-		if len(idx.GroupBy) > 0 {
+		if len(idx.GroupBy) > 0 && idx.Type != TypeLocal {
 			groupIndex := compileGroupIndex(recordType, accessors, idx)
 			if usedGroupTags[groupIndex.tag] {
 				panic(fmt.Sprintf("db: %s declares two GroupBy on the same Keys", recordType.Name()))
@@ -205,16 +205,19 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 			usedGroupTags[groupIndex.tag] = true
 			meta.groupIndexes = append(meta.groupIndexes, groupIndex)
 		}
-		// A delta index or an Index holding a ColSlice lives in hidden base-table rows, with no GSI slot.
-		if idx.Type == TypeDelta || holdsSliceColumn(idx) {
+		// A delta, local or fan-out index lives in hidden base-table rows, with no GSI slot.
+		if idx.Type == TypeDelta || idx.Type == TypeLocal || holdsSliceColumn(idx) {
 			var resolved arrayIndexMeta
-			if idx.Type == TypeDelta {
+			switch {
+			case idx.Type == TypeDelta:
 				resolved = compileDeltaIndex(recordType, accessors, idx, *meta.writeVersion)
-			} else {
+			case idx.Type == TypeLocal:
+				resolved = compileLocalIndex(recordType, accessors, idx)
+			default:
 				resolved = resolveArrayIndex(recordType, accessors, idx)
 			}
 			if usedRowColumnIDs[resolved.columnID] {
-				panic(fmt.Sprintf("db: %s declares two hidden-rows indexes named by cb id %s: a slice field takes one, and so does the first key of a delta index",
+				panic(fmt.Sprintf("db: %s declares two hidden-rows indexes named by cb id %s: a slice field takes one, and so does the first key of a delta or local index",
 					recordType.Name(), resolved.columnID))
 			}
 			usedRowColumnIDs[resolved.columnID] = true

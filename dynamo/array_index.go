@@ -66,6 +66,10 @@ type arrayIndexMeta struct {
 	// syncFilterField is the field Delta()'s values filter on a first sync ("" for none).
 	isDelta         bool
 	syncFilterField string
+
+	// isLocal marks a TypeLocal index (local_index.go): the planner offers it as an
+	// access path for Eq and ranges on its Keys.
+	isLocal bool
 }
 
 // cbColumnID returns a field's cb id, zero-padded: the stable id, unlike the Go

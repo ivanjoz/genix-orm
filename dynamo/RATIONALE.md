@@ -1,5 +1,10 @@
 # RATIONALE — dynamo
 
+## Local indexes are hidden base-table rows, not DynamoDB LSIs
+**Context** — An app needed "find the product with this name hash" read consistently (an import must not create a duplicate it just wrote). A real LSI can only be declared when the table is created, and every entity shares one table that already exists. A GSI reads only eventually.
+**Decision** — `TypeLocal` reuses the fan-out machinery with no element: one keys-only row per record under `base pk ‖ first key's cb id`, sk = index Keys # base sk, synced by every write and re-checked on read. The planner offers it next to the base table and the GSIs, after them on a tie. It takes scalar Keys only, no Slot and no GroupBy.
+**Rationale** — No table migration, consistent reads, and no new write path to maintain. Cost: a keys-only lookup is a Query plus a BatchGetItem, and a write that changes the key is two extra row writes.
+
 ## Sorted GSIs: details beyond "Keys are the sort key"
 **Context** — The GSIs moved from `nN`/`sN` hash + shared `sk` range to ten `hN` (hash, TableID ‖ partition) + `rN` (range) slots, with an optional per-Index `Partition`. How the range is built, how the planner chooses among paths, and what happens to old data were left open.
 **Decision** —

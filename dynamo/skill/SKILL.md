@@ -1,6 +1,6 @@
 ---
 name: genix-dynamo-orm
-description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the managed Updated/UpdatedVersion, delta indexes (TypeDelta/Delta()), the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs), GroupBy counters (GroupBy/GroupDelta/QueryGroups/RebuildGroups). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
+description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the managed Updated/UpdatedVersion, delta indexes (TypeDelta/Delta()), local indexes (TypeLocal, consistent reads), the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs), GroupBy counters (GroupBy/GroupDelta/QueryGroups/RebuildGroups). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
 ---
 
 # genix-orm/dynamo
@@ -121,6 +121,8 @@ A violation makes `NewRepo` panic at boot:
   `UpdatedVersion` (`json:"upv"`) in the record and the table struct. See section 3b.
 - **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need the same `int32` `UpdatedVersion`, and
   a `cb` tag on their first Key (on `UpdatedVersion` when they have none). See section 3c.
+- **Local indexes** (`{Type: TypeLocal, Keys: ...}`) take scalar Keys only, the first one with a
+  `cb` tag, and no Slot or GroupBy. See section 3c'.
 - **`VersionedWrites`** needs the same `int32` `UpdatedVersion`; it only enables `Modify` (section 2)
   on a table that has neither `SaveUpdatedVersion` nor a delta index (those imply it).
 - **Managed fields:** every Put stamps an integer field named `Updated` with the write time
@@ -288,6 +290,28 @@ Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(watermark, 1).Exec(&out)
   write moves all of them, because `UpdatedVersion` changed. A slice field takes either a fan-out
   index or a delta index, not both.
 - A record written before the index was declared has no delta row: re-`Put` existing records once.
+
+## 3c'. Local indexes (`TypeLocal`)
+
+Use it for a second sort order that must be read **consistently** (a GSI can't be): "is this name
+already taken?" right after another write. berryapps' products use it for the name hash.
+
+```go
+// schema (scalar Keys only: no Slot, no ColSlice, no GroupBy):
+{Type: dynamo.TypeLocal, Keys: dynamo.Cols(t.NameHash.Size(32))},
+
+Products.Query().Eq(Products.T.NameHash, hash).Consistent().Exec(&out)
+```
+
+- It is **not** a DynamoDB LSI (those can only be declared when the table is created). Its rows
+  are hidden base-table rows, `pk = base pk ‖ cb id of the first Key`, `sk = Keys ‖ base sk`,
+  keys-only: a read is a Query plus a BatchGetItem, and each row is re-checked against the record.
+- The planner treats it like a GSI over the entity's Partition: `Eq` on a leading run of its Keys,
+  then one range. `Consistent()` works, unlike on a GSI.
+- Writes keep the rows in sync (a changed Key deletes the old row and puts the new one), at one
+  extra write per changed record.
+- The first Key needs a `cb` tag, and no other hidden-row index (fan-out, delta) may use the same
+  field first. A record written before the index was declared has no row: re-`Put` it once.
 
 ## 3d. GroupBy counters (`GroupBy`, `QueryGroups`)
 

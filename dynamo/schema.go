@@ -270,6 +270,13 @@ type Schema struct {
 // client's watermark" as one exact sk range.
 const TypeDelta int8 = 10
 
+// TypeLocal marks an Index as a local index (local_index.go): one hidden
+// base-table row per record, under the record's own partition, whose sk is the
+// index Keys then the base Keys. The planner treats it like a GSI (an Eq on a
+// leading run of its Keys, then one range), but it lives in the base table, so
+// Consistent() reads it: a lookup right after a write sees that write.
+const TypeLocal int8 = 20
+
 // Slot identifies one of the ten physical GSIs. Each has its own hash attribute
 // hN (a number: TableID ‖ the index Partition columns) and range attribute rN (a
 // string: composite of the index Keys, then the base Keys not among them).
@@ -321,8 +328,10 @@ var (
 //     Keys that changes on a write rewrites every element row.
 //   - A delta index: Type is TypeDelta (see delta.go). It lives in hidden rows
 //     like a fan-out index, with or without a ColSlice among its Keys.
+//   - A local index: Type is TypeLocal (see local_index.go). Scalar Keys, no
+//     Slot: one hidden row per record, read like a GSI but consistently.
 type Index struct {
-	// Type is 0, or TypeDelta for a delta index.
+	// Type is 0, TypeDelta for a delta index or TypeLocal for a local index.
 	Type int8
 	Slot Slot
 	// Partition (GSIs only) overrides the entity's Partition as the GSI hash key:

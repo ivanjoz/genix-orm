@@ -41,6 +41,7 @@ const (
 	IndexGSI     = "gsi"     // a global secondary index slot (gsi-1..gsi-10): hN + rN
 	IndexArray   = "array"   // a fan-out Index over a slice field: hidden rows under pk ‖ cb id
 	IndexDelta   = "delta"   // a TypeDelta Index: hidden rows, its Keys then the managed UpdatedVersion
+	IndexLocal   = "local"   // a TypeLocal Index: one hidden row per record, its Keys then the base Keys
 )
 
 // IndexInfo describes one access path: a hash (a number, TableID ‖ Partition,
@@ -120,10 +121,12 @@ func GetSchema[T any]() TableSchema {
 		RangeColumns: out.Keys,
 	})
 	for _, idx := range schema.Indexes {
-		if idx.Type == TypeDelta || holdsSliceColumn(idx) {
+		if idx.Type == TypeDelta || idx.Type == TypeLocal || holdsSliceColumn(idx) {
 			kind := IndexArray
 			if idx.Type == TypeDelta {
 				kind = IndexDelta
+			} else if idx.Type == TypeLocal {
+				kind = IndexLocal
 			}
 			out.Indexes = append(out.Indexes, IndexInfo{
 				Kind:         kind,

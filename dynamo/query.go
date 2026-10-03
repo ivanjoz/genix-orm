@@ -572,13 +572,22 @@ func (q *QueryBuilder[E]) planArrayRows(byField map[string]predicate, arrayIndex
 func (q *QueryBuilder[E]) planBestAccessPath(byField map[string]predicate) (*queryPlan, map[string]bool, error) {
 	m := q.meta
 	type accessPath struct {
-		gsi         *indexMeta // nil: the base table
+		gsi         *indexMeta      // nil: the base table, or a local index
+		localIndex  *arrayIndexMeta // set: a local index's hidden rows (local_index.go)
 		partition   []keyCol
 		sortColumns []keyCol
 	}
 	paths := []accessPath{{partition: m.partition, sortColumns: m.keys}}
 	for i := range m.indexes {
 		paths = append(paths, accessPath{gsi: &m.indexes[i], partition: m.indexes[i].partition, sortColumns: m.indexes[i].sortColumns})
+	}
+	// Local indexes come last, so a tie keeps the base table or a GSI. Their row sk
+	// is the index Keys then the whole base sk.
+	for i := range m.arrayIndexes {
+		if localIndex := &m.arrayIndexes[i]; localIndex.isLocal {
+			sortColumns := append(append([]keyCol(nil), localIndex.keys...), m.keys...)
+			paths = append(paths, accessPath{localIndex: localIndex, partition: m.partition, sortColumns: sortColumns})
+		}
 	}
 
 	var bestPlan *queryPlan
@@ -598,6 +607,10 @@ func (q *QueryBuilder[E]) planBestAccessPath(byField map[string]predicate) (*que
 		}
 		plan.names["#pk"] = hashAttr
 		plan.values[":pk"] = &types.AttributeValueMemberN{Value: m.numericKey(partitionValues, path.partition)}
+		if path.localIndex != nil {
+			plan.arrayIndex, plan.basePK = path.localIndex, m.numericKey(partitionValues, path.partition)
+			plan.values[":pk"] = &types.AttributeValueMemberN{Value: plan.basePK + path.localIndex.columnID}
+		}
 		usedKeys, err := resolveKeys(byField, plan, path.sortColumns, rangeAttr)
 		if err != nil {
 			keysErr = err

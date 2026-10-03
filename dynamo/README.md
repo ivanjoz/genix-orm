@@ -244,6 +244,43 @@ Orders.Query().Eq(Orders.T.StoreID, 7).Eq(Orders.T.ProductIDs, 5).Exec(&out) // 
 A row pk is 3 digits longer than any base pk of its table, so they never meet,
 and rows carry no `hN`/`rN`, so they never show in a GSI query.
 
+## Local indexes: a second sort order, read consistently (`local_index.go`)
+
+A DynamoDB LSI can only be declared when the table is created, and every entity
+shares one table that already exists. `{Type: TypeLocal, Keys: ...}` gives the
+same access path with the fan-out machinery: **one hidden row per record** in
+the record's own partition.
+
+```go
+Indexes: []dynamo.Index{
+    {Type: dynamo.TypeLocal, Keys: dynamo.Cols(t.NameHash.Size(32))},
+},
+
+found, err := Products.Query().Eq(Products.T.NameHash, hash).Consistent().First(&product)
+```
+
+```
+pk = base pk ‖ the first Keys column's cb id (3 digits)
+sk = composite(index Keys) # base sk
+d  = the record blob, only with FullCopy
+```
+
+- **Planned like a GSI:** an `Eq` on a leading run of its Keys, then one range;
+  the base Keys follow. It competes with the base table and the GSIs, and loses a
+  tie to both.
+- **Consistent:** the rows are base-table items, so `Consistent()` works (a GSI
+  rejects it). A lookup right after a write sees that write.
+- **Cost:** a write whose index Keys changed puts the new row and deletes the old
+  one; an unchanged key writes nothing extra. Keys-only rows read their records
+  in a second BatchGetItem; `FullCopy` answers in one Query and rewrites the row
+  on every write.
+- **Rules:** scalar Keys only (a ColSlice is a fan-out index), no `Slot`, no
+  `GroupBy`, and the first Keys column needs a `cb` tag: its id names the rows,
+  so it can't be the first column of another hidden-rows index.
+- Same crash safety as fan-out rows: extra rows are possible, reads re-check
+  them. Records written before the index was declared have no row: re-`Put` them
+  once.
+
 ## Auto-increment IDs (`sequence.go`)
 
 Set two fields on the schema and the ORM assigns the record's integer `ID` on
@@ -579,11 +616,12 @@ index, not the call order.
 
 1. **Access path** — a `Contains` (or `Delta`) targets its fan-out rows (and
    needs `=` on every `Partition` column). Otherwise every path is a hash and a
-   sorted range: the base table (`pk` + `sk` over the `Keys`) and each GSI (`hN`
-   + `rN` over its Keys, then the base Keys). A path is usable when each of its
+   sorted range: the base table (`pk` + `sk` over the `Keys`), each GSI (`hN`
+   + `rN` over its Keys, then the base Keys) and each local index (its rows' `sk`
+   over its Keys, then the base Keys). A path is usable when each of its
    partition columns has an `=`; the usable one whose key condition serves the
    most predicates wins, and a tie goes to the base table, then to the GSIs in
-   declared order.
+   declared order, then to the local indexes.
 2. **Range condition** — an `=` on a leading run of the range columns, then one
    `=`, `begins_with`, range or `between`. On fan-out rows the sort columns are
    the index `Keys` (the element pins the slice like an `=`) followed by the
