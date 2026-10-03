@@ -3,187 +3,334 @@ package scylla
 import (
 	"context"
 	"fmt"
+	"math"
+	"slices"
+	"strings"
 	"time"
 	"unsafe"
 
-	"github.com/ivanjoz/genix-orm/scylla/text_search"
+	"github.com/ivanjoz/genix-orm/db"
 )
 
-// configureTextSearchIndex validates that the ORM table declaring a
-// TextSearchColumn has the shape the Sonic backend assumes: an int32
-// partition (company_id), exactly one numeric primary key, a string
-// source column, and an optional int8 status column. Schema mistakes
-// panic at compile time of the table — they're never recoverable at
+// configureTextSearchIndex validates a table's TextSearch declaration: a partition column, exactly
+// one numeric key (the document ID), persisted string columns for the text and an optional int8
+// status column. Schema mistakes panic when the table compiles; they are never recoverable at
 // runtime.
 func configureTextSearchIndex(scyllaTable *ScyllaTable, schema TableSchema) {
-	if schema.TextSearchColumn == nil {
+	textSearch := schema.TextSearch
+	if textSearch == nil {
 		return
 	}
-	if scyllaTable.PartKey == nil || scyllaTable.PartKey.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn requires a partition column`, scyllaTable.Name))
+
+	fail := func(format string, args ...any) {
+		panic(fmt.Sprintf(`Table "%v": TextSearch `, scyllaTable.Name) + fmt.Sprintf(format, args...))
 	}
-	partitionFieldType := scyllaTable.PartKey.GetType().FieldType
-	if partitionFieldType != "int32" && partitionFieldType != "int" {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn partition column "%v" must be int32. Found: %v`,
-			scyllaTable.Name, scyllaTable.PartKey.GetName(), partitionFieldType))
+
+	if scyllaTable.PartKey == nil || scyllaTable.PartKey.IsNil() {
+		fail("requires a partition column")
+	}
+	if fieldType := scyllaTable.PartKey.GetType().FieldType; fieldType != "int32" && fieldType != "int" {
+		fail(`partition column "%v" must be int32. Found: %v`, scyllaTable.PartKey.GetName(), fieldType)
 	}
 	if len(scyllaTable.Keys) != 1 {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn requires exactly one key column. Found: %v`, scyllaTable.Name, len(scyllaTable.Keys)))
+		fail("requires exactly one key column. Found: %v", len(scyllaTable.Keys))
+	}
+	if fieldType := scyllaTable.Keys[0].GetType().FieldType; !slices.Contains([]string{"int16", "int32", "int64", "int"}, fieldType) {
+		fail(`key column "%v" must be numeric. Found: %v`, scyllaTable.Keys[0].GetName(), fieldType)
+	}
+	if len(textSearch.Columns) == 0 {
+		fail("declares no Columns")
 	}
 
-	sourceColumn := scyllaTable.ColumnsMap[schema.TextSearchColumn.GetName()]
-	if sourceColumn == nil {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn "%v" was not found`, scyllaTable.Name, schema.TextSearchColumn.GetName()))
-	}
-	if sourceColumn.GetType().FieldType != "string" {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn "%v" must be string. Found: %v`, scyllaTable.Name, sourceColumn.GetName(), sourceColumn.GetType().FieldType))
-	}
+	info := &textSearchIndexInfo{manual: textSearch.Manual}
 
-	idColumn := scyllaTable.Keys[0]
-	idFieldType := idColumn.GetType().FieldType
-	if idFieldType != "int16" && idFieldType != "int32" && idFieldType != "int64" && idFieldType != "int" {
-		panic(fmt.Sprintf(`Table "%v": TextSearchColumn key column "%v" must be numeric. Found: %v`, scyllaTable.Name, idColumn.GetName(), idFieldType))
-	}
-
-	var statusColumn IColInfo
-	if column, exists := scyllaTable.ColumnsMap["status"]; exists {
-		if column.GetType().FieldType != "int8" {
-			panic(fmt.Sprintf(`Table "%v": TextSearchColumn status column must be int8. Found: %v`, scyllaTable.Name, column.GetType().FieldType))
+	for _, declared := range textSearch.Columns {
+		column := scyllaTable.ColumnsMap[declared.GetName()]
+		if column == nil {
+			fail(`column "%v" was not found`, declared.GetName())
 		}
-		statusColumn = column
+		if fieldType := column.GetType().FieldType; fieldType != "string" {
+			fail(`column "%v" must be string. Found: %v`, column.GetName(), fieldType)
+		}
+		// A reindex reads the text back from the table, so it has to be stored there.
+		if column.GetInfo().IsVirtual {
+			fail(`column "%v" is virtual; the indexed text must be persisted`, column.GetName())
+		}
+		info.columns = append(info.columns, column)
 	}
 
-	scyllaTable.textSearchIndex = &textSearchIndexInfo{
-		sourceColumn: sourceColumn,
-		statusColumn: statusColumn,
+	if textSearch.Status != nil {
+		column := scyllaTable.ColumnsMap[textSearch.Status.GetName()]
+		if column == nil {
+			fail(`status column "%v" was not found`, textSearch.Status.GetName())
+		}
+		if fieldType := column.GetType().FieldType; fieldType != "int8" {
+			fail(`status column "%v" must be int8. Found: %v`, column.GetName(), fieldType)
+		}
+		info.statusColumn = column
 	}
+
+	scyllaTable.textSearchIndex = info
 }
 
-// buildSearchText extracts the indexable text for one record. Records
-// implementing textSearchIndexProvider override the default (a single
-// column read) so they can stitch together denormalized fields like
-// {name brand sku} before normalization. The result is always run
-// through text_search.NormalizeSearchText so tokenize='ascii' gets the
-// pre-tokenized input it expects.
-func buildSearchText(record any, recordPointer unsafe.Pointer, info *textSearchIndexInfo) string {
-	if provider, ok := record.(textSearchIndexProvider); ok {
-		return text_search.NormalizeSearchText(provider.GetTextSearchIndex())
+// textOf is the indexed text of a record: its TextSearch columns joined by a space.
+func (info *textSearchIndexInfo) textOf(recordPointer unsafe.Pointer) string {
+	values := make([]string, len(info.columns))
+	for i, column := range info.columns {
+		values[i], _ = column.GetRawValue(recordPointer).(string)
 	}
-	raw, _ := info.sourceColumn.GetRawValue(recordPointer).(string)
-	return text_search.NormalizeSearchText(raw)
+	return db.JoinSearchText(values...)
 }
 
-// textSearchAffectedColumns reports whether the columns touched by an
-// update overlap with the indexed text column or the status column.
-// Both flags drive different sync paths in insert-update.go.
-func textSearchAffectedColumns(scyllaTable *ScyllaTable, affectedColumns []IColInfo) (bool, bool) {
-	if scyllaTable.textSearchIndex == nil {
-		return false, false
+// activeOf reports whether a record belongs in the index: its status is not 0, or the table has
+// no status column.
+func (info *textSearchIndexInfo) activeOf(recordPointer unsafe.Pointer) bool {
+	return info.statusColumn == nil || convertToInt64(info.statusColumn.GetRawValue(recordPointer)) != 0
+}
+
+// writesAll reports whether a write that set columns wrote every column the index depends on, so
+// the records in memory hold their stored text and status.
+func (info *textSearchIndexInfo) writesAll(columns []IColInfo) bool {
+	written := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		if column != nil {
+			written[column.GetName()] = true
+		}
 	}
-	textChanged := false
-	statusChanged := false
-	for _, affectedColumn := range affectedColumns {
-		if affectedColumn == nil {
+
+	for _, column := range info.columns {
+		if !written[column.GetName()] {
+			return false
+		}
+	}
+	return info.statusColumn == nil || written[info.statusColumn.GetName()]
+}
+
+// touches reports whether a write that set columns can change the index at all.
+func (info *textSearchIndexInfo) touches(columns []IColInfo) bool {
+	for _, column := range columns {
+		if column == nil {
 			continue
 		}
-		if affectedColumn.GetName() == scyllaTable.textSearchIndex.sourceColumn.GetName() {
-			textChanged = true
+		if info.statusColumn != nil && column.GetName() == info.statusColumn.GetName() {
+			return true
 		}
-		if scyllaTable.textSearchIndex.statusColumn != nil &&
-			affectedColumn.GetName() == scyllaTable.textSearchIndex.statusColumn.GetName() {
-			statusChanged = true
+		for _, textColumn := range info.columns {
+			if column.GetName() == textColumn.GetName() {
+				return true
+			}
 		}
 	}
-	return textChanged, statusChanged
+	return false
 }
 
-// ftsBucket groups records that share a (partition, statusGroup) pair
-// so we can issue one transactional batch per virtual table.
-type ftsBucket struct {
-	partition   int32
-	statusGroup int8
-	records     []text_search.Record
+// textSearchWrite is one phase of a write, as the index sees it.
+type textSearchWrite struct {
+	records recordSlice
+	// columns are the columns the phase wrote.
+	columns []IColInfo
+	// skip lists the IDs whose text and status are known not to have changed (Merge holds the
+	// previous record and compares).
+	skip map[int64]bool
 }
 
-// syncTextSearchIndexAfterWrite upserts each record into its matching
-// Sonic bucket (one per (partition, statusGroup) pair). The
-// preserveExistingStatus flag is accepted for call-site compatibility
-// but ignored here: status is encoded in the bucket name, and the
-// Sonic upsert path already clears the opposite-status bucket on every
-// write, so stale rows from a previous status group cannot linger.
-func syncTextSearchIndexAfterWrite(records recordSlice, scyllaTable *ScyllaTable, _ bool, skipRecordIDs map[int64]bool) error {
-	if scyllaTable.textSearchIndex == nil || records.len() == 0 {
+// textSearchPartitionChanges are the index writes of one partition.
+type textSearchPartitionChanges struct {
+	puts []db.TextDoc
+	dels []int32
+	// reread are records whose stored text or status this write did not fully set: they are read
+	// back from the table, which already holds their new values.
+	reread []int64
+}
+
+// syncTextSearchAfterWrite brings the index in line with what a write stored: an active record is
+// put with its text, an inactive one is deleted (a delete of a record the index does not hold
+// costs nothing: it travels in the same batch). Each partition gets one Apply.
+func syncTextSearchAfterWrite(scyllaTable *ScyllaTable, writes ...textSearchWrite) error {
+	info := scyllaTable.textSearchIndex
+	if info == nil || info.manual {
 		return nil
 	}
-	buckets := groupRecordsForTextSearch(records, scyllaTable, skipRecordIDs)
-	if len(buckets) == 0 {
+
+	byPartition := map[int64]*textSearchPartitionChanges{}
+	partitions := []int64{}
+
+	for _, write := range writes {
+		if write.records.len() == 0 || !info.touches(write.columns) {
+			continue
+		}
+		known := info.writesAll(write.columns)
+
+		for i := range write.records.len() {
+			recordPointer := write.records.at(i)
+			recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+			if write.skip[recordID] {
+				continue
+			}
+			if recordID < math.MinInt32 || recordID > math.MaxInt32 {
+				return fmt.Errorf(`text search: table "%v": key %v does not fit int32`, scyllaTable.Name, recordID)
+			}
+
+			partValue := scyllaTable.GetPartValue(recordPointer)
+			changes := byPartition[partValue]
+			if changes == nil {
+				changes = &textSearchPartitionChanges{}
+				byPartition[partValue] = changes
+				partitions = append(partitions, partValue)
+			}
+
+			switch {
+			case !known:
+				changes.reread = append(changes.reread, recordID)
+			case info.activeOf(recordPointer):
+				changes.puts = append(changes.puts, db.TextDoc{ID: int32(recordID), Text: info.textOf(recordPointer)})
+			default:
+				changes.dels = append(changes.dels, int32(recordID))
+			}
+		}
+	}
+
+	if len(partitions) == 0 {
 		return nil
+	}
+
+	backend, err := db.GetTextSearchBackend()
+	if err != nil {
+		return fmt.Errorf(`text search: table "%v": %w`, scyllaTable.Name, err)
 	}
 
 	start := time.Now()
-	totalRecords := 0
 	ctx := context.Background()
-	for _, bucket := range buckets {
-		totalRecords += len(bucket.records)
-		if err := text_search.UpsertBatch(ctx, scyllaTable.Name, bucket.partition, bucket.statusGroup, bucket.records); err != nil {
-			return fmt.Errorf("text search upsert %s_p%d_s%d: %w", scyllaTable.Name, bucket.partition, bucket.statusGroup, err)
+
+	for _, partValue := range partitions {
+		changes := byPartition[partValue]
+
+		if len(changes.reread) > 0 {
+			found := map[int64]bool{}
+			err := scanTextSearchDocs(scyllaTable, partValue, changes.reread, func(doc textSearchStoredDoc) error {
+				found[doc.id] = true
+				if doc.active {
+					changes.puts = append(changes.puts, db.TextDoc{ID: int32(doc.id), Text: doc.text})
+				} else {
+					changes.dels = append(changes.dels, int32(doc.id))
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf(`text search: table "%v": reading back partition %v: %w`, scyllaTable.Name, partValue, err)
+			}
+			// Not there anymore: nothing to index.
+			for _, recordID := range changes.reread {
+				if !found[recordID] {
+					changes.dels = append(changes.dels, int32(recordID))
+				}
+			}
+		}
+
+		partition := db.TextSearchPartition(partValue)
+		if err := backend.Apply(ctx, scyllaTable.Name, partition, changes.puts, changes.dels); err != nil {
+			return fmt.Errorf(`text search: table "%v" partition %v: %w`, scyllaTable.Name, partition, err)
 		}
 	}
+
 	if DebugFull {
-		fmt.Printf("TextSearchIndex sync: table=%s buckets=%d records=%d elapsed=%s\n",
-			scyllaTable.Name, len(buckets), totalRecords, time.Since(start))
+		fmt.Printf("TextSearch sync: table=%s partitions=%d elapsed=%s\n", scyllaTable.Name, len(partitions), time.Since(start))
 	}
 	return nil
 }
 
-// syncTextSearchStatusAfterWrite reroutes records whose status changed
-// into the Sonic bucket implied by the new status. Same upsert path as
-// the general sync — the opposite-bucket FLUSHO inside UpsertBatch
-// guarantees the stale row in the previous bucket is gone.
-func syncTextSearchStatusAfterWrite(records recordSlice, scyllaTable *ScyllaTable) error {
-	// Status-only changes must always reroute every record into its new bucket, so no skip set here.
-	return syncTextSearchIndexAfterWrite(records, scyllaTable, false, nil)
+// textSearchStoredDoc is a record's index state as the table stores it.
+type textSearchStoredDoc struct {
+	id     int64
+	text   string
+	active bool
 }
 
-// groupRecordsForTextSearch walks the record slice once and assembles
-// the per-bucket Record lists used by UpsertBatch. Iteration order is
-// not preserved across buckets, but it is preserved within each bucket,
-// which matches the SQLite WAL writer's single-threaded commit order.
-func groupRecordsForTextSearch(records recordSlice, scyllaTable *ScyllaTable, skipRecordIDs map[int64]bool) []ftsBucket {
+// scanTextSearchDocs reads the key, text columns and status of a partition's records: all of
+// them, or those of ids.
+func scanTextSearchDocs(scyllaTable *ScyllaTable, partValue int64, ids []int64, emit func(textSearchStoredDoc) error) error {
 	info := scyllaTable.textSearchIndex
-	indexByKey := map[uint32]int{}
-	buckets := make([]ftsBucket, 0, 4)
 
-	for i := range records.len() {
-		recordPointer := records.at(i)
-		partition := int32(scyllaTable.GetPartValue(recordPointer))
-		recordID := convertToInt32(scyllaTable.Keys[0].GetRawValue(recordPointer))
-		// Records whose searchable content and status are unchanged were flagged by the caller
-		// (e.g. Merge) so we avoid a redundant GenixSearch re-upsert.
-		if skipRecordIDs != nil && skipRecordIDs[int64(recordID)] {
-			continue
+	columnNames := []string{scyllaTable.Keys[0].GetName()}
+	for _, column := range info.columns {
+		columnNames = append(columnNames, column.GetName())
+	}
+	if info.statusColumn != nil {
+		columnNames = append(columnNames, info.statusColumn.GetName())
+	}
+
+	queryBase := fmt.Sprintf("SELECT %v FROM %v WHERE %v = ?",
+		strings.Join(columnNames, ", "), scyllaTable.GetFullName(), scyllaTable.PartKey.GetName())
+
+	run := func(queryString string, values []any) error {
+		iter := getScyllaConnection().Query(queryString, values...).Iter()
+		scanner := iter.Scanner()
+
+		var recordID, status int64
+		texts := make([]string, len(info.columns))
+		targets := []any{&recordID}
+		for i := range texts {
+			targets = append(targets, &texts[i])
 		}
-		status := int8(0)
 		if info.statusColumn != nil {
-			status = int8(convertToInt64(info.statusColumn.GetRawValue(recordPointer)))
+			targets = append(targets, &status)
 		}
-		statusGroup := text_search.PickStatusGroup(status)
-		searchText := buildSearchText(records.recordPointerAt(i), recordPointer, info)
 
-		// Pack (partition, statusGroup) into a single uint32 key. Partition
-		// is the company_id which is comfortably below 2^24 in practice;
-		// statusGroup is 0 or 1.
-		key := uint32(partition)<<1 | uint32(statusGroup&1)
-		idx, exists := indexByKey[key]
-		if !exists {
-			idx = len(buckets)
-			indexByKey[key] = idx
-			buckets = append(buckets, ftsBucket{partition: partition, statusGroup: statusGroup})
+		for scanner.Next() {
+			status = 1
+			if err := scanner.Scan(targets...); err != nil {
+				iter.Close()
+				return err
+			}
+			doc := textSearchStoredDoc{id: recordID, text: db.JoinSearchText(texts...), active: status != 0}
+			if err := emit(doc); err != nil {
+				iter.Close()
+				return err
+			}
 		}
-		buckets[idx].records = append(buckets[idx].records, text_search.Record{
-			ID:         recordID,
-			SearchText: searchText,
+		return iter.Close()
+	}
+
+	partitionValue := partitionQueryValue(scyllaTable, partValue)
+
+	if ids == nil {
+		return run(queryBase, []any{partitionValue})
+	}
+
+	for _, batch := range splitIDsIntoBatches(ids, queryCachedIDsMaxBatchSize) {
+		values := []any{partitionValue}
+		placeholders := make([]string, len(batch))
+		for i, id := range batch {
+			values = append(values, id)
+			placeholders[i] = "?"
+		}
+		queryString := fmt.Sprintf("%v AND %v IN (%v)", queryBase, scyllaTable.Keys[0].GetName(), strings.Join(placeholders, ", "))
+		if err := run(queryString, values); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// partitionQueryValue is a partition value typed as its column, for binding.
+func partitionQueryValue(scyllaTable *ScyllaTable, partValue int64) any {
+	if scyllaTable.PartKey.GetType().FieldType == "int32" {
+		return int32(partValue)
+	}
+	return partValue
+}
+
+// textSearchSource streams a partition's active records, for a reindex.
+func textSearchSource(scyllaTable *ScyllaTable, partValue int64) db.TextSource {
+	return func(_ context.Context, yield func(db.TextDoc) error) error {
+		return scanTextSearchDocs(scyllaTable, partValue, nil, func(doc textSearchStoredDoc) error {
+			if !doc.active {
+				return nil
+			}
+			if doc.id < math.MinInt32 || doc.id > math.MaxInt32 {
+				return fmt.Errorf(`key %v does not fit int32`, doc.id)
+			}
+			return yield(db.TextDoc{ID: int32(doc.id), Text: doc.text})
 		})
 	}
-	return buckets
 }

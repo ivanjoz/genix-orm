@@ -23,8 +23,8 @@ type recordSlice struct {
 	length       int
 	elementSize  uintptr
 	// asRecordPointer converts an element address back into an interface holding *T. A handful of
-	// places need the record's own method set rather than its columns -- SelfParse and
-	// GetTextSearchIndex are declared on the record type, so no column accessor can reach them.
+	// places need the record's own method set rather than its columns -- SelfParse is declared on
+	// the record type, so no column accessor can reach it.
 	// The closure captures nothing, so it is a static func value: no allocation, one per table.
 	asRecordPointer func(unsafe.Pointer) any
 }

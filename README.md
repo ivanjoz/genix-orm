@@ -217,6 +217,29 @@ Available operations: `Query`, `QueryIndexGroup`, `QueryCachedIDs`, `TableOf`,
 `InsertUpdateInclude`, `InsertUpdateExclude`, `Merge`, `SearchText`,
 `SearchTextIDs`, `MakeTable`, `MakeSchema`.
 
+### Text search
+
+A table declares a text index in its schema; the ORM keeps it in sync on every write and queries it
+per partition. The index lives in an external engine installed once at startup with
+`db.SetTextSearchBackend` (the GenixSearch daemon, `text_search.NewBackend()`, for now).
+
+```go
+TextSearch: &db.TextSearch{Columns: db.Cols(e.Nombre, e.Marca), Status: e.Status}
+
+hits, err := db.SearchTextIDs[Product](empresaID, "polo rojo", 20, 0) // []db.TextHit, best first
+hits, err = db.SearchText(&products, empresaID, "polo rojo", 20, 0)   // also reads the records
+```
+
+- The indexed text is the `Columns` joined by a space. They must be persisted string columns.
+- Only active records are indexed: a write that sets `Status` to 0 deletes the record from the
+  index, and setting it back puts it in again. Without `Status` every record is active.
+- A write sends one batch per partition, and only when it changed an indexed column or the status.
+  `Manual: true` turns the sync off.
+- The controller rebuilds, compacts or empties a partition's index: `ReindexTextSearch`,
+  `CompactTextSearch` and `DropTextSearch`. A reindex reads the table, so it is also how an index is
+  created for existing data.
+- The key must be a single numeric column whose values fit int32.
+
 ---
 
 ## 6. Two databases at once

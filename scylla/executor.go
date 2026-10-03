@@ -75,16 +75,14 @@ func (Exec[TableT, RecordT]) QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDU
 	return QueryCachedIDs[RecordT, TableT](refSlice, cachedIDs)
 }
 
-func (Exec[TableT, RecordT]) SearchTextIDs(
-	partition int32, query string, statusGroup int8, limit int,
-) ([]db.IDWeight, error) {
-	return SearchTextIDs[RecordT, TableT](partition, query, statusGroup, limit)
+func (Exec[TableT, RecordT]) SearchTextIDs(partition int32, query string, limit, offset int) ([]db.TextHit, error) {
+	return SearchTextIDs[RecordT, TableT](partition, query, limit, offset)
 }
 
 func (Exec[TableT, RecordT]) SearchText(
-	refSlice *[]RecordT, partition int32, query string, statusGroup int8, limit int,
-) ([]db.IDWeight, error) {
-	return SearchText[RecordT, TableT](refSlice, partition, query, statusGroup, limit)
+	refSlice *[]RecordT, partition int32, query string, limit, offset int,
+) ([]db.TextHit, error) {
+	return SearchText[RecordT, TableT](refSlice, partition, query, limit, offset)
 }
 
 func (Exec[TableT, RecordT]) CompileTable(schema *TableT) db.Table {

@@ -38,18 +38,12 @@ type Executor[TableT any, RecordT any] interface {
 	// QueryCachedIDs resolves records by ID, skipping any whose client cache version
 	// still matches the server.
 	QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error
-	// SearchTextIDs returns matching record IDs ranked by weight.
-	SearchTextIDs(partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
-	// SearchText fills refSlice with the matching records and returns their weights.
-	SearchText(refSlice *[]RecordT, partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
+	// SearchTextIDs returns the active records of one partition that match query, best first.
+	SearchTextIDs(partition int32, query string, limit, offset int) ([]TextHit, error)
+	// SearchText fills refSlice with the matching records, in the order of the returned hits.
+	SearchText(refSlice *[]RecordT, partition int32, query string, limit, offset int) ([]TextHit, error)
 	// CompileTable turns the declared schema into this driver's compiled form.
 	CompileTable(schema *TableT) Table
-}
-
-// IDWeight is one text-search hit: the record ID and how well it matched.
-type IDWeight struct {
-	ID     int32   `json:"id"`
-	Weight float32 `json:"w"`
 }
 
 // GroupIndexCache is a client's freshness claim for one index group, so a grouped

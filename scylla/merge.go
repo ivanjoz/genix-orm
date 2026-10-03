@@ -133,21 +133,19 @@ func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchema
 	return existingByRecordKey, nil
 }
 
-// textSearchRecordChanged reports whether a record's searchable content or status group
-// differs between the previously-stored record and the incoming one. When neither changed,
-// the update-phase GenixSearch re-index for that record is redundant and can be skipped.
+// textSearchRecordChanged reports whether a record's indexed text or status differs between the
+// previously-stored record and the incoming one. When neither changed, the index write for that
+// record is redundant and is skipped.
 func textSearchRecordChanged[T any](info *textSearchIndexInfo, previous, current *T) bool {
 	previousPointer := xunsafe.AsPointer(previous)
 	currentPointer := xunsafe.AsPointer(current)
 
-	if !info.sourceColumn.FieldsEqual(previousPointer, currentPointer) {
-		return true
+	for _, column := range info.columns {
+		if !column.FieldsEqual(previousPointer, currentPointer) {
+			return true
+		}
 	}
-	if info.statusColumn != nil &&
-		!info.statusColumn.FieldsEqual(previousPointer, currentPointer) {
-		return true
-	}
-	return false
+	return info.statusColumn != nil && !info.statusColumn.FieldsEqual(previousPointer, currentPointer)
 }
 
 func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](

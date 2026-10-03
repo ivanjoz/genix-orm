@@ -8,10 +8,10 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
-	"github.com/ivanjoz/genix-orm/scylla/text_search"
 )
 
 type ScyllaController[T db.RecordWithExecutor[E, T, Exec[E, T]], E TableSchemaInterface[E]] struct {
@@ -516,23 +516,44 @@ func applyCounterReset(namespace, counterName string, maxKeyValue int64) (int64,
 	return currentCounterValue, nil
 }
 
-// FlushTextSearchIndex erases this table's GenixSearch buckets for one
-// partition — both status groups (s0 inactive, s1 active) — via FLUSHB.
-// No-op for tables that don't declare a TextSearchColumn. Buckets are
-// re-created lazily on the next indexed write, so this is the clean-slate
-// step before reindexing a single partition.
-func (e *ScyllaController[T, E]) FlushTextSearchIndex(partValue int32) error {
-	scyllaTable := &e.Table
-	if scyllaTable.textSearchIndex == nil {
+// ReindexTextSearch rebuilds one partition's text index from the table's active records. Writes
+// that land while it runs are kept: they reach the index after their row is stored, so the
+// backend applies them on top of what it read.
+func (e *ScyllaController[T, E]) ReindexTextSearch(partValue int32) error {
+	return e.withTextSearch(partValue, "ReindexTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Rebuild(context.Background(), table, partition, textSearchSource(&e.Table, int64(partValue)))
+	})
+}
+
+// CompactTextSearch folds the partition's pending index writes, for backends with a write log.
+func (e *ScyllaController[T, E]) CompactTextSearch(partValue int32) error {
+	return e.withTextSearch(partValue, "CompactTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Compact(context.Background(), table, partition)
+	})
+}
+
+// DropTextSearch empties the partition's text index.
+func (e *ScyllaController[T, E]) DropTextSearch(partValue int32) error {
+	return e.withTextSearch(partValue, "DropTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Drop(context.Background(), table, partition)
+	})
+}
+
+// withTextSearch runs one index maintenance step, or nothing for a table without TextSearch.
+func (e *ScyllaController[T, E]) withTextSearch(partValue int32, step string, run func(backend db.TextSearchBackend, table, partition string) error) error {
+	if e.Table.textSearchIndex == nil {
 		return nil
 	}
-	ctx := context.Background()
-	for _, statusGroup := range []int8{0, 1} {
-		if err := text_search.FlushBucket(ctx, scyllaTable.Name, partValue, statusGroup); err != nil {
-			return Err("FlushTextSearchIndex failed for table", scyllaTable.Name, "partition", partValue, "group", statusGroup, ":", err)
-		}
+	backend, err := db.GetTextSearchBackend()
+	if err != nil {
+		return err
 	}
-	fmt.Printf("FlushTextSearchIndex | table=%s | partition=%d | groups=[0 1] flushed\n", scyllaTable.Name, partValue)
+	partition := db.TextSearchPartition(int64(partValue))
+	start := time.Now()
+	if err := run(backend, e.Table.Name, partition); err != nil {
+		return Err(step, "failed for table", e.Table.Name, "partition", partition, ":", err)
+	}
+	fmt.Printf("%s | table=%s | partition=%s | %s\n", step, e.Table.Name, partition, time.Since(start))
 	return nil
 }
 
@@ -677,6 +698,11 @@ func (e *ScyllaController[T, E]) RestoreRecordsColbin(
 		if err := QueryExec(statement); err != nil {
 			fmt.Println("Error en statement: ", statement)
 			return 0, Err("Error al eliminar registros:", err)
+		}
+		// The rows are gone, so their index entries go too; the inserts below put back the
+		// restored ones.
+		if err := e.DropTextSearch(partValue); err != nil {
+			return 0, err
 		}
 	}
 
@@ -994,10 +1020,8 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 			}
 		}
 
-		// TextSearchColumn-backed indexes used to live in Scylla as a
-		// {table}_{column}_search_idx companion table. They've moved to
-		// Sonic (backend/db/text_search) — collections and buckets are
-		// created lazily on first write, so deploy does nothing here.
+		// TextSearch indexes live in the backend set with db.SetTextSearchBackend, which creates
+		// each partition's index on its first write, so deploy does nothing here.
 
 		for _, index := range table.indexes {
 			if slices.Contains(tableIndexes, index.name) {

@@ -78,15 +78,15 @@ func QueryCachedIDs[RecordT RecordWithExecutor[TableT, RecordT, D], TableT Table
 }
 
 func SearchTextIDs[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
-	partition int32, query string, statusGroup int8, limit int,
-) ([]IDWeight, error) {
-	return executorFor[RecordT, TableT, D]().SearchTextIDs(partition, query, statusGroup, limit)
+	partition int32, query string, limit, offset int,
+) ([]TextHit, error) {
+	return executorFor[RecordT, TableT, D]().SearchTextIDs(partition, query, limit, offset)
 }
 
 func SearchText[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
-	refSlice *[]RecordT, partition int32, query string, statusGroup int8, limit int,
-) ([]IDWeight, error) {
-	return executorFor[RecordT, TableT, D]().SearchText(refSlice, partition, query, statusGroup, limit)
+	refSlice *[]RecordT, partition int32, query string, limit, offset int,
+) ([]TextHit, error) {
+	return executorFor[RecordT, TableT, D]().SearchText(refSlice, partition, query, limit, offset)
 }
 
 // MakeTable compiles a table's metadata, panicking on an invalid schema. Generated

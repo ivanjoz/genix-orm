@@ -70,14 +70,15 @@ type indexUpdatedTableInfo struct {
 }
 
 type textSearchIndexInfo struct {
-	sourceColumn IColInfo
+	// columns hold the indexed text, in order.
+	columns []IColInfo
+	// statusColumn marks a record inactive (0), which takes it out of the index; nil means every
+	// record is active.
 	statusColumn IColInfo
+	// manual: writes do not touch the index, only the controller's reindex does.
+	manual bool
 	// The record-ID column is always the table's single key (keys[0]) and the partition is
 	// always partKey, so both are read from the ScyllaTable directly rather than cached here.
-}
-
-type textSearchIndexProvider interface {
-	GetTextSearchIndex() string
 }
 
 type indexGroupSourceColumn struct {

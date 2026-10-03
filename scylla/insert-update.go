@@ -1056,22 +1056,16 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 
 	if scyllaTable.textSearchIndex != nil {
 		dataSyncGroup.Go(func() error {
-			if insertRecords.len() > 0 {
-				if err := syncTextSearchIndexAfterWrite(insertRecords, &scyllaTable, false, nil); err != nil {
-					return fmt.Errorf("syncing text search index after insert phase: %w", err)
-				}
-			}
-			if updateRecords.len() > 0 {
-				textChanged, statusChanged := textSearchAffectedColumns(&scyllaTable, updateAffectedColumns)
-				if textChanged {
-					if err := syncTextSearchIndexAfterWrite(updateRecords, &scyllaTable, !statusChanged, skipTextSearchIDs); err != nil {
-						return fmt.Errorf("syncing text search index after update phase: %w", err)
-					}
-				} else if statusChanged {
-					if err := syncTextSearchStatusAfterWrite(updateRecords, &scyllaTable); err != nil {
-						return fmt.Errorf("syncing text search status after update phase: %w", err)
-					}
-				}
+			// Both phases go in one call so each partition gets a single index write.
+			err := syncTextSearchAfterWrite(&scyllaTable,
+				textSearchWrite{
+					records: insertRecords,
+					columns: collectAffectedColumnsForInsert(&scyllaTable, columnsToExcludeInsert),
+				},
+				textSearchWrite{records: updateRecords, columns: updateAffectedColumns, skip: skipTextSearchIDs},
+			)
+			if err != nil {
+				return fmt.Errorf("syncing text search index: %w", err)
 			}
 			return nil
 		})

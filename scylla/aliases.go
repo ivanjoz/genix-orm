@@ -68,7 +68,8 @@ var Cols = db.Cols
 // Key encoding and the text-search/grouped-read value types are part of the shared
 // storage contract, so they live in db and are re-exported here.
 type (
-	IDWeight = db.IDWeight
+	TextHit    = db.TextHit
+	TextSearch = db.TextSearch
 )
 
 var (

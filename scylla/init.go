@@ -23,12 +23,8 @@ func init() {
 
 // Init prepares a keyspace for use: it creates the keyspace and the ORM's own internal tables.
 //
-// Sonic text-search backend: callers wire the Sonic endpoint via
-// text_search.Configure(host, port, password) before the first write.
-// The db package can't do it here without creating a core ->
-// core/types -> db -> core import cycle, so the application entry
-// points (main.go, exec/init.go) call Configure themselves after
-// core.PopulateVariables.
+// The text-search backend is not set here: the application picks it and installs it with
+// db.SetTextSearchBackend before the first write to a table that declares TextSearch.
 func Init() error {
 	if err := CreateKeyspaceIfNotExists(); err != nil {
 		return err

@@ -87,8 +87,8 @@ type Executor[TableT any, RecordT any] interface {
     Merge(records *[]RecordT, columnsToExcludeUpdate []Coln, onUpdate func(previous, current *RecordT) bool, onInsert func(*RecordT)) error
 
     QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error
-    SearchTextIDs(partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
-    SearchText(refSlice *[]RecordT, partition int32, query string, statusGroup int8, limit int) ([]IDWeight, error)
+    SearchTextIDs(partition int32, query string, limit, offset int) ([]TextHit, error)
+    SearchText(refSlice *[]RecordT, partition int32, query string, limit, offset int) ([]TextHit, error)
 
     CompileTable(schema *TableT) Table
 }

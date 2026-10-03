@@ -136,11 +136,13 @@ type TableSchema struct {
 	// it silently repoints a table's cached slot versions. Range: 1..MaxTableID.
 	ID int16
 	// Namespace is the logical grouping a table lives in — a keyspace on Scylla.
-	Namespace         string
-	Name              string
-	Keys              []Coln
-	Partition         Coln
-	TextSearchColumn  Coln
+	Namespace string
+	Name      string
+	Keys      []Coln
+	Partition Coln
+	// TextSearch declares the table's text index, kept by the backend set with
+	// SetTextSearchBackend. It requires a single numeric key that fits int32.
+	TextSearch        *TextSearch
 	Indexes           []Index
 	SequenceColumn    Coln
 	CounterColumn     Coln

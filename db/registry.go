@@ -99,7 +99,17 @@ type Controller interface {
 	RecalcGroupIndexHashes(partValue int32) error
 	ResetCounter(partValue any) error
 	DeleteViewsAndIndexes() error
-	FlushTextSearchIndex(partValue int32) error
+
+	// The three below maintain the text index of a table that declares TextSearch; on any other
+	// table they do nothing.
+
+	// ReindexTextSearch rebuilds one partition's index from the table's active records. Writes
+	// that land while it runs are kept.
+	ReindexTextSearch(partValue int32) error
+	// CompactTextSearch folds the partition's pending index writes, for backends with a write log.
+	CompactTextSearch(partValue int32) error
+	// DropTextSearch empties the partition's index.
+	DropTextSearch(partValue int32) error
 
 	// The four below are the name-addressed data surface (see generic_access.go): the read and
 	// write a caller can drive knowing only the table's name. Records cross the boundary as the
