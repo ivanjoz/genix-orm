@@ -1,4 +1,4 @@
-package text_search
+package daemon
 
 import (
 	"fmt"
@@ -14,33 +14,6 @@ type Record struct {
 	SearchText string
 }
 
-// PickStatusGroup centralizes the s0/s1 rule: status == 0 -> group 0,
-// everything else -> group 1.
-func PickStatusGroup(status int8) int8 {
-	if status == 0 {
-		return 0
-	}
-	return 1
-}
-
-// CollectionAndBucket maps an ORM (table, partition, statusGroup)
-// triple to the GenixSearch collection/bucket pair. Format:
-//
-//	collection = {tableName}
-//	bucket     = p{partitionID}_s{statusGroup}
-//
-// The "p" prefix keeps the bucket valid when partition_id is 0
-// (identifiers must start with a non-digit). Negative partition
-// values are not expected; abs() defensively avoids producing a
-// leading "-".
-func CollectionAndBucket(tableName string, partitionID int32, statusGroup int8) (string, string) {
-	id := partitionID
-	if id < 0 {
-		id = -id
-	}
-	return tableName, fmt.Sprintf("p%d_s%d", id, statusGroup)
-}
-
 // validIdentifier matches the subset of bytes the daemon accepts for
 // collection / bucket names. Pre-flight check so a malformed name
 // can't slip into a PUSHI/POPI command line.
@@ -48,7 +21,7 @@ var validIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func validateIdentifier(name string) error {
 	if !validIdentifier.MatchString(name) {
-		return fmt.Errorf("text_search: invalid identifier %q", name)
+		return fmt.Errorf("daemon: invalid identifier %q", name)
 	}
 	return nil
 }

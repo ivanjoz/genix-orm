@@ -1,4 +1,4 @@
-package text_search
+package daemon
 
 import (
 	"context"
@@ -43,10 +43,10 @@ func (Backend) Apply(ctx context.Context, table, partition string, puts []db.Tex
 
 	// Pushes first: an ID in both must end up deleted.
 	if err := pushI(ctx, conn, table, partition, records); err != nil {
-		return fmt.Errorf("text_search: pushI %s/%s: %w", table, partition, err)
+		return fmt.Errorf("daemon: pushI %s/%s: %w", table, partition, err)
 	}
 	if err := popIPipeline(ctx, conn, table, partition, dels); err != nil {
-		return fmt.Errorf("text_search: popI %s/%s: %w", table, partition, err)
+		return fmt.Errorf("daemon: popI %s/%s: %w", table, partition, err)
 	}
 	return nil
 }
@@ -69,18 +69,10 @@ func (Backend) Search(ctx context.Context, table, partition, query string, limit
 		return nil, err
 	}
 
-	line := fmt.Sprintf("QUERY %s %s %s", table, partition, quote(normalized))
-	if limit > 0 {
-		line += fmt.Sprintf(" LIMIT(%d)", limit)
-	}
-	if offset > 0 {
-		line += fmt.Sprintf(" OFFSET(%d)", offset)
-	}
-
-	res, err := conn.execPending(ctx, line)
+	res, err := conn.execPending(ctx, buildQueryLine(table, partition, normalized, limit, offset))
 	searchMgr.release(conn) // release discards the conn when execPending marked it broken
 	if err != nil {
-		return nil, fmt.Errorf("text_search: query %s/%s: %w", table, partition, err)
+		return nil, fmt.Errorf("daemon: query %s/%s: %w", table, partition, err)
 	}
 
 	matches, err := decodeMatches(res.payload)
@@ -139,7 +131,7 @@ func (Backend) Drop(ctx context.Context, table, partition string) error {
 	defer ingestMgr.release(conn)
 
 	if _, err := conn.exec(ctx, fmt.Sprintf("FLUSHB %s %s", table, partition)); err != nil {
-		return fmt.Errorf("text_search: flushB %s/%s: %w", table, partition, err)
+		return fmt.Errorf("daemon: flushB %s/%s: %w", table, partition, err)
 	}
 	return nil
 }

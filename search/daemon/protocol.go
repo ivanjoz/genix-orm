@@ -1,4 +1,4 @@
-package text_search
+package daemon
 
 import (
 	"bufio"
@@ -12,12 +12,12 @@ import (
 // ErrProtocol is returned when the search daemon replies with an
 // unexpected frame. Callers treat it as fatal for the connection
 // (discard, don't recycle).
-var ErrProtocol = errors.New("text_search: protocol error")
+var ErrProtocol = errors.New("daemon: protocol error")
 
 // ProtocolError wraps an ERR <reason> reply from the daemon.
 type ProtocolError struct{ Reason string }
 
-func (e *ProtocolError) Error() string { return "text_search: ERR: " + e.Reason }
+func (e *ProtocolError) Error() string { return "daemon: ERR: " + e.Reason }
 
 // resultKind tags the shape of a parsed reply.
 type resultKind int

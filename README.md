@@ -221,7 +221,22 @@ Available operations: `Query`, `QueryIndexGroup`, `QueryCachedIDs`, `TableOf`,
 
 A table declares a text index in its schema; the ORM keeps it in sync on every write and queries it
 per partition. The index lives in an external engine installed once at startup with
-`db.SetTextSearchBackend` (the GenixSearch daemon, `text_search.NewBackend()`, for now).
+`db.SetTextSearchBackend`. Two backends ship as their own modules, so an app links only the one it
+uses:
+
+```go
+// genix-s3: the index in an S3 bucket (S3 Express One Zone for speed), no server to run.
+backend, err := genixs3.New(ctx, genixs3.Config{Bucket: "genix--use1-az4--x-s3"}) // search/genixs3
+db.SetTextSearchBackend(backend)
+
+// The GenixSearch daemon over TCP.
+daemon.Configure(host, port, password) // search/daemon
+db.SetTextSearchBackend(daemon.NewBackend())
+```
+
+With genix-s3 every write appends to the partition's log in the bucket, and a compaction folds the
+log into the index once it grows: inside the write on AWS Lambda, in a goroutine elsewhere
+(`genixs3.Config.Compact`).
 
 ```go
 TextSearch: &db.TextSearch{Columns: db.Cols(e.Nombre, e.Marca), Status: e.Status}

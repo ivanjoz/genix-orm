@@ -1,4 +1,4 @@
-package text_search
+package daemon
 
 import (
 	"context"

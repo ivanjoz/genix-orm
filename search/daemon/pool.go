@@ -1,4 +1,4 @@
-package text_search
+package daemon
 
 import (
 	"context"
@@ -52,7 +52,7 @@ func (p *connPool) acquire(ctx context.Context) (*searchConn, error) {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, errors.New("text_search: pool closed")
+			return nil, errors.New("daemon: pool closed")
 		}
 		// Drain idle list, oldest first.
 		for len(p.idle) > 0 {
@@ -200,7 +200,7 @@ func (p *connPool) ensureMinWarm(ctx context.Context) error {
 			p.mu.Lock()
 			p.open -= (deficit - i)
 			p.mu.Unlock()
-			return fmt.Errorf("text_search: warm dial: %w", err)
+			return fmt.Errorf("daemon: warm dial: %w", err)
 		}
 		p.mu.Lock()
 		p.idle = append(p.idle, conn)

@@ -1,23 +1,17 @@
-// Package text_search talks to a GenixSearch daemon over TCP. It
-// preserves the ORM-facing API from the previous FTS5 / Sonic backends
-// so call sites in backend/db do not change.
+// Package daemon is the GenixSearch daemon as a text-search backend of the ORM
+// (db.TextSearchBackend), over TCP.
 //
-// Granularity: one logical index per (table, partition, statusGroup).
-// On the wire: collection = {tableName}, bucket = "p{partition}_s{group}".
-// Group 0 holds records with status == 0 (soft-deleted / inactive);
-// group 1 holds everything else.
+//	daemon.Configure(host, port, password)
+//	db.SetTextSearchBackend(daemon.NewBackend())
+//
+// Granularity: one index per (table, partition). On the wire: collection =
+// {table}, bucket = the partition name ("p12").
 //
 // GenixSearch exposes only PUSHI (multi-key, replace semantics) and
-// single-key POPI; there is no bulk POPI. UpsertBatch issues:
-//
-//  1. A pipelined POPI run on the opposite-status bucket for every
-//     record ID — guards against status flips (the server can't detect
-//     a flip on its own).
-//  2. A pipelined POPI run on the current-status bucket for records
-//     whose SearchText is empty (PUSHI rejects empty payloads).
-//  3. One or more PUSHI lines on the current-status bucket batching
-//     the non-empty records, chunked to fit the channel buffer.
-package text_search
+// single-key POPI; there is no bulk POPI. Apply pushes the documents in as
+// few PUSHI lines as the channel buffer allows, then pops the deletes in
+// pipelined POPI runs.
+package daemon
 
 import (
 	"bufio"
@@ -64,7 +58,7 @@ func getConfig() (searchConfig, error) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	if cfg.host == "" || cfg.port == 0 {
-		return searchConfig{}, errors.New("text_search: Configure(host, port, password) was not called")
+		return searchConfig{}, errors.New("daemon: Configure(host, port, password) was not called")
 	}
 	return cfg, nil
 }
@@ -191,7 +185,7 @@ func dialAndHandshake(ctx context.Context, mode string) (*searchConn, error) {
 	addr := fmt.Sprintf("%s:%d", conf.host, conf.port)
 	netConn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("text_search: dial %s: %w", addr, err)
+		return nil, fmt.Errorf("daemon: dial %s: %w", addr, err)
 	}
 	c := &searchConn{
 		mode:    mode,
@@ -205,32 +199,32 @@ func dialAndHandshake(ctx context.Context, mode string) (*searchConn, error) {
 	greeting, err := readLine(c.reader)
 	if err != nil {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("text_search: read greeting from %s: %w", addr, err)
+		return nil, fmt.Errorf("daemon: read greeting from %s: %w", addr, err)
 	}
 	if res, perr := parseResult(greeting); perr != nil || res.kind != kindConnected {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("text_search: unexpected greeting %q from %s", greeting, addr)
+		return nil, fmt.Errorf("daemon: unexpected greeting %q from %s", greeting, addr)
 	}
 	// 2. Send START <mode> <password>.
 	startLine := fmt.Sprintf("START %s %s", mode, conf.password)
 	if err := writeLine(c.writer, startLine); err != nil {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("text_search: send START: %w", err)
+		return nil, fmt.Errorf("daemon: send START: %w", err)
 	}
 	// 3. Wait for STARTED, capture buffer size.
 	startedLine, err := readLine(c.reader)
 	if err != nil {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("text_search: read STARTED: %w", err)
+		return nil, fmt.Errorf("daemon: read STARTED: %w", err)
 	}
 	res, err := parseResult(startedLine)
 	if err != nil {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("text_search: parse STARTED %q: %w", startedLine, err)
+		return nil, fmt.Errorf("daemon: parse STARTED %q: %w", startedLine, err)
 	}
 	if res.kind != kindStarted {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("text_search: expected STARTED, got %q", startedLine)
+		return nil, fmt.Errorf("daemon: expected STARTED, got %q", startedLine)
 	}
 	c.bufferSize = res.bufferSize
 	// Clear deadline for subsequent use; the pool will set per-command deadlines.
