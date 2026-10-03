@@ -3,6 +3,7 @@ module github.com/ivanjoz/genix-orm/search/genixs3
 go 1.27
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.47.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.4
 	github.com/ivanjoz/genix-orm/db v0.0.0
@@ -10,7 +11,6 @@ require (
 )
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.47.1 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.20 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.6 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.1 // indirect
