@@ -77,6 +77,9 @@ type TableSchema struct {
 	// filled by the ORM is always named "ID".
 	Autoincrement  bool `json:"autoincrement"`
 	AutoincPadding int  `json:"autoincPadding,omitempty"`
+
+	// DataFrames names the entity's DataFrames, for the rebuild commands.
+	DataFrames []string `json:"dataFrames,omitempty"`
 }
 
 // GetSchema returns the serializable schema of a table type. T is the table
@@ -109,6 +112,9 @@ func GetSchema[T any]() TableSchema {
 	}
 	if !schema.UseAutoincrement {
 		out.AutoincPadding = 0
+	}
+	for _, frame := range schema.DataFrames {
+		out.DataFrames = append(out.DataFrames, frame.Name)
 	}
 
 	// The primary key is an access path too — list it first so a visualizer can

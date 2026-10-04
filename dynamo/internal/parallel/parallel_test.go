@@ -1,4 +1,4 @@
-package dynamo
+package parallel
 
 import (
 	"errors"
@@ -7,16 +7,16 @@ import (
 	"time"
 )
 
-func TestRunInParallel(t *testing.T) {
-	if err := runInParallel(0, func(int) error { t.Fatal("no task must run"); return nil }); err != nil {
+func TestRun(t *testing.T) {
+	if err := Run(0, func(int) error { t.Fatal("no task must run"); return nil }); err != nil {
 		t.Fatalf("zero tasks: %v", err)
 	}
 
-	// Every task runs once, and never more than writeParallelism at a time.
+	// Every task runs once, and never more than maxConcurrentTasks at a time.
 	const taskCount = 35
 	var ranTasks [taskCount]atomic.Int32
 	var runningTasks, peakRunningTasks atomic.Int32
-	err := runInParallel(taskCount, func(taskIndex int) error {
+	err := Run(taskCount, func(taskIndex int) error {
 		running := runningTasks.Add(1)
 		for peak := peakRunningTasks.Load(); running > peak && !peakRunningTasks.CompareAndSwap(peak, running); peak = peakRunningTasks.Load() {
 		}
@@ -33,13 +33,13 @@ func TestRunInParallel(t *testing.T) {
 			t.Fatalf("task %d ran %d times", taskIndex, ranTasks[taskIndex].Load())
 		}
 	}
-	if peak := peakRunningTasks.Load(); peak > writeParallelism || peak < 2 {
-		t.Fatalf("peak parallelism %d, want 2..%d", peak, writeParallelism)
+	if peak := peakRunningTasks.Load(); peak > maxConcurrentTasks || peak < 2 {
+		t.Fatalf("peak parallelism %d, want 2..%d", peak, maxConcurrentTasks)
 	}
 
 	// The errors of every failed task come back joined.
 	firstErr, secondErr := errors.New("first"), errors.New("second")
-	err = runInParallel(3, func(taskIndex int) error {
+	err = Run(3, func(taskIndex int) error {
 		return []error{firstErr, nil, secondErr}[taskIndex]
 	})
 	if !errors.Is(err, firstErr) || !errors.Is(err, secondErr) {

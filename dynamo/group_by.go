@@ -13,6 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/ivanjoz/colbin"
+
+	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -369,7 +371,7 @@ func (m *tableMeta) applyGroupCounterDeltas(client *dynamodb.Client, deltas map[
 		})
 		counterSKs = append(counterSKs, delta.sk)
 	}
-	return runInParallel(len(counterUpdates), func(updateIndex int) error {
+	return parallel.Run(len(counterUpdates), func(updateIndex int) error {
 		if _, err := client.UpdateItem(context.Background(), counterUpdates[updateIndex]); err != nil {
 			return fmt.Errorf("db: %s updating the GroupBy counter %s: %w", m.recordType.Name(), counterSKs[updateIndex], err)
 		}

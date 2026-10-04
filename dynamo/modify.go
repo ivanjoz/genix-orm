@@ -13,6 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/ivanjoz/colbin"
+
+	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,11 +81,20 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 		ptrs[i] = unsafe.Pointer(&records[i])
 		expectedVersions[i] = r.meta.writeVersion.acc.getI64(ptrs[i])
 	}
+	if err := r.meta.checkFrameValues(ptrs); err != nil {
+		return nil, err
+	}
+	// The caller read the records before this reservation, so the version is above the one each
+	// write replaces, as a frame's log entry needs: no need to read before reserving here.
 	if _, err := r.meta.prepareWrite(ptrs); err != nil {
 		return nil, err
 	}
 	storedByKey, err := r.storedVersionsForWrite(client, ptrs, expectedVersions)
 	if err != nil {
+		return nil, err
+	}
+	r.meta.stampCreatedVersions(ptrs, storedByKey)
+	if err := r.meta.appendFrameLogEntries(r.meta.frameWritesOf(ptrs, storedByKey), false); err != nil {
 		return nil, err
 	}
 
@@ -117,7 +128,7 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	}
 
 	isWritten := make([]bool, len(records))
-	err = runInParallel(len(records), func(recordIndex int) (putErr error) {
+	err = parallel.Run(len(records), func(recordIndex int) (putErr error) {
 		isWritten[recordIndex], putErr = r.putItemIfVersion(client, items[recordIndex], expectedVersions[recordIndex])
 		return putErr
 	})
@@ -126,12 +137,13 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	}
 
 	var lostRecords []E
-	var writtenPtrs []unsafe.Pointer
+	var writtenPtrs, lostPtrs []unsafe.Pointer
 	var staleRowDeletes []types.WriteRequest
 	groupDeltas := map[string]*groupCounterDelta{}
 	for i := range records {
 		if !isWritten[i] {
 			lostRecords = append(lostRecords, records[i])
+			lostPtrs = append(lostPtrs, ptrs[i])
 			staleRowDeletes = append(staleRowDeletes, r.meta.deltaRowDeletes(ptrs[i])...)
 			continue
 		}
@@ -139,6 +151,12 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 		staleRowDeletes = append(staleRowDeletes, rowDeletesByRecord[i]...)
 		mergeGroupCounterDeltas(groupDeltas, groupDeltasByRecord[i])
 		refreshStoredItem(items[i], r.meta.writeVersion.acc.getI64(ptrs[i]))
+	}
+	// A lost record's log entry describes a write that never landed, and its version may be above
+	// the winner's: left in the log, a run would read the values before the winner's write as the
+	// record's values after it. Its cancel marker voids it.
+	if err := r.meta.appendFrameLogEntries(r.meta.frameWritesOf(lostPtrs, storedByKey), true); err != nil {
+		return nil, err
 	}
 	if err := r.batchWriteAll(client, staleRowDeletes); err != nil {
 		return nil, err

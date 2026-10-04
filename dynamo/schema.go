@@ -263,6 +263,36 @@ type Schema struct {
 	// "UpdatedVersion" field (delta.go) and stores it as the item attribute "upv".
 	// Those two already imply it.
 	VersionedWrites bool
+
+	// DataFrames are aggregates of the records kept as files in the frame store
+	// (data_frame.go), brought up to date by MaterializeDataFrames.
+	DataFrames []DataFrame
+}
+
+// DataFrame is an aggregate of the records kept as files in the frame store: one
+// file per distinct value of Keys, holding one row per distinct value of Rows,
+// ascending, with the sum of each Sums column. Keys[0] is the reprocessing unit (a
+// day): RebuildDataFrames recomputes a range of it from the records.
+//
+// A table with frames needs the managed int32 fields "UpdatedVersion" (json "upv")
+// and "CreatedVersion" (json "crv"), a TypeDelta index without pinned Keys (the run
+// reads the changed records through it), and no Partition.
+type DataFrame struct {
+	// Name is the frame's folder: lowercase letters, digits and '-', unique in the
+	// entity. Renaming it orphans the files.
+	Name string
+	// Keys name the file, 1 to 3 integer Cols with a cb tag. With 1, Keys[0] is the
+	// file; with 2–3, Keys[0] is a folder and the rest name the file inside it.
+	// Keys[0] must lead the entity's Keys, a GSI or a local index.
+	Keys []Coln
+	// Rows is the integer Col each file lists, ascending.
+	Rows Coln
+	// Sums are the integer Cols summed per row, one column each in the file. A write
+	// with a negative value fails, unless AllowNegativeSums.
+	Sums []Coln
+	// AllowNegativeSums accepts negative Sums values. It only changes that
+	// validation: the file format stores any int64.
+	AllowNegativeSums bool
 }
 
 // TypeDelta marks an Index as a delta index (delta.go): the ORM appends the

@@ -57,6 +57,15 @@ type Controller interface {
 	// RebuildGroupsAll recomputes every GroupBy counter from the records and returns
 	// how many it rewrote; an error when the entity declares no GroupBy (group_by.go).
 	RebuildGroupsAll() (int, error)
+	// MaterializeDataFrames brings every DataFrame of the entity up to date
+	// (data_frame_run.go). Without frames it does nothing.
+	MaterializeDataFrames() error
+	// RebuildDataFrames recomputes from the records the files of a frame ("" for
+	// every frame) whose first key is in [fromKey, toKey].
+	RebuildDataFrames(frameName string, fromKey, toKey int64) error
+	// RebuildDataFramesAll recomputes every file of a frame ("" for every frame) and
+	// deletes the files no record produces.
+	RebuildDataFramesAll(frameName string) error
 }
 
 // NewController compiles the schema (like NewRepo) and returns it as a
@@ -174,6 +183,9 @@ func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error
 		}
 		// Builds the group keys and checks every float GroupBy value fits its sum.
 		if err := r.meta.addGroupCounterDeltas(map[string]*groupCounterDelta{}, nil, ptr); err != nil {
+			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
+		}
+		if err := r.meta.checkFrameValues([]unsafe.Pointer{ptr}); err != nil {
 			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
 		}
 		records[i] = decodedRecords[i]

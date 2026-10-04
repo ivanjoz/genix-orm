@@ -54,9 +54,14 @@ func (r *Repo[T, E]) Put(record *E) error {
 // Autoincrement IDs are assigned as in Put.
 func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	ptr := unsafe.Pointer(record)
+	if err := r.meta.checkFrameValues([]unsafe.Pointer{ptr}); err != nil {
+		return false, err
+	}
 	if _, err := r.meta.prepareWrite([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
+	// Written only when absent, so an insert: it logs nothing to the frames.
+	r.meta.stampCreatedVersions([]unsafe.Pointer{ptr}, nil)
 	item, err := r.meta.marshalItem(ptr, record)
 	if err != nil {
 		return false, err
@@ -132,18 +137,15 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	for i := range records {
 		ptrs[i] = unsafe.Pointer(&records[i])
 	}
-	isAssignedNow, err := r.meta.prepareWrite(ptrs)
+	if err := r.meta.checkFrameValues(ptrs); err != nil {
+		return err
+	}
+	storedByKey, err := r.prepareWriteReadingStored(client, ptrs, areAllNew)
 	if err != nil {
 		return err
 	}
-	var possiblyStoredPtrs []unsafe.Pointer
-	for _, ptr := range ptrs {
-		if !areAllNew && !isAssignedNow[ptr] {
-			possiblyStoredPtrs = append(possiblyStoredPtrs, ptr)
-		}
-	}
-	storedByKey, err := r.storedVersions(client, possiblyStoredPtrs)
-	if err != nil {
+	r.meta.stampCreatedVersions(ptrs, storedByKey)
+	if err := r.meta.appendFrameLogEntries(r.meta.frameWritesOf(ptrs, storedByKey), false); err != nil {
 		return err
 	}
 
@@ -180,8 +182,52 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	return r.meta.bumpSlotVersions(client, ptrs)
 }
 
+// prepareWriteReadingStored assigns the autoincrement IDs, stamps the managed
+// columns (prepareWrite) and reads the stored version of every record whose ID this
+// call did not just assign. A table with DataFrames reserves the version after that
+// read, one round trip later: a frame's log entry says "the record held these
+// values right below my version", true only when that version is above the one the
+// write read. Records known to be new (InsertMany) have nothing to read.
+func (r *Repo[T, E]) prepareWriteReadingStored(client *dynamodb.Client, ptrs []unsafe.Pointer, areAllNew bool) (map[string]unsafe.Pointer, error) {
+	if areAllNew {
+		_, err := r.meta.prepareWrite(ptrs)
+		return nil, err
+	}
+	var isAssignedNow map[unsafe.Pointer]bool
+	if len(r.meta.dataFrames) == 0 {
+		var err error
+		if isAssignedNow, err = r.meta.prepareWrite(ptrs); err != nil {
+			return nil, err
+		}
+	} else {
+		assignedPtrs, err := r.meta.assignAutoIDs(ptrs)
+		if err != nil {
+			return nil, err
+		}
+		isAssignedNow = map[unsafe.Pointer]bool{}
+		for _, assignedPtr := range assignedPtrs {
+			isAssignedNow[assignedPtr] = true
+		}
+	}
+	var possiblyStoredPtrs []unsafe.Pointer
+	for _, ptr := range ptrs {
+		if !isAssignedNow[ptr] {
+			possiblyStoredPtrs = append(possiblyStoredPtrs, ptr)
+		}
+	}
+	storedByKey, err := r.storedVersions(client, possiblyStoredPtrs)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.meta.dataFrames) > 0 {
+		err = r.meta.stampManagedColumns(ptrs)
+	}
+	return storedByKey, err
+}
+
 // storedVersions reads (consistently) the stored version of each record, keyed
-// by recordKey, so its hidden rows and GroupBy counters can be diffed. Nil without them.
+// by recordKey, so its hidden rows, GroupBy counters and frame values can be
+// diffed. Nil without them.
 func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]unsafe.Pointer, error) {
 	if !r.meta.readsStoredVersion() {
 		return nil, nil
@@ -241,7 +287,8 @@ func (r *Repo[T, E]) batchWrite(client *dynamodb.Client, writes []types.WriteReq
 
 // Delete removes the item identified by the record's partition + sort fields.
 // Only the key fields of `record` need to be populated: with array indexes the
-// stored version is read to find its rows, which are deleted after the item.
+// stored version is read to find its rows, which are deleted after the item. With
+// DataFrames its frame values go to the frames' logs before the item is deleted.
 func (r *Repo[T, E]) Delete(record *E) error {
 	client, err := Client()
 	if err != nil {
@@ -257,6 +304,9 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
 		_, arrayRowDeletes = r.meta.arrayIndexWrites(storedPtr, nil, nil)
 		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, nil); err != nil {
+			return err
+		}
+		if err := r.meta.appendFrameDeleteEntries(storedPtr); err != nil {
 			return err
 		}
 	}

@@ -476,6 +476,101 @@ upv, upd = the last write that touched it (GroupDelta only)
   land after one reserving 10, so a client synced at 10 misses it until the
   group is written again.
 
+## DataFrames: group-by files kept by a cron (`data_frame*.go`, `dataframe/`)
+
+A DataFrame is an aggregate of an entity kept as compact columnar files in a
+`dataframe.Store` (S3 in berryapps): one file per distinct value of its Keys,
+one row per distinct value of Rows, ascending, with the sum of each Sums column.
+A read is one GET per file and never touches the records. A scheduled run brings
+the files up to date; a write shows up one to two runs later. The design,
+formats and measurements are in `DATA_FRAMES_PLAN.md`.
+
+The code is split in two. The `dataframe` package is the storage side, with no
+DynamoDB: the `Store` interface and `MemoryStore`, the file, log and `_index`
+codecs (`codec.go`), the file work of a run and of the rebuilds (`run.go`) and
+the file reads of `QueryFrame`, fresh or not (`query.go`). The `data_frame*.go` files of this
+package compile the declarations, hook the write path, read the records and
+hold each frame's state item and lease, then call `dataframe` for the files.
+
+```go
+DataFrames: []dynamo.DataFrame{
+    {Name: "day-product", Keys: dynamo.Cols(t.Fecha), Rows: t.ProductID, Sums: dynamo.Cols(t.Quantity)},
+    {Name: "day-client-product", Keys: dynamo.Cols(t.Fecha, t.ClientID), Rows: t.ProductID,
+        Sums: dynamo.Cols(t.Quantity, t.Amount)},
+},
+
+dynamo.SetDataFrames(store, lambdaTimeout+time.Minute) // at boot, before the first write
+err := SaleLines.MaterializeDataFrames()               // from the cron, every 10 minutes
+
+rows, err := SaleLines.QueryFrame("day-client-product").
+    Eq(SaleLines.T.ClientID, 412).Between(SaleLines.T.Fecha, from, to).Exec()
+rows[0].Key.Fecha; rows[0].Key.ProductID; rows[0].Sum(SaleLines.T.Amount)
+
+// the same rows as the records hold them now: the files plus the changes since the last run
+rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from, to).Fresh().Exec()
+```
+
+```text
+<entity>/<frame>/_log.<shape>       the old values of changed records, appended by writes
+<entity>/<frame>/20730              1 key: one file per Keys[0] value
+<entity>/<frame>/20730/412          2 keys (3 keys: 20730/412_7): a folder per Keys[0] value
+<entity>/<frame>/20730/_index       2–3 keys: the day's file keys and CRC-32C hashes
+```
+
+- **Rules (a violation panics at boot):** a kebab-case `Name`, unique in the
+  entity; 1–3 integer `Keys`, an integer `Rows` and at least one integer `Sums`,
+  scalar `Col`s with `cb` tags, none twice; `Keys[0]` leads the entity `Keys`, a
+  GSI or a local index (a rebuild ranges over it); the managed `int32`
+  `UpdatedVersion` and `CreatedVersion`; a whole-entity delta index
+  (`{Type: TypeDelta, Keys: Cols(t.Status)}`); no `Partition`.
+- **Values:** a write with a negative Keys or Rows value fails, and with a
+  negative Sums value unless the frame sets `AllowNegativeSums`. A record with
+  `Status == 0` counts in no frame. A row whose sums are all 0 is dropped.
+- **`CreatedVersion`** is the `UpdatedVersion` of the write that inserted the
+  record, copied by every later write: the ORM owns it. With it a run tells a
+  record the files already hold from a new one.
+- **The write path.** A table with frames reads its stored versions before it
+  reserves its version (one more sequential round trip on PutMany), then appends
+  to each frame's log, in parallel, the old values of every record whose frame
+  values change, **before** the base write. An insert logs nothing: the run reads
+  it. A `Delete` reserves a version for its entries. `PutManyIfVersion` appends
+  a cancel marker for each record that lost its condition. A write fails when no
+  store is set.
+- **A run** (`MaterializeDataFrames`, per frame, under a 10-minute lease in a
+  state item beside the GroupBy counters) goes from the snapshot the files hold,
+  W, to the sequence value the previous run read, once that value is older than
+  the settle time: every write that reserved a version up to it has landed and
+  logged. It reads the records written after W (delta index), then the log, and
+  applies to each touched file what each record held at the target less what it
+  held at W. A crashed run is retried to the same target and skips the files it
+  already wrote. The first run of a frame, or of a changed shape (format
+  version, Keys, Rows or Sums cb ids), only records its target; the next one
+  rebuilds every file.
+- **Rebuilds** recompute files from the records at the frame's snapshot, under
+  the lease: `RebuildDataFrames(frame, fromKey, toKey)` a range of at most 400
+  `Keys[0]` values (writing only the files whose `_index` hash differs on a 2–3
+  key frame), `RebuildDataFramesAll(frame)` every file, deleting the rest. `""`
+  is every frame. They fix drift: an `InsertMany` of a stored record, writes
+  from code that predates the frame, files edited by hand (those need
+  `RebuildDataFramesAll`: a range rebuild trusts `_index`).
+- **`QueryFrame`** takes an `Eq` or a `Between` (at most 400 values) on
+  `Keys[0]` and an `Eq` on a leading run of the later Keys; a later Key left out
+  reads the day's `_index`. It fails with `dataframe.ErrNotBuilt` until the first
+  build. Rows come sorted by Keys, then Rows.
+- **`QueryFrame(...).Fresh()`** returns the rows as the records hold them now,
+  not 10 to 30 minutes behind: it reads the files, then does a run's work in
+  memory (nothing is written). It reads the records written after the frame's
+  snapshot (consistently, through the delta index: every write of the entity in
+  the last 10 to 30 minutes, whatever the range), then the log, and adds to each
+  file the changes after that file's own snapshot. Files the changes create are
+  read even when the `_index` doesn't list them yet. A write counts once it
+  lands. If a run commits during the read, the read starts over (3 tries).
+- **`DeleteRecordsAll`** removes the state items too: the frame restarts and its
+  next build deletes the old files.
+- The narrow windows where a frame can be off until a rebuild (a losing
+  conditional write still in flight about a minute after the winner, a stale
+  insert, a crashed writer racing a slow one) are under "Limits" in the plan.
+
 ## Optimistic concurrency: `PutManyIfVersion`, `Modify` (`modify.go`)
 
 A write replaces the whole record (it is one blob), so two read-modify-writes of
@@ -646,10 +741,12 @@ index, not the call order.
 partitioned, packed sort key, sorted GSIs (one with its own partition), keys-only array
 indexes; `ormcheck_product`: no partition, FullCopy array index, a keyless and a
 ColSlice delta index), reads them back
-through every access path, updates them and reads again, then wipes them. Each
+through every access path, updates them and reads again, then wipes them. A third,
+`ormcheck_frame_line`, builds two DataFrames on an in-memory store with no settle,
+changes its lines and checks the frames follow and a rebuild finds nothing to fix. Each
 line shows the result, and the calls and capacity (RCU/WCU) the ORM spent. In
-berryapps it runs with `./deploy.sh 4` against the real table. Importing the
-package installs its capacity meter through `dynamo.ClientOptions`.
+berryapps it is action 4 of the deploy tool (`./app.sh deploy`), against the real
+table. Importing the package installs its capacity meter through `dynamo.ClientOptions`.
 
 ## Introspection: schema as data (`introspect.go`)
 

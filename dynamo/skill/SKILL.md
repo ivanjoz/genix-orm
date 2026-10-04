@@ -125,10 +125,12 @@ A violation makes `NewRepo` panic at boot:
   `cb` tag, and no Slot or GroupBy. See section 3c'.
 - **`VersionedWrites`** needs the same `int32` `UpdatedVersion`; it only enables `Modify` (section 2)
   on a table that has neither `SaveUpdatedVersion` nor a delta index (those imply it).
+- **DataFrames** need the `int32` `UpdatedVersion` and `CreatedVersion`, a whole-entity delta
+  index and no `Partition`. See section 3e.
 - **Managed fields:** every Put stamps an integer field named `Updated` with the write time
   (SUnixTime) and, on a versioned table (a delta index, `SaveUpdatedVersion` or `VersionedWrites`),
-  `UpdatedVersion` with the write sequence, also stored as the item attribute `upv`. Never set them
-  yourself.
+  `UpdatedVersion` with the write sequence, also stored as the item attribute `upv`. On a table
+  with DataFrames, `CreatedVersion` is the `UpdatedVersion` of the insert. Never set them yourself.
 
 ## 2. Writing and reading by key
 
@@ -349,6 +351,52 @@ Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Si
 - Every write pays one `UpdateItem` per touched group (merged over the call), and a hot group is a
   hot item.
 
+## 3e. DataFrames (`DataFrames`, `QueryFrame`)
+
+Use it for "totals per day and product (and client)" over long ranges without reading DynamoDB:
+compact files in S3, one per distinct value of the frame Keys, kept up to date by a 10-minute run.
+A write shows up 10–20 minutes later. GroupBy counters are live; frames are cheaper to read in bulk.
+
+```go
+// record and table struct:
+UpdatedVersion int32 `json:"upv,omitempty" cb:"12"`
+CreatedVersion int32 `json:"crv,omitempty" cb:"13"`
+// schema:
+Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)}}, // the run reads through it
+DataFrames: []dynamo.DataFrame{
+    {Name: "day-product", Keys: dynamo.Cols(t.Fecha), Rows: t.ProductID, Sums: dynamo.Cols(t.Quantity)},
+    {Name: "day-client-product", Keys: dynamo.Cols(t.Fecha, t.ClientID), Rows: t.ProductID,
+        Sums: dynamo.Cols(t.Quantity, t.Amount)},
+},
+
+rows, err := SaleLines.QueryFrame("day-client-product").
+    Eq(SaleLines.T.ClientID, 412).Between(SaleLines.T.Fecha, from, to).Exec()
+rows[0].Key.Fecha; rows[0].Key.ClientID; rows[0].Key.ProductID; rows[0].Sum(SaleLines.T.Amount)
+
+// up to the last landed write, not the last run:
+rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from, to).Fresh().Exec()
+```
+
+- **Keys** (1–3), **Rows** and **Sums** are integer `Col`s with `cb` tags. `Keys[0]` (usually the
+  day) must lead the entity `Keys`, a GSI or a local index: it is the rebuild unit.
+- **Values must be ≥ 0:** a negative Keys/Rows value fails the write, and a negative Sums value
+  too unless the frame sets `AllowNegativeSums`. `Status == 0` counts in no frame.
+- **`QueryFrame`:** `Eq` or `Between` (≤ 400 values) on `Keys[0]`, then `Eq` on a leading run of
+  the later Keys. `dataframe.ErrNotBuilt` (berryapps: `db.ErrFrameNotBuilt`) until the frame's
+  first build (two runs after it is declared). Rows lag the records by 10 to 30 minutes.
+- **`.Fresh()`** before `Exec()` returns the rows as the records hold them now: the files plus the
+  changes since the last run, computed in memory. It costs a consistent read of every record of
+  the entity written in the last 10 to 30 minutes. Use it when a screen or report must include the
+  sale just made; leave it off for history and dashboards.
+- **Writes** read the stored version and append the old values to S3 before the base write: an
+  update or delete of a frame table costs an S3 append per changed frame. A write fails when no
+  frame store is set (berryapps sets it at boot).
+- **Repair:** `RebuildDataFrames(frame, fromDay, toDay)` / `RebuildDataFramesAll(frame)`
+  (berryapps: `fn-db rebuild-frames`). Needed after an `InsertMany` of records already stored and
+  after editing files by hand.
+- Changing a frame's Keys, Rows or Sums rebuilds it automatically on the next two runs. Renaming
+  a frame orphans its old files.
+
 ## 4. Pitfalls
 
 - **Put a two-sided range in one `Between`, never `Gte(f, a).Lte(f, b)`.** The planner keeps one
@@ -368,14 +416,16 @@ Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Si
   write diffs both versions with the new shape, so the old-shape rows stay and keys-only rows are
   not rewritten.
 - A field referenced by a **GSI or `Keys`** must be set on every write. A zero value is still a key.
-- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows and its GroupBy counters.
-  It is destructive and there is no undo. It keeps the slot-versions items.
+- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows, its GroupBy counters
+  and its DataFrame states (the frames then rebuild). It is destructive and there is no undo. It
+  keeps the slot-versions items.
 
 ## 5. Checking your work
 
 - `go test ./...` in `genix-orm/dynamo` runs offline: encoding, marshaling and query planning. To
   assert which index a query picks, follow the plan tests in `query_test.go`.
-- `ormcheck/` is a live check against a real table: two entities, every access path, and the
-  capacity used. In berryapps: `./deploy.sh 4` (that table is production — pre-alpha, single environment).
+- `ormcheck/` is a live check against a real table: three entities, every access path, the
+  DataFrame runs, and the capacity used. In berryapps: action 4 of `./app.sh deploy` (that table is
+  production — pre-alpha, single environment).
 - Introspect a schema with `dynamo.GetSchema[OrderTable]()` / `Orders.Schema()` (JSON:
   `partition`, `keys`, every index).

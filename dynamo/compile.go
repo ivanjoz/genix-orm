@@ -9,6 +9,8 @@ import (
 	"unsafe"
 
 	"github.com/viant/xunsafe"
+
+	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,14 +81,18 @@ type tableMeta struct {
 	updated      *colAccessor
 	writeVersion *keyCol
 	// status is the record's integer "Status" field (nil without one): 0 marks a
-	// soft-deleted record, which counts in no GroupBy group.
+	// soft-deleted record, which counts in no GroupBy group or DataFrame.
 	status *colAccessor
+	// dataFrames are the schema's DataFrames (data_frame.go), and createdVersion the
+	// managed int32 "CreatedVersion" they need (nil without frames).
+	dataFrames     []dataFrameMeta
+	createdVersion *colAccessor
 }
 
 // readsStoredVersion reports whether a write needs the record as stored first: to
-// diff its hidden rows or its GroupBy counters.
+// diff its hidden rows or its GroupBy counters, or to log its frame values.
 func (m *tableMeta) readsStoredVersion() bool {
-	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0
+	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0 || len(m.dataFrames) > 0
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -180,8 +186,12 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	if statusAccessor := accessors[statusFieldName]; statusAccessor != nil && statusAccessor.kind.isInteger() {
 		meta.status = statusAccessor
 	}
-	if schema.SaveUpdatedVersion || schema.VersionedWrites || slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta || idx.GroupDelta }) {
+	if schema.SaveUpdatedVersion || schema.VersionedWrites || len(schema.DataFrames) > 0 ||
+		slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta || idx.GroupDelta }) {
 		meta.writeVersion = resolveWriteVersion(recordType, accessors)
+	}
+	if len(schema.DataFrames) > 0 {
+		meta.createdVersion = resolveCreatedVersion(recordType, accessors)
 	}
 
 	usedSlots := map[string]bool{}
@@ -239,10 +249,11 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		usedSlots[idx.Slot.index] = true
 		meta.indexes = append(meta.indexes, compileGSI(recordType, accessors, idx, meta))
 	}
+	meta.dataFrames = compileDataFrames(schema, recordType, accessors, meta)
 
 	pkDigits := len(meta.tableID) + meta.partitionDigits
-	// Fan-out rows, the slot-versions item and the GroupBy counters append 3 digits to the base pk.
-	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || schema.SaveUpdatedVersion {
+	// Fan-out rows, the slot-versions item, the GroupBy counters and the frame states append 3 digits to the base pk.
+	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || len(meta.dataFrames) > 0 || schema.SaveUpdatedVersion {
 		pkDigits += arrayIndexColumnIDDigits
 	}
 	if pkDigits > maxNumericKeyDigits {
@@ -364,7 +375,8 @@ func (m *tableMeta) assignAutoIDs(ptrs []unsafe.Pointer) ([]unsafe.Pointer, erro
 // yet, so those records need no stored-version read. Each step reserves a value of
 // its own sequence item. The version is reserved per base pk, so the steps depend
 // on each other only when the ID is a Partition column; otherwise they run in
-// parallel and the write pays one round trip for both.
+// parallel and the write pays one round trip for both. A table with DataFrames
+// reserves the version after its stored read instead (Repo.prepareWriteReadingStored).
 func (m *tableMeta) prepareWrite(ptrs []unsafe.Pointer) (map[unsafe.Pointer]bool, error) {
 	var assignedPtrs []unsafe.Pointer
 	assignIDs := func() (err error) {
@@ -377,7 +389,7 @@ func (m *tableMeta) prepareWrite(ptrs []unsafe.Pointer) (map[unsafe.Pointer]bool
 			err = m.stampManagedColumns(ptrs)
 		}
 	} else {
-		err = runInParallel(2, func(step int) error {
+		err = parallel.Run(2, func(step int) error {
 			if step == 0 {
 				return assignIDs()
 			}

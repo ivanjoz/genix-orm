@@ -21,18 +21,18 @@ const (
 
 const checkStoreID int32 = 7
 
-// Run works on the ORM's configured table. It wipes both check entities, writes one record into
+// Run works on the ORM's configured table. It wipes the check entities, writes records into
 // each, reads them back through every access path (and once more after updating them), wipes
 // them again, and prints one line per step with its result and consumed capacity. It returns an
-// error when any check failed.
+// error when any check failed. It sets an in-memory DataFrame store (SetDataFrames): run it from a
+// process that serves no writes.
 func Run(output io.Writer) error {
 	runner := &checkRunner{output: output}
 	// Leftovers of an interrupted run would change every expected result.
-	if _, err := CheckOrders.DeleteRecordsAll(); err != nil {
-		return err
-	}
-	if _, err := CheckProducts.DeleteRecordsAll(); err != nil {
-		return err
+	for _, checkEntity := range []dynamo.Controller{CheckOrders, CheckProducts, CheckFrameLines} {
+		if _, err := checkEntity.DeleteRecordsAll(); err != nil {
+			return err
+		}
 	}
 	fmt.Fprintln(output, "Capacity: an eventually consistent read costs 0.5 RCU per 4 KB, a consistent one 1 RCU;")
 	fmt.Fprintln(output, "a write costs 1 WCU per 1 KB and item. Each line shows the calls the ORM made for that step.")
@@ -197,6 +197,10 @@ func Run(output io.Writer) error {
 	runner.expect("Delta: since the first version, every status", []string{"5 Widget deleted"}, queryProducts(CheckProducts.Query().Delta(firstVersion, 1)))
 	runner.expect("Delta + Contains: TeamIDs contains 1 (removed)", nil, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 1).Delta(firstVersion, 1)))
 
+	if err := runDataFrameChecks(runner); err != nil {
+		return err
+	}
+
 	// DeleteRecordsAll is not repeatable (a second run deletes nothing), so it is checked once.
 	runner.section("Cleanup: the row counts prove no stale array rows were left behind")
 	runner.expectOnce("DeleteRecordsAll orders: base + 3 ProductIDs + 2 Tags rows + 6 counters", []string{"12"}, func() ([]string, error) {
@@ -205,6 +209,10 @@ func Run(output io.Writer) error {
 	})
 	runner.expectOnce("DeleteRecordsAll products: base + 2 CategoryIDs + 1 delta + 1 TeamIDs delta rows", []string{"5"}, func() ([]string, error) {
 		deleted, err := CheckProducts.DeleteRecordsAll()
+		return []string{strconv.Itoa(deleted)}, err
+	})
+	runner.expectOnce("DeleteRecordsAll frame lines: 3 base + 3 delta rows + 2 frame states", []string{"8"}, func() ([]string, error) {
+		deleted, err := CheckFrameLines.DeleteRecordsAll()
 		return []string{strconv.Itoa(deleted)}, err
 	})
 

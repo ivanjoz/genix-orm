@@ -1,5 +1,37 @@
 # RATIONALE — dynamo
 
+## DataFrames: `Fresh()` reads the frame as the records hold it now
+**Context** — An app needed a frame range up to the last write (the sale just made), not 10 to 30 minutes behind. Left open: the API, what to read, and how to stay right while a run writes the same files.
+**Decision** —
+- **A modifier on `QueryFrame`**, not a new function: same selection rules, same `[]FrameRow[E]`.
+- **It is a run done in memory** (`dataframe.ReadFreshFiles`): the incarnations changed after the frame's snapshot `w` (records written after it, then the log, the same reads as `CompactFrame`), and each file gets what they hold now (`valuesAt(+∞)`, the current record) less what they held at its own snapshot. A file a run didn't touch since an older snapshot takes `w`; a crashed run's file takes its target. The files the changes name inside the selection are read too, so a new client's file shows up before the `_index` lists it.
+- **`w` is read consistently before and after.** A run that commits meanwhile truncates the log up to its new snapshot: when `w` moved, the read starts over from it (3 tries, then an error).
+- **No settle wait.** A run waits for its target to settle; a fresh read takes the records as they are. A write still in flight is either not landed (its log entry's old values equal the record, so it adds nothing) or landed (counted). A losing conditional write can't make `valuesAt(w)` wrong: it lives less than the settle, so whatever it read was written after `w` by a write whose own entry comes first.
+**Rationale** — It reuses the run's arithmetic, so the randomized simulation checks it the same way (a fresh read at random points must equal the brute force of the records as they are, with writers reserved, logged, losing or crashed). Cost: the delta read covers the whole entity, not the range: every record written in the last 10 to 30 minutes, plus the log. Cheap for sales; a hot entity with large frames would want a run more often instead.
+
+## DataFrames: the storage side is its own package, `dataframe`
+**Context** — The DataFrame code was six `data_frame*.go` files inside `dynamo`, mixing DynamoDB reads and leases with the file codecs and the file arithmetic of a run. The split had to respect Go's import rule: `dynamo` calls the file work, so `dataframe` cannot import `dynamo`.
+**Decision** — `dataframe/` holds everything that never touches DynamoDB: `Frame` (name, folder, key and sums counts, shape) and the object keys, `Values`, the `Store` interface with `MemoryStore` and its errors, the codecs, the run's file work (`CompactFrame`, `RebuildAllFiles`, `RebuildFilesInRange`, `AppendLog`, `ReadLog`, `TruncateLog`) and the file reads (`SelectFileKeys`, `ReadFiles`). It takes the records as `[]RecordState` (sk, CreatedVersion, values), read by callbacks it is handed. `dynamo` keeps the declarations, the write path, the record reads, the state item and the lease; its `dataFrameMeta` embeds a `dataframe.Frame` next to the column accessors. The bounded-parallelism helper both need moved to `internal/parallel`.
+**Rationale** — The snapshot rule (`valuesAt`, incarnations, cancel markers) is now testable with no table at all (`dataframe/run_test.go`), and the codec has one home. The randomized simulation stays in `dynamo` because it drives the real write path, and its brute force no longer shares the run's aggregation helpers. Cost: one exported surface between two packages of one module, and `&frame.Frame` at every call.
+
+## DataFrames: implementation choices beyond DATA_FRAMES_PLAN.md
+**Context** — The plan fixed the snapshot rule, the log-before-write order, the formats, the state item and the lease. Building and testing it settled several details it left open or got wrong.
+**Decision** —
+- **Cancel markers.** `PutManyIfVersion` appends a marker (log entry kind 2, same sk and newVersion) for every record that lost its condition. The plan called a loser's entry a harmless phantom, but its old values are what the loser read, which the winner has since replaced: at a snapshot between the two versions the run would read stale values.
+- **The run's record read is not `Query().Delta()`.** It is the same consistent Query of the delta rows, but it keeps a record whose row moved while the read ran (`Delta()` drops a row whose record's version no longer matches). A moved record is still written after W.
+- **The log is read twice** when records with entries were not returned by the delta read (deleted, or a phantom): once to find them, and again after reading them by sk, so the second read covers any change those reads saw.
+- **A file already at the target is skipped**, instead of recomputing its "before" at the file's snapshot as the plan said. Any file above W is at the target: a retry targets the same `nx`, which only moves at the commit.
+- **An emptied file is kept with 0 rows** by a run, so its snapshot survives; only rebuilds delete files.
+- **A rebuild reads no records by sk.** An incarnation found only in the log has an entry above W, and `valuesAt(W)` is that entry's old values.
+- **A 1-key range rebuild writes each day** (PUT or DELETE): it has no `_index` to compare against. At most 400 PUTs per rebuild cost little, and skipping unchanged days would need a GET of each file first.
+- **The S3 implementation lives in berryapps** (`core/frames`), behind the `dataframe.Store` interface. The ORM ships only `dataframe.MemoryStore`. genix-s3's error sentinels are internal, so its client can't report NotFound or a failed precondition in a way the ORM can match.
+- **`QueryFrame` reads the state item** on every call, to fail with `dataframe.ErrNotBuilt` rather than return the files of an old shape or none.
+- **The settle is configured, not computed:** `SetDataFrames(store, settle)`. The ORM can't know the Lambda timeout.
+- **A rebuild waits up to a minute for the lease** (12 tries, 5 s apart) instead of failing at once: a scheduled rebuild always shares its 10-minute slot with a run, which holds the lease for seconds.
+- **`TableSchema.DataFrames`** lists the frame names, so an app can tell which tables have frames (berryapps fails its boot without a store) and the Database tools can show them.
+
+**Rationale** — The randomized simulation (`TestDataFrameRunsMatchBruteForce`) found that the plan's version of the loser case and of the crash retry was wrong, and it checks every file against a brute-force history after every commit and rebuild. The windows that stay open (an in-flight loser past the settle, a stale insert, a crashed writer racing a slow one) are listed under the plan's "Limits": closing them would need a longer settle or tombstones, for cases the nightly rebuild repairs.
+
 ## Local indexes are hidden base-table rows, not DynamoDB LSIs
 **Context** — An app needed "find the product with this name hash" read consistently (an import must not create a duplicate it just wrote). A real LSI can only be declared when the table is created, and every entity shares one table that already exists. A GSI reads only eventually.
 **Decision** — `TypeLocal` reuses the fan-out machinery with no element: one keys-only row per record under `base pk ‖ first key's cb id`, sk = index Keys # base sk, synced by every write and re-checked on read. The planner offers it next to the base table and the GSIs, after them on a tie. It takes scalar Keys only, no Slot and no GroupBy.
@@ -18,7 +50,7 @@
 ## Write latency: parallel counters, one-trip reservations, no read for new records
 **Context** — A berryapps sale (header + 5 lines, 4–5 GroupBys per table) made ~37 DynamoDB calls in sequence: 6.4 s from a laptop at 173 ms per call, and ~60% of them were counter UpdateItems sent one by one.
 **Decision** —
-- `applyGroupCounterDeltas` builds every UpdateItem first (reserving delete versions in that sequential loop) and sends them through `runInParallel`, at most `writeParallelism = 10` at a time. `PutManyIfVersion`'s conditional puts share the helper.
+- `applyGroupCounterDeltas` builds every UpdateItem first (reserving delete versions in that sequential loop) and sends them through `parallel.Run` (`internal/parallel`), at most `writeParallelism = 10` at a time. `PutManyIfVersion`'s conditional puts share the helper.
 - `prepareWrite` runs the autoincrement and the `UpdatedVersion` reservations in parallel, except when the ID is a Partition column (the version is reserved per base pk).
 - `PutMany` skips the stored-version read of records whose ID it has just assigned. `InsertMany` skips it for every record, and `AssignIDs` reserves the IDs ahead, so a caller can key child records by them and write parent and children together.
 **Rationale** — 10 matches the AWS SDK's 10 idle connections per host, so a parallel step reuses warm connections. The ADDs commute and each touches its own item, and they still run after the base items, so ordering and crash safety are unchanged. Parallelism does not change WCU or the per-item 1,000 WCU/s ceiling of hot counters. Cost: `InsertMany` on a record that was in fact stored leaves its old hidden rows and counts it twice in its groups until `RebuildGroups`. Measured in berryapps: a 5-line sale went from 6.4 s to 1.8 s locally (~37 → ~10 sequential calls).
