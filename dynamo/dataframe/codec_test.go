@@ -142,6 +142,52 @@ func TestFrameBlockCostIsExactAndSmallest(t *testing.T) {
 	}
 }
 
+// TestFrameFileHashIgnoresTheSnapshot: a file rewritten at a later snapshot with the same rows keeps
+// its hash; other rows change it.
+func TestFrameFileHashIgnoresTheSnapshot(t *testing.T) {
+	file := randomFrameFile(rand.New(rand.NewPCG(9, 10)), 50, 2, 30, 4)
+	hash := FileHash(appendFile(nil, cloneFrameFile(file), codecOptions{}))
+	rewritten := cloneFrameFile(file)
+	rewritten.Snapshot = file.Snapshot + 1_000_000_000
+	if rewrittenHash := FileHash(appendFile(nil, rewritten, codecOptions{})); rewrittenHash != hash {
+		t.Fatalf("the same rows at another snapshot hash to %08x, not %08x", rewrittenHash, hash)
+	}
+	rewritten.Sums[0][7]++
+	if changedHash := FileHash(appendFile(nil, rewritten, codecOptions{})); changedHash == hash {
+		t.Fatal("other rows kept the hash")
+	}
+}
+
+// TestFrameIndexRoundTrip: an _idx of 2- and 3-key entries, and an _ixt of several blocks, read back
+// their keys and hashes in order.
+func TestFrameIndexRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 12))
+	for _, keyCount := range []int{2, 3} {
+		var blocks [][]IndexEntry
+		var extension []byte
+		for _, entryCount := range []int{0, 1, 129, 1000} {
+			entries := make([]IndexEntry, entryCount)
+			for i := range entries {
+				entries[i] = IndexEntry{Hash: rng.Uint32()}
+				entries[i].Keys[0] = int64(i / 3)
+				if keyCount == 3 {
+					entries[i].Keys[1] = rng.Int64N(1 << 40)
+				}
+			}
+			decoded, err := DecodeIndex(appendIndex(nil, entries, keyCount), keyCount)
+			if err != nil || !reflect.DeepEqual(decoded, entries) {
+				t.Fatalf("%d-key _idx of %d entries: decoded %d entries, err %v", keyCount, entryCount, len(decoded), err)
+			}
+			blocks = append(blocks, entries)
+			extension = appendIndexExtensionBlock(extension, entries, keyCount)
+		}
+		decoded, err := DecodeIndexExtension(extension, keyCount)
+		if err != nil || !reflect.DeepEqual(decoded, slices.Concat(blocks...)) {
+			t.Fatalf("%d-key _ixt: decoded %d entries, err %v", keyCount, len(decoded), err)
+		}
+	}
+}
+
 // TestFrameFileTruncated: every proper prefix of a file is refused, never a panic.
 func TestFrameFileTruncated(t *testing.T) {
 	file := randomFrameFile(rand.New(rand.NewPCG(5, 6)), 300, 2, 40, 9)

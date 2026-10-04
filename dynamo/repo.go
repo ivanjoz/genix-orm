@@ -57,6 +57,8 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.checkFrameValues([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
+	// Nothing is read: the write deadline counts from the version reservation.
+	window := r.meta.frameWriteWindowFrom(Now())
 	if _, err := r.meta.prepareWrite([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
@@ -75,7 +77,9 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+	ctx, cancel := window.landingContext()
+	defer cancel()
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(tableName()),
 		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(pk)"),
@@ -85,13 +89,14 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, frameLandingError(err)
 	}
 	// Unlike PutMany, the array index rows go after the base item: written first,
-	// they would index a record that then loses the race for its key.
+	// they would index a record that then loses the race for its key. The deadline
+	// covers them too: a frame run reads inserts through the delta row.
 	arrayRowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item[dataColumn].(*types.AttributeValueMemberB).Value)
-	if err := r.batchWriteAll(client, arrayRowPuts); err != nil {
-		return true, err
+	if _, err := r.batchWriteAll(ctx, client, arrayRowPuts); err != nil {
+		return true, frameLandingError(err)
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return true, err
@@ -140,14 +145,13 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	if err := r.meta.checkFrameValues(ptrs); err != nil {
 		return err
 	}
+	// The write deadline counts from the stored read, or from the version reservation when nothing is read.
+	window := r.meta.frameWriteWindowFrom(Now())
 	storedByKey, err := r.prepareWriteReadingStored(client, ptrs, areAllNew)
 	if err != nil {
 		return err
 	}
 	r.meta.stampCreatedVersions(ptrs, storedByKey)
-	if err := r.meta.appendFrameLogEntries(r.meta.frameWritesOf(ptrs, storedByKey), false); err != nil {
-		return err
-	}
 
 	baseWrites := make([]types.WriteRequest, 0, len(records))
 	var arrayRowPuts, arrayRowDeletes []types.WriteRequest
@@ -171,10 +175,24 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 		arrayRowDeletes = append(arrayRowDeletes, deletes...)
 	}
 
-	for _, writes := range [][]types.WriteRequest{arrayRowPuts, baseWrites, arrayRowDeletes} {
-		if err := r.batchWriteAll(client, writes); err != nil {
-			return err
-		}
+	// The log entries, the new hidden rows and the base items land within the window. The base items
+	// go in record order, so the records from the first one not sent on did not land: their entries
+	// are voided.
+	ctx, cancel := window.landingContext()
+	defer cancel()
+	sentBaseCount := 0
+	err = r.meta.appendFrameLogEntries(ctx, r.meta.frameWritesOf(ptrs, storedByKey), false)
+	if err == nil {
+		_, err = r.batchWriteAll(ctx, client, arrayRowPuts)
+	}
+	if err == nil {
+		sentBaseCount, err = r.batchWriteAll(ctx, client, baseWrites)
+	}
+	if err != nil {
+		return errors.Join(frameLandingError(err), r.meta.cancelFrameWrites(window, r.meta.frameWritesOf(ptrs[sentBaseCount:], storedByKey)))
+	}
+	if _, err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
+		return err
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
@@ -256,22 +274,27 @@ func (m *tableMeta) recordKey(ptr unsafe.Pointer) string {
 	return m.pkValue(ptr) + keySeparator + m.skValue(ptr)
 }
 
-// batchWriteAll writes any number of requests in BatchWriteItem chunks of 25.
-func (r *Repo[T, E]) batchWriteAll(client *dynamodb.Client, writes []types.WriteRequest) error {
+// batchWriteAll writes any number of requests in BatchWriteItem chunks of 25, in order. sentCount is
+// how many it sent before it stopped: the chunk that failed was sent, and may have landed.
+func (r *Repo[T, E]) batchWriteAll(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) (sentCount int, err error) {
 	for start := 0; start < len(writes); start += 25 {
-		if err := r.batchWrite(client, writes[start:min(start+25, len(writes))]); err != nil {
-			return err
+		if err := ctx.Err(); err != nil {
+			return start, err
+		}
+		end := min(start+25, len(writes))
+		if err := r.batchWrite(ctx, client, writes[start:end]); err != nil {
+			return end, err
 		}
 	}
-	return nil
+	return len(writes), nil
 }
 
 // batchWrite issues one BatchWriteItem and retries any unprocessed items.
-func (r *Repo[T, E]) batchWrite(client *dynamodb.Client, writes []types.WriteRequest) error {
+func (r *Repo[T, E]) batchWrite(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) error {
 	table := tableName()
 	req := map[string][]types.WriteRequest{table: writes}
 	for attempt := 0; attempt < 8; attempt++ {
-		out, err := client.BatchWriteItem(context.Background(), &dynamodb.BatchWriteItemInput{
+		out, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
 			RequestItems: req,
 		})
 		if err != nil {
@@ -288,36 +311,46 @@ func (r *Repo[T, E]) batchWrite(client *dynamodb.Client, writes []types.WriteReq
 // Delete removes the item identified by the record's partition + sort fields.
 // Only the key fields of `record` need to be populated: with array indexes the
 // stored version is read to find its rows, which are deleted after the item. With
-// DataFrames its frame values go to the frames' logs before the item is deleted.
+// DataFrames its frame values go to the frames' logs before the item is deleted,
+// within the write deadline.
 func (r *Repo[T, E]) Delete(record *E) error {
 	client, err := Client()
 	if err != nil {
 		return err
 	}
 	ptr := unsafe.Pointer(record)
+	window := r.meta.frameWriteWindowFrom(Now())
 	storedByKey, err := r.storedVersions(client, []unsafe.Pointer{ptr})
 	if err != nil {
 		return err
 	}
+	ctx, cancel := window.landingContext()
+	defer cancel()
 	var arrayRowDeletes []types.WriteRequest
+	var frameWrites []frameWrite
 	groupDeltas := map[string]*groupCounterDelta{}
 	if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
 		_, arrayRowDeletes = r.meta.arrayIndexWrites(storedPtr, nil, nil)
 		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, nil); err != nil {
 			return err
 		}
-		if err := r.meta.appendFrameDeleteEntries(storedPtr); err != nil {
-			return err
-		}
+		frameWrites, err = r.meta.appendFrameDeleteEntries(ctx, storedPtr)
 	}
-	_, err = client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+	if err == nil {
+		err = ctx.Err()
+	}
+	// Not sent: the entries of the delete are voided.
+	if err != nil {
+		return errors.Join(frameLandingError(err), r.meta.cancelFrameWrites(window, frameWrites))
+	}
+	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName()),
 		Key:       r.meta.keyOnly(ptr),
 	})
 	if err != nil {
-		return err
+		return frameLandingError(err)
 	}
-	if err := r.batchWriteAll(client, arrayRowDeletes); err != nil {
+	if _, err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
 		return err
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {

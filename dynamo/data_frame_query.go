@@ -1,11 +1,9 @@
 package dynamo
 
 import (
-	"context"
 	"fmt"
 	"unsafe"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
 )
@@ -27,6 +25,14 @@ func (row FrameRow[E]) Sum(column Coln) int64 {
 		}
 	}
 	panic(fmt.Sprintf("db: %q is not a Sums column of DataFrame %q", fieldName, row.frame.Name))
+}
+
+// Count returns how many records the row sums, on a frame declared with Count.
+func (row FrameRow[E]) Count() int64 {
+	if !row.frame.countsRecords {
+		panic(fmt.Sprintf("db: DataFrame %q is not declared with Count", row.frame.Name))
+	}
+	return row.sums[len(row.frame.sums)]
 }
 
 // FrameQuery reads the files of one DataFrame.
@@ -69,10 +75,12 @@ func (q *FrameQuery[E]) Between(column Coln, a, b any) *FrameQuery[E] {
 	return q
 }
 
-// Fresh returns the rows as the records hold them now instead of as the frame's last run left them:
-// the files plus the changes since, read from the records written after the frame's snapshot
-// (consistently, through the delta index) and from the log. It costs that delta read, about 10 to
-// 30 minutes of writes of the whole entity, besides the files.
+// Fresh returns the rows as the records hold them now instead of as the frame's last compaction left
+// them: the files plus the changes since, read from the records written after the frame's snapshot
+// (consistently, through the delta index) and from the log. It costs that delta read besides the
+// files: the writes of the whole entity since the last compaction. When more than 100 records changed
+// up to a settled checkpoint, it also writes them into the files before it returns (an express
+// compaction), which keeps the next fresh reads small.
 func (q *FrameQuery[E]) Fresh() *FrameQuery[E] {
 	q.isFresh = true
 	return q
@@ -124,15 +132,18 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := q.frameSnapshot(client)
+	state, err := q.meta.readFrameState(client, frame)
 	if err != nil {
 		return nil, err
+	}
+	if !state.isBuiltAs(frame) {
+		return nil, q.notBuiltError()
 	}
 
 	var fileKeys [][dataframe.MaxKeys]int64
 	var files []dataframe.File
 	if q.isFresh {
-		fileKeys, files, err = q.readFreshFiles(client, snapshot, fromKey, toKey, pinnedKeys)
+		fileKeys, files, err = q.readFreshFiles(client, state, fromKey, toKey, pinnedKeys)
 	} else if fileKeys, err = dataframe.SelectFileKeys(frameStore, &frame.Frame, fromKey, toKey, pinnedKeys); err == nil {
 		files, err = dataframe.ReadFiles(frameStore, &frame.Frame, fileKeys)
 	}
@@ -143,13 +154,13 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 	var rows []FrameRow[E]
 	for i, file := range files {
 		for j, rowID := range file.RowIDs {
-			row := FrameRow[E]{frame: frame, sums: make([]int64, len(frame.sums))}
+			row := FrameRow[E]{frame: frame, sums: make([]int64, frame.SumsCount)}
 			keyPtr := unsafe.Pointer(&row.Key)
 			for k, key := range frame.keys {
 				key.acc.setI64(keyPtr, fileKeys[i][k])
 			}
 			frame.rows.acc.setI64(keyPtr, rowID)
-			for s := range frame.sums {
+			for s := range row.sums {
 				row.sums[s] = file.Sums[s][j]
 			}
 			rows = append(rows, row)
@@ -158,41 +169,36 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 	return rows, nil
 }
 
-// frameSnapshot reads the snapshot the frame's files hold (w), consistently. It fails with
-// dataframe.ErrNotBuilt while the files are not those of the frame's current shape: before its
-// first run, or until a shape change is rebuilt.
-func (q *FrameQuery[E]) frameSnapshot(client *dynamodb.Client) (int64, error) {
-	out, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName:      aws.String(tableName()),
-		Key:            q.meta.frameStateKey(q.frame),
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return 0, err
-	}
-	if _, hasSnapshot := out.Item["w"]; !hasSnapshot || uint32(numberAttrValue(out.Item, "sh")) != q.frame.Shape {
-		return 0, fmt.Errorf("%w: %s DataFrame %q", dataframe.ErrNotBuilt, q.meta.recordType.Name(), q.frame.Name)
-	}
-	return numberAttrValue(out.Item, "w"), nil
+// notBuiltError is what a read gets while the frame's files are not those of its current shape: before
+// its first run, or until a shape change is rebuilt.
+func (q *FrameQuery[E]) notBuiltError() error {
+	return fmt.Errorf("%w: %s DataFrame %q", dataframe.ErrNotBuilt, q.meta.recordType.Name(), q.frame.Name)
 }
 
 // readFreshFiles is dataframe.ReadFreshFiles from the frame's snapshot. A run that commits meanwhile
-// truncates the log up to its new snapshot, maybe before the read got the entries it needed: when
-// the snapshot moved, the read starts over from the new one.
-func (q *FrameQuery[E]) readFreshFiles(client *dynamodb.Client, snapshot, fromKey, toKey int64, pinnedKeys []int64) ([][dataframe.MaxKeys]int64, []dataframe.File, error) {
+// truncates the log up to its new snapshot, maybe before the read got the entries it needed: when the
+// snapshot moved, the read starts over from the new one. A read that held still goes on to
+// expressCompactFrame.
+func (q *FrameQuery[E]) readFreshFiles(client *dynamodb.Client, state frameState, fromKey, toKey int64, pinnedKeys []int64) ([][dataframe.MaxKeys]int64, []dataframe.File, error) {
 	readWrittenAfter, readBySK := frameRecordReaders[E](q.meta, client, q.frame)
 	for attempt := 1; ; attempt++ {
-		fileKeys, files, err := dataframe.ReadFreshFiles(frameStore, &q.frame.Frame, snapshot, fromKey, toKey, pinnedKeys, readWrittenAfter, readBySK)
+		fresh, err := dataframe.ReadFreshFiles(frameStore, &q.frame.Frame, state.snapshot, fromKey, toKey, pinnedKeys, readWrittenAfter, readBySK)
 		if err != nil {
 			return nil, nil, err
 		}
-		snapshotAfter, err := q.frameSnapshot(client)
-		if err != nil || snapshotAfter == snapshot {
-			return fileKeys, files, err
+		stateAfter, err := q.meta.readFrameState(client, q.frame)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !stateAfter.isBuiltAs(q.frame) {
+			return nil, nil, q.notBuiltError()
+		}
+		if stateAfter.snapshot == state.snapshot {
+			return fresh.FileKeys, fresh.Files, q.meta.expressCompactFrame(client, q.frame, state, stateAfter, fresh)
 		}
 		if attempt == frameFreshReadAttempts {
-			return nil, nil, fmt.Errorf("the frame's runs kept committing during %d fresh reads: retry", attempt)
+			return nil, nil, fmt.Errorf("the frame's compactions kept committing during %d fresh reads: retry", attempt)
 		}
-		snapshot = snapshotAfter
+		state = stateAfter
 	}
 }

@@ -73,15 +73,15 @@ func refreshStoredItem(item map[string]types.AttributeValue, version int64) {
 	}
 }
 
-// cachedStoredBlob returns the stored blob of a record at exactly expectedVersion.
-func cachedStoredBlob(cacheKey string, expectedVersion int64) ([]byte, bool) {
+// cachedStoredBlob returns the stored blob of a record at exactly expectedVersion, and when it was read.
+func cachedStoredBlob(cacheKey string, expectedVersion int64) ([]byte, time.Time, bool) {
 	writeCache.Lock()
 	defer writeCache.Unlock()
 	entry, isCached := writeCache.entriesByKey[cacheKey]
 	if !isCached || entry.version != expectedVersion || Now().Sub(entry.cachedAt) > writeCacheTTL {
-		return nil, false
+		return nil, time.Time{}, false
 	}
-	return entry.blob, true
+	return entry.blob, entry.cachedAt, true
 }
 
 // storeWriteCacheEntry must run under the lock. The blob is copied: an SDK

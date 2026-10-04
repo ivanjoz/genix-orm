@@ -682,3 +682,36 @@ func DecodeIndex(content []byte, keyCount int) ([]IndexEntry, error) {
 	}
 	return entries, nil
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Day index extension (_ixt): what express compactions append to a day folder
+// instead of rewriting its _idx (index.go). One block per append:
+//
+//	uvarint   block length (the bytes after this field)
+//	body      an _idx body: the files one compaction wrote there, with their hashes
+// ─────────────────────────────────────────────────────────────────────────────
+
+func appendIndexExtensionBlock(out []byte, entries []IndexEntry, keyCount int) []byte {
+	body := appendIndex(nil, entries, keyCount)
+	out = binary.AppendUvarint(out, uint64(len(body)))
+	return append(out, body...)
+}
+
+// DecodeIndexExtension reads the entries of every block, in the order they were appended.
+func DecodeIndexExtension(content []byte, keyCount int) ([]IndexEntry, error) {
+	var entries []IndexEntry
+	for position := 0; position < len(content); {
+		blockLength, lengthBytes := binary.Uvarint(content[position:])
+		if lengthBytes <= 0 || blockLength > uint64(len(content)-position-lengthBytes) {
+			return nil, errCorrupt
+		}
+		position += lengthBytes
+		blockEntries, err := DecodeIndex(content[position:position+int(blockLength)], keyCount)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, blockEntries...)
+		position += int(blockLength)
+	}
+	return entries, nil
+}

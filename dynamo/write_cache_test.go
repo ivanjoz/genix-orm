@@ -39,14 +39,14 @@ func TestWriteCacheServesTheExactVersionWithinTheTTL(t *testing.T) {
 	rememberStoredItems([]map[string]types.AttributeValue{storedItemOf(t, members, member)})
 	recordKey := members.meta.recordKey(unsafe.Pointer(&member))
 
-	if _, isCached := cachedStoredBlob(recordKey, 4); !isCached {
+	if _, _, isCached := cachedStoredBlob(recordKey, 4); !isCached {
 		t.Fatal("version 4 was read for update but is not cached")
 	}
-	if _, isCached := cachedStoredBlob(recordKey, 5); isCached {
+	if _, _, isCached := cachedStoredBlob(recordKey, 5); isCached {
 		t.Fatal("an entry served a version it does not hold")
 	}
 	*clock = clock.Add(writeCacheTTL + time.Second)
-	if _, isCached := cachedStoredBlob(recordKey, 4); isCached {
+	if _, _, isCached := cachedStoredBlob(recordKey, 4); isCached {
 		t.Fatal("an expired entry was served")
 	}
 }
@@ -62,7 +62,7 @@ func TestStoredVersionsForWriteDecodesCachedBlobs(t *testing.T) {
 	edited := deltaMember{ID: 9, TeamIDs: []int16{2}, Status: 1}
 	created := deltaMember{ID: 10, TeamIDs: []int16{3}, Status: 1}
 	ptrs := []unsafe.Pointer{unsafe.Pointer(&edited), unsafe.Pointer(&created)}
-	storedByKey, err := members.storedVersionsForWrite(nil, ptrs, []int64{4, 0})
+	storedByKey, _, err := members.storedVersionsForWrite(nil, ptrs, []int64{4, 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,12 +84,12 @@ func TestRefreshKeepsOnlyKeysReadForUpdate(t *testing.T) {
 
 	readMember.UpdatedVersion = 7
 	refreshStoredItem(storedItemOf(t, members, readMember), 7)
-	if _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&readMember)), 7); !isCached {
+	if _, _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&readMember)), 7); !isCached {
 		t.Fatal("the written version did not replace the cached one")
 	}
 	otherMember := deltaMember{ID: 11, Status: 1, UpdatedVersion: 7}
 	refreshStoredItem(storedItemOf(t, members, otherMember), 7)
-	if _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&otherMember)), 7); isCached {
+	if _, _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&otherMember)), 7); isCached {
 		t.Fatal("a record never read for update entered the cache")
 	}
 }

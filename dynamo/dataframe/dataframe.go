@@ -1,16 +1,20 @@
 // Package dataframe is the storage side of genix-orm's DataFrames (../DATA_FRAMES_PLAN.md): group-by
 // aggregates of a table, kept as compact files in a Store (an S3 bucket) and brought up to date by
 // runs. It knows nothing of DynamoDB: the dynamo package compiles a table's DataFrames into Frames,
-// reads the records, holds each frame's state and lease, and calls this package for the files.
+// reads the records, holds each frame's state, and calls this package for the files and the lock.
 //
-//	<entity>/<frame>/_log.<shape>          the old values of the writes that changed the frame
-//	<entity>/<frame>/<k0>                  a 1-key frame's file
-//	<entity>/<frame>/<k0>/<k1>[_<k2>]      a 2–3-key frame's file
-//	<entity>/<frame>/<k0>/_idx           the folder's keys and file hashes
+//	<table>/<frame>/_log.<shape>          the old values of the writes that changed the frame
+//	<table>/<frame>/_lock                 the compaction holding the frame, and until when (lock.go)
+//	<table>/<frame>/<k0>                  a 1-key frame's file
+//	<table>/<frame>/<k0>/<k1>[_<k2>]      a 2–3-key frame's file
+//	<table>/<frame>/<k0>/_idx             the folder's keys and file hashes
+//	<table>/<frame>/<k0>/_ixt             keys and hashes express compactions appended since (index.go)
+//
+// <table> and <frame> are short names the dynamo package gives (Frame.Folder); the Keys are decimal.
 //
 // Every file holds its frame at a snapshot: the sum of what each record held at that
-// UpdatedVersion. A run from snapshot W to a target takes out of the files what each record held at
-// W and adds what it held at the target (run.go); the formats are in codec.go.
+// UpdatedVersion. A compaction from snapshot W to a target takes out of the files what each record
+// held at W and adds what it held at the target (run.go); the formats are in codec.go.
 package dataframe
 
 import (
@@ -26,8 +30,10 @@ const (
 	// MaxFirstKeys caps a range of Keys[0] a rebuild or a read covers: one request per value.
 	MaxFirstKeys = 400
 
-	indexFileName = "_idx"
-	logFilePrefix = "_log."
+	indexFileName          = "_idx"
+	indexExtensionFileName = "_ixt"
+	logFilePrefix          = "_log."
+	lockFileName           = "_lock"
 )
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
@@ -35,19 +41,20 @@ var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // Frame is what the file work needs of a compiled DataFrame.
 type Frame struct {
 	Name string
-	// Folder is "<entity>/<name>/", the prefix of every object of the frame.
+	// Folder is "<table>/<frame>/", the prefix of every object of the frame.
 	Folder    string
 	KeyCount  int
 	SumsCount int
-	// Shape hashes the format version and the cb ids of Keys, Rows and Sums (ShapeOf). It names the
-	// log, and a change of it makes the next run rebuild every file.
+	// Shape hashes the format version, the folder and the cb ids of Keys, Rows and Sums (ShapeOf). It
+	// names the log, and a change of it makes the next run rebuild every file.
 	Shape uint32
 }
 
-// ShapeOf hashes a frame's columns, given as their cb ids joined, with the format version: a new
-// codec version changes every shape, so the next runs rebuild every file.
-func ShapeOf(keysIDs, rowsID, sumsIDs string) uint32 {
-	return crc32.Checksum(fmt.Appendf(nil, "v%d|%s|%s|%s", formatVersion, keysIDs, rowsID, sumsIDs), castagnoliTable)
+// ShapeOf hashes where a frame's files are and what they hold: the format version, the folder and the
+// columns, given as their cb ids joined. A new codec version or a new folder changes the shape, so the
+// next runs rebuild every file, in the new format or the new folder.
+func ShapeOf(folder, keysIDs, rowsID, sumsIDs string) uint32 {
+	return crc32.Checksum(fmt.Appendf(nil, "v%d|%s|%s|%s|%s", formatVersion, folder, keysIDs, rowsID, sumsIDs), castagnoliTable)
 }
 
 // LogKey is the frame's log. The shape is in its name: Lambdas still running the code of another
@@ -79,6 +86,12 @@ func (frame *Frame) dayFolder(firstKey int64) string {
 func (frame *Frame) indexKey(firstKey int64) string {
 	return frame.dayFolder(firstKey) + indexFileName
 }
+
+func (frame *Frame) indexExtensionKey(firstKey int64) string {
+	return frame.dayFolder(firstKey) + indexExtensionFileName
+}
+
+func (frame *Frame) lockKey() string { return frame.Folder + lockFileName }
 
 // Values is what one record version contributes to a frame: the file it lands in (Keys), its row
 // and the values summed into that row. A record that counts in no file has nil Values.

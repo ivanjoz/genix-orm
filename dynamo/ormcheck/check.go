@@ -211,7 +211,7 @@ func Run(output io.Writer) error {
 		deleted, err := CheckProducts.DeleteRecordsAll()
 		return []string{strconv.Itoa(deleted)}, err
 	})
-	runner.expectOnce("DeleteRecordsAll frame lines: 3 base + 3 delta rows + 2 frame states", []string{"8"}, func() ([]string, error) {
+	runner.expectOnce("DeleteRecordsAll frame lines: 104 base + 104 delta rows + 2 frame states", []string{"210"}, func() ([]string, error) {
 		deleted, err := CheckFrameLines.DeleteRecordsAll()
 		return []string{strconv.Itoa(deleted)}, err
 	})

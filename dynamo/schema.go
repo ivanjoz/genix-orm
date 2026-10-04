@@ -293,6 +293,10 @@ type DataFrame struct {
 	// AllowNegativeSums accepts negative Sums values. It only changes that
 	// validation: the file format stores any int64.
 	AllowNegativeSums bool
+	// Count adds one more summed column after the Sums, which every record (Status
+	// ≠ 0) adds 1 to: how many records a row sums, read with FrameRow.Count. With it
+	// the Sums may be empty.
+	Count bool
 }
 
 // TypeDelta marks an Index as a delta index (delta.go): the ORM appends the

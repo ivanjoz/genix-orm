@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -62,7 +63,7 @@ func (t frameLineTable) GetSchema() Schema {
 		Indexes: []Index{{Type: TypeDelta, Keys: Cols(t.Status)}},
 		DataFrames: []DataFrame{
 			{Name: "day-product", Keys: Cols(t.Fecha), Rows: t.ProductID, Sums: Cols(t.Quantity)},
-			{Name: "day-client-product", Keys: Cols(t.Fecha, t.ClientID), Rows: t.ProductID, Sums: Cols(t.Quantity, t.Amount)},
+			{Name: "day-client-product", Keys: Cols(t.Fecha, t.ClientID), Rows: t.ProductID, Sums: Cols(t.Quantity, t.Amount), Count: true},
 			// Discount is summed only here, so it alone may be negative.
 			{Name: "day-client-sale", Keys: Cols(t.Fecha, t.ClientID, t.SaleID), Rows: t.ProductID, Sums: Cols(t.Amount, t.Discount), AllowNegativeSums: true},
 		},
@@ -88,6 +89,9 @@ func TestDataFrameDeclarationRules(t *testing.T) {
 			schema.Indexes = []Index{{Slot: G1, Keys: Cols(t.ClientID.Size(32))}}
 		},
 		"a Partition": func(t *frameLineTable, schema *Schema) { schema.Partition = Cols(t.ClientID.Size(32)) },
+		"two names hashing to one folder": func(t *frameLineTable, schema *Schema) {
+			schema.DataFrames[0].Name, schema.DataFrames[1].Name = "frame-1522789", "frame-1739192"
+		},
 	} {
 		func() {
 			defer func() {
@@ -111,8 +115,50 @@ func TestDataFrameDeclarationRules(t *testing.T) {
 	schema.Entity, schema.TableID = "gsi_frame_line", 78901262
 	schema.Indexes = append(schema.Indexes, Index{Slot: G1, Keys: Cols(tablePtr.ClientID.Size(32))})
 	schema.DataFrames = []DataFrame{{Name: "client", Keys: Cols(tablePtr.ClientID), Rows: tablePtr.ProductID, Sums: Cols(tablePtr.Quantity)}}
-	if meta := buildTableMeta(schema, reflect.TypeFor[frameLine]()); meta.dataFrames[0].firstKeyLeadsBaseKeys {
+	meta := buildTableMeta(schema, reflect.TypeFor[frameLine]())
+	if meta.dataFrames[0].firstKeyLeadsBaseKeys {
 		t.Fatal("a frame keyed by a GSI column must not read its rebuild range from the base table")
+	}
+	// The folder is stored data: a change of it moves every frame to a new folder, rebuilt from scratch.
+	if folder := meta.dataFrames[0].Folder; folder != "3gz-D/1EZdkT/" {
+		t.Fatalf("frame folder %q: the TableID and name hash encode differently", folder)
+	}
+}
+
+// TestFrameCountColumn checks Count: one more Sums column after the declared ones, 1 per record and
+// nothing for a soft-deleted one, in the shape, and enough alone for a frame.
+func TestFrameCountColumn(t *testing.T) {
+	dayClientProduct := &frameLines.meta.dataFrames[1]
+	line := frameLine{Fecha: 20730, ClientID: 9, ProductID: 3, Quantity: 2000, Amount: 500, Status: 1}
+	if values := frameLines.meta.frameValuesOf(dayClientProduct, unsafe.Pointer(&line)); dayClientProduct.SumsCount != 3 || !slices.Equal(values.Sums, []int64{2000, 500, 1}) {
+		t.Fatalf("day-client-product: %d sums, values %+v", dayClientProduct.SumsCount, values)
+	}
+	line.Status = 0
+	if values := frameLines.meta.frameValuesOf(dayClientProduct, unsafe.Pointer(&line)); values != nil {
+		t.Fatalf("a soft-deleted record counts: %+v", values)
+	}
+
+	tablePtr := new(frameLineTable)
+	populateColumnNames(tablePtr)
+	schema := tablePtr.GetSchema()
+	schema.Entity, schema.TableID = "count_frame_line", 78901264
+	schema.DataFrames = []DataFrame{
+		{Name: "day-client", Keys: Cols(tablePtr.Fecha), Rows: tablePtr.ClientID, Count: true},
+		{Name: "day-client-uncounted", Keys: Cols(tablePtr.Fecha), Rows: tablePtr.ClientID, Sums: Cols(tablePtr.Amount)},
+		{Name: "day-client-counted", Keys: Cols(tablePtr.Fecha), Rows: tablePtr.ClientID, Sums: Cols(tablePtr.Amount), Count: true},
+	}
+	meta := buildTableMeta(schema, reflect.TypeFor[frameLine]())
+	line.Status = 1
+	if values := meta.frameValuesOf(&meta.dataFrames[0], unsafe.Pointer(&line)); !slices.Equal(values.Sums, []int64{1}) {
+		t.Fatalf("a count-only frame: values %+v", values)
+	}
+	// Declaring Count changes the files: a shape change, rebuilt from scratch.
+	counted := &meta.dataFrames[2]
+	if counted.Shape != dataframe.ShapeOf(counted.Folder, "001", "005", "007+count") || counted.Shape == dataframe.ShapeOf(counted.Folder, "001", "005", "007") {
+		t.Fatal("Count must change the shape, through the Sums")
+	}
+	if meta.dataFrames[1].Shape != dataframe.ShapeOf(meta.dataFrames[1].Folder, "001", "005", "007") {
+		t.Fatal("a frame without Count must keep its shape")
 	}
 }
 
@@ -172,12 +218,12 @@ func TestCheckFrameValues(t *testing.T) {
 // TestFrameLogEntriesOfWrites checks which writes log which frames: only the frames whose values change.
 func TestFrameLogEntriesOfWrites(t *testing.T) {
 	store := dataframe.NewMemoryStore()
-	SetDataFrames(store, time.Minute)
-	defer SetDataFrames(nil, frameSettle)
+	SetDataFrames(store, frameWriteDeadline)
+	defer SetDataFrames(nil, frameWriteDeadline)
 
 	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, ClientID: 9, Quantity: 2000, Amount: 500, Status: 1, UpdatedVersion: 10, CreatedVersion: 4}
 	logFrames := func(written *frameLine) []string {
-		store.Delete(slices.Collect(func(yield func(string) bool) {
+		store.Delete(context.Background(), slices.Collect(func(yield func(string) bool) {
 			keys, _ := store.List("")
 			for _, key := range keys {
 				yield(key)
@@ -188,7 +234,7 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 		if written != nil {
 			write.writtenPtr = unsafe.Pointer(written)
 		}
-		if err := frameLines.meta.appendFrameLogEntries([]frameWrite{write}, false); err != nil {
+		if err := frameLines.meta.appendFrameLogEntries(context.Background(), []frameWrite{write}, false); err != nil {
 			t.Fatal(err)
 		}
 		var loggedFrames []string
@@ -233,33 +279,73 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 	}
 }
 
+// TestFrameWriteWindow checks the write deadline: past it a write's log append fails with
+// ErrWriteDeadline, its cancel markers still go in within the grace after it, and not later.
+func TestFrameWriteWindow(t *testing.T) {
+	store := dataframe.NewMemoryStore()
+	SetDataFrames(store, frameWriteDeadline)
+	defer SetDataFrames(nil, frameWriteDeadline)
+	frame := &frameLines.meta.dataFrames[0]
+
+	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, Quantity: 2000, Status: 1, UpdatedVersion: 10, CreatedVersion: 4}
+	written := *stored
+	written.Quantity, written.UpdatedVersion = 3000, 11
+	writes := []frameWrite{{storedPtr: unsafe.Pointer(stored), writtenPtr: unsafe.Pointer(&written), newVersion: 11}}
+
+	expiredWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-frameWriteDeadline))
+	ctx, cancel := expiredWindow.landingContext()
+	defer cancel()
+	if err := frameLandingError(frameLines.meta.appendFrameLogEntries(ctx, writes, false)); !errors.Is(err, ErrWriteDeadline) {
+		t.Fatalf("a log append past the deadline returned %v", err)
+	}
+	if err := frameLines.meta.cancelFrameWrites(expiredWindow, writes); err != nil {
+		t.Fatalf("cancel markers within the grace: %v", err)
+	}
+	if entries, _ := dataframe.ReadLog(store, &frame.Frame); len(entries) != 1 || !entries[0].IsCancel || entries[0].NewVersion != 11 {
+		t.Fatalf("the log holds %+v, want one cancel marker of version 11", entries)
+	}
+	pastGraceWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-frameWriteDeadline - frameCancelGrace))
+	if err := frameLines.meta.cancelFrameWrites(pastGraceWindow, writes); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancel markers past the grace returned %v", err)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// The randomized run test: the spec of the runs. Writers race on a small table
-// through the real write-path code (stampCreatedVersions, frameWritesOf,
-// appendFrameLogEntries) in steps (read, reserve, log, land) interleaved with
-// runs and rebuilds, which crash at random points. After every committed run each
-// file must equal a brute-force aggregate of the records at the run's snapshot.
+// The randomized compaction test: the spec of the runs and of the express
+// compactions. Writers race on a small table through the real write-path code
+// (stampCreatedVersions, frameWritesOf, appendFrameLogEntries) in steps (read,
+// reserve, log, land), interleaved with runs, fresh reads, express compactions and
+// rebuilds, which crash at random points. After every commit and rebuild each file
+// must equal a brute-force aggregate of the records at its own snapshot (the
+// frame's, when older), and every fresh read the records as they are.
 //
 // A writer lands conditionally, as PutManyIfVersion does: one that read a version
 // since replaced loses and appends its cancel markers. Time is counted in steps: a
-// writer lives at most frameSimWriterLifetime steps, and a run targets a version
-// read at least frameSimSettle steps before. frameSimSettle is twice the lifetime,
-// which makes every losing writer finish before a run can read its entry; in
-// production the settle is the Lambda timeout plus a minute, which leaves the
-// narrow window described in the README's Limits. A writer crashes after logging
-// only when the record is unchanged since its read and no other writer is on it:
-// the crash phantoms the design tolerates.
+// writer lives at most frameSimWriterLifetime steps from its read, as the write
+// deadline bounds a real one, and a compaction targets only a checkpoint at least
+// frameSimSettle steps old, twice the lifetime plus one, as frameSettle is. A writer
+// crashes after logging only when the record is unchanged since its read and no
+// other writer is on it: the crash phantoms the design tolerates.
+//
+// Every compaction takes the frame's lock (dataframe.TakeLock) on a clock of
+// frameSimStepDuration per step, and skips while another holds it. One that crashes
+// never releases it: the next takes it over once it expired. Some express
+// compactions are slow: they wait steps between their read and their files, and
+// hold the lock steps between their files and their commit, maybe past its expiry,
+// when another compaction may have taken it over.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
 	frameSimWriterLifetime = 6
 	frameSimSettle         = 2*frameSimWriterLifetime + 1
+	frameSimStepDuration   = 2 * time.Second
 )
 
 var errSimulatedCrash = errors.New("simulated crash")
 
-// crashingFrameStore fails the run's writes once its budget is spent, and lets the
-// writers move on right before the run reads the log.
+// crashingFrameStore fails the compactions' writes once its budget is spent, and lets the writers move
+// on right before a run reads the log. The lock's writes spend none: a crash is a holder that stops
+// writing and never releases its lock.
 type crashingFrameStore struct {
 	*dataframe.MemoryStore
 	mutex              sync.Mutex
@@ -268,9 +354,10 @@ type crashingFrameStore struct {
 	beforeLogRead      func()
 }
 
-// isFrameDataFile tells a file of rows from a frame's _idx and _log.<shape>.
+// isFrameDataFile tells a file of rows from a frame's _idx, _ixt, _log.<shape> and _lock.
 func isFrameDataFile(key string) bool {
-	return !strings.HasSuffix(key, "/_idx") && !strings.Contains(key, "/_log.")
+	return !strings.HasSuffix(key, "/_idx") && !strings.HasSuffix(key, "/_ixt") && !strings.HasSuffix(key, "/_lock") &&
+		!strings.Contains(key, "/_log.")
 }
 
 func (store *crashingFrameStore) spendRunWrite(isDataFile bool) error {
@@ -288,25 +375,27 @@ func (store *crashingFrameStore) spendRunWrite(isDataFile bool) error {
 	return nil
 }
 
-func (store *crashingFrameStore) Put(key string, content []byte) error {
+func (store *crashingFrameStore) Put(ctx context.Context, key string, content []byte) error {
 	if err := store.spendRunWrite(isFrameDataFile(key)); err != nil {
 		return err
 	}
-	return store.MemoryStore.Put(key, content)
+	return store.MemoryStore.Put(ctx, key, content)
 }
 
-func (store *crashingFrameStore) PutIfMatch(key string, content []byte, etag string) error {
-	if err := store.spendRunWrite(isFrameDataFile(key)); err != nil {
-		return err
+func (store *crashingFrameStore) PutIfMatch(ctx context.Context, key string, content []byte, etag string) (string, error) {
+	if !strings.HasSuffix(key, "/_lock") {
+		if err := store.spendRunWrite(isFrameDataFile(key)); err != nil {
+			return "", err
+		}
 	}
-	return store.MemoryStore.PutIfMatch(key, content, etag)
+	return store.MemoryStore.PutIfMatch(ctx, key, content, etag)
 }
 
-func (store *crashingFrameStore) Delete(keys ...string) error {
+func (store *crashingFrameStore) Delete(ctx context.Context, keys ...string) error {
 	if err := store.spendRunWrite(false); err != nil {
 		return err
 	}
-	return store.MemoryStore.Delete(keys...)
+	return store.MemoryStore.Delete(ctx, keys...)
 }
 
 func (store *crashingFrameStore) Get(key string) ([]byte, string, error) {
@@ -331,50 +420,129 @@ type frameSimWriter struct {
 	crashes         bool
 }
 
+// frameSimState is a frame's state item, as the simulation keeps it.
 type frameSimState struct {
 	hasShape, isBuilt bool
-	snapshot, target  int64
+	snapshot          int64
+	hasTarget         bool
+	target            int64
 	targetTime        int
-	// hasPendingCrash: the last run crashed, so files may be at target and the _idx behind them.
+	hasPreviousTarget bool
+	previousTarget    int64
+	extendedDays      map[int64]bool
+	// hasPendingCrash: a compaction crashed since the last run committed, so files may be ahead of
+	// the snapshot with the indexes behind them.
 	hasPendingCrash bool
 }
 
+// pushCheckpoint and settledTarget are pushFrameCheckpoint and frameState.settledTarget, in steps.
+func (state *frameSimState) pushCheckpoint(sequence int64, now int) {
+	if state.hasTarget && now-state.targetTime < frameSimSettle {
+		return
+	}
+	state.hasPreviousTarget, state.previousTarget = state.hasTarget, state.target
+	state.hasTarget, state.target, state.targetTime = true, sequence, now
+}
+
+func (state *frameSimState) settledTarget(now int) (int64, bool) {
+	if state.hasTarget && now-state.targetTime >= frameSimSettle {
+		return state.target, true
+	}
+	return state.previousTarget, state.hasPreviousTarget
+}
+
+// frameSimExpress is an express compaction between its steps: read; then lock taken and files written;
+// then committed.
+type frameSimExpress struct {
+	frameIndex   int
+	read         *dataframe.FreshRead
+	baseSnapshot int64
+	target       int64
+	lock         *dataframe.Lock // set once its files are written
+	lockedAt     int
+	extendedDays []int64
+}
+
 type frameSimulation struct {
-	t        *testing.T
-	rng      *rand.Rand
-	now      int
-	store    *crashingFrameStore
-	records  map[string]*frameLine
-	history  map[string][]frameSimLanding
-	sequence int64
-	writers  []*frameSimWriter
-	states   []frameSimState
-	counts   map[string]int
-	trace    []string
+	t         *testing.T
+	rng       *rand.Rand
+	now       int
+	store     *crashingFrameStore
+	records   map[string]*frameLine
+	history   map[string][]frameSimLanding
+	sequence  int64
+	writers   []*frameSimWriter
+	expresses []*frameSimExpress // the slow ones in flight
+	states    []frameSimState
+	// unreleasedLocks is each frame's last lock taken, until its holder releases it.
+	unreleasedLocks []*dataframe.Lock
+	counts          map[string]int
+	trace           []string
 }
 
 func (sim *frameSimulation) tracef(format string, args ...any) {
 	sim.trace = append(sim.trace, fmt.Sprintf("t=%d ", sim.now)+fmt.Sprintf(format, args...))
 }
 
+// clock is the time of the locks: frameSimStepDuration per step.
+func (sim *frameSimulation) clock() time.Time {
+	return time.Unix(1_000_000_000, 0).Add(time.Duration(sim.now) * frameSimStepDuration)
+}
+
+// takeLock is dataframe.TakeLock on the simulation's clock: nil, counted as skippedEvent, while another
+// compaction holds the lock.
+func (sim *frameSimulation) takeLock(frameIndex int, skippedEvent string) *dataframe.Lock {
+	lock, err := dataframe.TakeLock(sim.store, &frameLines.meta.dataFrames[frameIndex].Frame, sim.clock)
+	if err != nil {
+		sim.t.Fatal(err)
+	}
+	if lock == nil {
+		sim.counts[skippedEvent]++
+		return nil
+	}
+	if sim.unreleasedLocks[frameIndex] != nil {
+		sim.counts["locks taken over"]++
+		sim.tracef("lock of frame %d taken over", frameIndex)
+	}
+	sim.unreleasedLocks[frameIndex] = lock
+	return lock
+}
+
+func (sim *frameSimulation) releaseLock(frameIndex int, lock *dataframe.Lock) {
+	if err := lock.Release(); err != nil {
+		sim.t.Fatal(err)
+	}
+	if sim.unreleasedLocks[frameIndex] == lock {
+		sim.unreleasedLocks[frameIndex] = nil
+	}
+}
+
 func TestDataFrameRunsMatchBruteForce(t *testing.T) {
-	defer SetDataFrames(nil, frameSettle)
+	defer SetDataFrames(nil, frameWriteDeadline)
 	counts := map[string]int{}
 	for seed := range uint64(250) {
 		store := &crashingFrameStore{MemoryStore: dataframe.NewMemoryStore(), remainingRunWrites: -1}
-		SetDataFrames(store, time.Minute)
+		SetDataFrames(store, frameWriteDeadline)
 		sim := &frameSimulation{
 			t: t, rng: rand.New(rand.NewPCG(seed, 77)), store: store,
 			records: map[string]*frameLine{}, history: map[string][]frameSimLanding{},
-			states: make([]frameSimState, len(frameLines.meta.dataFrames)), counts: counts,
+			states:          make([]frameSimState, len(frameLines.meta.dataFrames)),
+			unreleasedLocks: make([]*dataframe.Lock, len(frameLines.meta.dataFrames)), counts: counts,
+		}
+		for i := range sim.states {
+			sim.states[i].extendedDays = map[int64]bool{}
 		}
 		store.beforeLogRead = sim.advanceSomeWriters
 		for range 300 {
 			sim.step()
 		}
-		// Drain the writers, let time pass and run until every frame holds the table as it is now.
+		// Drain the writers and the express compactions, let time pass (the locks of crashed compactions
+		// expire) and run until every frame holds the table as it is now.
 		for len(sim.writers) > 0 {
 			sim.advanceWriter(sim.writers[0])
+		}
+		for len(sim.expresses) > 0 {
+			sim.advanceExpress(sim.expresses[0])
 		}
 		for range 3 {
 			sim.now += frameSimSettle
@@ -389,7 +557,10 @@ func TestDataFrameRunsMatchBruteForce(t *testing.T) {
 		}
 	}
 	t.Logf("%v", counts)
-	for _, event := range []string{"committed runs", "crashed runs", "lost writes", "crashed writers", "deletes", "range rebuilds", "full rebuilds", "fresh reads"} {
+	for _, event := range []string{"committed runs", "crashed runs", "lost writes", "crashed writers", "deletes", "range rebuilds", "full rebuilds",
+		"fresh reads", "express commits", "crashed expresses", "slow expresses", "expresses behind w", "runs skipped for the lock",
+		"rebuilds skipped for the lock", "expresses skipped for the lock", "locks taken over", "expresses that lost their lock",
+		"expresses committed past their lock's expiry"} {
 		if counts[event] == 0 {
 			t.Errorf("the simulation never produced %s", event)
 		}
@@ -398,7 +569,7 @@ func TestDataFrameRunsMatchBruteForce(t *testing.T) {
 
 func (sim *frameSimulation) step() {
 	sim.now++
-	// A writer never outlives its Lambda: one at the end of its lifetime finishes now.
+	// A writer never outlives its deadline: one at the end of its lifetime finishes now.
 	for i := 0; i < len(sim.writers); {
 		if writer := sim.writers[i]; sim.now-writer.startTime >= frameSimWriterLifetime {
 			sim.advanceWriter(writer)
@@ -409,10 +580,14 @@ func (sim *frameSimulation) step() {
 	switch roll := sim.rng.IntN(100); {
 	case roll < 35:
 		sim.startWriter()
-	case roll < 75:
+	case roll < 70:
 		sim.advanceSomeWriters()
 	case roll < 80:
 		sim.freshReadFrame(sim.rng.IntN(len(sim.states)))
+	case roll < 85:
+		if len(sim.expresses) > 0 {
+			sim.advanceExpress(sim.expresses[sim.rng.IntN(len(sim.expresses))])
+		}
 	case roll < 94:
 		for i := range sim.states {
 			sim.runFrame(i, sim.rng.IntN(3) == 0)
@@ -496,7 +671,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 		}
 		sim.tracef("writer v%d on %q reserved: stored %+v written %+v", writer.version, writer.sk, writer.stored, writer.written)
 	case 2:
-		if err := meta.appendFrameLogEntries(writer.writes, false); err != nil {
+		if err := meta.appendFrameLogEntries(context.Background(), writer.writes, false); err != nil {
 			sim.t.Fatal(err)
 		}
 		sim.tracef("writer v%d logged", writer.version)
@@ -509,7 +684,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 			sim.counts["crashed writers"]++
 			sim.tracef("writer v%d crashed", writer.version)
 		case !isUnchanged:
-			if err := meta.appendFrameLogEntries(writer.writes, true); err != nil {
+			if err := meta.appendFrameLogEntries(context.Background(), writer.writes, true); err != nil {
 				sim.t.Fatal(err)
 			}
 			sim.counts["lost writes"]++
@@ -541,107 +716,163 @@ func (sim *frameSimulation) readRecords(frame *dataFrameMeta, matches func(line 
 	return frameLines.meta.frameRecordStates(frame, ptrs)
 }
 
+// recordReaders are the record reads of a compaction: the records written after a snapshot, and by sk.
+func (sim *frameSimulation) recordReaders(frame *dataFrameMeta) (func(snapshot int64) ([]dataframe.RecordState, error), func(sks []string) ([]dataframe.RecordState, error)) {
+	readWrittenAfter := func(snapshot int64) ([]dataframe.RecordState, error) {
+		return sim.readRecords(frame, func(line *frameLine) bool { return int64(line.UpdatedVersion) > snapshot }), nil
+	}
+	readBySK := func(sks []string) ([]dataframe.RecordState, error) {
+		return sim.readRecords(frame, func(line *frameLine) bool {
+			return slices.Contains(sks, frameLines.meta.skValue(unsafe.Pointer(line)))
+		}), nil
+	}
+	return readWrittenAfter, readBySK
+}
+
+// checkSettled fails when a writer of a version up to target still runs: target would not be settled.
+func (sim *frameSimulation) checkSettled(target int64) {
+	for _, writer := range sim.writers {
+		if writer.version != 0 && writer.version <= target {
+			sim.t.Fatalf("writer of version %d still running past the settle of target %d", writer.version, target)
+		}
+	}
+}
+
+// runFrame is the scheduled run: it takes the lock, pushes a checkpoint when the newest has settled,
+// then builds the frame or compacts it to the newest settled checkpoint, merging the days in ix. One
+// that crashes keeps the lock.
 func (sim *frameSimulation) runFrame(frameIndex int, mayCrash bool) {
 	frame := &frameLines.meta.dataFrames[frameIndex]
 	state := &sim.states[frameIndex]
+	lock := sim.takeLock(frameIndex, "runs skipped for the lock")
+	if lock == nil {
+		return
+	}
 	if !state.hasShape {
-		// The reset run of a new frame: its first build targets the version read now.
-		state.hasShape, state.target, state.targetTime = true, sim.sequence, sim.now
+		// The reset run of a new frame records a checkpoint; its first build targets it once settled.
+		state.hasShape, state.hasTarget, state.target, state.targetTime = true, true, sim.sequence, sim.now
+		sim.releaseLock(frameIndex, lock)
 		return
 	}
-	if sim.now-state.targetTime < frameSimSettle {
+	state.pushCheckpoint(sim.sequence, sim.now)
+	target, hasTarget := state.settledTarget(sim.now)
+	if !state.isBuilt && !hasTarget {
+		sim.releaseLock(frameIndex, lock)
 		return
 	}
-	for _, writer := range sim.writers {
-		if writer.version != 0 && writer.version <= state.target {
-			sim.t.Fatalf("writer of version %d still running past the settle of target %d", writer.version, state.target)
-		}
-	}
-	nextTarget := sim.sequence
+	sim.checkSettled(target)
 	if mayCrash {
 		sim.store.remainingRunWrites = sim.rng.IntN(6)
 		defer func() { sim.store.remainingRunWrites = -1 }()
 	}
-	target := state.target
+	snapshot := state.snapshot
+	mergedDays := slices.Sorted(maps.Keys(state.extendedDays))
 	var err error
-	switch {
-	case !state.isBuilt:
-		err = dataframe.RebuildAllFiles(sim.store, &frame.Frame, sim.readRecords(frame, func(*frameLine) bool { return true }), target)
-	case target > state.snapshot:
-		err = dataframe.CompactFrame(sim.store, &frame.Frame, state.snapshot, target,
+	if !state.isBuilt {
+		snapshot = target
+		err = dataframe.RebuildAllFiles(lock, &frame.Frame, sim.readRecords(frame, func(*frameLine) bool { return true }), target)
+	} else {
+		if hasTarget && target > snapshot {
+			snapshot = target
+		}
+		readWrittenAfter, readBySK := sim.recordReaders(frame)
+		err = dataframe.CompactFrame(lock, &frame.Frame, state.snapshot, snapshot, mergedDays,
 			func(snapshot int64) ([]dataframe.RecordState, error) {
-				records := sim.readRecords(frame, func(line *frameLine) bool { return int64(line.UpdatedVersion) > snapshot })
+				records, err := readWrittenAfter(snapshot)
 				sim.advanceSomeWriters() // writes landing between the record read and the log read
-				return records, nil
-			},
-			func(sks []string) ([]dataframe.RecordState, error) {
-				return sim.readRecords(frame, func(line *frameLine) bool {
-					return slices.Contains(sks, frameLines.meta.skValue(unsafe.Pointer(line)))
-				}), nil
-			})
-	default:
-		target = state.snapshot
+				return records, err
+			}, readBySK)
 	}
 	if err != nil {
 		if !errors.Is(err, errSimulatedCrash) {
 			sim.t.Fatal(err)
 		}
 		sim.counts["crashed runs"]++
-		sim.tracef("run %s %d → %d crashed", frame.Name, state.snapshot, target)
-		// A first build that crashed leaves files at target too, but the frame is not built yet.
-		state.hasPendingCrash = state.isBuilt
+		sim.tracef("run %s %d → %d crashed", frame.Name, state.snapshot, snapshot)
+		// A first build that crashed leaves files too, but the frame is not built yet.
+		state.hasPendingCrash = state.hasPendingCrash || state.isBuilt
 		return
 	}
-	sim.tracef("run %s %d → %d committed (built %v), next target %d", frame.Name, state.snapshot, target, state.isBuilt, nextTarget)
-	state.isBuilt, state.snapshot, state.target, state.targetTime, state.hasPendingCrash = true, target, nextTarget, sim.now, false
+	if !sim.commitUnder(lock) {
+		sim.t.Fatalf("run %s lost its lock within a step", frame.Name)
+	}
+	sim.tracef("run %s %d → %d committed (built %v), merged days %v", frame.Name, state.snapshot, snapshot, state.isBuilt, mergedDays)
+	for _, day := range mergedDays {
+		delete(state.extendedDays, day)
+	}
+	state.isBuilt, state.snapshot, state.hasPendingCrash = true, snapshot, false
 	sim.counts["committed runs"]++
-	if err := dataframe.TruncateLog(sim.store, &frame.Frame, target); err != nil && !errors.Is(err, errSimulatedCrash) {
+	if err := dataframe.TruncateLog(sim.store, &frame.Frame, snapshot); err != nil && !errors.Is(err, errSimulatedCrash) {
 		sim.t.Fatal(err)
 	}
+	sim.releaseLock(frameIndex, lock)
 	sim.verifyFrame(frame, *state)
 }
 
-// rebuildFrame rebuilds a built frame at its snapshot, a range of days or all of it.
-// Unless a crashed run left files ahead, they already hold that snapshot, so on a
-// 2–3-key frame a range rebuild must not even rewrite one.
+// commitUnder is the bound commitFrameState puts on its write: false once the lock was taken over.
+func (sim *frameSimulation) commitUnder(lock *dataframe.Lock) bool {
+	_, cancel, err := lock.WriteContext()
+	if errors.Is(err, dataframe.ErrLockLost) {
+		return false
+	}
+	if err != nil {
+		sim.t.Fatal(err)
+	}
+	cancel()
+	return true
+}
+
+// rebuildFrame rebuilds a built frame at its snapshot, a range of days or all of it, under the lock.
+// Unless a crashed or an uncommitted compaction left files ahead, they already hold that snapshot, so
+// on a 2–3-key frame a range rebuild must not even rewrite one.
 func (sim *frameSimulation) rebuildFrame(frameIndex int, isRange bool) {
 	frame := &frameLines.meta.dataFrames[frameIndex]
-	state := sim.states[frameIndex]
+	state := &sim.states[frameIndex]
 	if !state.isBuilt {
 		return
 	}
+	lock := sim.takeLock(frameIndex, "rebuilds skipped for the lock")
+	if lock == nil {
+		return
+	}
+	defer sim.releaseLock(frameIndex, lock)
+	isQuiet := !state.hasPendingCrash && !sim.hasFilesAhead(frame, state.snapshot)
 	filePutsBefore := sim.store.filePuts
 	if isRange {
 		fromKey := 20730 + int64(sim.rng.IntN(3))
 		toKey := fromKey + int64(sim.rng.IntN(int(20733-fromKey)))
 		records := sim.readRecords(frame, func(line *frameLine) bool { return int64(line.Fecha) >= fromKey && int64(line.Fecha) <= toKey })
-		if err := dataframe.RebuildFilesInRange(sim.store, &frame.Frame, records, state.snapshot, fromKey, toKey); err != nil {
+		if err := dataframe.RebuildFilesInRange(lock, &frame.Frame, records, state.snapshot, fromKey, toKey); err != nil {
 			sim.t.Fatal(err)
 		}
-		if len(frame.keys) > 1 && !state.hasPendingCrash && sim.store.filePuts != filePutsBefore {
-			sim.t.Fatalf("%s: a range rebuild of files already right rewrote %d of them", frame.Name, sim.store.filePuts-filePutsBefore)
+		if len(frame.keys) > 1 && isQuiet && sim.store.filePuts != filePutsBefore {
+			sim.t.Fatalf("%s\n%s: a range rebuild of files already right rewrote %d of them", strings.Join(sim.trace, "\n"), frame.Name, sim.store.filePuts-filePutsBefore)
 		}
 		sim.counts["range rebuilds"]++
 		sim.tracef("range rebuild %s at %d of [%d, %d]", frame.Name, state.snapshot, fromKey, toKey)
 	} else {
-		if err := dataframe.RebuildAllFiles(sim.store, &frame.Frame, sim.readRecords(frame, func(*frameLine) bool { return true }), state.snapshot); err != nil {
+		if err := dataframe.RebuildAllFiles(lock, &frame.Frame, sim.readRecords(frame, func(*frameLine) bool { return true }), state.snapshot); err != nil {
 			sim.t.Fatal(err)
 		}
+		state.hasPendingCrash = false
 		sim.counts["full rebuilds"]++
 		sim.tracef("full rebuild %s at %d", frame.Name, state.snapshot)
 	}
-	sim.verifyFrame(frame, state)
+	sim.verifyFrame(frame, *state)
 }
 
-// freshReadFrame checks a fresh read of a built frame, over a random range of days and
-// maybe a pinned ClientID, against a brute-force aggregate of the records as they are
-// now, while writers are reserved, logged, about to lose or crashed.
+// freshReadFrame checks a fresh read of a built frame, over a random range of days and maybe a pinned
+// ClientID, against a brute-force aggregate of the records as they are now, while writers are
+// reserved, logged, about to lose or crashed. Then, as expressCompactFrame, it pushes a checkpoint,
+// and may start an express compaction to the newest checkpoint settled when the read began: half of
+// them finish now, the slow ones over later steps.
 func (sim *frameSimulation) freshReadFrame(frameIndex int) {
 	frame := &frameLines.meta.dataFrames[frameIndex]
-	state := sim.states[frameIndex]
+	state := &sim.states[frameIndex]
 	if !state.isBuilt {
 		return
 	}
+	startState := *state
 	fromKey := 20730 + int64(sim.rng.IntN(3))
 	toKey := fromKey + int64(sim.rng.IntN(int(20733-fromKey)))
 	var pinnedKeys []int64
@@ -654,15 +885,8 @@ func (sim *frameSimulation) freshReadFrame(frameIndex int) {
 	// No writer moves during the read, so "now" is one state of the records.
 	beforeLogRead := sim.store.beforeLogRead
 	sim.store.beforeLogRead = nil
-	fileKeys, files, err := dataframe.ReadFreshFiles(sim.store, &frame.Frame, state.snapshot, fromKey, toKey, pinnedKeys,
-		func(snapshot int64) ([]dataframe.RecordState, error) {
-			return sim.readRecords(frame, func(line *frameLine) bool { return int64(line.UpdatedVersion) > snapshot }), nil
-		},
-		func(sks []string) ([]dataframe.RecordState, error) {
-			return sim.readRecords(frame, func(line *frameLine) bool {
-				return slices.Contains(sks, frameLines.meta.skValue(unsafe.Pointer(line)))
-			}), nil
-		})
+	readWrittenAfter, readBySK := sim.recordReaders(frame)
+	fresh, err := dataframe.ReadFreshFiles(sim.store, &frame.Frame, state.snapshot, fromKey, toKey, pinnedKeys, readWrittenAfter, readBySK)
 	sim.store.beforeLogRead = beforeLogRead
 	if err != nil {
 		sim.t.Fatal(err)
@@ -672,19 +896,19 @@ func (sim *frameSimulation) freshReadFrame(frameIndex int) {
 		sim.t.Fatalf("%s\n%s fresh read of [%d, %d] %v at snapshot %d: %s", strings.Join(sim.trace, "\n"), frame.Name, fromKey, toKey, pinnedKeys,
 			state.snapshot, fmt.Sprintf(format, args...))
 	}
-	if !slices.IsSortedFunc(fileKeys, func(a, b [dataframe.MaxKeys]int64) int { return slices.Compare(a[:], b[:]) }) {
-		failf("file keys out of order: %v", fileKeys)
+	if !slices.IsSortedFunc(fresh.FileKeys, func(a, b [dataframe.MaxKeys]int64) int { return slices.Compare(a[:], b[:]) }) {
+		failf("file keys out of order: %v", fresh.FileKeys)
 	}
 	expected := sim.bruteForceFiles(frame, math.MaxInt64, isSelected)
-	for i, keys := range fileKeys {
+	for i, keys := range fresh.FileKeys {
 		objectKey := frame.FileKey(keys)
 		if !isSelected(keys) {
 			failf("read %s, outside the selection", objectKey)
 		}
 		want := expected[objectKey]
 		delete(expected, objectKey)
-		if !slices.Equal(files[i].RowIDs, want.RowIDs) || (len(want.RowIDs) > 0 && !reflect.DeepEqual(files[i].Sums, want.Sums)) {
-			failf("%s holds rows %v sums %v, the records add up to rows %v sums %v", objectKey, files[i].RowIDs, files[i].Sums, want.RowIDs, want.Sums)
+		if !slices.Equal(fresh.Files[i].RowIDs, want.RowIDs) || (len(want.RowIDs) > 0 && !reflect.DeepEqual(fresh.Files[i].Sums, want.Sums)) {
+			failf("%s holds rows %v sums %v, the records add up to rows %v sums %v", objectKey, fresh.Files[i].RowIDs, fresh.Files[i].Sums, want.RowIDs, want.Sums)
 		}
 	}
 	for objectKey := range expected {
@@ -692,12 +916,94 @@ func (sim *frameSimulation) freshReadFrame(frameIndex int) {
 	}
 	sim.counts["fresh reads"]++
 	sim.tracef("fresh read %s of [%d, %d] %v", frame.Name, fromKey, toKey, pinnedKeys)
+
+	state.pushCheckpoint(sim.sequence, sim.now)
+	target, hasTarget := startState.settledTarget(sim.now)
+	if !hasTarget || target <= startState.snapshot || fresh.ChangedRecords(target) == 0 || sim.rng.IntN(2) == 0 {
+		return
+	}
+	sim.checkSettled(target)
+	express := &frameSimExpress{frameIndex: frameIndex, read: fresh, baseSnapshot: startState.snapshot, target: target}
+	sim.tracef("express %s %d → %d read", frame.Name, express.baseSnapshot, target)
+	if sim.rng.IntN(2) == 0 {
+		sim.counts["slow expresses"]++
+		sim.expresses = append(sim.expresses, express)
+		return
+	}
+	sim.advanceExpress(express)
+}
+
+// advanceExpress takes the express compaction's next step. First it takes the lock, unless another
+// compaction holds it, and goes on only while w is still its read's: then it writes its files and
+// appends to the _ixt of their days, maybe crashing partway. Then it commits w and ix, unless its lock
+// was taken over meanwhile, and releases the lock. A fast one takes both steps at once.
+func (sim *frameSimulation) advanceExpress(express *frameSimExpress) {
+	frame := &frameLines.meta.dataFrames[express.frameIndex]
+	state := &sim.states[express.frameIndex]
+	drop := func() {
+		sim.expresses = slices.DeleteFunc(sim.expresses, func(other *frameSimExpress) bool { return other == express })
+	}
+	if express.lock == nil {
+		lock := sim.takeLock(express.frameIndex, "expresses skipped for the lock")
+		if lock == nil {
+			drop()
+			return
+		}
+		if !state.isBuilt || state.snapshot != express.baseSnapshot {
+			sim.counts["expresses behind w"]++
+			sim.releaseLock(express.frameIndex, lock)
+			drop()
+			return
+		}
+		if sim.rng.IntN(8) == 0 {
+			sim.store.remainingRunWrites = sim.rng.IntN(4)
+		}
+		extendedDays, err := express.read.CompactTo(lock, &frame.Frame, express.target)
+		sim.store.remainingRunWrites = -1
+		if err != nil {
+			if !errors.Is(err, errSimulatedCrash) {
+				sim.t.Fatal(err)
+			}
+			sim.counts["crashed expresses"]++
+			sim.tracef("express %s %d → %d crashed", frame.Name, express.baseSnapshot, express.target)
+			state.hasPendingCrash = true
+			drop()
+			return
+		}
+		express.lock, express.lockedAt, express.extendedDays = lock, sim.now, extendedDays
+		sim.tracef("express %s %d → %d wrote its files, days %v", frame.Name, express.baseSnapshot, express.target, extendedDays)
+		if slices.Contains(sim.expresses, express) {
+			return
+		}
+	}
+	drop()
+	defer sim.releaseLock(express.frameIndex, express.lock)
+	if !sim.commitUnder(express.lock) {
+		// Its files are ahead of w, as a crashed compaction's, and indexed.
+		sim.counts["expresses that lost their lock"]++
+		sim.tracef("express %s %d → %d lost its lock", frame.Name, express.baseSnapshot, express.target)
+		return
+	}
+	if state.snapshot != express.baseSnapshot {
+		sim.t.Fatalf("%s\nexpress %s %d → %d: w moved to %d under its lock", strings.Join(sim.trace, "\n"), frame.Name,
+			express.baseSnapshot, express.target, state.snapshot)
+	}
+	if time.Duration(sim.now-express.lockedAt)*frameSimStepDuration > dataframe.LockDuration {
+		sim.counts["expresses committed past their lock's expiry"]++
+	}
+	state.snapshot = express.target
+	for _, day := range express.extendedDays {
+		state.extendedDays[day] = true
+	}
+	sim.counts["express commits"]++
+	sim.tracef("express %s %d → %d committed", frame.Name, express.baseSnapshot, express.target)
+	sim.verifyFrame(frame, *state)
 }
 
 // bruteForceFiles aggregates the records as they were at snapshot into the frame's
 // files whose keys isSelected, by object key, from the history of what landed. It
-// shares no code with the runs: rows whose sums are all 0 are left out, as the runs
-// leave them out.
+// shares no code with the compactions: rows whose sums are all 0 are left out, as
+// the compactions leave them out.
 func (sim *frameSimulation) bruteForceFiles(frame *dataFrameMeta, snapshot int64, isSelected func(keys [dataframe.MaxKeys]int64) bool) map[string]dataframe.File {
 	sumsByRowByObjectKey := map[string]map[int64][]int64{}
 	for _, landings := range sim.history {
@@ -746,10 +1052,55 @@ func (sim *frameSimulation) bruteForceFiles(frame *dataFrameMeta, snapshot int64
 	return filesByObjectKey
 }
 
-// verifyFrame checks every file of the frame against a brute-force aggregate of the
-// records at the frame's snapshot, or, for a file a crashed run left ahead, at that
-// run's target. With no crashed run pending, every _idx must list exactly the
-// hashes of its folder's files.
+// hasFilesAhead reports whether a file of the frame is past snapshot: a compaction that crashed or did
+// not commit (yet) wrote it.
+func (sim *frameSimulation) hasFilesAhead(frame *dataFrameMeta, snapshot int64) bool {
+	objectKeys, _ := sim.store.MemoryStore.List(frame.Folder)
+	for _, objectKey := range objectKeys {
+		if !isFrameDataFile(objectKey) {
+			continue
+		}
+		content, _, _ := sim.store.MemoryStore.Get(objectKey)
+		if file, err := dataframe.DecodeFile(content, frame.SumsCount); err == nil && file.Snapshot > snapshot {
+			return true
+		}
+	}
+	return false
+}
+
+// indexedHashes reads every day index of the frame as object key → hash: the _idx, then the _ixt over
+// it, the later entries winning.
+func (sim *frameSimulation) indexedHashes(frame *dataFrameMeta) map[string]uint32 {
+	objectKeys, _ := sim.store.MemoryStore.List(frame.Folder)
+	hashes := map[string]uint32{}
+	for _, indexSuffix := range []string{"/_idx", "/_ixt"} {
+		for _, objectKey := range objectKeys {
+			if !strings.HasSuffix(objectKey, indexSuffix) {
+				continue
+			}
+			day, _ := strconv.ParseInt(path.Base(path.Dir(objectKey)), 10, 64)
+			content, _, _ := sim.store.MemoryStore.Get(objectKey)
+			decode := dataframe.DecodeIndex
+			if indexSuffix == "/_ixt" {
+				decode = dataframe.DecodeIndexExtension
+			}
+			entries, err := decode(content, frame.KeyCount)
+			if err != nil {
+				sim.t.Fatalf("%s: %v", objectKey, err)
+			}
+			for _, entry := range entries {
+				hashes[frame.FileKey([dataframe.MaxKeys]int64{day, entry.Keys[0], entry.Keys[1]})] = entry.Hash
+			}
+		}
+	}
+	return hashes
+}
+
+// verifyFrame checks every file of the frame against a brute-force aggregate of the records at its own
+// snapshot, or at the frame's when older: a file ahead of the frame is one a compaction that crashed or
+// did not commit (yet) wrote. Every file with rows at the frame's snapshot must exist and, on a 2–3-key
+// frame, be listed by its day's index. With no crash pending, the indexes must list exactly the files,
+// with their hashes, files ahead included.
 func (sim *frameSimulation) verifyFrame(frame *dataFrameMeta, state frameSimState) {
 	t := sim.t
 	t.Helper()
@@ -758,18 +1109,18 @@ func (sim *frameSimulation) verifyFrame(frame *dataFrameMeta, state frameSimStat
 		t.Fatalf("%s\n%s at snapshot %d: %s", strings.Join(sim.trace, "\n"), frame.Name, state.snapshot, fmt.Sprintf(format, args...))
 	}
 	isAnyFile := func([dataframe.MaxKeys]int64) bool { return true }
-	expectedAtSnapshot := sim.bruteForceFiles(frame, state.snapshot, isAnyFile)
-	var expectedAtTarget map[string]dataframe.File
+	expectedBySnapshot := map[int64]map[string]dataframe.File{}
+	expectedAt := func(snapshot int64) map[string]dataframe.File {
+		if expectedBySnapshot[snapshot] == nil {
+			expectedBySnapshot[snapshot] = sim.bruteForceFiles(frame, snapshot, isAnyFile)
+		}
+		return expectedBySnapshot[snapshot]
+	}
 
-	listedKeys, _ := sim.store.MemoryStore.List(frame.Folder)
-	fileHashesByFolder := map[string]map[string]uint32{}
-	var indexKeys []string
-	for _, objectKey := range listedKeys {
-		switch {
-		case strings.Contains(objectKey, "/_log."):
-			continue
-		case strings.HasSuffix(objectKey, "/_idx"):
-			indexKeys = append(indexKeys, objectKey)
+	objectKeys, _ := sim.store.MemoryStore.List(frame.Folder)
+	fileHashes := map[string]uint32{}
+	for _, objectKey := range objectKeys {
+		if !isFrameDataFile(objectKey) {
 			continue
 		}
 		content, _, _ := sim.store.MemoryStore.Get(objectKey)
@@ -777,50 +1128,27 @@ func (sim *frameSimulation) verifyFrame(frame *dataFrameMeta, state frameSimStat
 		if err != nil {
 			failf("%s: %v", objectKey, err)
 		}
-		expected := expectedAtSnapshot[objectKey]
-		delete(expectedAtSnapshot, objectKey)
-		if file.Snapshot > state.snapshot {
-			if !state.hasPendingCrash || file.Snapshot != state.target {
-				failf("%s is at snapshot %d, and no crashed run targets it", objectKey, file.Snapshot)
-			}
-			if expectedAtTarget == nil {
-				expectedAtTarget = sim.bruteForceFiles(frame, state.target, isAnyFile)
-			}
-			expected = expectedAtTarget[objectKey]
-		}
+		expected := expectedAt(max(file.Snapshot, state.snapshot))[objectKey]
 		if !slices.Equal(file.RowIDs, expected.RowIDs) || (len(file.RowIDs) > 0 && !reflect.DeepEqual(file.Sums, expected.Sums)) {
 			failf("%s (at %d) holds rows %v sums %v, the records add up to rows %v sums %v", objectKey, file.Snapshot, file.RowIDs, file.Sums, expected.RowIDs, expected.Sums)
 		}
-		folder := path.Dir(objectKey) + "/"
-		if fileHashesByFolder[folder] == nil {
-			fileHashesByFolder[folder] = map[string]uint32{}
+		fileHashes[objectKey] = dataframe.FileHash(content)
+	}
+	for objectKey := range expectedAt(state.snapshot) {
+		if _, isPresent := fileHashes[objectKey]; !isPresent {
+			failf("%s is missing", objectKey)
 		}
-		fileHashesByFolder[folder][objectKey] = dataframe.FileHash(content)
 	}
-	for objectKey := range expectedAtSnapshot {
-		failf("%s is missing", objectKey)
-	}
-	if len(frame.keys) == 1 || state.hasPendingCrash {
+	if frame.KeyCount == 1 {
 		return
 	}
-	for _, indexKey := range indexKeys {
-		folder := strings.TrimSuffix(indexKey, "_idx")
-		day, _ := strconv.ParseInt(path.Base(folder), 10, 64)
-		content, _, _ := sim.store.MemoryStore.Get(indexKey)
-		entries, err := dataframe.DecodeIndex(content, frame.KeyCount)
-		if err != nil {
-			failf("%s: %v", indexKey, err)
+	indexedHashes := sim.indexedHashes(frame)
+	for objectKey := range expectedAt(state.snapshot) {
+		if _, isListed := indexedHashes[objectKey]; !isListed {
+			failf("%s has rows and no index lists it", objectKey)
 		}
-		indexedHashes := map[string]uint32{}
-		for _, entry := range entries {
-			indexedHashes[frame.FileKey([dataframe.MaxKeys]int64{day, entry.Keys[0], entry.Keys[1]})] = entry.Hash
-		}
-		if !reflect.DeepEqual(indexedHashes, fileHashesByFolder[folder]) {
-			failf("%s lists %v, the folder holds %v", indexKey, indexedHashes, fileHashesByFolder[folder])
-		}
-		delete(fileHashesByFolder, folder)
 	}
-	for folder := range fileHashesByFolder {
-		failf("folder %s has files and no _idx", folder)
+	if !state.hasPendingCrash && !maps.Equal(indexedHashes, fileHashes) {
+		failf("the indexes list %v, the folders hold %v", indexedHashes, fileHashes)
 	}
 }

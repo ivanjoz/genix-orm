@@ -86,17 +86,21 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	}
 	// The caller read the records before this reservation, so the version is above the one each
 	// write replaces, as a frame's log entry needs: no need to read before reserving here.
+	windowStart := Now()
 	if _, err := r.meta.prepareWrite(ptrs); err != nil {
 		return nil, err
 	}
-	storedByKey, err := r.storedVersionsForWrite(client, ptrs, expectedVersions)
+	storedByKey, oldestCachedAt, err := r.storedVersionsForWrite(client, ptrs, expectedVersions)
 	if err != nil {
 		return nil, err
 	}
-	r.meta.stampCreatedVersions(ptrs, storedByKey)
-	if err := r.meta.appendFrameLogEntries(r.meta.frameWritesOf(ptrs, storedByKey), false); err != nil {
-		return nil, err
+	// The write deadline counts from the oldest stored read the write diffs against: a cached one, or
+	// its own, which comes after windowStart.
+	if !oldestCachedAt.IsZero() && oldestCachedAt.Before(windowStart) {
+		windowStart = oldestCachedAt
 	}
+	window := r.meta.frameWriteWindowFrom(windowStart)
+	r.meta.stampCreatedVersions(ptrs, storedByKey)
 
 	items := make([]map[string]types.AttributeValue, len(records))
 	rowDeletesByRecord := make([][]types.WriteRequest, len(records))
@@ -120,45 +124,57 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 		rowPuts = append(rowPuts, puts...)
 		rowDeletesByRecord[i] = deletes
 	}
-	// New rows first, as in PutMany: a record that then loses its conditional write
-	// deletes its delta rows below, and leaves its fan-out rows as extra rows, which
-	// every read re-checks and drops.
-	if err := r.batchWriteAll(client, rowPuts); err != nil {
-		return nil, err
-	}
-
+	// The log entries, the new hidden rows and the base items land within the window. New rows first,
+	// as in PutMany: a record that then loses its conditional write deletes its delta rows below, and
+	// leaves its fan-out rows as extra rows, which every read re-checks and drops.
+	ctx, cancel := window.landingContext()
+	defer cancel()
+	isSent := make([]bool, len(records))
 	isWritten := make([]bool, len(records))
-	err = parallel.Run(len(records), func(recordIndex int) (putErr error) {
-		isWritten[recordIndex], putErr = r.putItemIfVersion(client, items[recordIndex], expectedVersions[recordIndex])
-		return putErr
-	})
-	if err != nil {
-		return nil, err
+	isUncertain := make([]bool, len(records))
+	err = r.meta.appendFrameLogEntries(ctx, r.meta.frameWritesOf(ptrs, storedByKey), false)
+	if err == nil {
+		_, err = r.batchWriteAll(ctx, client, rowPuts)
+	}
+	if err == nil {
+		err = parallel.Run(len(records), func(recordIndex int) (putErr error) {
+			if putErr = ctx.Err(); putErr != nil {
+				return putErr
+			}
+			isSent[recordIndex] = true
+			isWritten[recordIndex], putErr = r.putItemIfVersion(ctx, client, items[recordIndex], expectedVersions[recordIndex])
+			isUncertain[recordIndex] = putErr != nil
+			return putErr
+		})
 	}
 
 	var lostRecords []E
-	var writtenPtrs, lostPtrs []unsafe.Pointer
+	var writtenPtrs, cancelledPtrs []unsafe.Pointer
 	var staleRowDeletes []types.WriteRequest
 	groupDeltas := map[string]*groupCounterDelta{}
 	for i := range records {
-		if !isWritten[i] {
+		switch {
+		case isWritten[i]:
+			writtenPtrs = append(writtenPtrs, ptrs[i])
+			staleRowDeletes = append(staleRowDeletes, rowDeletesByRecord[i]...)
+			mergeGroupCounterDeltas(groupDeltas, groupDeltasByRecord[i])
+			refreshStoredItem(items[i], r.meta.writeVersion.acc.getI64(ptrs[i]))
+		case !isSent[i]:
+			cancelledPtrs = append(cancelledPtrs, ptrs[i])
+		case !isUncertain[i]:
 			lostRecords = append(lostRecords, records[i])
-			lostPtrs = append(lostPtrs, ptrs[i])
+			cancelledPtrs = append(cancelledPtrs, ptrs[i])
 			staleRowDeletes = append(staleRowDeletes, r.meta.deltaRowDeletes(ptrs[i])...)
-			continue
 		}
-		writtenPtrs = append(writtenPtrs, ptrs[i])
-		staleRowDeletes = append(staleRowDeletes, rowDeletesByRecord[i]...)
-		mergeGroupCounterDeltas(groupDeltas, groupDeltasByRecord[i])
-		refreshStoredItem(items[i], r.meta.writeVersion.acc.getI64(ptrs[i]))
 	}
-	// A lost record's log entry describes a write that never landed, and its version may be above
-	// the winner's: left in the log, a run would read the values before the winner's write as the
-	// record's values after it. Its cancel marker voids it.
-	if err := r.meta.appendFrameLogEntries(r.meta.frameWritesOf(lostPtrs, storedByKey), true); err != nil {
-		return nil, err
+	// A record that lost its condition or was never sent did not land, and its version may be above
+	// a write that did: its log entry, left in the log, would read as the record's values after that
+	// write. Its cancel marker voids it. A record whose put failed may have landed: it keeps its entry.
+	cancelErr := r.meta.cancelFrameWrites(window, r.meta.frameWritesOf(cancelledPtrs, storedByKey))
+	if err != nil || cancelErr != nil {
+		return nil, errors.Join(frameLandingError(err), cancelErr)
 	}
-	if err := r.batchWriteAll(client, staleRowDeletes); err != nil {
+	if _, err := r.batchWriteAll(context.Background(), client, staleRowDeletes); err != nil {
 		return nil, err
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
@@ -190,46 +206,51 @@ func (m *tableMeta) deltaRowDeletes(lostPtr unsafe.Pointer) []types.WriteRequest
 // recordKey. A record expected new (version 0) has no stored version to read, and
 // one whose blob the write cache holds at its expected version is decoded from
 // there: in both cases the write's condition proves the shortcut, since it only
-// lands if the stored item is exactly that. Only the rest is read. Nil without
-// hidden rows or GroupBy.
-func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsafe.Pointer, expectedVersions []int64) (map[string]unsafe.Pointer, error) {
+// lands if the stored item is exactly that. Only the rest is read. oldestCachedAt
+// is when the oldest cached blob used was read (zero: none). Nil without hidden
+// rows or GroupBy.
+func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsafe.Pointer, expectedVersions []int64) (
+	storedByKey map[string]unsafe.Pointer, oldestCachedAt time.Time, err error) {
 	if !r.meta.readsStoredVersion() {
-		return nil, nil
+		return nil, oldestCachedAt, nil
 	}
-	storedByKey := map[string]unsafe.Pointer{}
+	storedByKey = map[string]unsafe.Pointer{}
 	var uncachedPtrs []unsafe.Pointer
 	for i, ptr := range ptrs {
 		if expectedVersions[i] == 0 {
 			continue
 		}
 		recordKey := r.meta.recordKey(ptr)
-		storedBlob, isCached := cachedStoredBlob(recordKey, expectedVersions[i])
+		storedBlob, cachedAt, isCached := cachedStoredBlob(recordKey, expectedVersions[i])
 		if !isCached {
 			uncachedPtrs = append(uncachedPtrs, ptr)
 			continue
 		}
+		if oldestCachedAt.IsZero() || cachedAt.Before(oldestCachedAt) {
+			oldestCachedAt = cachedAt
+		}
 		storedRecord := new(E)
 		if err := colbin.Unmarshal(storedBlob, storedRecord); err != nil {
-			return nil, fmt.Errorf("db: colbin unmarshaling %s: %w", r.meta.recordType.Name(), err)
+			return nil, oldestCachedAt, fmt.Errorf("db: colbin unmarshaling %s: %w", r.meta.recordType.Name(), err)
 		}
 		storedByKey[recordKey] = unsafe.Pointer(storedRecord)
 	}
 	if len(uncachedPtrs) == 0 {
-		return storedByKey, nil
+		return storedByKey, oldestCachedAt, nil
 	}
 	readByKey, err := r.storedVersions(client, uncachedPtrs)
 	if err != nil {
-		return nil, err
+		return nil, oldestCachedAt, err
 	}
 	for recordKey, storedPtr := range readByKey {
 		storedByKey[recordKey] = storedPtr
 	}
-	return storedByKey, nil
+	return storedByKey, oldestCachedAt, nil
 }
 
 // putItemIfVersion is one conditional PutItem, false when the stored item moved
 // on. A stored item with no "upv" can never match: that is an error, not a race.
-func (r *Repo[T, E]) putItemIfVersion(client *dynamodb.Client, item map[string]types.AttributeValue, expectedVersion int64) (bool, error) {
+func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue, expectedVersion int64) (bool, error) {
 	input := &dynamodb.PutItemInput{
 		TableName:                           aws.String(tableName()),
 		Item:                                item,
@@ -242,7 +263,7 @@ func (r *Repo[T, E]) putItemIfVersion(client *dynamodb.Client, item map[string]t
 		input.ExpressionAttributeNames = map[string]string{"#upv": versionColumn}
 		input.ExpressionAttributeValues = map[string]types.AttributeValue{":upv": &types.AttributeValueMemberN{Value: strconv.FormatInt(expectedVersion, 10)}}
 	}
-	_, err := client.PutItem(context.Background(), input)
+	_, err := client.PutItem(ctx, input)
 	var lostRaceErr *types.ConditionalCheckFailedException
 	if errors.As(err, &lostRaceErr) {
 		if _, hasVersion := lostRaceErr.Item[versionColumn]; len(lostRaceErr.Item) > 0 && !hasVersion {

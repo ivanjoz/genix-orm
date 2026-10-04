@@ -778,7 +778,8 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		}
 		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
 	}
-	return len(counterWrites), r.batchWriteAll(client, counterWrites)
+	_, err := r.batchWriteAll(context.Background(), client, counterWrites)
+	return len(counterWrites), err
 }
 
 // storedCounterMatches reports whether a stored counter already holds the expected count and sums.

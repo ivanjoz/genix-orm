@@ -1,7 +1,10 @@
 package dynamo
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"reflect"
 	"regexp"
 	"slices"
@@ -34,19 +37,71 @@ const (
 
 var dataFrameNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
-var (
-	frameStore dataframe.Store
-	// frameSettle is how long after a version is reserved its write has surely landed: the longest
-	// a writer can run (the API function's timeout) plus a margin.
-	frameSettle = 540 * time.Second
+// ErrWriteDeadline is what a write to a table with DataFrames returns when it could not land within
+// its deadline (SetDataFrames) of reading the stored records: nothing it had not sent yet was written.
+// Retry it.
+var ErrWriteDeadline = errors.New("db: the write passed its DataFrame write deadline: retry it")
+
+const (
+	// frameCancelGrace is how long after its deadline a write may still append the cancel markers of
+	// the records it logged and did not land.
+	frameCancelGrace = 3 * time.Second
+	// frameSettleMargin covers a request already sent when its deadline hits, and the clock skew
+	// between Lambdas.
+	frameSettleMargin = 2 * time.Second
 )
 
-// SetDataFrames sets the store of every table's DataFrame files and the settle time: the longest a
-// write can take, from reserving its version to its last append (the API function's timeout), plus a
-// margin. A run only reaches versions reserved that long before, so a write shows up in the frames
-// one to two runs later. Call it once at boot, before the first write.
-func SetDataFrames(store dataframe.Store, settle time.Duration) {
-	frameStore, frameSettle = store, settle
+var (
+	frameStore         dataframe.Store
+	frameWriteDeadline = 10 * time.Second
+	// frameSettle is how long after a checkpoint is read every write with a version up to it has landed
+	// or given up, its cancel markers appended. Such a write reserved its version before the
+	// checkpoint, so it lands by the deadline after it. A write that loses to it read the record before
+	// it landed, so it is done one deadline plus the grace later.
+	frameSettle = 2*frameWriteDeadline + frameCancelGrace + frameSettleMargin
+)
+
+// SetDataFrames sets the store of every table's DataFrame files and the write deadline (10 s by
+// default): a write to a table with frames lands within it of reading the stored records, or fails
+// with ErrWriteDeadline. Compactions reach a version twice the deadline plus 5 s after it was
+// reserved (frameSettle). Call it once at boot, before the first write.
+func SetDataFrames(store dataframe.Store, writeDeadline time.Duration) {
+	frameStore, frameWriteDeadline = store, writeDeadline
+	frameSettle = 2*frameWriteDeadline + frameCancelGrace + frameSettleMargin
+}
+
+// frameWriteWindow bounds a write to a table with frames (DATA_FRAMES_PLAN.md, D5). It starts at the
+// stored read the write diffs against, or at the version reservation when it reads nothing: the log
+// entries, the new hidden rows and the base items are sent by landBy, and the cancel markers of the
+// records logged and not landed are appended within frameCancelGrace after. landBy is zero on a table
+// without frames: no bound.
+type frameWriteWindow struct{ landBy time.Time }
+
+func (m *tableMeta) frameWriteWindowFrom(start time.Time) frameWriteWindow {
+	if len(m.dataFrames) == 0 {
+		return frameWriteWindow{}
+	}
+	return frameWriteWindow{landBy: start.Add(frameWriteDeadline)}
+}
+
+// landingContext bounds the calls that land the write.
+func (window frameWriteWindow) landingContext() (context.Context, context.CancelFunc) {
+	return window.contextUntil(window.landBy)
+}
+
+func (window frameWriteWindow) contextUntil(at time.Time) (context.Context, context.CancelFunc) {
+	if window.landBy.IsZero() {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), at.Sub(Now()))
+}
+
+// frameLandingError marks the error of a write that ran out of its window with ErrWriteDeadline.
+func frameLandingError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrWriteDeadline, err)
+	}
+	return err
 }
 
 // frameColumn is one integer column of a frame.
@@ -63,6 +118,8 @@ type dataFrameMeta struct {
 	rows               frameColumn
 	sums               []frameColumn
 	allowsNegativeSums bool
+	// countsRecords: the file's last Sums column is the record count (DataFrame.Count).
+	countsRecords bool
 	// firstKeyLeadsBaseKeys: a rebuild reads a range of Keys[0] from the base table, consistently;
 	// otherwise it goes through a GSI, which cannot.
 	firstKeyLeadsBaseKeys bool
@@ -101,8 +158,8 @@ func compileDataFrames(schema Schema, recordType reflect.Type, accessors map[str
 		if slices.ContainsFunc(frames, func(frame dataFrameMeta) bool { return frame.Name == declared.Name }) {
 			panic(fmt.Sprintf("db: %s declares DataFrame %q twice", recordName, declared.Name))
 		}
-		if len(declared.Keys) < 1 || len(declared.Keys) > dataframe.MaxKeys || declared.Rows == nil || len(declared.Sums) == 0 {
-			panic(fmt.Sprintf("db: %s DataFrame %q needs 1 to %d Keys, a Rows column and at least one Sums column", recordName, declared.Name, dataframe.MaxKeys))
+		if len(declared.Keys) < 1 || len(declared.Keys) > dataframe.MaxKeys || declared.Rows == nil || (len(declared.Sums) == 0 && !declared.Count) {
+			panic(fmt.Sprintf("db: %s DataFrame %q needs 1 to %d Keys, a Rows column and at least one Sums column or Count", recordName, declared.Name, dataframe.MaxKeys))
 		}
 
 		isUsed := map[string]bool{}
@@ -127,7 +184,7 @@ func compileDataFrames(schema Schema, recordType reflect.Type, accessors map[str
 			return strings.Join(ids, ".")
 		}
 
-		frame := dataFrameMeta{allowsNegativeSums: declared.AllowNegativeSums}
+		frame := dataFrameMeta{allowsNegativeSums: declared.AllowNegativeSums, countsRecords: declared.Count}
 		for _, column := range declared.Keys {
 			frame.keys = append(frame.keys, resolveColumn(column))
 		}
@@ -140,16 +197,33 @@ func compileDataFrames(schema Schema, recordType reflect.Type, accessors map[str
 				recordName, declared.Name, frame.keys[0].fieldName))
 		}
 		frame.firstKeyLeadsBaseKeys = leadingKeyFields[0] == frame.keys[0].fieldName
+		folder := frameFolder(resolveTableID(schema), declared.Name)
+		if collision := slices.IndexFunc(frames, func(other dataFrameMeta) bool { return other.Folder == folder }); collision >= 0 {
+			panic(fmt.Sprintf("db: %s DataFrames %q and %q hash to the same folder: rename one", recordName, frames[collision].Name, declared.Name))
+		}
+		sumsCount, sumsIDs := len(frame.sums), columnIDs(frame.sums)
+		if frame.countsRecords {
+			sumsCount, sumsIDs = sumsCount+1, sumsIDs+"+count"
+		}
 		frame.Frame = dataframe.Frame{
 			Name:      declared.Name,
-			Folder:    schema.Entity + "/" + declared.Name + "/",
+			Folder:    folder,
 			KeyCount:  len(frame.keys),
-			SumsCount: len(frame.sums),
-			Shape:     dataframe.ShapeOf(columnIDs(frame.keys), columnIDs([]frameColumn{frame.rows}), columnIDs(frame.sums)),
+			SumsCount: sumsCount,
+			Shape:     dataframe.ShapeOf(folder, columnIDs(frame.keys), columnIDs([]frameColumn{frame.rows}), sumsIDs),
 		}
 		frames = append(frames, frame)
 	}
 	return frames
+}
+
+// frameFolder names a frame's folder in the store by its entity's TableID and a 32-bit hash of its name,
+// in the order-preserving base64 of the keys (5 and 6 characters): every object key stays short, and an
+// entity renamed with its TableID pinned keeps its files as it keeps its items.
+func frameFolder(tableID int32, frameName string) string {
+	nameHasher := fnv.New32a()
+	nameHasher.Write([]byte(frameName))
+	return EncodeOrderedInt(int64(tableID), 5) + "/" + EncodeOrderedUint(uint64(nameHasher.Sum32()), 6) + "/"
 }
 
 // resolveCreatedVersion validates the managed CreatedVersion field a table with frames needs.
@@ -162,17 +236,20 @@ func resolveCreatedVersion(recordType reflect.Type, accessors map[string]*colAcc
 }
 
 // frameValuesOf reads what the record at ptr contributes to the frame: nil for no record, or for a
-// soft-deleted one (Status 0), which counts nowhere.
+// soft-deleted one (Status 0), which counts nowhere. A counting frame gets a 1 after the Sums.
 func (m *tableMeta) frameValuesOf(frame *dataFrameMeta, ptr unsafe.Pointer) *dataframe.Values {
 	if ptr == nil || (m.status != nil && m.status.getI64(ptr) == 0) {
 		return nil
 	}
-	values := &dataframe.Values{Row: frame.rows.acc.getI64(ptr), Sums: make([]int64, len(frame.sums))}
+	values := &dataframe.Values{Row: frame.rows.acc.getI64(ptr), Sums: make([]int64, frame.SumsCount)}
 	for i, key := range frame.keys {
 		values.Keys[i] = key.acc.getI64(ptr)
 	}
 	for i, sum := range frame.sums {
 		values.Sums[i] = sum.acc.getI64(ptr)
+	}
+	if frame.countsRecords {
+		values.Sums[len(frame.sums)] = 1
 	}
 	return values
 }
@@ -238,9 +315,9 @@ func (m *tableMeta) frameWritesOf(ptrs []unsafe.Pointer, storedByKey map[string]
 // appendFrameLogEntries appends to each frame's log one entry per write that changes the frame's
 // values: the stored values, keyed by the write's version. It runs before the base write, so a change
 // a run sees in DynamoDB always has its entry. isCancel appends instead the markers that void the
-// entries of writes that lost their condition (PutManyIfVersion). One append per frame, frames in
-// parallel.
-func (m *tableMeta) appendFrameLogEntries(writes []frameWrite, isCancel bool) error {
+// entries of writes that did not land (cancelFrameWrites). One append per frame, frames in parallel,
+// bounded by ctx.
+func (m *tableMeta) appendFrameLogEntries(ctx context.Context, writes []frameWrite, isCancel bool) error {
 	entriesByFrame := make([][]dataframe.LogEntry, len(m.dataFrames))
 	for _, write := range writes {
 		sk := m.skValue(write.storedPtr)
@@ -270,23 +347,34 @@ func (m *tableMeta) appendFrameLogEntries(writes []frameWrite, isCancel bool) er
 	}
 	return parallel.Run(len(appendedFrames), func(position int) error {
 		frameIndex := appendedFrames[position]
-		return dataframe.AppendLog(frameStore, &m.dataFrames[frameIndex].Frame, entriesByFrame[frameIndex])
+		return dataframe.AppendLog(ctx, frameStore, &m.dataFrames[frameIndex].Frame, entriesByFrame[frameIndex])
 	})
 }
 
+// cancelFrameWrites appends the cancel markers of logged writes that did not land: they lost their
+// condition, or were never sent. Left in the log, the entry of a write that never landed could read
+// as the record's values after another write that did.
+func (m *tableMeta) cancelFrameWrites(window frameWriteWindow, writes []frameWrite) error {
+	ctx, cancel := window.contextUntil(window.landBy.Add(frameCancelGrace))
+	defer cancel()
+	return m.appendFrameLogEntries(ctx, writes, true)
+}
+
 // appendFrameDeleteEntries logs the values a record about to be deleted held in the frames it counts
-// in. A delete stamps no version, so it reserves one for the entries, above the version it read.
-func (m *tableMeta) appendFrameDeleteEntries(storedPtr unsafe.Pointer) error {
+// in, and returns the write it logged. A delete stamps no version, so it reserves one for the entries,
+// above the version it read.
+func (m *tableMeta) appendFrameDeleteEntries(ctx context.Context, storedPtr unsafe.Pointer) ([]frameWrite, error) {
 	countsInAFrame := false
 	for i := range m.dataFrames {
 		countsInAFrame = countsInAFrame || m.frameValuesOf(&m.dataFrames[i], storedPtr) != nil
 	}
 	if !countsInAFrame {
-		return nil
+		return nil, nil
 	}
 	deleteVersion, err := reserveSequence(m.pkValue(storedPtr)+updatedVersionSeqSuffix, 1)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return m.appendFrameLogEntries([]frameWrite{{storedPtr: storedPtr, newVersion: deleteVersion}}, false)
+	writes := []frameWrite{{storedPtr: storedPtr, newVersion: deleteVersion}}
+	return writes, m.appendFrameLogEntries(ctx, writes, false)
 }

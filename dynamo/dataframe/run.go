@@ -2,28 +2,35 @@ package dataframe
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The file work of a run (../DATA_FRAMES_PLAN.md, "The snapshot rule" and after),
-// also used by the fresh read (ReadFreshFiles), which applies it in memory.
-// A version is reserved before its write lands, so the caller targets a version
-// only once it is settled: every write that took a version up to it has landed and
-// logged. A run from W to the target takes out of the files what each incarnation
-// held at W and adds what it held at the target (valuesAt). A file carries the
-// snapshot it was written at, so a run that crashed halfway is retried to the same
-// target and skips the files it already wrote.
+// The file work of a compaction (../DATA_FRAMES_PLAN.md, "The snapshot rule" and
+// after): the scheduled run's (CompactFrame) and the express one of a fresh read
+// (FreshRead.CompactTo), which also applies it in memory. A version is reserved
+// before its write lands, so the caller targets a version only once it is settled:
+// every write that took a version up to it has landed and logged. A compaction
+// from W to the target takes out of the files what each incarnation held at W and
+// adds what it held at the target (valuesAt).
+//
+// One compaction at a time holds the frame's lock and writes through it (lock.go).
+// One that crashed, or lost its lock, leaves files ahead of W: each file carries
+// the snapshot it was written at and takes the changes after it, and a compaction
+// rewrites every file a change in its window names, even unchanged, so no file
+// keeps a change of a lower target that W has passed ("The lock", rule 2).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// logTruncateAttempts bounds the conditional rewrite of the log, which every write may append to.
-const logTruncateAttempts = 8
+// conditionalWriteAttempts bounds the truncation of the log, which every write may append to meanwhile.
+const conditionalWriteAttempts = 8
 
 // RecordState is a stored record as a run read it: its sk, its CreatedVersion and what it
 // contributes to the frame (nil: nothing, as with Status 0).
@@ -57,6 +64,13 @@ func (life *incarnation) valuesAt(snapshot int64) *Values {
 		}
 	}
 	return life.current
+}
+
+// changesBetween reports whether the incarnation's frame values changed in (from, to]: a logged change
+// in the window, or values that differ at its ends (an insert, which logs nothing).
+func (life *incarnation) changesBetween(from, to int64) bool {
+	return !EqualValues(life.valuesAt(from), life.valuesAt(to)) ||
+		slices.ContainsFunc(life.entries, func(entry LogEntry) bool { return entry.NewVersion > from && entry.NewVersion <= to })
 }
 
 // incarnations groups the records a run read and its log entries above baseSnapshot into
@@ -163,15 +177,28 @@ func expectedFiles(lives []*incarnation, snapshot int64, isInRange func(firstKey
 	return files
 }
 
-// CompactFrame brings the frame's files from snapshot W to target. readWrittenAfter (the records
-// whose UpdatedVersion is above a snapshot) and readBySK read the table: DynamoDB, or a test's fake one.
-func CompactFrame(store Store, frame *Frame, W, target int64,
+// CompactFrame is a run's compaction, as lock's holder: it brings the frame's files from snapshot W to
+// target, then rewrites the _idx of the day folders it touched and of extendedDays (the days express
+// compactions appended to), merging their _ixt. With target = W it only merges. readWrittenAfter (the
+// records whose UpdatedVersion is above a snapshot) and readBySK read the table: DynamoDB, or a
+// test's fake one.
+func CompactFrame(lock *Lock, frame *Frame, W, target int64, extendedDays []int64,
 	readWrittenAfter func(snapshot int64) ([]RecordState, error), readBySK func(sks []string) ([]RecordState, error)) error {
-	lives, err := readIncarnations(store, frame, W, readWrittenAfter, readBySK)
-	if err != nil {
-		return err
+	var fileKeys [][MaxKeys]int64
+	var fileHashes []uint32
+	if target > W {
+		lives, err := readIncarnations(lock.store, frame, W, readWrittenAfter, readBySK)
+		if err != nil {
+			return err
+		}
+		if fileKeys, fileHashes, err = compactFiles(lock, frame, lives, W, target); err != nil {
+			return err
+		}
 	}
-	return compactFiles(store, frame, lives, W, target)
+	if frame.KeyCount == 1 {
+		return nil
+	}
+	return updateIndexes(lock, frame, fileKeys, fileHashes, extendedDays)
 }
 
 // readIncarnations reads every incarnation changed after snapshot W. The records are read before the
@@ -231,14 +258,12 @@ func deltasBetween(lives []*incarnation, from, to int64) map[[MaxKeys]int64]rowS
 	return deltas
 }
 
-// addRowSums adds delta to rows and reports whether any sum changed.
-func addRowSums(rows, delta rowSums) bool {
-	isChanged := false
+// addRowSums adds delta to rows.
+func addRowSums(rows, delta rowSums) {
 	for rowID, rowDelta := range delta {
 		if !slices.ContainsFunc(rowDelta, func(sum int64) bool { return sum != 0 }) {
 			continue
 		}
-		isChanged = true
 		sums := rows[rowID]
 		if sums == nil {
 			sums = make([]int64, len(rowDelta))
@@ -248,145 +273,107 @@ func addRowSums(rows, delta rowSums) bool {
 			sums[i] += rowDelta[i]
 		}
 	}
-	return isChanged
 }
 
-// compactFiles brings the files the incarnations touch from snapshot W to target, then the _idx
-// of their folders.
-func compactFiles(store Store, frame *Frame, lives []*incarnation, W, target int64) error {
-	deltas := deltasBetween(lives, W, target)
-	fileKeys := slices.Collect(maps.Keys(deltas))
-	fileHashes := make([]*uint32, len(fileKeys))
+// filesChangedBetween lists every file a change of lives in (from, to] names: the files of every value
+// a changed incarnation held in that window.
+func filesChangedBetween(lives []*incarnation, from, to int64) [][MaxKeys]int64 {
+	isNamed := map[[MaxKeys]int64]bool{}
+	name := func(values *Values) {
+		if values != nil {
+			isNamed[values.Keys] = true
+		}
+	}
+	for _, life := range lives {
+		if !life.changesBetween(from, to) {
+			continue
+		}
+		name(life.valuesAt(from))
+		name(life.valuesAt(to))
+		for _, entry := range life.entries {
+			if entry.NewVersion > from && entry.NewVersion <= to {
+				name(entry.OldValues)
+			}
+		}
+	}
+	return slices.Collect(maps.Keys(isNamed))
+}
+
+// compactFiles brings to target every file a change of lives in (W, target] names, and returns their
+// keys and their hashes after.
+func compactFiles(lock *Lock, frame *Frame, lives []*incarnation, W, target int64) ([][MaxKeys]int64, []uint32, error) {
+	fileKeys := filesChangedBetween(lives, W, target)
+	deltas := &deltasToTarget{lives: lives, target: target, byFrom: map[int64]map[[MaxKeys]int64]rowSums{}}
+	fileHashes := make([]uint32, len(fileKeys))
 	err := parallel.Run(len(fileKeys), func(i int) (err error) {
-		fileHashes[i], err = compactFile(store, frame, fileKeys[i], deltas[fileKeys[i]], target)
+		fileHashes[i], err = compactFile(lock, frame, fileKeys[i], W, target, deltas)
 		return err
 	})
-	if err != nil || frame.KeyCount == 1 {
-		return err
-	}
-	return updateIndexes(store, frame, fileKeys, fileHashes)
+	return fileKeys, fileHashes, err
 }
 
-// compactFile adds delta to one file at target and returns its hash after, nil when there is no
-// file. A file already at target was written by a run that crashed before its commit, to this same
-// target: it is left as it is. A missing file is empty: nothing at W counted in it (a rebuild
-// deletes the files it leaves empty). An emptied file is kept, rows 0, so the snapshot of its last
-// change survives.
-func compactFile(store Store, frame *Frame, keys [MaxKeys]int64, delta rowSums, target int64) (*uint32, error) {
+// deltasToTarget is deltasBetween(lives, from, target) by file, computed once per from: the files of a
+// compaction hold few distinct snapshots. Safe for concurrent use.
+type deltasToTarget struct {
+	mutex  sync.Mutex
+	lives  []*incarnation
+	target int64
+	byFrom map[int64]map[[MaxKeys]int64]rowSums
+}
+
+func (deltas *deltasToTarget) of(from int64, keys [MaxKeys]int64) rowSums {
+	deltas.mutex.Lock()
+	defer deltas.mutex.Unlock()
+	if deltas.byFrom[from] == nil {
+		deltas.byFrom[from] = deltasBetween(deltas.lives, from, deltas.target)
+	}
+	return deltas.byFrom[from][keys]
+}
+
+// compactFile brings one file to target and returns its hash after. A file at or past target is left
+// as it is: a compaction to that target or a later one wrote it, and crashed or lost its lock before
+// it committed. A file older than W holds the frame at W too, and a missing one was never written (no
+// compaction deletes a file), so it is empty at W; a file past W takes the changes after its own
+// snapshot. The file is written even when its rows don't change, and an emptied one is kept, rows 0,
+// so its snapshot moves to target.
+func compactFile(lock *Lock, frame *Frame, keys [MaxKeys]int64, W, target int64, deltas *deltasToTarget) (uint32, error) {
 	objectKey := frame.FileKey(keys)
-	content, _, err := store.Get(objectKey)
+	content, _, err := lock.store.Get(objectKey)
 	isMissing := errors.Is(err, ErrObjectNotFound)
 	if err != nil && !isMissing {
-		return nil, err
+		return 0, err
 	}
-	rows := rowSums{}
+	rows, snapshot := rowSums{}, W
 	if !isMissing {
 		file, err := DecodeFile(content, frame.SumsCount)
 		if err != nil {
-			return nil, fmt.Errorf("db: frame file %s: %w: rebuild the frame", objectKey, err)
+			return 0, fmt.Errorf("db: frame file %s: %w: rebuild the frame", objectKey, err)
 		}
 		if file.Snapshot >= target {
-			hash := FileHash(content)
-			return &hash, nil
+			return FileHash(content), nil
 		}
-		rows = rowSumsOf(file)
+		rows, snapshot = rowSumsOf(file), max(file.Snapshot, W)
 	}
-	if !addRowSums(rows, delta) {
-		if isMissing {
-			return nil, nil
-		}
-		hash := FileHash(content)
-		return &hash, nil
-	}
+	addRowSums(rows, deltas.of(snapshot, keys))
 	content = appendFile(nil, fileOf(rows, target, frame.SumsCount), codecOptions{})
-	if err := store.Put(objectKey, content); err != nil {
-		return nil, err
+	if err := lock.put(objectKey, content); err != nil {
+		return 0, err
 	}
-	hash := FileHash(content)
-	return &hash, nil
+	return FileHash(content), nil
 }
 
-// updateIndexes sets in the _idx of each day folder the hash of every touched file of it, or
-// drops the file when there is none.
-func updateIndexes(store Store, frame *Frame, fileKeys [][MaxKeys]int64, fileHashes []*uint32) error {
-	touchedFilesByDay := map[int64][]int{}
-	for i, keys := range fileKeys {
-		touchedFilesByDay[keys[0]] = append(touchedFilesByDay[keys[0]], i)
-	}
-	days := slices.Collect(maps.Keys(touchedFilesByDay))
-	return parallel.Run(len(days), func(position int) error {
-		day := days[position]
-		hashByKeys, err := readIndex(store, frame, day)
-		if err != nil {
-			return err
-		}
-		isChanged := false
-		for _, i := range touchedFilesByDay[day] {
-			indexKeys := [MaxKeys - 1]int64{fileKeys[i][1], fileKeys[i][2]}
-			storedHash, isListed := hashByKeys[indexKeys]
-			switch {
-			case fileHashes[i] == nil && isListed:
-				delete(hashByKeys, indexKeys)
-				isChanged = true
-			case fileHashes[i] != nil && (!isListed || storedHash != *fileHashes[i]):
-				hashByKeys[indexKeys] = *fileHashes[i]
-				isChanged = true
-			}
-		}
-		if !isChanged {
-			return nil
-		}
-		return writeIndex(store, frame, day, hashByKeys)
-	})
-}
-
-// readIndex reads a day folder's _idx as file keys → hash; empty when it is missing.
-func readIndex(store Store, frame *Frame, day int64) (map[[MaxKeys - 1]int64]uint32, error) {
-	hashByKeys := map[[MaxKeys - 1]int64]uint32{}
-	content, _, err := store.Get(frame.indexKey(day))
-	if errors.Is(err, ErrObjectNotFound) {
-		return hashByKeys, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	entries, err := DecodeIndex(content, frame.KeyCount)
-	if err != nil {
-		return nil, fmt.Errorf("db: frame index %s: %w: rebuild the frame", frame.indexKey(day), err)
-	}
-	for _, entry := range entries {
-		hashByKeys[entry.Keys] = entry.Hash
-	}
-	return hashByKeys, nil
-}
-
-// writeIndex writes a day folder's _idx, sorted by keys; a folder left without files loses it.
-func writeIndex(store Store, frame *Frame, day int64, hashByKeys map[[MaxKeys - 1]int64]uint32) error {
-	if len(hashByKeys) == 0 {
-		return store.Delete(frame.indexKey(day))
-	}
-	return store.Put(frame.indexKey(day), encodeIndex(frame, hashByKeys))
-}
-
-func encodeIndex(frame *Frame, hashByKeys map[[MaxKeys - 1]int64]uint32) []byte {
-	entries := make([]IndexEntry, 0, len(hashByKeys))
-	for keys, hash := range hashByKeys {
-		entries = append(entries, IndexEntry{Keys: keys, Hash: hash})
-	}
-	slices.SortFunc(entries, func(a, b IndexEntry) int { return slices.Compare(a.Keys[:], b.Keys[:]) })
-	return appendIndex(nil, entries, frame.KeyCount)
-}
-
-// RebuildAllFiles writes every file and _idx the records produce at snapshot, without reading the
-// stored ones (after a change of shape they are in another format), then deletes every other object
-// of the frame but its log. records were read before this call: the log it reads after them holds
-// the entries of every record deleted or changed since snapshot.
-func RebuildAllFiles(store Store, frame *Frame, records []RecordState, snapshot int64) error {
-	entries, err := ReadLog(store, frame)
+// RebuildAllFiles writes every file and _idx the records produce at snapshot, as lock's holder,
+// without reading the stored ones (after a change of shape they are in another format), then deletes
+// every other object of the frame but its log and its lock: the files nothing produces, every _ixt,
+// and whatever the frame's Keys can't name (another shape's files). records were read before this
+// call: the log it reads after them holds the entries of every record deleted or changed since
+// snapshot.
+func RebuildAllFiles(lock *Lock, frame *Frame, records []RecordState, snapshot int64) error {
+	entries, err := ReadLog(lock.store, frame)
 	if err != nil {
 		return err
 	}
-	listedKeys, err := store.List(frame.Folder)
+	listedKeys, err := lock.store.List(frame.Folder)
 	if err != nil {
 		return err
 	}
@@ -407,31 +394,32 @@ func RebuildAllFiles(store Store, frame *Frame, records []RecordState, snapshot 
 		}
 	}
 	for day, hashByKeys := range hashByKeysByDay {
-		contentByKey[frame.indexKey(day)] = encodeIndex(frame, hashByKeys)
+		contentByKey[frame.indexKey(day)] = appendIndex(nil, sortedIndexEntries(hashByKeys), frame.KeyCount)
 	}
 	objectKeys := slices.Collect(maps.Keys(contentByKey))
-	if err := parallel.Run(len(objectKeys), func(i int) error { return store.Put(objectKeys[i], contentByKey[objectKeys[i]]) }); err != nil {
+	if err := parallel.Run(len(objectKeys), func(i int) error { return lock.put(objectKeys[i], contentByKey[objectKeys[i]]) }); err != nil {
 		return err
 	}
 	var staleKeys []string
 	for _, listedKey := range listedKeys {
-		if _, isWritten := contentByKey[listedKey]; !isWritten && listedKey != frame.LogKey() {
+		if _, isWritten := contentByKey[listedKey]; !isWritten && listedKey != frame.LogKey() && listedKey != frame.lockKey() {
 			staleKeys = append(staleKeys, listedKey)
 		}
 	}
 	if len(staleKeys) == 0 {
 		return nil
 	}
-	return store.Delete(staleKeys...)
+	return lock.Delete(staleKeys...)
 }
 
-// RebuildFilesInRange rewrites the files whose Keys[0] is in [fromKey, toKey] as the records held
-// them at snapshot; records are those of the range, read before this call (a record moved out of
-// the range since snapshot is found through its log entry). On a 1-key frame it writes each day's
-// file, or deletes it when nothing produces it. On a 2–3-key frame it writes the files whose hash
-// differs from the day's _idx and deletes the ones it lists that nothing produces anymore.
-func RebuildFilesInRange(store Store, frame *Frame, records []RecordState, snapshot, fromKey, toKey int64) error {
-	entries, err := ReadLog(store, frame)
+// RebuildFilesInRange rewrites, as lock's holder, the files whose Keys[0] is in [fromKey, toKey] as
+// the records held them at snapshot; records are those of the range, read before this call (a record
+// moved out of the range since snapshot is found through its log entry). On a 1-key frame it writes
+// each day's file, or deletes it when nothing produces it. On a 2–3-key frame it writes the files
+// whose hash differs from the day's index (its _idx with its _ixt merged), deletes the listed files
+// nothing produces, then rewrites _idx and deletes _ixt.
+func RebuildFilesInRange(lock *Lock, frame *Frame, records []RecordState, snapshot, fromKey, toKey int64) error {
+	entries, err := ReadLog(lock.store, frame)
 	if err != nil {
 		return err
 	}
@@ -451,13 +439,14 @@ func RebuildFilesInRange(store Store, frame *Frame, records []RecordState, snaps
 		day := fromKey + int64(offset)
 		contentByKeys := contentByKeysByDay[day]
 		if frame.KeyCount == 1 {
+			fileKey := frame.FileKey([MaxKeys]int64{day})
 			if content := contentByKeys[[MaxKeys - 1]int64{}]; content != nil {
-				return store.Put(frame.FileKey([MaxKeys]int64{day}), content)
+				return lock.put(fileKey, content)
 			}
-			return store.Delete(frame.FileKey([MaxKeys]int64{day}))
+			return lock.Delete(fileKey)
 		}
 		// A corrupt index lists nothing: the rebuild is what repairs it.
-		storedHashByKeys, err := readIndex(store, frame, day)
+		storedHashByKeys, hasExtension, err := readIndex(lock.store, frame, day)
 		if errors.Is(err, errCorrupt) {
 			storedHashByKeys, err = map[[MaxKeys - 1]int64]uint32{}, nil
 		}
@@ -470,36 +459,36 @@ func RebuildFilesInRange(store Store, frame *Frame, records []RecordState, snaps
 			if storedHash, isListed := storedHashByKeys[indexKeys]; isListed && storedHash == hashByKeys[indexKeys] {
 				continue
 			}
-			if err := store.Put(frame.FileKey([MaxKeys]int64{day, indexKeys[0], indexKeys[1]}), content); err != nil {
+			if err := lock.put(frame.FileKey([MaxKeys]int64{day, indexKeys[0], indexKeys[1]}), content); err != nil {
 				return err
 			}
 		}
 		var staleKeys []string
 		for indexKeys := range storedHashByKeys {
-			if _, isExpected := hashByKeys[indexKeys]; !isExpected {
+			if _, isProduced := hashByKeys[indexKeys]; !isProduced {
 				staleKeys = append(staleKeys, frame.FileKey([MaxKeys]int64{day, indexKeys[0], indexKeys[1]}))
 			}
 		}
 		if len(staleKeys) > 0 {
-			if err := store.Delete(staleKeys...); err != nil {
+			if err := lock.Delete(staleKeys...); err != nil {
 				return err
 			}
 		}
-		if maps.Equal(storedHashByKeys, hashByKeys) {
+		if maps.Equal(storedHashByKeys, hashByKeys) && !hasExtension {
 			return nil
 		}
-		return writeIndex(store, frame, day, hashByKeys)
+		return writeIndexMerged(lock, frame, day, hashByKeys, hasExtension)
 	})
 }
 
 // AppendLog appends entries to the frame's log in one append. Writes call it before their base
-// write, so a change a run sees in the table always has its entry.
-func AppendLog(store Store, frame *Frame, entries []LogEntry) error {
+// write, so a change a run sees in the table always has its entry; ctx carries the write's deadline.
+func AppendLog(ctx context.Context, store Store, frame *Frame, entries []LogEntry) error {
 	var encoded []byte
 	for _, entry := range entries {
 		encoded = appendLogEntry(encoded, entry, frame.KeyCount)
 	}
-	return store.Append(frame.LogKey(), encoded)
+	return store.Append(ctx, frame.LogKey(), encoded)
 }
 
 // ReadLog reads every entry of the frame's log; none when it is missing.
@@ -542,8 +531,8 @@ func TruncateLog(store Store, frame *Frame, snapshot int64) error {
 		if len(keptContent) == len(content) {
 			return nil
 		}
-		err = store.PutIfMatch(frame.LogKey(), keptContent, etag)
-		if !errors.Is(err, ErrPreconditionFailed) || attempt == logTruncateAttempts {
+		_, err = store.PutIfMatch(context.Background(), frame.LogKey(), keptContent, etag)
+		if !errors.Is(err, ErrPreconditionFailed) || attempt == conditionalWriteAttempts {
 			return err
 		}
 		time.Sleep(time.Duration(attempt*attempt) * 10 * time.Millisecond)

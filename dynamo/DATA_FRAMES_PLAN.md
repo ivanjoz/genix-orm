@@ -1,9 +1,13 @@
 # Plan — DataFrames: group-by files in S3, kept up to date by the cron (`dynamo`)
 
-Status: **implemented in genix-orm (2026-10-04), not committed; the live check has not run yet.**
-D1–D4 are decided. Where this document and the code disagree, the code wins; the choices made
-during implementation are in `RATIONALE.md` ("DataFrames: implementation choices"), and the
-reference is the README section "DataFrames".
+Status: **v1 committed in genix-orm. v2 implemented (2026-10-04), not committed:** the write
+deadline, the checkpoints, the express compactions of `.Fresh()` and `_ixt` (D5–D7), and the
+frame's lock in S3 that serializes every compaction ("The lock"), and folders named by the TableID
+and a hash of the frame's name ("Storage"), with the choices made while
+building them recorded where they apply. The S3 Express store (v2 step 7) waits
+for `s3express:CreateSession` on the Lambda role. Each v2 piece is marked "(v2)". D1–D7 are decided.
+Where this document and the code disagree, the code wins; v1's implementation choices are in
+`RATIONALE.md` ("DataFrames: implementation choices").
 
 ## Goal
 
@@ -24,7 +28,11 @@ day-client-product   key(Fecha, ClientID) → [ProductID: Quantity: Amount, ...]
   frame the write changes. If an update touches no column of a frame, that frame's log gets nothing.
 - **Reprocessing works one day at a time, by the first key.** A day can be rebuilt from DynamoDB.
   The day's hash file lets the rebuild write only the files that changed.
-- **A write shows up in the frames 10–20 minutes later.** See "Which version a run reaches".
+- **A fresh read is exact.** `QueryFrame(...).Fresh()` returns the frame as the records hold it
+  now: the files plus the changes since, computed in memory. When it finds many changes, it also
+  writes them into the files (an express compaction, D6, v2).
+- **A write reaches the files 25–50 s later on a frame read with `.Fresh()`, and within about 10
+  minutes otherwise (v2; 10–20 minutes in v1).** See "Which version a run reaches".
 
 ## Decisions
 
@@ -69,21 +77,20 @@ frame column changed, so the entry tells when the record was inserted. That rule
 costs the same storage (one int32 per record) plus an S3 append per first update, and the run rule
 gets more complex.
 
-**D2 — the bucket. Decided:** the recommended option below. The ORM only defines the
-`dataframe.Store` interface; the S3 implementation lives in berryapps (`core/frames`).
+**D2 — the bucket. Decided:** S3 Express One Zone is the target; a general purpose bucket is the
+compatibility mode until Express is available. The ORM only defines the `dataframe.Store`
+interface; the S3 implementation lives in berryapps (`core/frames`).
 
-- Every update of a frame table appends to S3 from the API Lambda.
+- The design leans on Express's native byte append: the log and `_ixt` (D7) are append-only, and
+  every update of a frame table appends from the API Lambda.
 - S3 Express needs `s3express:CreateSession` on the Lambda role. The role doesn't have it today, and
   only an account admin can grant it.
-- On a general purpose bucket, an append is emulated: a GET of the small log, then a conditional PUT.
-  That is the same mechanism genix-search uses today on `[search].bucket`
-  (`berryapps-lambda-artifacts`).
-
-**Recommended:**
-
-- Add a new `[frames]` config section (`bucket`, `root = "frames/"`).
-- Start on the same general purpose bucket.
-- Switch to a directory bucket once the role is granted. That is a config change only.
+- On a general purpose bucket, an append is emulated: a GET, then a conditional PUT. It behaves the
+  same and costs one GET more per append. genix-search uses the same mechanism today on
+  `[search].bucket` (`berryapps-lambda-artifacts`).
+- A `[frames]` config section (`bucket`, `root = "frames/"`). v1 runs on that general purpose
+  bucket. Moving to a directory bucket is a config change plus the Express append path in
+  `core/frames` (v2).
 
 **D3 — keys in the day hash file. Decided:** `_idx`, keys and hashes. As you asked, `_hashes` holds only the uint32 hashes, in the
 same order as the files. Two problems follow:
@@ -113,6 +120,79 @@ key is a uvarint delta of the ClientID.
   Only the column's base carries a sign: one bit on one number per column. That is the saving the
   flag was meant to buy, and it is now free on every frame. So the flag is not part of the shape.
 - `SaleLine` doesn't set the flag: `sale_rules.go` already rejects `Quantity <= 0`.
+
+**D5 — a write deadline of 10 s. Decided (v2):** a write to a frame table lands within 10 s of
+reading the stored record, or not at all.
+
+- **Why.** A compaction may only stop at version M once every write that took a version ≤ M has
+  landed or given up. A write takes its version before it lands, and between taking it and
+  appending to the log, the write exists only in one Lambda's memory: no read of DynamoDB or S3 can
+  see it. So the guarantee has to come from the writer. In v1 only the Lambda timeout bounds a
+  write, hence the 9-minute settle.
+- **The clock starts at the stored read**, or at the version reservation for a write that reads
+  nothing (`InsertMany`, `PutIfAbsent`). The read comes before the reservation (see "Managed
+  columns"), so the window covers the version too. A `PutManyIfVersion` that diffs against blobs
+  from the process write cache starts it at the oldest of those reads (`GetManyForUpdate`), or at
+  its own call when that is earlier.
+- **What it covers:** the log append, the new hidden rows and the base items (steps 4–5 of "Order
+  of a write"). Each of those calls carries a context deadline at start + 10 s, and the writer
+  checks the clock before each one. The stale hidden-row deletes, the GroupBy ADDs and the slot
+  bumps come after and stay outside it: frames don't read them.
+- **Past the deadline** the write lands nothing more and returns `ErrWriteDeadline`: the handler
+  fails and the client retries. For every record it logged and didn't land, it appends a cancel
+  marker, as a losing conditional write does. Base items that already landed are valid writes.
+  - **Which records get a marker:** the ones never sent, and the ones whose conditional write
+    answered a lost condition. A record whose request failed without an answer (a timeout while
+    in flight) may have landed: it keeps its entry. An entry for a write that didn't land is a
+    phantom, harmless on its own (Limits).
+  - **The markers have a grace of 3 s** after the deadline (`frameCancelGrace`): their append
+    carries a context deadline at start + 13 s.
+- **Settle = 2 × 10 s + 3 s + 2 s = 25 s.** Take a checkpoint M read at time T:
+  - A write with a version ≤ M read its record before T, so it lands or gives up by T + 10 s.
+  - A losing conditional write can only hide a version ≤ M if it read the record before the
+    winner landed, so before T + 10 s. It appends its cancel marker by T + 23 s (its deadline, then
+    the grace). Counting the deadline from the read, not from the version, is what closes v1's
+    "losing write still in flight" window (Limits).
+  - The 2 s margin (`frameSettleMargin`) covers a request already sent when its deadline hits, and
+    clock skew between Lambdas.
+- `SetDataFrames(store, writeDeadline)` takes the deadline (10 s by default); the settle is derived
+  from it.
+
+**D6 — `.Fresh()` saves what it computed: express compactions. Decided (v2):** a fresh read that
+finds more than 100 changed records above W also writes them into the files, in the same request,
+then returns.
+
+- `.Fresh()` (built in v1) reads the files, the records written after W and the log, and computes
+  the rows as the records hold them now, in memory.
+- It can't save "now": a write still in flight below the newest version it saw would be lost
+  (D5). It saves up to M, the newest settled checkpoint (see "Checkpoints"). Every write ≤ M landed
+  before its reads, so the records and entries it already holds give `valuesAt(M)` exactly: no
+  extra DynamoDB read.
+- The extra cost is mostly S3: the frame's lock (see "The lock"), a GET and a PUT per file the
+  changes touch, inside the query's selection or not (every touched file must reach M before W
+  moves), and one `_ixt` append per touched day. The selection's files are read again under the
+  lock rather than reused from the fresh read: a compaction that crashed or lost its lock may have
+  moved one since, and it must be redone from its new content.
+- An express compaction holds the frame's lock, as every compaction does, and skips while another
+  holds it: "The lock" has the rules.
+- The scheduled run stays. It compacts the frames nobody reads fresh, merges `_ixt` and truncates
+  the log.
+
+**D7 — `_ixt`, the append-only extension of `_idx`. Decided (v2):** an express compaction never
+rewrites a day's `_idx`; it appends the keys and hashes of the files it wrote (or found already past
+its target) to the day's `_ixt`.
+
+- With 1,000 clients a day, `_idx` is about 6 KB, and an express compaction touches a few files of
+  it. An append writes only the entries of those files: a few bytes instead of the whole `_idx`.
+- Readers read `_ixt`, then `_idx`, take the union of the keys, and **the last entry wins**: `_idx`
+  first, then the `_ixt` blocks in the order they were appended. That order is the order the files
+  were written in, because one compaction at a time holds the frame's lock and appends after
+  writing its files (see "The lock"). Reading `_ixt` first never misses an entry, because a merge
+  rewrites `_idx` before it deletes `_ixt`.
+- An express compaction adds the days it appended to into the state item's `ix` set, in the same
+  update that commits `w`. The next run merges each one's `_ixt` into `_idx`, deletes the `_ixt`
+  and removes the day from `ix`. Under the lock nothing appends meanwhile, so the delete loses no
+  entry.
 
 
 ## Declaration
@@ -217,21 +297,34 @@ DataFrames: []db.DataFrame{
 ## Storage
 
 ```text
-<root>example_sale_line/day-product/_log.<shape>               pending changes (appends)
-<root>example_sale_line/day-product/20730                      Fecha 20730
-<root>example_sale_line/day-client-product/_log.<shape>
-<root>example_sale_line/day-client-product/20730/412           Fecha 20730, ClientID 412
-<root>example_sale_line/day-client-product/20730/_idx        the day's keys and hashes (D3)
+<root>2JY-k/-Ba0pU/_log.<shape>          day-product: pending changes (appends)
+<root>2JY-k/-Ba0pU/_lock                 the compaction holding the frame, and until when (v2)
+<root>2JY-k/-Ba0pU/20730                 Fecha 20730
+<root>2JY-k/21TPlh/_log.<shape>          day-client-product
+<root>2JY-k/21TPlh/20730/412             Fecha 20730, ClientID 412
+<root>2JY-k/21TPlh/20730/_idx            the day's keys and hashes (D3)
+<root>2JY-k/21TPlh/20730/_ixt            entries appended since the last merge (D7, v2)
 ```
 
-- **Folders.** Each frame has one folder under its entity's folder.
+- **Folders.** Each frame has one folder, `<table>/<frame>/`, in the order-preserving base64 the
+  keys already use (`-0-9A-Z_a-z`, every character safe in an S3 key):
+  - `<table>` is the entity's TableID in 5 characters (`example_sale_line` is 55717936: `2JY-k`).
+    The files follow the table's identity as its items do: an entity renamed with its TableID
+    pinned keeps them.
+  - `<frame>` is the FNV-32a hash of the frame's name in 6 characters. Two frames of an entity
+    whose names hash alike fail the boot. The folders are in the schema introspection
+    (`TableSchema.DataFrames`), to find a frame's files by hand.
+  - Short names keep every key and listing short: a client file's key goes from 53 to 29
+    characters with the `frames/` root. z85 would save one more character on `<frame>`, but its
+    alphabet holds `/`, S3's folder separator, and characters S3 asks to avoid.
   - In a 1-key frame, `Keys[0]` is the file name.
   - In a 2–3-key frame, `Keys[0]` is a folder, and the remaining Keys name the file, joined by `_`.
-  - Every value is written in decimal.
-- **`<shape>`** is 8 hex digits of the frame's shape hash: the format version and the cb ids of
-  Keys, Rows and Sums. After a shape change, Lambdas still running the old code append to a log
-  nobody reads. Frames are derived data, so a better codec later is just a format version bump:
-  the shape changes and the next runs rebuild every file.
+  - Every Keys value is written in decimal.
+- **`<shape>`** is 8 hex digits of the frame's shape hash: the format version, the folder and the
+  cb ids of Keys, Rows and Sums. After a shape change, Lambdas still running the old code append to
+  a log nobody reads. Frames are derived data, so a better codec or another folder later is just a
+  new shape: the next runs rebuild every file. Moving from v1's `<entity>/<frame name>/` folders
+  did that; the v1 folders are left to a one-off delete.
 - **The state item lives in DynamoDB.** It can be written conditionally and read consistently,
   which S3 does not offer as simply:
 
@@ -239,9 +332,12 @@ DataFrames: []db.DataFrame{
   pk  = base pk ‖ 000      the bookkeeping pk, beside the GroupBy counters (sk g…) and slot versions (sk v)
   sk  = "f" + frame name
   w        the snapshot (UpdatedVersion) the frame's files hold; absent = never built
-  nx, nxt  the upv sequence value the last run read and when (unix seconds): the next run's target
+  nx, nxt  v1: the upv sequence value the last run read and when (unix seconds): the next run's target
+           v2: the newest checkpoint (see "Checkpoints")
+  px       the previous checkpoint (v2)
+  ix       the days whose _ixt has entries to merge, a number set (v2)
   sh       the shape hash the files were built with
-  lo, le   lease owner and expiry
+  lo, le   v1 only: lease owner and expiry. v2 holds the frame with the _lock object in S3
   ```
 
 ## Formats
@@ -344,7 +440,7 @@ block := u8 head   bits 0–6  width w (0..64): every residual of the block is p
 ```text
 u8        format version (1)
 uvarint   snapshot: the UpdatedVersion whose state the file holds
-uvarint   row count n (0: an emptied file, kept so its snapshot survives)
+uvarint   row count n (0: an emptied file, kept so its version survives)
 column    Rows: uvarint first, uvarint minStep, uvarint divisor, blocks of the n − 1 residuals
 column    each Sums column in declaration order: varint min, uvarint divisor, blocks of the n residuals
           (no columns at all when n = 0)
@@ -353,6 +449,8 @@ column    each Sums column in declaration order: varint min, uvarint divisor, bl
 - A row whose sums are all 0 is dropped before encoding.
 - The file hash is a CRC-32C of everything after the snapshot. A file rewritten at a newer
   snapshot with the same rows keeps its hash.
+- The format version is part of every shape, so a new format changes each frame's shape: the next
+  runs rebuild every file in it. v2 keeps the v1 formats.
 - **Measured** (`TestFrameFileSizeExample`, implemented in `dataframe/codec.go`). The test file is
   one day of 5,000 products drawn from a 20,000-product catalog. Quantities are multiples of 1000
   (log-normal, median 5 units). Unit prices are cents, multiples of 100, log-uniform from 1.00 to
@@ -409,6 +507,18 @@ u32 LE × n   CRC-32C of each file, in the same order: hashes don't compress, so
 If D3 is answered "keyless", the file is `_hashes` instead: only the u32s, in the order of the
 folder's sorted LIST.
 
+### Day index extension (`_ixt`, appended, v2)
+
+```text
+block*    one per append:
+          uvarint   block length (the bytes after this field)
+          body      an _idx body: the files one compaction wrote (or found past its target) in this
+                    folder, with their hashes
+```
+
+The last entry of a file wins, `_idx` first, then the blocks in order (D7). The next run's merge
+deletes the `_ixt`, and so does a rebuild of the day.
+
 ## Write path
 
 | Writer | Stored version | Log entries |
@@ -424,10 +534,11 @@ or nil when `Status == 0`.
 **Order of a write:**
 
 1. Assign IDs.
-2. Read the stored versions.
+2. Read the stored versions. The 10-second write deadline starts here (D5, v2).
 3. Reserve the version.
 4. Append the entries: one append per frame per call, frames in parallel.
-5. Write the new hidden rows, then the base items, then delete the stale hidden rows.
+5. Write the new hidden rows, then the base items, then delete the stale hidden rows. Step 4 and
+   step 5 up to the base items finish by the deadline, or the write stops (v2).
 6. ADD the GroupBy counters.
 7. Bump the slot versions.
 
@@ -441,21 +552,25 @@ or nil when `Status == 0`.
   write has since replaced; at a snapshot between the two versions, `valuesAt` would return the
   stale values. So `PutManyIfVersion` appends a cancel marker for each record that lost, and the
   run drops the entries a marker voids. A run reads the log only once its target has settled, so
-  the marker is there by then (see Limits for the window that remains).
+  the marker is there by then: in v1 except for the window under Limits, in v2 always (D5).
 
-**Appending** (berryapps' `core/frames` implements only the general purpose path today):
+**Appending:**
 
-- **General purpose bucket (implemented):** a GET, then a PUT with `If-Match` (`If-None-Match` when
-  the log is missing). A 412, or a 409 for a concurrent conditional write, retries the pair after a
-  random pause of up to `attempt × 50 ms`, 30 attempts. Each round has one winner per log: measured
-  on the real bucket, 20 concurrent appenders to one log all landed in about 8 s.
-- **S3 Express (not built):** a `PutObject` with `WriteOffsetBytes` set to the object's size.
-  - The size is cached per process. On a mismatch, the writer does a HEAD and retries, up to 16
-    times.
-  - Offset 0 creates the log.
-  - S3 Express caps the appends per object (verify before relying on it). Because the run rewrites
-    the log every 10 minutes, the count resets each time. Past the cap, an append falls back to the
-    GET + PUT path.
+- **S3 Express (the target, v2):** a `PutObject` with `x-amz-write-offset-bytes` set to the
+  object's size; 0 creates the object.
+  - If another append got there first, the size no longer matches and S3 answers
+    `400 InvalidWriteOffset`. The writer HEADs the object and retries with the new size, so no
+    entry is lost. The size is cached per process.
+  - Each append is billed as one PUT.
+  - An object takes at most 10,000 appends (`400 TooManyParts`). Each run rewrites the log when it
+    truncates it, and each merge rewrites `_ixt`, which resets the count. So a frame's log takes
+    about 16 changing writes per second, sustained. Past the cap, the appender rewrites the object
+    (GET + conditional PUT), which also resets it.
+- **General purpose bucket (the compatibility mode, implemented):** a GET, then a PUT with
+  `If-Match` (`If-None-Match` when the object is missing). A 412, or a 409 for a concurrent
+  conditional write, retries the pair after a random pause of up to `attempt × 50 ms`, 30 attempts.
+  Each round has one winner per object: measured on the real bucket, 20 concurrent appenders to one
+  log all landed in about 8 s.
 
 ## The snapshot rule
 
@@ -516,27 +631,43 @@ just below the entry.
 
 **Which version a run reaches.**
 
-- A version is reserved before its write lands. A run may only stop at version X' once every write
-  that took a version ≤ X' has landed.
-- Writes run inside the API Lambda, so they land within its timeout. So **settle = the Lambda
-  timeout (480 s) + 60 s**, the same margin `core/cron` uses for stale dispatches.
-- Each run reads the sequence value for the next run (`nx`). The next run, at least `settle` later,
-  stops at that value.
-- So a write reaches the frames 10–20 minutes later.
+- A version is reserved before its write lands. A compaction may only stop at version X' once
+  every write that took a version ≤ X' has landed or given up: X' must be **settled**.
+- **v1:** writes run inside the API Lambda, so they land within its timeout. So **settle = the
+  Lambda timeout (480 s) + 60 s**, the same margin `core/cron` uses for stale dispatches. Each run
+  reads the sequence value for the next run (`nx`); the next run, at least `settle` later, stops at
+  that value. A write reaches the frames 10–20 minutes later.
+- **v2:** settle = 25 s (D5), and the target comes from the checkpoints.
 
-**Steps, per frame.** The frames of one entity share steps 4a–4c.
+**Checkpoints (v2).** A checkpoint is a sequence value and the time it was read, in that order:
+every version ≤ the value was reserved before that time, so the checkpoint is settled `settle`
+later.
+
+- The state item keeps two: the newest (`nx`, `nxt`) and the previous (`px`). The previous one
+  needs no time: it is settled by construction.
+- Every run and every `.Fresh()` reads the sequence, then the clock, and pushes a checkpoint when
+  the newest is at least `settle` old: previous ← newest, newest ← (value, now). The push is an
+  `UpdateItem` conditioned on `nxt` being that old, so two concurrent pushers don't both push.
+- The target is the newest settled checkpoint: `nx` when `nxt ≤ now − settle`, else `px`. The
+  previous one is always settled: a push only happens once the newest is.
+- Pushes happen at most every 25 s. With fresh reads every few seconds the target lags 25–50 s;
+  with only the cron, a write reaches the files within about 10 minutes.
+
+**Steps, per frame.** The frames of one entity share steps 4a–4c. The v2 changes are marked.
 
 1. **Take the lease.** An `UpdateItem` on the state item, conditioned on there being no lease or an
    expired one. The lease expires after 10 minutes. If it's held, skip the frame; that's not an
-   error.
+   error. **v2:** take the frame's lock instead, an object in S3 (see "The lock"), then read the
+   state item, consistently.
 2. **No state, or `sh` differs from the code's shape:** reset.
    - Set `w` absent, `nx` = the sequence value now, `sh` = the new shape.
    - Delete the old shape's log.
    - Release the lease. The next run builds the frame.
 3. **`nxt` is newer than `now − settle`:** release the lease and stop. This happens when a retried
-   run arrives early.
+   run arrives early. **v2:** push a checkpoint if allowed. With no settled checkpoint above `w`
+   (an express compaction got there first), the run only merges the days in `ix`.
 4. **If `w` is absent, run RebuildAll at X' = `nx`. Otherwise, run a compaction from W = `w` to
-   X' = `nx`:**
+   X' = `nx` (v2: X' = the newest settled checkpoint):**
    1. **Records.** A consistent Query of the whole-entity delta index from W, every Status. Unlike
       `Query().Delta()`, it keeps a record whose row moved while the read ran (a later write
       landed): it is still written after W.
@@ -553,27 +684,93 @@ just below the entry.
       - Apply −before and +after.
       - If the rows changed, PUT the file with snapshot X'. A file left with no rows is kept, so its
         snapshot survives.
-   6. **Update the day indexes.** Rewrite the `_idx` of every touched day folder.
+      - **v2:** a file at X' or past it is left as it is; an older one takes the changes after its
+        own snapshot (or W when older), and every file a change above W names is rewritten even
+        when its rows don't change (rules 1–2 of "The lock").
+   6. **Update the day indexes.** Rewrite the `_idx` of every touched day folder. **v2:** also of
+      every day in `ix`, merging its `_ixt` first; then delete those `_ixt` (D7).
 5. **Commit.** Set `w = X'`, `nx` = the sequence value now, `nxt` = now. The write is conditioned on
-   holding the lease.
+   holding the lease. **v2:** one `UpdateItem` sets `w = X'` and removes the merged days from `ix`,
+   with the deadline of the holder's writes (see "The lock"); the checkpoint was pushed at step 3.
 6. **Truncate the log.** Rewrite it keeping only the entries with `newVersion > X'`, conditioned
    with `If-Match` on the ETag read. On a 412, re-read and retry. Nothing new can land at or below
    X': those writes have all settled.
-7. **Release the lease.**
+7. **Release the lease.** **v2:** release the lock.
 
 **If a run crashes:**
 
 | Crash after | What the next run does |
 |---|---|
-| Part of step 4e | Targets the same X', because `nx` only moves at commit. Files already at X' are left as they are; the rest are applied. |
+| Part of step 4e | Targets the same X', because `nx` only moves at commit. Files already at X' are left as they are; the rest are applied. **v2:** the next target may be a newer checkpoint; each file takes the changes after its own snapshot. |
 | Step 4f, before the commit | The same, and it rewrites the indexes of the folders it touches, which are the same folders. |
 | The commit, before truncation | Ignores entries ≤ the new W (the rule reads only entries above W) and drops them when it truncates. |
-| Anywhere, with the lease held | Waits: the lease expires after 10 minutes. |
+| Anywhere, with the lease held | Waits: the lease expires after 10 minutes. **v2:** the lock expires 20 s after its holder last renewed it. |
+
+## Express compactions and the lock (v2)
+
+**An express compaction** (D6) runs inside `.Fresh()`, after it has computed the rows:
+
+1. **Trigger.** More than 100 incarnations changed in (W, M], M being the newest checkpoint settled
+   when the fresh read began (taken from the state it started with, so M was settled before its
+   record read). Otherwise the fresh read only pushes a checkpoint if allowed, and returns.
+2. **Lock.** Take the frame's lock, or skip while another compaction holds it. Read the state again
+   and go on only while `w` is still the W the fresh read started from: the changes it read start
+   there.
+3. **Files.** The files any change in (W, M] names, each read again and brought to M (rules 1–2
+   below).
+4. **Index.** For a 2–3-key frame, one append per touched day to its `_ixt`, with the entries of
+   the files there.
+5. **Commit.** One `UpdateItem`: `w = M`, and the touched days ADDed to `ix`. Losing the lock
+   before it is not an error: the files it wrote are ahead of W, like a crashed run's.
+6. **Release** the lock and **return** the fresh rows. The log is left to the scheduled run.
+
+**The lock.** One compaction at a time writes a frame's files, its indexes and its `w`: the
+scheduled run, a rebuild or an express compaction. The lock is the object `_lock` of the frame's
+folder, holding an expiry (unix milliseconds, a varint) and its holder's random id. It works through
+S3 conditional writes, which S3 Express One Zone and general purpose buckets both support:
+
+- **Take.** GET `_lock`. A live one (its expiry is ahead): skip. A missing one: PUT with
+  `If-None-Match: *`. An expired or unreadable one: PUT over it with `If-Match` on the ETag read.
+  S3 answers 412 (or 409) to every concurrent taker but one, so nothing is read back. The lock lasts
+  20 s (`LockDuration`).
+- **Renew.** Before each write, a holder with less than 10 s left rewrites the lock with a new
+  expiry, `If-Match` on the ETag of its own last write. A 412 means another compaction took it over:
+  the holder stops with `ErrLockLost`. A lock that expired and that nobody took over renews: nobody
+  wrote meanwhile. The holder id makes every holder's ETag its own.
+- **Bound every write.** Each write of the holder (file PUTs, `_ixt` appends, deletes, the commit in
+  DynamoDB) carries a context deadline 2 s before the lock's expiry, and the lock is only taken over
+  once expired: the holder's last write lands before the next holder's first. The 2 s cover a
+  request already sent when its deadline hits and clock skew between Lambdas, as D5's margin does.
+- **Release.** Write the lock with expiry 0, `If-Match` on the holder's ETag, so the next compaction
+  takes it at once; a 412 (taken over) is ignored. A holder that crashes never releases: its lock
+  expires 20 s after its last renewal.
+
+Under the lock, what is left to handle is what a crashed holder, or one that lost its lock, leaves
+behind: files written at its target, above `w`, and maybe not indexed.
+
+1. **A file at the target or past it is left as it is,** and an older one takes the changes after
+   max(its snapshot, W). A file's snapshot is older than W only when no change above that snapshot
+   touched it, so it holds the frame at W too. Every reader, run and compaction therefore computes
+   the same rows. A missing file is empty at W: under the lock nothing deletes a file a compaction
+   still has to write.
+2. **A compaction rewrites every file a change above W names,** even when the file's rows end up
+   the same, so its snapshot moves to the target. Example: a line moves into a client's file at
+   version 101 and back out at 103, and a compaction to 101 writes the file and crashes. The next
+   compaction, to 103, sees no net change in that file: without this rule the file would stay at
+   101 with the line, and once `w` passed 103 every reader would take it as it is.
+3. **`_ixt` holds the entries in the order the files were written** (D7), and a run indexes again
+   every day it touches, so a crash between a file and its entry is fixed by the next compaction of
+   the file. Only the runs and the rebuilds rewrite `_idx` and delete `_ixt`.
+
+The randomized test checks each part: a `TakeLock` that ignores a live lock, a renewal that doesn't
+check its ETag, rule 2, or `_idx` entries winning over `_ixt` ones, and it fails. The scheduled run
+alone truncates the log, after its commit; the truncation is conditioned on the log's ETag, so it
+needs no lock.
 
 ## Rebuild
 
 `RebuildDataFrames(frame, fromKey, toKey)` recomputes the days [from, to] of `Keys[0]` at the
-committed snapshot W. It runs under the lease and writes only what differs:
+committed snapshot W. It runs under the lease (v2: the lock) and writes only what differs:
 
 1. Take the lease, and read W = `w`. A frame not built yet fails with `dataframe.ErrNotBuilt`.
 2. Gather the incarnations to recompute:
@@ -591,6 +788,19 @@ committed snapshot W. It runs under the lease and writes only what differs:
 **`RebuildDataFramesAll`** does the same for every day: a Query of the entity's whole pk, a PUT of
 every file it produces, and a DELETE of every other object under the frame folder but the log. It
 runs on a frame's first build, after a shape change, and from `fn-db rebuild-frames`.
+
+**v2:**
+
+- Rebuilds hold the frame's lock instead of the lease, and wait up to a minute for it (12 tries,
+  5 s apart): the compaction holding it takes seconds, and a crashed one's lock expires within 20 s.
+  The DELETEs stay: under the lock no compaction still has a file to write.
+- A range rebuild compares against each day's `_idx` with its `_ixt` merged over it, then rewrites
+  `_idx` and deletes `_ixt` when either changed or `_ixt` existed.
+- `RebuildDataFramesAll` deletes every `_ixt` (after a shape change it may be in another format) and
+  every other object but the log and the lock, and leaves `ix`: the next run merges a day with no
+  `_ixt` at no cost.
+- A rebuild never moves `w`, so an express compaction that read before it still commits after it
+  (its W is still `w`), with files it computed from the records, not from the rebuilt files.
 
 ## Read API
 
@@ -621,15 +831,19 @@ func (row FrameRow[E]) Sum(column Coln) int64
   filter on Rows; the caller filters.
 - **Files are at the last run's snapshot.** While a run is writing, some files can be one run ahead
   of others.
+- **`.Fresh()`** (built) returns the rows as the records hold them now (D6). Besides the files, it
+  costs a consistent read of the records written after W (25–50 s of writes in v2, 10–20 minutes
+  in v1) and a GET of the log. If W moves during the read, it starts over (3 tries). v2 adds the
+  express compaction after it.
 
 ## berryapps wiring
 
 | File | Change |
 |---|---|
 | `backend/example/types/sales.go` | `SaleLine`: `UpdatedVersion` (cb 12), `CreatedVersion` (cb 13), the TypeDelta index, `DataFrames`, the frame name constants |
-| `backend/db/db.go` | Aliases `DataFrame`, `FrameRow[E]`, plus `SetDataFrames(store, settle)` |
+| `backend/db/db.go` | Aliases `DataFrame`, `FrameRow[E]`, plus `SetDataFrames(store, writeDeadline)` (D5; v1 took the settle) |
 | `backend/core/config.go`, `config.example.toml` | `[frames]` with `bucket` and `root` (D2) |
-| `backend/core/frames/` (new, like `core/textsearch`) | Builds the store from `[frames]` at boot. `cron.go` registers `frames-materialize` with `Schedule: "*:*"`; it calls `MaterializeDataFrames()` on every `db.RegisteredTables()` entry that has frames and joins the per-table errors |
+| `backend/core/frames/` (new, like `core/textsearch`) | Builds the store from `[frames]` at boot. `cron.go` registers `frames-materialize` with `Schedule: "*:*"`; it calls `MaterializeDataFrames()` on every `db.RegisteredTables()` entry that has frames and joins the per-table errors. **v2:** the Express append path (D2) |
 | `backend/core/admin/database_cli.go` | Op `rebuild-frames <entity> [frame] [from to]`, next to `rebuild-groups` |
 | `backend/core/health/` | Frames bucket reachability: a GET of a missing key that answers NotFound |
 | `backend/example/cron.go` | `example-rebuild-sales-frames` at `09:10` UTC, rebuilding yesterday and today. It's a safety net for the drift sources under "Limits" |
@@ -648,11 +862,18 @@ without its type.
     1 PUT each; on a general purpose bucket, a GET plus a PUT of the log.
 - **Delete:** one version reservation plus the appends.
 - **Run, per frame:**
-  - About 4 state-item requests.
+  - About 4 state-item requests. **v2:** about 3, plus the lock: a GET and a PUT to take it, a PUT
+    to release it, and a PUT per 10 s of writing to renew it.
   - One delta Query plus a BatchGetItem of the records changed in the window.
   - One log GET and one log PUT.
   - One GET plus at most one PUT per touched file (usually today's file and the clients who bought).
   - One GET plus one PUT per touched day `_idx`.
+- **`.Fresh()`:** a GetItem of the state twice, the delta Query plus a BatchGetItem of the records
+  changed since W (about 100 RCU per 100 records, consistent), one log GET, and the files of the
+  selection. v2 adds a conditional checkpoint push (1 WCU), at most every 25 s.
+- **Express compaction (v2):** the lock (a GET and a PUT to take it, a PUT to release it), a
+  consistent GetItem of the state, per touched file a GET and a PUT, one `_ixt` append per touched
+  day, and the commit with the `ix` ADD (1 WCU).
 - **S3 request prices** are per 1,000 requests, so all of this is negligible at this volume.
 
 ## Limits
@@ -669,12 +890,27 @@ without its type.
 - **Files edited or deleted by hand.** A range rebuild of a 2–3-key frame trusts the `_idx`
   hashes: a file whose hash matches is not read. Repair hand edits with `RebuildDataFramesAll`
   (`fn-db rebuild-frames` without a range).
-- **A losing conditional write still in flight long after the winner.** The cancel marker is
-  appended when the loser learns it lost. A run reads the log at least `settle` (Lambda timeout +
-  60 s) after its target was read, so it can miss a marker only when the winning write took more
-  than about 60 s between reserving its version and landing, while the loser read the record in
-  that window. The run then sees no change for the winner's write, and the frame keeps the record's
-  old values until its day is rebuilt.
+- **A compaction that crashes between a file PUT and its index entry** leaves that file's entry
+  behind: the keys stay exact, the hash may be the old one. The next compaction of the file indexes
+  it again. A range rebuild in between may skip the file, which then keeps its newer, correct rows.
+- **A compaction holds the lock 20 s past a crash (v2).** Until it expires, the runs skip the frame,
+  the express compactions skip their write (the fresh read still answers) and a rebuild waits.
+- **The lock relies on the clocks (v2).** A holder stops writing 2 s before its lock expires, by its
+  own clock, and the next holder takes it over once expired, by its own. Lambda clocks are synced
+  well within that; a skew past 2 s, or a write request that lands more than 2 s after its deadline,
+  could let two holders' writes overlap.
+- **A losing conditional write still in flight long after the winner (v1 only).** The cancel
+  marker is appended when the loser learns it lost. A run reads the log at least `settle` (Lambda
+  timeout + 60 s) after its target was read, so it can miss a marker only when the winning write
+  took more than about 60 s between reserving its version and landing, while the loser read the
+  record in that window. The run then sees no change for the winner's write, and the frame keeps
+  the record's old values until its day is rebuilt. v2's deadline, counted from the read, closes
+  it (D5).
+- **A write slower than 10 s fails (v2).** DynamoDB throttling or a slow S3 append can push a write
+  past its deadline. It then lands nothing more and returns `ErrWriteDeadline`; the client retries.
+  A writer that dies before appending its cancel markers leaves phantom entries (below).
+- **10,000 appends per object on S3 Express (v2).** A frame's log takes about 16 changing writes
+  per second, sustained, between two runs; past that the appender rewrites it (see "Appending").
 - **A stale insert.** A `PutManyIfVersion` insert (expected version 0) that read "absent", then
   lands after another writer inserted and deleted the same key, carries a version older than that
   delete. At a snapshot between the other insert and its delete, both incarnations count. It lasts
@@ -722,18 +958,49 @@ without its type.
     `_idx` must list exactly its folder's hashes. A range rebuild of a 2–3-key frame must not
     rewrite a file.
   - Writer lifetimes are bounded and the settle is twice that, so the run is exact; the windows
-    under "Limits" are outside it.
+    under "Limits" are outside it. That is already D5's model: a lifetime counted from the read,
+    and a settle of twice it plus a margin.
+  - `.Fresh()` reads at random points must equal a brute-force aggregate of the records as they
+    are (built).
+  - **v2 (implemented):**
+    - Every compaction takes the frame's lock on a clock of 2 s per step, and skips while another
+      holds it. A crashed one keeps it until it expires, and the next takes it over.
+    - Express compactions at random points, with targets taken from the checkpoints. Half are slow:
+      they take the lock and write their files steps after their read (w may have moved: they
+      skip), then hold the lock steps more before committing. Some outlive their lock: taken over
+      meanwhile, their commit fails with `ErrLockLost`; not taken over, it renews and commits.
+      Some crash partway.
+    - Every file must keep matching the brute force at its own snapshot. With no crash pending,
+      `_idx` then `_ixt`, the last entry winning, must list exactly the folder's files and hashes,
+      including files ahead of W. A commit must find `w` where the compaction read it.
+    - Every event above must happen in the 250 seeds (the test fails otherwise).
+    - Mutations: a `TakeLock` that ignores a live lock, a renewal over whatever ETag is there, a
+      file ahead of W taken for compacted (rule 1), rule 2, or `_idx` entries winning over `_ixt`
+      ones each make it fail.
+  - **`TestFrameLock`:** taken, refused while live, renewed by a write past its first expiry, taken
+    over once expired (the old holder's write then fails and its release leaves the new lock),
+    released and taken at once, renewed after expiring when nobody took it.
+  - **`TestFrameWriteWindow`:** an expired window fails the write with `ErrWriteDeadline`; cancel
+    markers append within the grace and fail after it.
 - **Rules:** the compile panics (`TestDataFrameDeclarationRules`).
 
-**Live check (`ormcheck`):** a frame on `ormcheck_frame_line`, on the in-memory store: write,
-materialize twice (the first run only records the target), read it back with `QueryFrame`, update
-and delete, materialize again, and compare with the records. Settle is 0 there.
+**Live check (`ormcheck`):** a frame on `ormcheck_frame_line`, on the in-memory store, with the
+10 s write deadline. The check moves the ORM's clock (`dynamo.Now`) a minute forward wherever a
+checkpoint must settle, instead of waiting 25 s:
+
+- Write, run twice (the first run only records a checkpoint), read it back with `QueryFrame`.
+- Update and delete, run, check the files didn't change yet and `.Fresh()` sees the changes, then
+  run again once that checkpoint settled.
+- A range rebuild that rewrites no file (it writes `_idx` and the lock), then `RebuildDataFramesAll`.
+- 101 inserts: a fresh read checkpoints them, and the next one, once that settled, compacts them
+  into the files (the express compaction: the lock, `_ixt`, the commit with the `ix` ADD). A plain
+  read must then list them through `_ixt`, and again after the next run merged it.
 
 **berryapps:**
 
 - `./app.sh test` and `./app.sh fn-check`.
-- Two `fn-cron-tick` runs at least 9 minutes apart. The first records `nx`; the second builds the
-  frames.
+- Two `fn-cron-tick` runs at least 25 s apart (v1: 9 minutes). The first records `nx`; the second
+  builds the frames.
 - Cross-check: the `day-product` frame must match `QueryGroups(Fecha, ProductID)` Quantity sums
   over the last 30 days, exactly. Any difference means drift in one of them.
 - Cancel a sale. Two runs later, its lines must be gone from both frames.
@@ -774,10 +1041,45 @@ and delete, materialize again, and compare with the records. Settle is 0 there.
     - Watch the first two runs, then run the cross-check.
 11. **The nightly `example-rebuild-sales-frames`.**
 
+**v2, in order** (1–6 implemented, not committed):
+
+1. **The write deadline** (D5): the clock from the stored read, the context deadlines, the cancel
+   markers past it, `ErrWriteDeadline`, `SetDataFrames(store, writeDeadline)`.
+2. **Checkpoints:** `px`, the conditional push, the target choice, in the run.
+3. **The lock and rules 1–2 in the run:** `dataframe/lock.go` replaces the lease; every write of a
+   compaction goes through it; changes after each file's own snapshot; files named by any change
+   rewritten.
+4. **`_ixt`:** the codec, the reader (`_idx` then `_ixt`, the last entry winning), the merge in the
+   run and the rebuilds, `ix`.
+5. **The express compaction in `.Fresh()`**, under the lock.
+6. **The randomized test** extended as under "Tests", then `ormcheck`. berryapps: `core/frames`
+   sets the 10 s deadline, and its general purpose store takes a context on every write and returns
+   the ETag of a conditional PUT.
+7. **The Express store** in `core/frames`, once the Lambda role has `s3express:CreateSession`.
+
 ## Alternatives considered
 
 - **Recompute every touched file from DynamoDB, with no log.** It's simpler, but every run would
   re-read whole days (every line of today, every 10 minutes) instead of only the changes.
+- **An express compaction that saves "now"** (everything the fresh read saw). A write that took a
+  lower version and lands a moment later would be counted as already in the files and lost (D5).
+- **A fence instead of the deadline** (Option B). The state item holds a claimed version, and every
+  frame-table write lands in a transaction with a ConditionCheck that its version is above it; a
+  compaction claims the current version and compacts to it at once, with no clock at all. Rejected:
+  transactions double the write cost of frame tables and take 100 items each, every write reads the
+  state item, a fenced write retries with a new version, and losing conditional writes would also
+  need each log entry to name the version it replaced.
+- **Lock-free parallel compactions** (implemented, then replaced by the lock). Express compactions
+  took no lease and ran beside the run and the rebuilds: every file PUT conditional on its ETag, a
+  version per file (the lease epoch `ep`, then the snapshot) so a compaction only wrote over an older
+  one, the same version in every `_idx` / `_ixt` entry with the newest winning, rebuilds rewriting
+  files as empty instead of deleting them, and a commit conditioned on `ep`. The randomized test
+  passed it, but it cost a version column per index entry and a conditional PUT per file, and every
+  rule was there only for the overlap. The lock removes the overlap.
+- **The lock in DynamoDB** (the v1 lease on the state item, taken by express compactions too). It
+  works the same, but the lock is kept beside the files it guards, in S3, taken with the
+  conditional writes S3 Express One Zone supports (general purpose buckets too, the compatibility
+  mode).
 - **`UpdatedCount`:** see D1.
 - **Settle on each record's `Updated` time instead of the sequence value.** The latency is the same
   here, because settle (540 s) is close to the cron period. It would also need a timestamp in every

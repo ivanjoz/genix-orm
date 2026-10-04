@@ -115,7 +115,7 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := r.batchWrite(client, batch); err != nil {
+		if err := r.batchWrite(context.Background(), client, batch); err != nil {
 			return err
 		}
 		deleted += len(batch)
