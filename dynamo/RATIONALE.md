@@ -1,5 +1,14 @@
 # RATIONALE — dynamo
 
+## DataFrames: `FrameSource.Scan` hands over the files only after the state check
+**Context** — FrameSQL needs a frame read as raw files: a key range, pinned keys, and a hook (`selectFiles`) that drops files before they are read. `QueryFrame` returns rows, not files. Left open: the shape of that source, and whether it streams.
+**Decision**
+- `Repo.FrameSource(name)` panics on an unknown frame, like the other schema lookups.
+- `Scan(fromKey, toKey, pinnedKeys, selectFiles, fn)` is the fresh read (now `dataframe.Read`, shared with `QueryFrame`; `FrameSource` itself moved to `../dataframe/`). `selectFiles` runs on the sorted file keys before the read, and its error is returned unwrapped.
+- `fn` gets each file only after the state is re-read unchanged. A file the fresh read doesn't change passes through as read, so only the changed files are rebuilt.
+
+**Rationale** — The fresh read retries when the snapshot `w` moves. A source that streamed would hand `fn` files the retry then reads again, so every caller would have to undo partial results. Buffering keeps "`fn` sees one consistent snapshot, once". The cost is holding the selected files in memory: a FrameSQL query reads a bounded range, and `selectFiles` exists to keep it small.
+
 ## DataFrames: `Fresh()` reads the frame as the records hold it now
 **Context** — An app needed a frame range up to the last write (the sale just made), not 10 to 30 minutes behind. Left open: the API, what to read, and how to stay right while a run writes the same files.
 **Decision** —
@@ -10,6 +19,8 @@
 **Rationale** — It reuses the run's arithmetic, so the randomized simulation checks it the same way (a fresh read at random points must equal the brute force of the records as they are, with writers reserved, logged, losing or crashed). Cost: the delta read covers the whole entity, not the range: every record written in the last 10 to 30 minutes, plus the log. Cheap for sales; a hot entity with large frames would want a run more often instead.
 
 ## DataFrames: the storage side is its own package, `dataframe`
+*Superseded by "Everything that is not DynamoDB is the `dataframe` module" in `../dataframe/RATIONALE.md`: the package left `dynamo`, and took the state machine and the write path's logic with it.*
+
 **Context** — The DataFrame code was six `data_frame*.go` files inside `dynamo`, mixing DynamoDB reads and leases with the file codecs and the file arithmetic of a run. The split had to respect Go's import rule: `dynamo` calls the file work, so `dataframe` cannot import `dynamo`.
 **Decision** — `dataframe/` holds everything that never touches DynamoDB: `Frame` (name, folder, key and sums counts, shape) and the object keys, `Values`, the `Store` interface with `MemoryStore` and its errors, the codecs, the run's file work (`CompactFrame`, `RebuildAllFiles`, `RebuildFilesInRange`, `AppendLog`, `ReadLog`, `TruncateLog`) and the file reads (`SelectFileKeys`, `ReadFiles`). It takes the records as `[]RecordState` (sk, CreatedVersion, values), read by callbacks it is handed. `dynamo` keeps the declarations, the write path, the record reads, the state item and the lease; its `dataFrameMeta` embeds a `dataframe.Frame` next to the column accessors. The bounded-parallelism helper both need moved to `internal/parallel`.
 **Rationale** — The snapshot rule (`valuesAt`, incarnations, cancel markers) is now testable with no table at all (`dataframe/run_test.go`), and the codec has one home. The randomized simulation stays in `dynamo` because it drives the real write path, and its brute force no longer shares the run's aggregation helpers. Cost: one exported surface between two packages of one module, and `&frame.Frame` at every call.
@@ -26,7 +37,7 @@
 - **A 1-key range rebuild writes each day** (PUT or DELETE): it has no `_index` to compare against. At most 400 PUTs per rebuild cost little, and skipping unchanged days would need a GET of each file first.
 - **The S3 implementation lives in berryapps** (`core/frames`), behind the `dataframe.Store` interface. The ORM ships only `dataframe.MemoryStore`. genix-s3's error sentinels are internal, so its client can't report NotFound or a failed precondition in a way the ORM can match.
 - **`QueryFrame` reads the state item** on every call, to fail with `dataframe.ErrNotBuilt` rather than return the files of an old shape or none.
-- **The settle is configured, not computed:** `SetDataFrames(store, settle)`. The ORM can't know the Lambda timeout.
+- **The settle is configured, not computed:** `SetDataFrames(store, settle)`. The ORM can't know the Lambda timeout. (Later replaced by a write deadline the settle is computed from, now `dataframe.Configure(store, writeDeadline)`.)
 - **A rebuild waits up to a minute for the lease** (12 tries, 5 s apart) instead of failing at once: a scheduled rebuild always shares its 10-minute slot with a run, which holds the lease for seconds.
 - **`TableSchema.DataFrames`** lists the frame names, so an app can tell which tables have frames (berryapps fails its boot without a store) and the Database tools can show them.
 

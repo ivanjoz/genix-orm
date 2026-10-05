@@ -10,6 +10,7 @@ import (
 
 	"github.com/viant/xunsafe"
 
+	"github.com/ivanjoz/genix-orm/dataframe"
 	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
@@ -85,7 +86,7 @@ type tableMeta struct {
 	status *colAccessor
 	// dataFrames are the schema's DataFrames (data_frame.go), and createdVersion the
 	// managed int32 "CreatedVersion" they need (nil without frames).
-	dataFrames     []dataFrameMeta
+	dataFrames     []dataframe.Frame
 	createdVersion *colAccessor
 }
 

@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // maxGroups bounds GROUP BY: every Key, the Rows column, and WEEK and MONTH of a day.

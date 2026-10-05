@@ -476,21 +476,21 @@ upv, upd = the last write that touched it (GroupDelta only)
   land after one reserving 10, so a client synced at 10 misses it until the
   group is written again.
 
-## DataFrames: group-by files kept by a cron (`data_frame*.go`, `dataframe/`)
+## DataFrames: group-by files kept by a cron (`data_frame*.go`, `../dataframe/`)
 
 A DataFrame is an aggregate of an entity kept as compact columnar files in a
 `dataframe.Store` (S3 in berryapps): one file per distinct value of its Keys,
 one row per distinct value of Rows, ascending, with the sum of each Sums column.
 A read is one GET per file and never touches the records. A scheduled run brings
-the files up to date; a write shows up one to two runs later. The design,
-formats and measurements are in `DATA_FRAMES_PLAN.md`.
+the files up to date; a write shows up one to two runs later. The reference
+(formats, the run, the lock, invariants) is `../DATA_FRAMES.md`.
 
-The code is split in two. The `dataframe` package is the storage side, with no
-DynamoDB: the `Store` interface and `MemoryStore`, the file, log and `_index`
-codecs (`codec.go`), the file work of a run and of the rebuilds (`run.go`) and
-the file reads of `QueryFrame`, fresh or not (`query.go`). The `data_frame*.go` files of this
-package compile the declarations, hook the write path, read the records and
-hold each frame's state item and lease, then call `dataframe` for the files.
+The code is split in two. The `dataframe` module (`../dataframe/`) holds
+everything that works for any database: the compile rules, the write path's log
+entries and deadline, the runs, rebuilds and reads with their state machine, the
+files, codecs and lock. The `data_frame*.go` files of this package resolve the
+schema's declarations, hook the write path, and implement `dataframe.Table`: the
+state item, the upv sequence and the record reads.
 
 ```go
 DataFrames: []dynamo.DataFrame{
@@ -499,8 +499,8 @@ DataFrames: []dynamo.DataFrame{
         Sums: dynamo.Cols(t.Quantity, t.Amount)},
 },
 
-dynamo.SetDataFrames(store, lambdaTimeout+time.Minute) // at boot, before the first write
-err := SaleLines.MaterializeDataFrames()               // from the cron, every 10 minutes
+dataframe.Configure(store, 10*time.Second) // at boot, before the first write
+err := SaleLines.MaterializeDataFrames()   // from the cron, every 10 minutes
 
 rows, err := SaleLines.QueryFrame("day-client-product").
     Eq(SaleLines.T.ClientID, 412).Between(SaleLines.T.Fecha, from, to).Exec()

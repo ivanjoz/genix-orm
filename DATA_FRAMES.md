@@ -1,9 +1,12 @@
-# DataFrames — how they are built, kept up to date and read (`dynamo`)
+# DataFrames — how they are built, kept up to date and read (`dataframe`, `dynamo`)
 
 This is the reference of the DataFrames implementation as it is: what a frame is, how the ORM feeds
 it on every write, how the scheduled run and the reads turn that into files, and which invariants
-hold it together. The decisions and the alternatives that led here are in `DATA_FRAMES_PLAN.md`.
-Where this document and the code disagree, the code wins.
+hold it together. Everything that does not depend on the database is the `dataframe` module; a
+driver (today `dynamo`; `scylla` is planned in `DATA_FRAMES_SCYLLA_PLAN.md`) resolves the
+declarations, feeds the write path and implements `dataframe.Table`. Where a section names a
+DynamoDB call, it describes the `dynamo` driver. Where this document and the code disagree, the
+code wins.
 
 ## 1. What a DataFrame is
 
@@ -49,15 +52,33 @@ read sees a write 10 to 20 minutes later. `.Fresh()` returns the rows as the rec
 
 ## 2. Map of the code
 
+**`dataframe/`** — its own Go module (`github.com/ivanjoz/genix-orm/dataframe`), no database:
+
 | Where | What |
 |---|---|
-| `dynamo/data_frame.go` | `SetDataFrames`, the compile rules (`compileDataFrames`, `frameFolder`), the write deadline (`frameWriteWindow`), and the write-path hooks: `checkFrameValues`, `stampCreatedVersions`, `frameWritesOf`, `appendFrameLogEntries`, `cancelFrameWrites`, `appendFrameDeleteEntries` |
-| `dynamo/data_frame_run.go` | The state item and checkpoints, `MaterializeDataFrames` (the run), `expressCompactFrame`, `RebuildDataFrames` / `RebuildDataFramesAll`, the record readers of a compaction |
-| `dynamo/data_frame_query.go` | `QueryFrame`, `FrameRow`, `.Fresh()` |
-| `dynamo/repo.go`, `modify.go`, `controller.go` | The writes that call the hooks: `PutMany`, `InsertMany`, `PutIfAbsent`, `Delete`, `PutManyIfVersion`, `Modify`, `DecodeRecords`. `Controller` exposes the run and the rebuilds without the record type |
-| `dynamo/dataframe/` | The storage side; it knows nothing of DynamoDB. `dataframe.go` (Frame, keys, shape), `codec.go` (formats), `run.go` (incarnations, compactions, rebuilds, the log), `index.go` (`_idx` / `_ixt`), `query.go` (selection, plain and fresh file reads, express compaction), `lock.go` (the frame lock), `store.go` (`Store`, `MemoryStore`) |
-| `backend/core/frames/` (berryapps) | The S3 store, installed at boot (`installStore`), and the `frames-materialize` cron job |
-| `backend/db/db.go` (berryapps) | Aliases: `db.DataFrame`, `db.FrameRow`, `db.FrameStore`, `db.SetDataFrames`, `db.ErrFrameNotBuilt` |
+| `dataframe.go` | `Frame` (the compiled frame: folder, counts, shape, its `Column`s), `ValuesOf`, the object keys, `ShapeOf` |
+| `compile.go` | `Declaration` and `Compile`: the rules every driver shares (name, 1–3 Keys, Rows, Sums or Count, no column twice, folder collisions) and the shape |
+| `write.go` | `Configure` (store and write deadline), the settle, `WriteWindow`, `ErrWriteDeadline`, and the write path's logic: `CheckValues`, `LoggedWrite`, `AppendLogEntries`, `AppendCancelMarkers` |
+| `table.go` | `Table`, the interface a driver implements (state record, write sequence, four record reads), `State`, checkpoint push and `settledTarget` |
+| `materialize.go` | The state machine over a `Table`: `Materialize` (the run), `RebuildRange` / `RebuildAll`, `Read` (plain and fresh, with the express compaction), `FrameSource` (FrameSQL's read) |
+| `run.go`, `query.go`, `index.go`, `codec.go`, `lock.go`, `store.go` | The file work: incarnations, compactions, rebuilds and the log; selection and file reads; `_idx` / `_ixt`; formats; the frame lock; `Store`, `MemoryStore` |
+| `framesql/` | FrameSQL (`DATA_FRAMES_SQL.md`) |
+
+**`dynamo/`** — only what needs DynamoDB or its schema:
+
+| Where | What |
+|---|---|
+| `data_frame.go` | Resolving `Schema.DataFrames` into `dataframe.Declaration`s (`compileDataFrames`) and the rules that depend on the schema (no Partition, a whole-entity delta index, `Keys[0]` leads the Keys / a GSI / a local index, `CreatedVersion`), `frameFolder`, and the write-path hooks: `frameWriteWindowFrom`, `stampCreatedVersions`, `frameWritesOf`, `appendFrameDeleteEntries` |
+| `data_frame_run.go` | `frameTable`, the `dataframe.Table` on DynamoDB: the state item, the upv sequence, the record reads. `MaterializeDataFrames`, `RebuildDataFrames` / `RebuildDataFramesAll` |
+| `data_frame_query.go` | `QueryFrame`, `FrameRow`, `.Fresh()`, `Repo.FrameSource` |
+| `repo.go`, `modify.go`, `controller.go` | The writes that call the hooks: `PutMany`, `InsertMany`, `PutIfAbsent`, `Delete`, `PutManyIfVersion`, `Modify`, `DecodeRecords`. `Controller` exposes the run and the rebuilds without the record type |
+
+**berryapps:**
+
+| Where | What |
+|---|---|
+| `backend/core/frames/` | The S3 store, installed at boot (`installStore`), and the `frames-materialize` cron job |
+| `backend/db/db.go` | Aliases: `db.DataFrame`, `db.FrameRow`, `db.FrameStore`, `db.SetDataFrames` (calls `dataframe.Configure`), `db.ErrFrameNotBuilt` |
 
 ## 3. Declaring a frame
 
@@ -72,15 +93,15 @@ type DataFrame struct {
 }
 ```
 
-**`Count`** is no field of the record: `frameValuesOf` puts a 1 after the Sums values of every record
+**`Count`** is no field of the record: `Frame.ValuesOf` puts a 1 after the Sums values of every record
 it counts (Status ≠ 0), so the file's last Sums column is the number of records per row and every
 other part of the code (log, compactions, rebuilds, codec) sums it like any column. `SumsCount` is
 `len(Sums) + 1`, the shape takes the Sums ids plus `+count`, and `FrameRow.Count()` reads it.
 
-`compileDataFrames` (at `NewRepo`) panics on a violation:
+`dataframe.Compile` and the driver's `compileDataFrames` (at `NewRepo`) panic on a violation:
 
 - Keys, Rows and Sums are scalar integer `Col`s with a `cb` tag, none listed twice; 1–3 Keys, at
-  least one Sums column or `Count`.
+  least one Sums column or `Count` (`Compile`; the rest of this list is the `dynamo` driver's).
 - `Keys[0]` leads the entity's `Keys`, a GSI or a local index: a rebuild queries a range of it.
   When it leads the base `Keys`, that read is consistent; through a GSI it can't be.
 - The entity has a `TypeDelta` index with no pinned Keys (`{Type: TypeDelta, Keys: Cols(t.Status)}`):
@@ -98,7 +119,7 @@ other part of the code (log, compactions, rebuilds, codec) sums it like any colu
   existed reads 0: older than every snapshot.
 - `Status`: a record with `Status == 0` counts in no frame (soft delete).
 
-**Write-time check** (`checkFrameValues`): a negative Keys or Rows value always fails the write (they
+**Write-time check** (`dataframe.CheckValues`): a negative Keys or Rows value always fails the write (they
 name files and are delta-coded); a negative Sums value fails unless `AllowNegativeSums`.
 
 ## 4. Versions and snapshots
@@ -127,21 +148,22 @@ before they reserve by construction.
 version once every write that took a version up to it has landed (or given up and logged its cancel
 markers). The write deadline bounds that:
 
-- **Write deadline** (`frameWriteDeadline`, 10 s, `SetDataFrames`): a write lands within 10 s of
+- **Write deadline** (`dataframe.WriteDeadline()`, 10 s, `dataframe.Configure`): a write lands within 10 s of
   the stored read it diffs against (or of its version reservation when it reads nothing). Its log
   append, new hidden rows and base items carry a context deadline; past it the write lands nothing
   more and returns `ErrWriteDeadline`.
 - **Cancel grace** (3 s): a write's cancel markers carry a deadline 3 s after its own.
-- **Settle** = 2 × 10 s + 3 s + 2 s margin = **25 s** (`frameSettle`). A losing conditional write
+- **Settle** = 2 × 10 s + 3 s + 2 s margin = **25 s** (`settle`, `write.go`). A losing conditional write
   read the record before the winner landed, so it finishes one deadline plus the grace after that.
 
 **Checkpoints** (state item `nx`, `nxt`, `px`). A checkpoint is a value of the upv sequence and the
 time it was read, sequence first: every version up to it was reserved by then, so it is settled 25 s
 later.
 
-- `pushFrameCheckpoint`: when the newest checkpoint is more than 25 s old (or there is none), read
-  the sequence, then the clock, and set `px = nx, nx = value, nxt = now`, conditioned on `nxt` being
-  the one read. Of two pushers one wins; the other keeps its state, as valid.
+- `pushCheckpoint` (`table.go`): when the newest checkpoint is more than 25 s old (or there is
+  none), read the sequence, then the clock, and have the driver set `px = nx, nx = value, nxt = now`,
+  conditioned on `nxt` being the one read (`Table.PushCheckpoint`). Of two pushers one wins; the
+  other keeps its state, as valid.
 - `settledTarget(now)`: `nx` once `now − nxt > 25 s`, else `px` (settled by construction: a push
   only happens once the newest has settled).
 - Runs and fresh reads push. The target of a compaction is the newest settled checkpoint.
@@ -168,11 +190,11 @@ later.
 - Keys values are written in decimal.
 - `<root>` is the store's own prefix (berryapps: `[frames].root`, default `frames/`).
 - **`<shape>`** is 8 hex digits of `ShapeOf`: a CRC-32C of the format version, the folder and the
-  cb ids of Keys, Rows and Sums (plus `+count` with `Count`). A new shape (a column changed, a new codec, a new folder scheme)
+  column ids of Keys, Rows and Sums (`Column.ID`; dynamo: the `cb` tags) (plus `+count` with `Count`). A new shape (a column changed, a new codec, a new folder scheme)
   resets the frame: the next runs rebuild every file (section 7). Lambdas still on the old code
   append to the old shape's log, which nobody reads.
 
-### The state item (DynamoDB)
+### The state record (`State`; on DynamoDB, an item)
 
 ```text
 pk = base pk ‖ 000      beside the GroupBy counters (sk g…) and the slot versions (sk v)
@@ -184,10 +206,10 @@ ix       the days whose _ixt has entries to merge into their _idx (a number set)
 sh       the shape the files were built with
 ```
 
-Read consistently (`readFrameState`). Only the holder of the frame's lock moves `w`, `ix` and `sh`;
+Read consistently (`Table.ReadState`; dynamo: a consistent GetItem). Only the holder of the frame's lock moves `w`, `ix` and `sh`;
 anyone may push a checkpoint.
 
-### Formats (`dataframe/codec.go`)
+### Formats (`codec.go`)
 
 - **Frame file**, columnar raw bytes: `u8` format version (1), `uvarint` snapshot, `uvarint` row
   count n, then the Rows column (ascending: first value, smallest step, residual steps) and each
@@ -206,7 +228,7 @@ anyone may push a checkpoint.
   Sums-style column, then one `u32` hash per file.
 - **`_ixt`**: blocks of `uvarint length` + an `_idx` body, one per append.
 
-### The day index (`_idx` + `_ixt`, 2–3-key frames, `dataframe/index.go`)
+### The day index (`_idx` + `_ixt`, 2–3-key frames, `index.go`)
 
 - `_idx` lets a read list a day's files in one GET, and lets a rebuild skip the files whose hash
   already matches.
@@ -223,20 +245,21 @@ anyone may push a checkpoint.
 
 ## 6. The write path
 
-Every write to a table with frames goes through the same steps (`repo.go`, `modify.go`):
+Every write to a table with frames goes through the same steps (the logic in `write.go`, the calls in
+the driver: `dynamo/repo.go`, `modify.go`):
 
-1. **`checkFrameValues`** on the records to write.
-2. **The window opens** (`frameWriteWindowFrom`): at the stored read the write diffs against, or at
+1. **`CheckValues`** on the records to write.
+2. **The window opens** (`OpenWriteWindow`; dynamo: `frameWriteWindowFrom`): at the stored read the write diffs against, or at
    the version reservation when it reads nothing.
 3. **Stored read, then version.** The stored records are read consistently, then the version is
    reserved and stamped. `CreatedVersion` is stamped from the stored record, or set to the new
    `UpdatedVersion` for an insert.
-4. **Log append, before the base write** (`appendFrameLogEntries`). For every record with a stored
-   version and, per frame, whose frame values change (`frameValuesOf` differs, Status 0 = nil), one
+4. **Log append, before the base write** (`AppendLogEntries`). For every record with a stored
+   version and, per frame, whose frame values change (`Frame.ValuesOf` differs, Status 0 = nil), one
    entry with the stored values. One `Append` per frame, frames in parallel. An insert logs nothing:
    the run finds it in DynamoDB through the delta index.
 5. **Land**: the new hidden rows and the base items, all with the window's deadline.
-6. **Cancel markers** (`cancelFrameWrites`) for the records logged that did not land: never sent,
+6. **Cancel markers** (`AppendCancelMarkers`) for the records logged that did not land: never sent,
    or lost their condition. A record whose request failed without an answer may have landed: it
    keeps its entry. The markers have the 3 s grace.
 7. Stale hidden-row deletes, GroupBy counters and slot versions come after, outside the window:
@@ -253,12 +276,12 @@ Per write call:
 | `Delete` | consistent read of the record | when the record counts in a frame, it reserves a version for the delete and logs its values (`appendFrameDeleteEntries`); a delete not sent gets cancel markers |
 | `DecodeRecords` (`Controller`, imports) | — | validates frame values only |
 
-A table with frames needs the store set (`SetDataFrames`) before its first update or delete.
+A table with frames needs the store set (`dataframe.Configure`) before its first update or delete.
 
 ## 7. The scheduled run (`MaterializeDataFrames`)
 
 berryapps' `frames-materialize` job (every 10-minute slot) calls it on every registered table. Per
-frame (`materializeDataFrame` → `runDataFrame`):
+frame (`dataframe.Materialize` → `runFrame`, over the driver's `Table`):
 
 1. **Take the lock** (`dataframe.TakeLock`). Held by another compaction: skip the frame, no error.
    Then read the state item.
@@ -274,7 +297,7 @@ frame (`materializeDataFrame` → `runDataFrame`):
      the log and the lock. This happens on the second run after the reset.
    - Otherwise **compact** (`CompactFrame`) from W = `w` to max(W, T), merging the days in `ix`:
      1. *Records*: a consistent Query of the whole-entity delta index for `UpdatedVersion > W`
-        (`frameRecordsWrittenAfter`, which keeps a record whose row moved during the read).
+        (`Table.ReadRecordsWrittenAfter`, which keeps a record whose row moved during the read).
      2. *Log*: GET `_log.<shape>` after the records: an entry is appended before its write lands,
         so every change the record read saw is in the log.
      3. *Missing records*: the sks with entries above W that the read didn't return (deleted, or a
@@ -304,7 +327,7 @@ expiry (unix ms) followed by the holder's random id, taken and kept with conditi
   `If-None-Match: *`. Expired or unreadable: PUT over it with `If-Match` on the ETag read. Of
   concurrent takers, S3 answers 412 (or 409) to all but one. It lasts `LockDuration` = 20 s.
 - **Write through it**: every write of the holder goes through `lock.put`, `lock.append`,
-  `lock.Delete` or, for DynamoDB, `lock.WriteContext()` (`commitFrameState`). Each gets a context
+  `lock.Delete` or, for the state record, `lock.WriteContext()` (`commitSnapshot`, `Table.ResetState`). Each gets a context
   that ends 2 s before the lock expires. With under 10 s left, `WriteContext` first renews the lock
   (`If-Match` on the holder's last ETag): if another compaction took it over, it fails with
   `ErrLockLost` and the holder writes nothing more. A lock that expired but nobody took over renews.
@@ -349,7 +372,7 @@ rows, err := repo.QueryFrame(name).Eq(...).Fresh().Exec()            // the reco
 3. Rows come back sorted by the Keys, then by Rows, as `FrameRow[E]` (`Key` holds the Keys and
    Rows values, `Sum(column)` a Sums value, `Count()` the record count of a `Count` frame).
 
-**A fresh read** (`readFreshFiles` → `dataframe.ReadFreshFiles` at W = `w`):
+**A fresh read** (`dataframe.Read` → `readFresh` → `ReadFreshFiles` at W = `w`):
 
 1. Read the incarnations changed after W, as a compaction does (delta index, log, by-sk reads).
 2. Select the files as a plain read, plus every file inside the selection that a change names (it
@@ -358,10 +381,10 @@ rows, err := repo.QueryFrame(name).Eq(...).Fresh().Exec()            // the reco
    A write counts once it has landed.
 4. Read the state again. If `w` moved (a compaction committed and may have truncated entries the
    read needed), start over from the new `w`, up to 3 times.
-5. **Express compaction** (`expressCompactFrame`), in the same request:
+5. **Express compaction** (`expressCompact`), in the same request:
    - Push a checkpoint if the newest has settled.
    - M = the newest checkpoint settled when the read began. Go on only when M > W and more than 100
-     incarnations changed in (W, M] (`frameExpressMinChanges`): every write up to M had landed
+     incarnations changed in (W, M] (`expressMinChanges`): every write up to M had landed
      before the read, so the read already holds the values at M, with no extra DynamoDB read.
    - Take the lock (held: skip). Re-read the state: go on only if `w` is still W.
    - `FreshRead.CompactTo`: the files changes in (W, M] name, brought to M as in the run (rules 1–2),
@@ -412,7 +435,8 @@ stored record, files edited by hand. Both take the frame's lock, waiting up to a
 
 ## 12. Tests
 
-`go test ./...` in `genix-orm/dynamo`:
+`go test ./...` in `genix-orm/dataframe` (codec, snapshot rules, lock, FrameSQL) and in `genix-orm/dynamo`
+(declarations, write path, the randomized spec):
 
 - **Codec** (`dataframe/codec_test.go`): round trips of files at every width and block boundary,
   the width choice against every alternative, the hash ignoring the snapshot, `_idx` / `_ixt` round

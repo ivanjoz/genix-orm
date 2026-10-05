@@ -10,7 +10,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DataFrame file codec (../DATA_FRAMES_PLAN.md, "Formats"): raw bytes, columnar.
+// DataFrame file codec (../DATA_FRAMES.md, section 5, "Formats"): raw bytes, columnar.
 //
 //	u8        format version
 //	uvarint   snapshot: the UpdatedVersion whose state the file holds

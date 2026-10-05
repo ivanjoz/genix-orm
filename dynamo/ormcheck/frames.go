@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-orm/dynamo"
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // CheckFrameLine is a sale line with two DataFrames: quantities and line counts per day and product, and
@@ -68,7 +68,7 @@ const checkFrameDay int16 = 20_000
 // checkpoint must settle (25 s with the 10 s write deadline) instead of waiting for it.
 func runDataFrameChecks(runner *checkRunner) error {
 	frameStore := dataframe.NewMemoryStore()
-	dynamo.SetDataFrames(frameStore, 10*time.Second)
+	dataframe.Configure(frameStore, 10*time.Second)
 	clockOffset := time.Duration(0)
 	realNow := dynamo.Now
 	dynamo.Now = func() time.Time { return realNow().Add(clockOffset) }
@@ -129,6 +129,21 @@ func runDataFrameChecks(runner *checkRunner) error {
 	}
 	runner.expect("Fresh day-client-product: Fecha = 20000, the new client's file read too", []string{"20000/5/10 q5000 a300", "20000/7/12 q500 a50"},
 		queryFrame(CheckFrameLines.QueryFrame(checkFrameDayClientProduct).Eq(lines.Fecha, checkFrameDay).Fresh()))
+	// FrameSQL's read: the same fresh files, filtered by the caller before any GET and handed over as decoded.
+	runner.expect("FrameSource day-client-product: Fecha = 20000, selectFiles keeps client 7", []string{"20000/7/12 q500 a50"}, func() ([]string, error) {
+		labels := []string{}
+		_, err := CheckFrameLines.FrameSource(checkFrameDayClientProduct).Scan(int64(checkFrameDay), int64(checkFrameDay), nil,
+			func(fileKeys [][dataframe.MaxKeys]int64) ([][dataframe.MaxKeys]int64, error) {
+				return slices.DeleteFunc(fileKeys, func(keys [dataframe.MaxKeys]int64) bool { return keys[1] != 7 }), nil
+			},
+			func(keys [dataframe.MaxKeys]int64, file dataframe.File) error {
+				for row, productID := range file.RowIDs {
+					labels = append(labels, fmt.Sprintf("%d/%d/%d q%d a%d", keys[0], keys[1], productID, file.Sums[0][row], file.Sums[1][row]))
+				}
+				return nil
+			})
+		return labels, err
+	})
 	passSettle()
 	if err := materialize("Run 4, run 3's checkpoint settled: adds the changes"); err != nil {
 		return err

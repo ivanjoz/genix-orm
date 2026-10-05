@@ -11,7 +11,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The frame lock (../DATA_FRAMES_PLAN.md, "The lock"). One compaction at a time
+// The frame lock (../DATA_FRAMES.md, section 8). One compaction at a time
 // writes a frame's files, its indexes and its w: the scheduled run, a rebuild or
 // the express compaction of a fresh read, and every write of it goes through its
 // Lock. The lock is the frame folder's _lock object: its owner and its expiry.

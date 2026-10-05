@@ -24,7 +24,7 @@ const checkStoreID int32 = 7
 // Run works on the ORM's configured table. It wipes the check entities, writes records into
 // each, reads them back through every access path (and once more after updating them), wipes
 // them again, and prints one line per step with its result and consumed capacity. It returns an
-// error when any check failed. It sets an in-memory DataFrame store (SetDataFrames): run it from a
+// error when any check failed. It sets an in-memory DataFrame store (dataframe.Configure): run it from a
 // process that serves no writes.
 func Run(output io.Writer) error {
 	runner := &checkRunner{output: output}

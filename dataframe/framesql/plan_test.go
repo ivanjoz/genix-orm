@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // memorySource is a Source over files held in memory. It honours Scan's contract, files in a random

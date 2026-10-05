@@ -5,7 +5,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // accumulator holds one slot per group: its key and, per slot, every accumulated sum and the row

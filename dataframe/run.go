@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/dataframe/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The file work of a compaction (../DATA_FRAMES_PLAN.md, "The snapshot rule" and
+// The file work of a compaction (../DATA_FRAMES.md, sections 4 and 7, and
 // after): the scheduled run's (CompactFrame) and the express one of a fresh read
 // (FreshRead.CompactTo), which also applies it in memory. A version is reserved
 // before its write lands, so the caller targets a version only once it is settled:

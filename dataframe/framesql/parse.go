@@ -7,7 +7,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The closed subset FrameSQL reads (DATA_FRAMES_SQL_PLAN.md, "The language"):
+// The closed subset FrameSQL reads (../../DATA_FRAMES_SQL.md, section 4):
 //
 //	SELECT  item [, item]...          item := expression [[AS] alias]
 //	[FROM   frame]                    day_product or day-product; Run's frameName when left out

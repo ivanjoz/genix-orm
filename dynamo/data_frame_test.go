@@ -17,7 +17,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ── DataFrame test entity: SaleLine's shape, with a 1-, a 2- and a 3-key frame ──
@@ -116,7 +116,7 @@ func TestDataFrameDeclarationRules(t *testing.T) {
 	schema.Indexes = append(schema.Indexes, Index{Slot: G1, Keys: Cols(tablePtr.ClientID.Size(32))})
 	schema.DataFrames = []DataFrame{{Name: "client", Keys: Cols(tablePtr.ClientID), Rows: tablePtr.ProductID, Sums: Cols(tablePtr.Quantity)}}
 	meta := buildTableMeta(schema, reflect.TypeFor[frameLine]())
-	if meta.dataFrames[0].firstKeyLeadsBaseKeys {
+	if meta.frameKeyLeadsBaseKeys(&meta.dataFrames[0]) {
 		t.Fatal("a frame keyed by a GSI column must not read its rebuild range from the base table")
 	}
 	// The folder is stored data: a change of it moves every frame to a new folder, rebuilt from scratch.
@@ -218,8 +218,8 @@ func TestCheckFrameValues(t *testing.T) {
 // TestFrameLogEntriesOfWrites checks which writes log which frames: only the frames whose values change.
 func TestFrameLogEntriesOfWrites(t *testing.T) {
 	store := dataframe.NewMemoryStore()
-	SetDataFrames(store, frameWriteDeadline)
-	defer SetDataFrames(nil, frameWriteDeadline)
+	dataframe.Configure(store, dataframe.WriteDeadline())
+	defer dataframe.Configure(nil, dataframe.WriteDeadline())
 
 	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, ClientID: 9, Quantity: 2000, Amount: 500, Status: 1, UpdatedVersion: 10, CreatedVersion: 4}
 	logFrames := func(written *frameLine) []string {
@@ -230,17 +230,14 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 			}
 		})...)
 		written.UpdatedVersion = 11
-		write := frameWrite{storedPtr: unsafe.Pointer(stored), newVersion: 11}
-		if written != nil {
-			write.writtenPtr = unsafe.Pointer(written)
-		}
-		if err := frameLines.meta.appendFrameLogEntries(context.Background(), []frameWrite{write}, false); err != nil {
+		write := frameLines.meta.loggedWrite(unsafe.Pointer(stored), unsafe.Pointer(written), 11)
+		if err := dataframe.AppendLogEntries(context.Background(), frameLines.meta.dataFrames, []dataframe.LoggedWrite{write}, false); err != nil {
 			t.Fatal(err)
 		}
 		var loggedFrames []string
 		for i := range frameLines.meta.dataFrames {
 			frame := &frameLines.meta.dataFrames[i]
-			entries, err := dataframe.ReadLog(store, &frame.Frame)
+			entries, err := dataframe.ReadLog(store, frame)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -283,29 +280,30 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 // ErrWriteDeadline, its cancel markers still go in within the grace after it, and not later.
 func TestFrameWriteWindow(t *testing.T) {
 	store := dataframe.NewMemoryStore()
-	SetDataFrames(store, frameWriteDeadline)
-	defer SetDataFrames(nil, frameWriteDeadline)
+	dataframe.Configure(store, dataframe.WriteDeadline())
+	defer dataframe.Configure(nil, dataframe.WriteDeadline())
 	frame := &frameLines.meta.dataFrames[0]
 
 	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, Quantity: 2000, Status: 1, UpdatedVersion: 10, CreatedVersion: 4}
 	written := *stored
 	written.Quantity, written.UpdatedVersion = 3000, 11
-	writes := []frameWrite{{storedPtr: unsafe.Pointer(stored), writtenPtr: unsafe.Pointer(&written), newVersion: 11}}
+	writes := []dataframe.LoggedWrite{frameLines.meta.loggedWrite(unsafe.Pointer(stored), unsafe.Pointer(&written), 11)}
+	frames := frameLines.meta.dataFrames
 
-	expiredWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-frameWriteDeadline))
-	ctx, cancel := expiredWindow.landingContext()
+	expiredWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-dataframe.WriteDeadline()))
+	ctx, cancel := expiredWindow.LandingContext(Now())
 	defer cancel()
-	if err := frameLandingError(frameLines.meta.appendFrameLogEntries(ctx, writes, false)); !errors.Is(err, ErrWriteDeadline) {
+	if err := dataframe.LandingError(dataframe.AppendLogEntries(ctx, frames, writes, false)); !errors.Is(err, dataframe.ErrWriteDeadline) {
 		t.Fatalf("a log append past the deadline returned %v", err)
 	}
-	if err := frameLines.meta.cancelFrameWrites(expiredWindow, writes); err != nil {
+	if err := dataframe.AppendCancelMarkers(expiredWindow, Now(), frames, writes); err != nil {
 		t.Fatalf("cancel markers within the grace: %v", err)
 	}
-	if entries, _ := dataframe.ReadLog(store, &frame.Frame); len(entries) != 1 || !entries[0].IsCancel || entries[0].NewVersion != 11 {
+	if entries, _ := dataframe.ReadLog(store, frame); len(entries) != 1 || !entries[0].IsCancel || entries[0].NewVersion != 11 {
 		t.Fatalf("the log holds %+v, want one cancel marker of version 11", entries)
 	}
-	pastGraceWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-frameWriteDeadline - frameCancelGrace))
-	if err := frameLines.meta.cancelFrameWrites(pastGraceWindow, writes); !errors.Is(err, context.DeadlineExceeded) {
+	pastGraceWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-dataframe.WriteDeadline() - dataframe.CancelGrace))
+	if err := dataframe.AppendCancelMarkers(pastGraceWindow, Now(), frames, writes); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("cancel markers past the grace returned %v", err)
 	}
 }
@@ -323,7 +321,7 @@ func TestFrameWriteWindow(t *testing.T) {
 // since replaced loses and appends its cancel markers. Time is counted in steps: a
 // writer lives at most frameSimWriterLifetime steps from its read, as the write
 // deadline bounds a real one, and a compaction targets only a checkpoint at least
-// frameSimSettle steps old, twice the lifetime plus one, as frameSettle is. A writer
+// frameSimSettle steps old, twice the lifetime plus one, as dataframe's settle is. A writer
 // crashes after logging only when the record is unchanged since its read and no
 // other writer is on it: the crash phantoms the design tolerates.
 //
@@ -414,7 +412,7 @@ type frameSimWriter struct {
 	sk              string
 	startTime       int
 	stored, written *frameLine // stored nil: an insert; written nil: a delete
-	writes          []frameWrite
+	writes          []dataframe.LoggedWrite
 	version         int64
 	step            int // 1: read, 2: reserved, 3: logged
 	crashes         bool
@@ -435,7 +433,7 @@ type frameSimState struct {
 	hasPendingCrash bool
 }
 
-// pushCheckpoint and settledTarget are pushFrameCheckpoint and frameState.settledTarget, in steps.
+// pushCheckpoint and settledTarget are dataframe's pushCheckpoint and State.settledTarget, in steps.
 func (state *frameSimState) pushCheckpoint(sequence int64, now int) {
 	if state.hasTarget && now-state.targetTime < frameSimSettle {
 		return
@@ -492,7 +490,7 @@ func (sim *frameSimulation) clock() time.Time {
 // takeLock is dataframe.TakeLock on the simulation's clock: nil, counted as skippedEvent, while another
 // compaction holds the lock.
 func (sim *frameSimulation) takeLock(frameIndex int, skippedEvent string) *dataframe.Lock {
-	lock, err := dataframe.TakeLock(sim.store, &frameLines.meta.dataFrames[frameIndex].Frame, sim.clock)
+	lock, err := dataframe.TakeLock(sim.store, &frameLines.meta.dataFrames[frameIndex], sim.clock)
 	if err != nil {
 		sim.t.Fatal(err)
 	}
@@ -518,11 +516,11 @@ func (sim *frameSimulation) releaseLock(frameIndex int, lock *dataframe.Lock) {
 }
 
 func TestDataFrameRunsMatchBruteForce(t *testing.T) {
-	defer SetDataFrames(nil, frameWriteDeadline)
+	defer dataframe.Configure(nil, dataframe.WriteDeadline())
 	counts := map[string]int{}
 	for seed := range uint64(250) {
 		store := &crashingFrameStore{MemoryStore: dataframe.NewMemoryStore(), remainingRunWrites: -1}
-		SetDataFrames(store, frameWriteDeadline)
+		dataframe.Configure(store, dataframe.WriteDeadline())
 		sim := &frameSimulation{
 			t: t, rng: rand.New(rand.NewPCG(seed, 77)), store: store,
 			records: map[string]*frameLine{}, history: map[string][]frameSimLanding{},
@@ -658,7 +656,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 		sim.sequence++
 		writer.version = sim.sequence
 		if writer.written == nil {
-			writer.writes = []frameWrite{{storedPtr: unsafe.Pointer(writer.stored), newVersion: writer.version}}
+			writer.writes = []dataframe.LoggedWrite{meta.loggedWrite(unsafe.Pointer(writer.stored), nil, writer.version)}
 		} else {
 			writer.written.UpdatedVersion = int32(writer.version)
 			writtenPtrs := []unsafe.Pointer{unsafe.Pointer(writer.written)}
@@ -671,7 +669,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 		}
 		sim.tracef("writer v%d on %q reserved: stored %+v written %+v", writer.version, writer.sk, writer.stored, writer.written)
 	case 2:
-		if err := meta.appendFrameLogEntries(context.Background(), writer.writes, false); err != nil {
+		if err := dataframe.AppendLogEntries(context.Background(), meta.dataFrames, writer.writes, false); err != nil {
 			sim.t.Fatal(err)
 		}
 		sim.tracef("writer v%d logged", writer.version)
@@ -684,7 +682,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 			sim.counts["crashed writers"]++
 			sim.tracef("writer v%d crashed", writer.version)
 		case !isUnchanged:
-			if err := meta.appendFrameLogEntries(context.Background(), writer.writes, true); err != nil {
+			if err := dataframe.AppendLogEntries(context.Background(), meta.dataFrames, writer.writes, true); err != nil {
 				sim.t.Fatal(err)
 			}
 			sim.counts["lost writes"]++
@@ -706,7 +704,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 }
 
 // readRecords is a record read of the run: what matches now, before any writer moves on.
-func (sim *frameSimulation) readRecords(frame *dataFrameMeta, matches func(line *frameLine) bool) []dataframe.RecordState {
+func (sim *frameSimulation) readRecords(frame *dataframe.Frame, matches func(line *frameLine) bool) []dataframe.RecordState {
 	var ptrs []unsafe.Pointer
 	for _, record := range sim.records {
 		if matches(record) {
@@ -717,7 +715,7 @@ func (sim *frameSimulation) readRecords(frame *dataFrameMeta, matches func(line 
 }
 
 // recordReaders are the record reads of a compaction: the records written after a snapshot, and by sk.
-func (sim *frameSimulation) recordReaders(frame *dataFrameMeta) (func(snapshot int64) ([]dataframe.RecordState, error), func(sks []string) ([]dataframe.RecordState, error)) {
+func (sim *frameSimulation) recordReaders(frame *dataframe.Frame) (func(snapshot int64) ([]dataframe.RecordState, error), func(sks []string) ([]dataframe.RecordState, error)) {
 	readWrittenAfter := func(snapshot int64) ([]dataframe.RecordState, error) {
 		return sim.readRecords(frame, func(line *frameLine) bool { return int64(line.UpdatedVersion) > snapshot }), nil
 	}
@@ -770,13 +768,13 @@ func (sim *frameSimulation) runFrame(frameIndex int, mayCrash bool) {
 	var err error
 	if !state.isBuilt {
 		snapshot = target
-		err = dataframe.RebuildAllFiles(lock, &frame.Frame, sim.readRecords(frame, func(*frameLine) bool { return true }), target)
+		err = dataframe.RebuildAllFiles(lock, frame, sim.readRecords(frame, func(*frameLine) bool { return true }), target)
 	} else {
 		if hasTarget && target > snapshot {
 			snapshot = target
 		}
 		readWrittenAfter, readBySK := sim.recordReaders(frame)
-		err = dataframe.CompactFrame(lock, &frame.Frame, state.snapshot, snapshot, mergedDays,
+		err = dataframe.CompactFrame(lock, frame, state.snapshot, snapshot, mergedDays,
 			func(snapshot int64) ([]dataframe.RecordState, error) {
 				records, err := readWrittenAfter(snapshot)
 				sim.advanceSomeWriters() // writes landing between the record read and the log read
@@ -802,7 +800,7 @@ func (sim *frameSimulation) runFrame(frameIndex int, mayCrash bool) {
 	}
 	state.isBuilt, state.snapshot, state.hasPendingCrash = true, snapshot, false
 	sim.counts["committed runs"]++
-	if err := dataframe.TruncateLog(sim.store, &frame.Frame, snapshot); err != nil && !errors.Is(err, errSimulatedCrash) {
+	if err := dataframe.TruncateLog(sim.store, frame, snapshot); err != nil && !errors.Is(err, errSimulatedCrash) {
 		sim.t.Fatal(err)
 	}
 	sim.releaseLock(frameIndex, lock)
@@ -842,16 +840,16 @@ func (sim *frameSimulation) rebuildFrame(frameIndex int, isRange bool) {
 		fromKey := 20730 + int64(sim.rng.IntN(3))
 		toKey := fromKey + int64(sim.rng.IntN(int(20733-fromKey)))
 		records := sim.readRecords(frame, func(line *frameLine) bool { return int64(line.Fecha) >= fromKey && int64(line.Fecha) <= toKey })
-		if err := dataframe.RebuildFilesInRange(lock, &frame.Frame, records, state.snapshot, fromKey, toKey); err != nil {
+		if err := dataframe.RebuildFilesInRange(lock, frame, records, state.snapshot, fromKey, toKey); err != nil {
 			sim.t.Fatal(err)
 		}
-		if len(frame.keys) > 1 && isQuiet && sim.store.filePuts != filePutsBefore {
+		if frame.KeyCount > 1 && isQuiet && sim.store.filePuts != filePutsBefore {
 			sim.t.Fatalf("%s\n%s: a range rebuild of files already right rewrote %d of them", strings.Join(sim.trace, "\n"), frame.Name, sim.store.filePuts-filePutsBefore)
 		}
 		sim.counts["range rebuilds"]++
 		sim.tracef("range rebuild %s at %d of [%d, %d]", frame.Name, state.snapshot, fromKey, toKey)
 	} else {
-		if err := dataframe.RebuildAllFiles(lock, &frame.Frame, sim.readRecords(frame, func(*frameLine) bool { return true }), state.snapshot); err != nil {
+		if err := dataframe.RebuildAllFiles(lock, frame, sim.readRecords(frame, func(*frameLine) bool { return true }), state.snapshot); err != nil {
 			sim.t.Fatal(err)
 		}
 		state.hasPendingCrash = false
@@ -879,14 +877,23 @@ func (sim *frameSimulation) freshReadFrame(frameIndex int) {
 	if frame.KeyCount > 1 && sim.rng.IntN(2) == 0 {
 		pinnedKeys = []int64{1 + int64(sim.rng.IntN(3))}
 	}
+	// Half the reads keep only the files of odd days, as a caller's key filter does (FrameSQL's
+	// selectFiles): the read must GET exactly those.
+	keepsOddDays := sim.rng.IntN(2) == 0
 	isSelected := func(keys [dataframe.MaxKeys]int64) bool {
-		return keys[0] >= fromKey && keys[0] <= toKey && slices.Equal(keys[1:1+len(pinnedKeys)], pinnedKeys)
+		return keys[0] >= fromKey && keys[0] <= toKey && slices.Equal(keys[1:1+len(pinnedKeys)], pinnedKeys) && (!keepsOddDays || keys[0]%2 == 1)
+	}
+	var selectFiles func(fileKeys [][dataframe.MaxKeys]int64) ([][dataframe.MaxKeys]int64, error)
+	if keepsOddDays {
+		selectFiles = func(fileKeys [][dataframe.MaxKeys]int64) ([][dataframe.MaxKeys]int64, error) {
+			return slices.DeleteFunc(fileKeys, func(keys [dataframe.MaxKeys]int64) bool { return keys[0]%2 == 0 }), nil
+		}
 	}
 	// No writer moves during the read, so "now" is one state of the records.
 	beforeLogRead := sim.store.beforeLogRead
 	sim.store.beforeLogRead = nil
 	readWrittenAfter, readBySK := sim.recordReaders(frame)
-	fresh, err := dataframe.ReadFreshFiles(sim.store, &frame.Frame, state.snapshot, fromKey, toKey, pinnedKeys, readWrittenAfter, readBySK)
+	fresh, err := dataframe.ReadFreshFiles(sim.store, frame, state.snapshot, fromKey, toKey, pinnedKeys, selectFiles, readWrittenAfter, readBySK)
 	sim.store.beforeLogRead = beforeLogRead
 	if err != nil {
 		sim.t.Fatal(err)
@@ -958,7 +965,7 @@ func (sim *frameSimulation) advanceExpress(express *frameSimExpress) {
 		if sim.rng.IntN(8) == 0 {
 			sim.store.remainingRunWrites = sim.rng.IntN(4)
 		}
-		extendedDays, err := express.read.CompactTo(lock, &frame.Frame, express.target)
+		extendedDays, err := express.read.CompactTo(lock, frame, express.target)
 		sim.store.remainingRunWrites = -1
 		if err != nil {
 			if !errors.Is(err, errSimulatedCrash) {
@@ -1004,7 +1011,7 @@ func (sim *frameSimulation) advanceExpress(express *frameSimExpress) {
 // files whose keys isSelected, by object key, from the history of what landed. It
 // shares no code with the compactions: rows whose sums are all 0 are left out, as
 // the compactions leave them out.
-func (sim *frameSimulation) bruteForceFiles(frame *dataFrameMeta, snapshot int64, isSelected func(keys [dataframe.MaxKeys]int64) bool) map[string]dataframe.File {
+func (sim *frameSimulation) bruteForceFiles(frame *dataframe.Frame, snapshot int64, isSelected func(keys [dataframe.MaxKeys]int64) bool) map[string]dataframe.File {
 	sumsByRowByObjectKey := map[string]map[int64][]int64{}
 	for _, landings := range sim.history {
 		var recordPtr unsafe.Pointer
@@ -1054,7 +1061,7 @@ func (sim *frameSimulation) bruteForceFiles(frame *dataFrameMeta, snapshot int64
 
 // hasFilesAhead reports whether a file of the frame is past snapshot: a compaction that crashed or did
 // not commit (yet) wrote it.
-func (sim *frameSimulation) hasFilesAhead(frame *dataFrameMeta, snapshot int64) bool {
+func (sim *frameSimulation) hasFilesAhead(frame *dataframe.Frame, snapshot int64) bool {
 	objectKeys, _ := sim.store.MemoryStore.List(frame.Folder)
 	for _, objectKey := range objectKeys {
 		if !isFrameDataFile(objectKey) {
@@ -1070,7 +1077,7 @@ func (sim *frameSimulation) hasFilesAhead(frame *dataFrameMeta, snapshot int64) 
 
 // indexedHashes reads every day index of the frame as object key → hash: the _idx, then the _ixt over
 // it, the later entries winning.
-func (sim *frameSimulation) indexedHashes(frame *dataFrameMeta) map[string]uint32 {
+func (sim *frameSimulation) indexedHashes(frame *dataframe.Frame) map[string]uint32 {
 	objectKeys, _ := sim.store.MemoryStore.List(frame.Folder)
 	hashes := map[string]uint32{}
 	for _, indexSuffix := range []string{"/_idx", "/_ixt"} {
@@ -1101,7 +1108,7 @@ func (sim *frameSimulation) indexedHashes(frame *dataFrameMeta) map[string]uint3
 // did not commit (yet) wrote. Every file with rows at the frame's snapshot must exist and, on a 2–3-key
 // frame, be listed by its day's index. With no crash pending, the indexes must list exactly the files,
 // with their hashes, files ahead included.
-func (sim *frameSimulation) verifyFrame(frame *dataFrameMeta, state frameSimState) {
+func (sim *frameSimulation) verifyFrame(frame *dataframe.Frame, state frameSimState) {
 	t := sim.t
 	t.Helper()
 	failf := func(format string, args ...any) {

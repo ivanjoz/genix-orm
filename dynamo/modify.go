@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/ivanjoz/colbin"
 
+	"github.com/ivanjoz/genix-orm/dataframe"
 	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
@@ -127,12 +128,12 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	// The log entries, the new hidden rows and the base items land within the window. New rows first,
 	// as in PutMany: a record that then loses its conditional write deletes its delta rows below, and
 	// leaves its fan-out rows as extra rows, which every read re-checks and drops.
-	ctx, cancel := window.landingContext()
+	ctx, cancel := window.LandingContext(Now())
 	defer cancel()
 	isSent := make([]bool, len(records))
 	isWritten := make([]bool, len(records))
 	isUncertain := make([]bool, len(records))
-	err = r.meta.appendFrameLogEntries(ctx, r.meta.frameWritesOf(ptrs, storedByKey), false)
+	err = dataframe.AppendLogEntries(ctx, r.meta.dataFrames, r.meta.frameWritesOf(ptrs, storedByKey), false)
 	if err == nil {
 		_, err = r.batchWriteAll(ctx, client, rowPuts)
 	}
@@ -170,9 +171,9 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	// A record that lost its condition or was never sent did not land, and its version may be above
 	// a write that did: its log entry, left in the log, would read as the record's values after that
 	// write. Its cancel marker voids it. A record whose put failed may have landed: it keeps its entry.
-	cancelErr := r.meta.cancelFrameWrites(window, r.meta.frameWritesOf(cancelledPtrs, storedByKey))
+	cancelErr := dataframe.AppendCancelMarkers(window, Now(), r.meta.dataFrames, r.meta.frameWritesOf(cancelledPtrs, storedByKey))
 	if err != nil || cancelErr != nil {
-		return nil, errors.Join(frameLandingError(err), cancelErr)
+		return nil, errors.Join(dataframe.LandingError(err), cancelErr)
 	}
 	if _, err := r.batchWriteAll(context.Background(), client, staleRowDeletes); err != nil {
 		return nil, err

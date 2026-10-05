@@ -1,0 +1,14 @@
+# RATIONALE — dataframe
+
+## Everything that is not DynamoDB is the `dataframe` module
+**Context** — DataFrames and FrameSQL lived in `dynamo/dataframe` and `dynamo/framesql`, and the state machine (checkpoints, settle, build or compact, commit, fresh-read retries, express compaction, rebuild lock wait) and the write path's logic sat in `dynamo/data_frame*.go` next to the DynamoDB calls. ScyllaDB needs the same frames. Left open: where the shared code lives, how a driver plugs in, and what stays per driver.
+**Decision**
+- **Its own Go module** at the top level, `github.com/ivanjoz/genix-orm/dataframe`, with `framesql` as a subpackage. The root module holds `scylla` and gocql: a `dataframe` folder in it would pull gocql into every DynamoDB binary. It imports nothing of `db`, `dynamo` or `scylla`.
+- **A driver implements `Table`** (`table.go`): read the state record, push a checkpoint conditionally, reset, commit the snapshot, read the write sequence, and four consistent record reads. The lock's write deadline is applied by `dataframe` (it passes the lock's context), so a driver never sees the lock. `Materialize`, `RebuildRange` / `RebuildAll`, `Read` and `FrameSource` are written once over it.
+- **The compiled frame carries its columns** (`Column`: field name, stable id, get and set funcs), so `Compile`, `ValuesOf`, `CheckValues` and `AppendLogEntries` are shared. A driver resolves its own schema type into `Declaration`s: `dynamo` and `db.TableSchema` don't share a `Coln`, and the shared code needs none.
+- **Per driver stays:** the folder name (`dynamo` encodes its TableID; the folder is stored data, so it must not change), the schema rules that need the driver's indexes (which column can lead a rebuild's range, the delta index, `CreatedVersion`), where the write path calls the hooks, and the record and state reads.
+- **One process-wide configuration**, `Configure(store, writeDeadline)`. The settle the state machine waits for is computed from the deadline every write is bounded by, so both must read the same value, whatever the driver.
+- **`internal/parallel` is copied**, not shared: `dynamo` uses it for its own writes, and a shared copy would need a third module or `dataframe` importing `dynamo`.
+- **`frameKeyLeadsBaseKeys` is computed, not stored**: `dynamo` no longer keeps a per-frame struct beside `dataframe.Frame`, so `meta.dataFrames` is `[]dataframe.Frame` and every call takes `&meta.dataFrames[i]`.
+
+**Rationale** — The delicate part is the concurrency (settle, checkpoint push, the retry of a fresh read, the express compaction's checks): written once, the randomized spec in `dynamo` covers it for every driver that implements `Table` faithfully. Cost: an interface of ten methods, `unsafe.Pointer` getters in `Column`, and a global configuration shared by both drivers (one store per process).

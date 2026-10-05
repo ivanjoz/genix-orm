@@ -6,11 +6,11 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/dataframe/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The day indexes of a 2–3-key frame (../DATA_FRAMES_PLAN.md, D3 and D7). A day
+// The day indexes of a 2–3-key frame (../DATA_FRAMES.md, section 5, "The day index"). A day
 // folder's _idx lists its files and their hashes; its _ixt holds the blocks express
 // compactions appended since the last merge, a few bytes each instead of a rewrite
 // of the whole _idx. A reader reads _ixt, then _idx, and the _ixt entries win, the

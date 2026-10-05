@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // addFile stores a file of rows given as {rowID, sum0, sum1, ...}.

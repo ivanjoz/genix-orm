@@ -6,7 +6,7 @@ import (
 	"math"
 	"slices"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/dataframe/internal/parallel"
 )
 
 // SelectFileKeys lists the files of the days [fromKey, toKey] whose later Keys start with
@@ -60,7 +60,7 @@ func (read *FreshRead) ChangedRecords(target int64) int {
 	return changed
 }
 
-// CompactTo is an express compaction (../DATA_FRAMES_PLAN.md, D6), as lock's holder: it brings to
+// CompactTo is an express compaction (../DATA_FRAMES.md, section 9), as lock's holder: it brings to
 // target every file the changes it read name, then appends their keys and hashes to their days' _ixt,
 // and returns those days. It needs no other read: target must have settled before the read began, so
 // every write up to it had landed, and the read holds what each record held at target. The frame's w
@@ -78,7 +78,10 @@ func (read *FreshRead) CompactTo(lock *Lock, frame *Frame, target int64) ([]int6
 // computed in memory as a compaction would. snapshot is the frame's: every file holds the frame at
 // it, a file a compaction touched since at a later one, and the log keeps every entry above it. A
 // write counts once it lands. The files hold no snapshot (0); the readers are CompactFrame's.
+// selectFiles, when set, gets every file the read would GET, before the first GET, and returns the
+// ones to read; its error ends the read as is.
 func ReadFreshFiles(store Store, frame *Frame, snapshot, fromKey, toKey int64, pinnedKeys []int64,
+	selectFiles func(fileKeys [][MaxKeys]int64) ([][MaxKeys]int64, error),
 	readWrittenAfter func(snapshot int64) ([]RecordState, error), readBySK func(sks []string) ([]RecordState, error)) (*FreshRead, error) {
 	lives, err := readIncarnations(store, frame, snapshot, readWrittenAfter, readBySK)
 	if err != nil {
@@ -109,6 +112,11 @@ func ReadFreshFiles(store Store, frame *Frame, snapshot, fromKey, toKey int64, p
 		}
 	}
 	slices.SortFunc(fileKeys, func(a, b [MaxKeys]int64) int { return slices.Compare(a[:], b[:]) })
+	if selectFiles != nil {
+		if fileKeys, err = selectFiles(fileKeys); err != nil {
+			return nil, err
+		}
+	}
 
 	files, err := ReadFiles(store, frame, fileKeys)
 	if err != nil {
@@ -116,14 +124,21 @@ func ReadFreshFiles(store Store, frame *Frame, snapshot, fromKey, toKey int64, p
 	}
 	// A file no compaction touched since an older snapshot (or a missing one) holds the frame at
 	// snapshot too. One that didn't commit leaves files above it: each file takes the changes after its own.
+	// Only a file a change names is rebuilt as a map: a long read has one or two of them, and the rest
+	// pass through as decoded.
 	deltasByFileSnapshot := map[int64]map[[MaxKeys]int64]rowSums{}
 	for i, file := range files {
 		fileSnapshot := max(file.Snapshot, snapshot)
 		if deltasByFileSnapshot[fileSnapshot] == nil {
 			deltasByFileSnapshot[fileSnapshot] = deltasBetween(lives, fileSnapshot, math.MaxInt64)
 		}
+		fileDelta, isChanged := deltasByFileSnapshot[fileSnapshot][fileKeys[i]]
+		if !isChanged {
+			files[i].Snapshot = 0
+			continue
+		}
 		rows := rowSumsOf(file)
-		addRowSums(rows, deltasByFileSnapshot[fileSnapshot][fileKeys[i]])
+		addRowSums(rows, fileDelta)
 		files[i] = fileOf(rows, 0, frame.SumsCount)
 	}
 	return &FreshRead{FileKeys: fileKeys, Files: files, snapshot: snapshot, lives: lives}, nil

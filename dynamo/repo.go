@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	ctx, cancel := window.landingContext()
+	ctx, cancel := window.LandingContext(Now())
 	defer cancel()
 	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(tableName()),
@@ -89,14 +90,14 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
-		return false, frameLandingError(err)
+		return false, dataframe.LandingError(err)
 	}
 	// Unlike PutMany, the array index rows go after the base item: written first,
 	// they would index a record that then loses the race for its key. The deadline
 	// covers them too: a frame run reads inserts through the delta row.
 	arrayRowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item[dataColumn].(*types.AttributeValueMemberB).Value)
 	if _, err := r.batchWriteAll(ctx, client, arrayRowPuts); err != nil {
-		return true, frameLandingError(err)
+		return true, dataframe.LandingError(err)
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return true, err
@@ -178,10 +179,10 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	// The log entries, the new hidden rows and the base items land within the window. The base items
 	// go in record order, so the records from the first one not sent on did not land: their entries
 	// are voided.
-	ctx, cancel := window.landingContext()
+	ctx, cancel := window.LandingContext(Now())
 	defer cancel()
 	sentBaseCount := 0
-	err = r.meta.appendFrameLogEntries(ctx, r.meta.frameWritesOf(ptrs, storedByKey), false)
+	err = dataframe.AppendLogEntries(ctx, r.meta.dataFrames, r.meta.frameWritesOf(ptrs, storedByKey), false)
 	if err == nil {
 		_, err = r.batchWriteAll(ctx, client, arrayRowPuts)
 	}
@@ -189,7 +190,7 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 		sentBaseCount, err = r.batchWriteAll(ctx, client, baseWrites)
 	}
 	if err != nil {
-		return errors.Join(frameLandingError(err), r.meta.cancelFrameWrites(window, r.meta.frameWritesOf(ptrs[sentBaseCount:], storedByKey)))
+		return errors.Join(dataframe.LandingError(err), dataframe.AppendCancelMarkers(window, Now(), r.meta.dataFrames, r.meta.frameWritesOf(ptrs[sentBaseCount:], storedByKey)))
 	}
 	if _, err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
 		return err
@@ -324,10 +325,10 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := window.landingContext()
+	ctx, cancel := window.LandingContext(Now())
 	defer cancel()
 	var arrayRowDeletes []types.WriteRequest
-	var frameWrites []frameWrite
+	var frameWrites []dataframe.LoggedWrite
 	groupDeltas := map[string]*groupCounterDelta{}
 	if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
 		_, arrayRowDeletes = r.meta.arrayIndexWrites(storedPtr, nil, nil)
@@ -341,14 +342,14 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	}
 	// Not sent: the entries of the delete are voided.
 	if err != nil {
-		return errors.Join(frameLandingError(err), r.meta.cancelFrameWrites(window, frameWrites))
+		return errors.Join(dataframe.LandingError(err), dataframe.AppendCancelMarkers(window, Now(), r.meta.dataFrames, frameWrites))
 	}
 	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(tableName()),
 		Key:       r.meta.keyOnly(ptr),
 	})
 	if err != nil {
-		return frameLandingError(err)
+		return dataframe.LandingError(err)
 	}
 	if _, err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
 		return err

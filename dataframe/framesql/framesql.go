@@ -1,4 +1,4 @@
-// Package framesql runs FrameSQL (../DATA_FRAMES_SQL_PLAN.md): one SQL statement over one DataFrame,
+// Package framesql runs FrameSQL (../../DATA_FRAMES_SQL.md): one SQL statement over one DataFrame,
 // folded from the frame's files as they arrive, without a record per row. It is pure: the files come
 // from a Source (the ORM's live read), dates and record names from the caller's Resolvers.
 //
@@ -10,7 +10,7 @@
 package framesql
 
 import (
-	"github.com/ivanjoz/genix-orm/dynamo/dataframe"
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // Kind is what a column's integers mean. The ORM stores only integers: the caller declares the rest.

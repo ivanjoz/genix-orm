@@ -1,4 +1,4 @@
-# FrameSQL — SQL over DataFrames, and the answers it draws (`dynamo/framesql`)
+# FrameSQL — SQL over DataFrames, and the answers it draws (`dataframe/framesql`)
 
 This is the reference of FrameSQL as it is:
 - how a statement is read, checked and run against a DataFrame's files;
@@ -6,16 +6,15 @@ This is the reference of FrameSQL as it is:
 - how berryapps' agent tool turns the result into the table and the chart the user sees.
 
 It builds on `DATA_FRAMES.md` (what a frame is, its files, `QueryFrame`, `.Fresh()`), which it does
-not repeat. The decisions and the alternatives that led here are in `DATA_FRAMES_SQL_PLAN.md`.
+not repeat.
 Where this document and the code disagree, the code wins.
 
-**Status (2026-10-04).**
-- Built and tested: the language, the planner, the engine, the agent tool, the reply's tables and
-  the chat's table.
-- **Not built yet:** the ORM's side of the read. That is `Repo.FrameSource`, which implements
-  `framesql.Source` on top of `QueryFrame(...).Fresh()` (change 1 of the plan). The example
-  module's tool, which needs it, is not built either.
-- Until then FrameSQL runs on the tests' in-memory sources only.
+**Status (2026-10-04).** Built and tested:
+- the language, the planner and the engine;
+- the ORM's read, `Repo.FrameSource`;
+- the agent tool, with the example module's `example_frame_sql` over the four sale frames;
+- the datasets lane of the chat's search (§7);
+- the reply's tables and the chat's table.
 
 ## 1. What FrameSQL is
 
@@ -43,10 +42,10 @@ currency units, each row underlined by a bar as long as its share of the largest
 
 | Where | What |
 |---|---|
-| `dynamo/framesql/framesql.go` | The API: `Frame`, `Column`, the kinds, `Source`, `Resolvers`, `Options`, `Prepare` → `Statement.Columns` / `Statement.Run`, `Run`, `Result`, `ResultColumn` |
-| `dynamo/framesql/parse.go` | The tokenizer, the recursive-descent parser, the words it refuses with a rewrite, `formatExpr` (the canonical text of an expression) |
-| `dynamo/framesql/plan.go` | The statement bound to a frame: groups, items and their names, types, ORDER BY, then WHERE split into the read's bounds, the file filters and the row filter; `selectFiles` and the file cap |
-| `dynamo/framesql/engine.go` | The fold of each file into one accumulator; items, ORDER BY, LIMIT; `PeriodStarts` |
+| `dataframe/framesql/framesql.go` | The API: `Frame`, `Column`, the kinds, `Source`, `Resolvers`, `Options`, `Prepare` → `Statement.Columns` / `Statement.Run`, `Run`, `Result`, `ResultColumn` |
+| `dataframe/framesql/parse.go` | The tokenizer, the recursive-descent parser, the words it refuses with a rewrite, `formatExpr` (the canonical text of an expression) |
+| `dataframe/framesql/plan.go` | The statement bound to a frame: groups, items and their names, types, ORDER BY, then WHERE split into the read's bounds, the file filters and the row filter; `selectFiles` and the file cap |
+| `dataframe/framesql/engine.go` | The fold of each file into one accumulator; items, ORDER BY, LIMIT; `PeriodStarts` |
 | `backend/db/frame_sql.go` (berryapps) | Aliases: `db.SQLFrame`, `db.SQLColumn`, `db.SQLDay`…, `db.PrepareFrameSQL`, `db.FramePeriodStarts`, `db.FrameMaxDays` |
 | `core/agent/agenttools/frame_sql.go` | `NewFrameSQLTool`: the tool's input, its schema text, the run, the table and the chart |
 | `core/agent/agenttools/table.go`, `chart.go` | `Table` / `ValidateTables`, `Chart` / `ValidateCharts`: the reply's JSON and the renderer's rules |
@@ -108,6 +107,14 @@ The contract every implementation keeps:
   the ones to read, or an error that ends the read. `Scan` returns that error unwrapped.
 - **`fn`, one file at a time.** Each file once, from one goroutine at a time, in any order.
 - **Snapshot.** It returns the snapshot the files hold.
+
+**The ORM's implementation**, `dataframe.FrameSource` (`dataframe/materialize.go`), built by a driver's
+`Repo.FrameSource(frameName)` (dynamo: `data_frame_query.go`), which panics on an unknown frame:
+- `Scan` is the fresh read of `QueryFrame(...).Fresh()` (`dataframe.Read`): the files as the records
+  hold them now. A frame never built returns `ErrNotBuilt`.
+- It hands `fn` the files only after the frame's state is re-read unchanged. A fresh read retries
+  when a run commits meanwhile, so streaming would hand `fn` files that the retry reads again.
+- A file with no change since its snapshot passes through as read.
 
 ### Prepare, check, run
 
@@ -447,37 +454,50 @@ The tool layer then writes `2026-09-28`, the product names, and 17.00 / 5.00.
 ### 6.1 Declaring it
 
 A module builds its tool from its frames and registers it from `init()`, like its other tools. Its
-`RequiredAPIs` gate who may run it.
+`RequiredAPIs` gate who may run it. The example module's is `backend/example/tools/frames.go`.
 
 ```go
-agenttools.Register(agenttools.NewFrameSQLTool(agenttools.ToolCard{
-	Name: "example_frame_sql", Title: "…", Description: "…", Examples: []string{"…"},
+agenttools.NewFrameSQLTool(agenttools.ToolCard{
+	Name: "example_frame_sql", Title: "…", Description: "…",
 	RequiredAPIs: []string{"GET.example-sales-groups"},
-}, []db.SQLFrame{{
-	Name: "day-product",
-	Keys: []db.SQLColumn{{Name: "fecha", Label: "Date|Fecha", Kind: db.SQLDay}},
-	Rows: db.SQLColumn{Name: "product_id", Label: "Product|Producto", Kind: db.SQLRef, Collection: "example_product"},
-	Sums: []db.SQLColumn{{Name: "quantity", Label: "Units|Unidades"}, {Name: "amount", Label: "Amount|Monto", Kind: db.SQLCents}},
-	Source: …, // the frame's FrameSource: not built yet
+}, []agenttools.FrameSQLDataset{{
+	Frame: db.SQLFrame{
+		Name:   types.FrameDayProduct,
+		Keys:   []db.SQLColumn{{Name: "fecha", Label: "Date|Fecha", Kind: db.SQLDay}},
+		Rows:   db.SQLColumn{Name: "product_id", Label: "Product|Producto", Kind: db.SQLRef, Collection: "example_product"},
+		Sums:   []db.SQLColumn{{Name: "quantity", Label: "Units|Unidades"}, {Name: "amount", Label: "Amount|Monto", Kind: db.SQLCents}},
+		Source: types.SaleLines.FrameSource(types.FrameDayProduct),
+	},
+	Title:       "Sales per day and product",
+	Description: "One row per product sold on a day: its units and money, cancelled sales left out.",
+	Examples:    []string{"ventas por semana de cada producto", "…"},
 }}, map[string]agenttools.FrameSQLRecords{
-	"example_product": {Noun: "product|producto", NamesByID: productNamesByID},
-}))
+	"example_product": {Noun: "product|producto", NamesByID: func(_ *agenttools.Run, ids []int32) (map[int32]string, error) { … }},
+})
 ```
 
+- **`FrameSQLDataset`**: a frame, and the card the tools index finds it by. A dataset without a
+  `Title`, a `Description` or `Examples` panics at boot.
+  - `Description` says what one row is and what its numbers count. The model reads it too, so it
+    also carries the rules the columns can't say: "payment_method is 1 cash, 2 card, 3 transfer".
+  - `Examples` are questions as users type them. The tool's card gets them all, so leave the card's
+    `Examples` empty.
 - **`FrameSQLRecords`**, one per collection of a `Ref` column. A missing one panics at boot.
   - `Noun` names a record in the choice card's question.
-  - `NamesByID` names the result's IDs, deleted records included: a past sale of a deleted product
-    still shows its name. A record with no name shows as `#412`.
+  - `NamesByID(run, ids)` names the result's IDs, deleted records included: a past sale of a deleted
+    product still shows its name. A record with no name shows as `#412`.
+  - The run gives the user's language, for values the app names itself: the payment methods have no
+    records, so their names come from the app, and their column is filtered by number.
 - **The schema.** The `dataset` argument is an enum of the frames' names (`day_product`). The `sql`
   argument's description carries:
-  - each dataset with its columns and kinds:
-    `- day_product: Keys fecha (day); Rows product_id (product); Sums quantity (number), amount (money)`;
+  - each dataset with its title, description, columns and kinds:
+    `- day_product: Sales per day and product. One row per … \n  Keys fecha (day); Rows product_id (product); Sums quantity (number), amount (money)`;
   - the grammar;
   - two example calls built from the first frame (a ranking with an inline bar, and a weekly line
     per named record);
   - the period notation.
-
-  None of it reaches the tools index, which reads only the arguments' own descriptions.
+- **The index.** `Tool.Datasets` (title, description, column labels, examples) is what the tools
+  index holds of the tool: one card per dataset, never the tool's own card (§7).
 
 ### 6.2 The input
 
@@ -642,6 +662,19 @@ the choice card's questions.
 
 ## 7. In the chat
 
+- **How a turn finds it.** The tools index searches in two lanes (point `kind` in `agent/src/tools.rs`):
+  - the report tools, ranked as always;
+  - the datasets, as each dataset's card plus one dense-only point per example question.
+
+  `discovery.SelectDatasets` keeps the datasets whose closest point has a dense cosine ≥
+  `DatasetMinDenseScore` (0.40). Their tool joins the turn after the reports; with none, the turn
+  has no SQL tool.
+- **What the model reads.** A `[Datasets]` context block lists the retrieved datasets with their
+  probabilities. It says to prefer a report that answers the request exactly and to use the dataset
+  tool for the rest. The usage guide stays in the tool's schema.
+- **Its quality.** `./app.sh fn-agent-tools-eval` checks the lane against the `"dataset"` of each
+  golden line (`core/agent/agenttools/testdata/discovery-golden.jsonl`). The bars: offered ≥ 95%,
+  never offered for a question none answers.
 - **Validation.** `finishAgentTool` validates the answer's charts and tables (`ValidateCharts`,
   `ValidateTables`). An invalid one returns to the model as an error. Otherwise the reply frame
   carries `Message`, `Summary`, `Charts` and `Tables`.
@@ -670,11 +703,12 @@ the choice card's questions.
 - **Filled periods.** A chart over days fills every period between the read's bounds: with
   `fecha IN (1, 3)`, day 2 shows as 0.
 - **Names in the answer** exist only for `Ref` columns; any other group shows its integer.
-- **Not built yet:** the ORM's `Source`, so nothing reads a real frame through FrameSQL yet.
+- **Quoted names** resolve only in a text-search collection. A `Ref` the app names itself (a payment
+  method) is filtered by number.
 
 ## 9. Tests
 
-`go test ./framesql/` in `genix-orm/dynamo`:
+`go test ./framesql/` in `genix-orm/dataframe`:
 - **`parse_test.go`**:
   - valid statements, printed back canonically;
   - invalid ones, to their exact error text;
