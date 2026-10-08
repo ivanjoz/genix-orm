@@ -1,6 +1,6 @@
 ---
 name: genix-dynamo-orm
-description: How to declare tables, design keys, write and query records with the genix-orm DynamoDB ORM (genix-orm/dynamo) — Schema Keys/Partition, GSI slots, Size(bits), fan-out Index/ColSlice/Contains, Query() vs QueryScan(), autoincrement, the managed Updated/UpdatedVersion, delta indexes (TypeDelta/Delta()), local indexes (TypeLocal, consistent reads), the by-IDs cache (SaveUpdatedVersion/QueryCachedIDs), GroupBy counters (GroupBy/GroupDelta/QueryGroups/RebuildGroups). Use whenever code reads or writes DynamoDB through this ORM, or adds/changes a table (in berryapps: anything under backend/**/types/ or importing "app/db").
+description: Declare tables, design keys and indexes, and read/write DynamoDB records with the genix-orm ORM. Use whenever backend code queries or writes the database, or adds or changes a table.
 ---
 
 # genix-orm/dynamo
