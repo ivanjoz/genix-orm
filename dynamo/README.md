@@ -64,6 +64,12 @@ Two entities on one TableID — a hash collision, or a copied explicit ID — pa
 at boot. Pin an explicit `TableID` to resolve it, or to keep the data in place
 when renaming an `Entity`.
 
+`EntityOfItemKey(pk, sk)` reads it back: the entity owning a raw item, for code
+that sees DynamoDB requests rather than records (a proxy authorizing writes per
+entity). Sequence items (pk 0) are attributed by the TableID their sk starts with;
+`ReserveIDs` sequences belong to no entity. `FrameTableFolder(tableID)` is the
+same for the DataFrame files: the folder of every frame of one entity.
+
 ## The core idea: order-preserving Base64
 
 A composite key concatenates several columns into one string. Strings go in
@@ -871,6 +877,9 @@ by-IDs slot versions and entity controllers are kept/ported — see above.)
 - Table name from `dynamo.TableName` (set at startup); falls back to the
   `DYNAMO_TABLE` environment variable, then `demo-app`.
 - Client uses the standard AWS chain; set `DYNAMO_ENDPOINT` for a local DynamoDB.
+  `ClientOptions` customize the client before its first call: an `HTTPClient`
+  whose transport tunnels each request elsewhere (through a proxy that signs it)
+  plus placeholder `Credentials` leave every operation of the ORM unchanged.
 - `go test ./dynamo/` runs fully offline (encoding, marshaling and query
   planning); it does not require AWS.
 

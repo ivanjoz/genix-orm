@@ -117,8 +117,12 @@ func (m *tableMeta) frameKeyLeadsBaseKeys(frame *dataframe.Frame) bool {
 func frameFolder(tableID int32, frameName string) string {
 	nameHasher := fnv.New32a()
 	nameHasher.Write([]byte(frameName))
-	return EncodeOrderedInt(int64(tableID), 5) + "/" + EncodeOrderedUint(uint64(nameHasher.Sum32()), 6) + "/"
+	return FrameTableFolder(tableID) + EncodeOrderedUint(uint64(nameHasher.Sum32()), 6) + "/"
 }
+
+// FrameTableFolder is the folder holding every frame of one entity, relative to the store's root:
+// whoever guards the store by entity (a proxy authorizing writes) matches object keys against it.
+func FrameTableFolder(tableID int32) string { return EncodeOrderedInt(int64(tableID), 5) + "/" }
 
 // resolveCreatedVersion validates the managed CreatedVersion field a table with frames needs.
 func resolveCreatedVersion(recordType reflect.Type, accessors map[string]*colAccessor) *colAccessor {

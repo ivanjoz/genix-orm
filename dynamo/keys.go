@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unsafe"
 )
@@ -72,4 +73,29 @@ func (m *tableMeta) skValue(ptr unsafe.Pointer) string {
 func (m *tableMeta) partitionRange(extraDigits int) (string, string) {
 	width := m.partitionDigits + extraDigits
 	return m.tableID + strings.Repeat("0", width), m.tableID + strings.Repeat("9", width)
+}
+
+// EntityOfItemKey names the entity that owns a stored item, from its raw pk (the DynamoDB number as
+// text) and sk, for code that sees raw requests instead of records (a proxy authorizing writes by
+// entity). Every pk an entity writes starts with its 8-digit TableID: base, index and delta rows,
+// slot versions and group counters. The sequence items share pk 0 and carry it at the start of the
+// sk instead: "<TableID>" (autoincrement) and "<base pk>#upv" (write versions). A ReserveIDs
+// sequence belongs to no entity, nor does a key no registered entity produced: both return false.
+func EntityOfItemKey(pk, sk string) (string, bool) {
+	ownerKey := pk
+	if pk == sequencePartitionKey {
+		ownerKey = sk
+	}
+	if len(ownerKey) < 8 {
+		return "", false
+	}
+	tableID, err := strconv.ParseInt(ownerKey[:8], 10, 32)
+	if err != nil {
+		return "", false
+	}
+	entity, found := entityByTableID.Load(int32(tableID))
+	if !found {
+		return "", false
+	}
+	return entity.(string), true
 }
