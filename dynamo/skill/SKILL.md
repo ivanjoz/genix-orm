@@ -131,7 +131,7 @@ A violation makes `NewRepo` panic at boot:
   `Partition`. See section 3e.
 - **An index of your own keyed on `Updated`** declares `.Size(42)`, its full width.
 - **Managed fields:** every write stamps `Updated` with the write time in **milliseconds since the
-  UpdatedEpoch** (`dynamo.SetUpdatedEpoch`, set once at boot; berryapps: `[dynamo].unix_time_start`),
+  UpdatedEpoch** (`dynamo.SetUpdatedEpoch`, set once at boot; berryapps: `unix_time_start`),
   with no round trip, and above the record's stored value whenever the write reads it (hidden rows,
   GroupBy, frames, `Modify`/`PutManyIfVersion`). A versioned table also stores it
   as the item attribute `upd`. On a table with DataFrames, `CreatedVersion` is the `Updated` of the

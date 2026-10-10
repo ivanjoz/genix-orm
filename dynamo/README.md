@@ -413,7 +413,7 @@ Customers.Query().Delta(dynamo.DeltaSince{Updated: w, Fingerprint: fp}, 1).Exec(
 - **The managed `Updated`, stamped on every Put/PutMany/PutIfAbsent/Delete,** is
   the write time in **milliseconds since the UpdatedEpoch**, an `int64`
   (`json:"upd"`). `SetUpdatedEpoch(unixSeconds)` sets the epoch once at boot
-  (berryapps passes `config.toml` `[dynamo].unix_time_start`); changing it later
+  (berryapps passes `config.toml` `unix_time_start`); changing it later
   corrupts every stored value, row and client watermark. `UpdatedNow()`,
   `UpdatedOfTime(t)` and `UpdatedToTime(upd)` convert; `dynamo.Now` is the clock.
   An integer field named `Updated` must be an `int64` (compile panics
