@@ -861,6 +861,8 @@ type Controller interface {
     DecodeRecords(recordsJSON []byte) ([]any, error)
     // PutMany of E values; returns them as written (autoincrement IDs assigned).
     PutRecords(records []any) ([]any, error)
+    // Re-encode in the current colbin every "d" blob the previous one wrote (dry run unless write).
+    ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error)
 }
 
 // Registry — the analogue of genix's MakeScyllaControllers().
@@ -880,6 +882,15 @@ The by-IDs slot items go too: a recreated record is stamped a later `Updated`, s
 it can't match a value a client still holds. Sibling entities and the internal
 sequence counters (pk 0) are outside those ranges and untouched.
 **Destructive, no undo.** Exposed on the CLI as `go run . wipe`.
+
+`ReprocessBlobs` carries the stored data across a colbin release that changes the
+wire. It scans the same two pk ranges, and every `d` there (base rows, full-copy
+array index rows, GroupBy counter keys) is a colbin of `E`: it decodes it with
+`decodeLegacy` (the caller vendors the old colbin, since Go holds one version of a
+module), re-encodes it with the current one, checks the result decodes back to
+the same record, and `UpdateItem`s only `d`, conditional on the blob read. `upd`,
+keys and counters are untouched, so no delta client refetches. A blob the current
+colbin already round-trips is left alone, so a second run rewrites nothing.
 
 ## Performance: cached metadata + precompiled accessors
 

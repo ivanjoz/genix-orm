@@ -1,5 +1,15 @@
 # RATIONALE — dynamo
 
+## `ReprocessBlobs`: rewrite only `d`, and leave a blob both colbin versions read alone
+**Context** — colbin 0.6 made every blob written by 0.3.1 unreadable. Each entity needed a way to decode with the old version and re-encode with the new one, saving only what changed. Left open: how to write it back, how to stay safe on a rerun, and how to get the old decoder into a module that can import one colbin version.
+**Decision**
+- One generic method on `Repo`, part of `Controller`, instead of code per table: every `d` in an entity's pk ranges is a colbin of `E`. The old decoder is a parameter (`decodeLegacy`); the caller vendors that version.
+- Write back with `UpdateItem SET d`, conditional on `d` still being the blob read. Never through `Put`: it decodes the stored version with the new decoder (which fails), and it would stamp `upd` (every delta client refetches every table) and diff GroupBy counters.
+- A blob the current colbin decodes and re-encodes to identical bytes is current, *if* the old decoder fails on it or reads the same record. When both read it as different records, it is counted as `Ambiguous` and left alone: bytes can't say which version wrote it. Before a first run that count must be 0 (berryapps: 0 of 11,014); after the run it counts blobs the run wrote that 0.3.1 happens to misread (200 of 11,016).
+- Each written blob must decode back to the very record (`reflect.DeepEqual`) the legacy decoder read. Writes run in parallel per scan page (`parallel.Run`): one at a time took ~220 ms per record from a laptop.
+
+**Rationale** — Rewriting just the blob changes nothing a client or a counter sees, and the condition makes it safe next to live writes; a lost race is reported, and running again fixes it. Ambiguous blobs cost a noisy count on a rerun, but the alternative is guessing which version wrote them, and a wrong guess silently corrupts a record.
+
 ## One managed stamp: `Updated` in milliseconds, with an overlap window and a fingerprint instead of a write sequence
 **Context** — Every versioned table stamped two fields: `Updated` (an `int32` SUnixTime, 2 s resolution) and `UpdatedVersion` (`upv`), a per-partition sequence reserved with an atomic ADD on a `<base pk>#upv` item before each write. The sequence was what made "> watermark" exact, and it cost one sequential DynamoDB call on every write (one per record in `Modify`, plus fresh reservations for deletes and GroupBy rebuilds). A timestamp can replace it only if two facts are handled: it is not unique across processes (two Lambdas stamp the same millisecond), and a write stamped at t can land after a client synced past t (in flight, or from a lagging clock).
 **Decision** —

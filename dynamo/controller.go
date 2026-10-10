@@ -66,6 +66,9 @@ type Controller interface {
 	// RebuildDataFramesAll recomputes every file of a frame ("" for every frame) and
 	// deletes the files no record produces.
 	RebuildDataFramesAll(frameName string) error
+	// ReprocessBlobs re-encodes in the current colbin every stored blob written by the previous
+	// one, which decodeLegacy reads; write false is a dry run (reprocess.go).
+	ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error)
 }
 
 // NewController compiles the schema (like NewRepo) and returns it as a
