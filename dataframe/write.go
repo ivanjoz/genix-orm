@@ -41,7 +41,7 @@ var (
 
 // Configure sets the store of every table's DataFrame files and the write deadline (10 s by default):
 // a write to a table with frames lands within it of reading the stored records, or fails with
-// ErrWriteDeadline. Compactions reach a version twice the deadline plus 5 s after it was reserved
+// ErrWriteDeadline. Compactions reach a version twice the deadline plus 5 s after it was stamped
 // (settle). Call it once at boot, before the first write.
 func Configure(store Store, deadline time.Duration) {
 	configuredStore, writeDeadline = store, deadline
@@ -51,7 +51,7 @@ func Configure(store Store, deadline time.Duration) {
 func WriteDeadline() time.Duration { return writeDeadline }
 
 // settle is how long after a checkpoint is read every write with a version up to it has landed or
-// given up, its cancel markers appended. Such a write reserved its version before the checkpoint, so
+// given up, its cancel markers appended. Such a write stamped its version before the checkpoint, so
 // it lands by the deadline after it. A write that loses to it read the record before it landed, so it
 // is done one deadline plus the grace later.
 func settle() time.Duration { return 2*writeDeadline + CancelGrace + settleMargin }
@@ -67,7 +67,7 @@ func configured() (Store, error) {
 }
 
 // WriteWindow bounds a write to a table with frames. It opens at the stored read the write diffs
-// against, or at the version reservation when it reads nothing: the log entries and the base items are
+// against, or at the version stamp when it reads nothing: the log entries and the base items are
 // sent by landBy, and the cancel markers of the records logged and not landed within CancelGrace
 // after. The zero WriteWindow is a table without frames: no bound.
 type WriteWindow struct{ landBy time.Time }
@@ -129,7 +129,7 @@ type LoggedWrite struct {
 	SK string
 	// CreatedVersion is the stored record's: the incarnation the entry belongs to.
 	CreatedVersion int64
-	// NewVersion is the write's UpdatedVersion.
+	// NewVersion is the write's Updated.
 	NewVersion      int64
 	Stored, Written unsafe.Pointer
 }

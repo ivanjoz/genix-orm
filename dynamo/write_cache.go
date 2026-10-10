@@ -15,7 +15,7 @@ import (
 //
 // PutManyIfVersion diffs a record's hidden rows (fan-out, delta) against the
 // record as stored. GetManyForUpdate and Modify keep the blob they read, keyed by
-// the record's pk#sk and tagged with its "upv". A write uses an entry only when
+// the record's pk#sk and tagged with its "upd". A write uses an entry only when
 // that version equals the one it is conditioned on, and the condition then
 // proves the entry: if the write succeeds, the stored item was exactly that
 // version, so the cached blob was the stored state. A stale entry is just a miss.
@@ -49,7 +49,7 @@ func rememberStoredItems(items []map[string]types.AttributeValue) {
 	writeCache.Lock()
 	defer writeCache.Unlock()
 	for _, item := range items {
-		versionAttr, hasVersion := item[versionColumn].(*types.AttributeValueMemberN)
+		versionAttr, hasVersion := item[updatedColumn].(*types.AttributeValueMemberN)
 		blobAttr, hasBlob := item[dataColumn].(*types.AttributeValueMemberB)
 		if !hasVersion || !hasBlob {
 			continue

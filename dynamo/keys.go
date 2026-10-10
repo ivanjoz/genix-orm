@@ -78,8 +78,8 @@ func (m *tableMeta) partitionRange(extraDigits int) (string, string) {
 // EntityOfItemKey names the entity that owns a stored item, from its raw pk (the DynamoDB number as
 // text) and sk, for code that sees raw requests instead of records (a proxy authorizing writes by
 // entity). Every pk an entity writes starts with its 8-digit TableID: base, index and delta rows,
-// slot versions and group counters. The sequence items share pk 0 and carry it at the start of the
-// sk instead: "<TableID>" (autoincrement) and "<base pk>#upv" (write versions). A ReserveIDs
+// the by-IDs slots and group counters. The autoincrement sequence items share pk 0 and carry it at
+// the start of the sk instead: "<TableID>". A ReserveIDs
 // sequence belongs to no entity, nor does a key no registered entity produced: both return false.
 func EntityOfItemKey(pk, sk string) (string, bool) {
 	ownerKey := pk

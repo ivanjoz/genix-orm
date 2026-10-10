@@ -109,9 +109,9 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	}
 	item := m.keyOnly(ptr)
 	item[dataColumn] = &types.AttributeValueMemberB{Value: blob}
-	// A versioned table exposes UpdatedVersion outside the blob: Modify's conditional write compares it.
-	if m.writeVersion != nil {
-		item[versionColumn] = &types.AttributeValueMemberN{Value: strconv.FormatInt(m.writeVersion.acc.getI64(ptr), 10)}
+	// A versioned table exposes Updated outside the blob: Modify's conditional write compares it.
+	if m.isVersioned {
+		item[updatedColumn] = &types.AttributeValueMemberN{Value: strconv.FormatInt(m.updated.acc.getI64(ptr), 10)}
 	}
 	for _, idx := range m.indexes {
 		item[idx.slot.hashAttr] = &types.AttributeValueMemberN{Value: m.partitionValue(ptr, idx.partition)}

@@ -16,7 +16,7 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // The file work of a compaction (../DATA_FRAMES.md, sections 4 and 7, and
 // after): the scheduled run's (CompactFrame) and the express one of a fresh read
-// (FreshRead.CompactTo), which also applies it in memory. A version is reserved
+// (FreshRead.CompactTo), which also applies it in memory. A version is stamped
 // before its write lands, so the caller targets a version only once it is settled:
 // every write that took a version up to it has landed and logged. A compaction
 // from W to the target takes out of the files what each incarnation held at W and
@@ -180,7 +180,7 @@ func expectedFiles(lives []*incarnation, snapshot int64, isInRange func(firstKey
 // CompactFrame is a run's compaction, as lock's holder: it brings the frame's files from snapshot W to
 // target, then rewrites the _idx of the day folders it touched and of extendedDays (the days express
 // compactions appended to), merging their _ixt. With target = W it only merges. readWrittenAfter (the
-// records whose UpdatedVersion is above a snapshot) and readBySK read the table: DynamoDB, or a
+// records whose Updated is above a snapshot) and readBySK read the table: DynamoDB, or a
 // test's fake one.
 func CompactFrame(lock *Lock, frame *Frame, W, target int64, extendedDays []int64,
 	readWrittenAfter func(snapshot int64) ([]RecordState, error), readBySK func(sks []string) ([]RecordState, error)) error {

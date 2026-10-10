@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 	"unsafe"
 
@@ -24,12 +23,13 @@ import (
 //
 // A record is one opaque blob, so a write always replaces the whole record and
 // two read-modify-writes of the same record lose one of them. On a versioned
-// table (VersionedWrites, SaveUpdatedVersion or a TypeDelta index) every write
-// stamps the managed UpdatedVersion (delta.go), and the base item also carries it
-// as the number attribute "upv", the one value DynamoDB can compare.
+// table (VersionedWrites, CacheByIDs, GroupDelta, DataFrames or a TypeDelta index)
+// the base item also carries the managed Updated (delta.go) as the number
+// attribute "upd", the one value DynamoDB can compare. A write always stamps an
+// Updated above the one it replaces, so the value never comes back.
 //
-// PutManyIfVersion writes each record with a conditional PutItem: "upv" must
-// still hold the UpdatedVersion the record was read with (no item at all, for 0).
+// PutManyIfVersion writes each record with a conditional PutItem: "upd" must
+// still hold the Updated the record was read with (no item at all, for 0).
 // Records that lost to a concurrent write come back unwritten, for the caller to
 // read again, re-apply its edit and retry. Modify is that loop for one record.
 //
@@ -41,8 +41,8 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	// versionColumn is the item attribute holding UpdatedVersion on a versioned table.
-	versionColumn     = "upv"
+	// updatedColumn is the item attribute holding Updated on a versioned table.
+	updatedColumn     = "upd"
 	modifyMaxAttempts = 8
 )
 
@@ -57,16 +57,16 @@ func ConflictBackoff(attempt int) time.Duration {
 }
 
 // PutManyIfVersion writes each record only while its stored item still carries
-// the UpdatedVersion the record holds (0: no item may exist yet). The records
-// come from a consistent read (GetMany, Query().Consistent()) and were edited
-// since. As in PutMany, one version is reserved per base pk for the whole call,
-// the hidden rows are diffed against the stored versions, and the slot versions
-// are bumped once. BatchWriteItem takes no condition, so the base items are
-// conditional PutItems, run in parallel. It returns the records that lost to a
-// concurrent write, unwritten: read them again, re-apply the edit and retry.
+// the Updated the record holds (0: no item may exist yet). The records come from a
+// consistent read (GetMany, Query().Consistent()) and were edited since. As in
+// PutMany, Updated is stamped (above the one each record replaces), the hidden
+// rows are diffed against the stored versions, and the by-IDs slots are set once.
+// BatchWriteItem takes no condition, so the base items are conditional PutItems,
+// run in parallel. It returns the records that lost to a concurrent write,
+// unwritten: read them again, re-apply the edit and retry.
 func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	recordName := r.meta.recordType.Name()
-	if r.meta.writeVersion == nil {
+	if !r.meta.isVersioned {
 		return nil, fmt.Errorf("db: %s PutManyIfVersion needs a versioned table: set VersionedWrites", recordName)
 	}
 	if len(records) == 0 {
@@ -78,23 +78,26 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	}
 	ptrs := make([]unsafe.Pointer, len(records))
 	expectedVersions := make([]int64, len(records))
+	expectedVersionByPtr := make(map[unsafe.Pointer]int64, len(records))
 	for i := range records {
 		ptrs[i] = unsafe.Pointer(&records[i])
-		expectedVersions[i] = r.meta.writeVersion.acc.getI64(ptrs[i])
+		expectedVersions[i] = r.meta.updated.acc.getI64(ptrs[i])
+		expectedVersionByPtr[ptrs[i]] = expectedVersions[i]
 	}
 	if err := r.meta.checkFrameValues(ptrs); err != nil {
 		return nil, err
 	}
-	// The caller read the records before this reservation, so the version is above the one each
-	// write replaces, as a frame's log entry needs: no need to read before reserving here.
 	windowStart := Now()
-	if _, err := r.meta.prepareWrite(ptrs); err != nil {
+	if _, err := r.meta.assignAutoIDs(ptrs); err != nil {
 		return nil, err
 	}
 	storedByKey, oldestCachedAt, err := r.storedVersionsForWrite(client, ptrs, expectedVersions)
 	if err != nil {
 		return nil, err
 	}
+	// A record only lands over the version it expects, so stamping above it is stamping above the
+	// version it replaces, as a frame's log entry and the condition of the next write need.
+	r.meta.stampManagedColumns(ptrs, func(ptr unsafe.Pointer) int64 { return expectedVersionByPtr[ptr] + 1 })
 	// The write deadline counts from the oldest stored read the write diffs against: a cached one, or
 	// its own, which comes after windowStart.
 	if !oldestCachedAt.IsZero() && oldestCachedAt.Before(windowStart) {
@@ -133,6 +136,7 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	isSent := make([]bool, len(records))
 	isWritten := make([]bool, len(records))
 	isUncertain := make([]bool, len(records))
+	winnerUpdated := make([]int64, len(records))
 	err = dataframe.AppendLogEntries(ctx, r.meta.dataFrames, r.meta.frameWritesOf(ptrs, storedByKey), false)
 	if err == nil {
 		_, err = r.batchWriteAll(ctx, client, rowPuts)
@@ -143,7 +147,7 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 				return putErr
 			}
 			isSent[recordIndex] = true
-			isWritten[recordIndex], putErr = r.putItemIfVersion(ctx, client, items[recordIndex], expectedVersions[recordIndex])
+			isWritten[recordIndex], winnerUpdated[recordIndex], putErr = r.putItemIfVersion(ctx, client, items[recordIndex], expectedVersions[recordIndex])
 			isUncertain[recordIndex] = putErr != nil
 			return putErr
 		})
@@ -159,13 +163,16 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 			writtenPtrs = append(writtenPtrs, ptrs[i])
 			staleRowDeletes = append(staleRowDeletes, rowDeletesByRecord[i]...)
 			mergeGroupCounterDeltas(groupDeltas, groupDeltasByRecord[i])
-			refreshStoredItem(items[i], r.meta.writeVersion.acc.getI64(ptrs[i]))
+			refreshStoredItem(items[i], r.meta.updated.acc.getI64(ptrs[i]))
 		case !isSent[i]:
 			cancelledPtrs = append(cancelledPtrs, ptrs[i])
 		case !isUncertain[i]:
 			lostRecords = append(lostRecords, records[i])
 			cancelledPtrs = append(cancelledPtrs, ptrs[i])
-			staleRowDeletes = append(staleRowDeletes, r.meta.deltaRowDeletes(ptrs[i])...)
+			// A winner stamped in the same millisecond put the very delta rows this write put: they stay.
+			if winnerUpdated[i] != r.meta.updated.acc.getI64(ptrs[i]) {
+				staleRowDeletes = append(staleRowDeletes, r.meta.deltaRowDeletes(ptrs[i])...)
+			}
 		}
 	}
 	// A record that lost its condition or was never sent did not land, and its version may be above
@@ -181,13 +188,14 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return nil, err
 	}
-	return lostRecords, r.meta.bumpSlotVersions(client, writtenPtrs)
+	return lostRecords, r.meta.setSlotsUpdated(client, writtenPtrs)
 }
 
 // deltaRowDeletes deletes the delta rows a record that lost its conditional write
-// had put. Their sk holds the write version this call reserved, which no other
-// write ever holds, so no live record can need them. Fan-out rows carry no version
-// and may be the winner's too: those stay, as extra rows reads re-check.
+// had put. Their sk holds the Updated this call stamped, which only a winner
+// stamped in the same millisecond can share (the caller checks it), so no live
+// record can need them. Fan-out rows carry no Updated and may be the winner's too:
+// those stay, as extra rows reads re-check.
 func (m *tableMeta) deltaRowDeletes(lostPtr unsafe.Pointer) []types.WriteRequest {
 	var deletes []types.WriteRequest
 	basePK := m.pkValue(lostPtr)
@@ -250,8 +258,9 @@ func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsa
 }
 
 // putItemIfVersion is one conditional PutItem, false when the stored item moved
-// on. A stored item with no "upv" can never match: that is an error, not a race.
-func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue, expectedVersion int64) (bool, error) {
+// on, with the Updated of the write it lost to. A stored item with no "upd" can
+// never match: that is an error, not a race.
+func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue, expectedVersion int64) (bool, int64, error) {
 	input := &dynamodb.PutItemInput{
 		TableName:                           aws.String(tableName()),
 		Item:                                item,
@@ -260,20 +269,20 @@ func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Clie
 	if expectedVersion == 0 {
 		input.ConditionExpression = aws.String("attribute_not_exists(pk)")
 	} else {
-		input.ConditionExpression = aws.String("#upv = :upv")
-		input.ExpressionAttributeNames = map[string]string{"#upv": versionColumn}
-		input.ExpressionAttributeValues = map[string]types.AttributeValue{":upv": &types.AttributeValueMemberN{Value: strconv.FormatInt(expectedVersion, 10)}}
+		input.ConditionExpression = aws.String("#upd = :upd")
+		input.ExpressionAttributeNames = map[string]string{"#upd": updatedColumn}
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{":upd": numberAttr(expectedVersion)}
 	}
 	_, err := client.PutItem(ctx, input)
 	var lostRaceErr *types.ConditionalCheckFailedException
 	if errors.As(err, &lostRaceErr) {
-		if _, hasVersion := lostRaceErr.Item[versionColumn]; len(lostRaceErr.Item) > 0 && !hasVersion {
-			return false, fmt.Errorf("db: %s pk %s sk %s was stored before its table was versioned and has no %q attribute: Put it once",
-				r.meta.recordType.Name(), item["pk"].(*types.AttributeValueMemberN).Value, item["sk"].(*types.AttributeValueMemberS).Value, versionColumn)
+		if _, hasUpdated := lostRaceErr.Item[updatedColumn]; len(lostRaceErr.Item) > 0 && !hasUpdated {
+			return false, 0, fmt.Errorf("db: %s pk %s sk %s was stored before its table was versioned and has no %q attribute: Put it once",
+				r.meta.recordType.Name(), item["pk"].(*types.AttributeValueMemberN).Value, item["sk"].(*types.AttributeValueMemberS).Value, updatedColumn)
 		}
-		return false, nil
+		return false, numberAttrValue(lostRaceErr.Item, updatedColumn), nil
 	}
-	return err == nil, err
+	return err == nil, 0, err
 }
 
 // Modify reads the record with key's Keys (consistently), lets change edit it and
@@ -284,10 +293,10 @@ func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Clie
 // record (left as the bare key, nothing is written). A change that leaves the
 // record byte-identical writes nothing and moves no version. It returns the
 // record as stored when Modify ends (nil when nothing is). change must not edit
-// the Keys; what it does to UpdatedVersion is ignored.
+// the Keys; what it does to Updated is ignored.
 func (r *Repo[T, E]) Modify(key E, change func(record *E, exists bool) error) (*E, error) {
 	recordName := r.meta.recordType.Name()
-	if r.meta.writeVersion == nil {
+	if !r.meta.isVersioned {
 		return nil, fmt.Errorf("db: %s Modify needs a versioned table: set VersionedWrites", recordName)
 	}
 	client, err := Client()
@@ -319,7 +328,7 @@ func (r *Repo[T, E]) Modify(key E, change func(record *E, exists bool) error) (*
 			if err := r.meta.unmarshalItem(out.Item, &record); err != nil {
 				return nil, err
 			}
-			storedVersion = r.meta.writeVersion.acc.getI64(unsafe.Pointer(&record))
+			storedVersion = r.meta.updated.acc.getI64(unsafe.Pointer(&record))
 			unchangedBlob = out.Item[dataColumn].(*types.AttributeValueMemberB).Value
 		}
 
@@ -341,7 +350,7 @@ func (r *Repo[T, E]) Modify(key E, change func(record *E, exists bool) error) (*
 		}
 
 		// The write is conditioned on the version read, whatever change did to the field.
-		r.meta.writeVersion.acc.setI64(unsafe.Pointer(&record), storedVersion)
+		r.meta.updated.acc.setI64(unsafe.Pointer(&record), storedVersion)
 		modifiedRecords := []E{record}
 		lostRecords, err := r.PutManyIfVersion(modifiedRecords)
 		if err != nil {

@@ -40,7 +40,7 @@ const (
 	IndexPrimary = "primary" // the base table: pk + sk
 	IndexGSI     = "gsi"     // a global secondary index slot (gsi-1..gsi-10): hN + rN
 	IndexArray   = "array"   // a fan-out Index over a slice field: hidden rows under pk ‖ cb id
-	IndexDelta   = "delta"   // a TypeDelta Index: hidden rows, its Keys then the managed UpdatedVersion
+	IndexDelta   = "delta"   // a TypeDelta Index: hidden rows, its Keys then the managed Updated
 	IndexLocal   = "local"   // a TypeLocal Index: one hidden row per record, its Keys then the base Keys
 )
 

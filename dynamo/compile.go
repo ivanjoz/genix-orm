@@ -11,7 +11,6 @@ import (
 	"github.com/viant/xunsafe"
 
 	"github.com/ivanjoz/genix-orm/dataframe"
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,17 +74,17 @@ type tableMeta struct {
 	groupIndexes    []groupIndexMeta        // the Indexes declaring GroupBy (group_by.go)
 	accessors       map[string]*colAccessor // record field name -> precompiled accessor
 	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
-	updatedVersion  *updatedVersionConfig   // nil unless the schema sets SaveUpdatedVersion
-	// Managed fields (delta.go): updated is the record's integer "Updated" field (nil
-	// without one); writeVersion its UpdatedVersion, nil unless a TypeDelta index,
-	// SaveUpdatedVersion or VersionedWrites consumes it.
-	updated      *colAccessor
-	writeVersion *keyCol
+	cacheByIDs      *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
+	// The managed "Updated" field (delta.go), nil without one. isVersioned: a TypeDelta
+	// index, GroupDelta, CacheByIDs, VersionedWrites or DataFrames consume it, and the
+	// item also carries it as the attribute "upd", which Modify's conditional write compares.
+	updated     *keyCol
+	isVersioned bool
 	// status is the record's integer "Status" field (nil without one): 0 marks a
 	// soft-deleted record, which counts in no GroupBy group or DataFrame.
 	status *colAccessor
 	// dataFrames are the schema's DataFrames (data_frame.go), and createdVersion the
-	// managed int32 "CreatedVersion" they need (nil without frames).
+	// managed int64 "CreatedVersion" they need (nil without frames).
 	dataFrames     []dataframe.Frame
 	createdVersion *colAccessor
 }
@@ -181,16 +180,12 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		meta.partitionDigits += decimalWidth(partitionCol.bits)
 	}
 
-	if updatedAccessor := accessors[updatedFieldName]; updatedAccessor != nil && updatedAccessor.kind.isInteger() {
-		meta.updated = updatedAccessor
-	}
 	if statusAccessor := accessors[statusFieldName]; statusAccessor != nil && statusAccessor.kind.isInteger() {
 		meta.status = statusAccessor
 	}
-	if schema.SaveUpdatedVersion || schema.VersionedWrites || len(schema.DataFrames) > 0 ||
-		slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta || idx.GroupDelta }) {
-		meta.writeVersion = resolveWriteVersion(recordType, accessors)
-	}
+	meta.isVersioned = schema.CacheByIDs || schema.VersionedWrites || len(schema.DataFrames) > 0 ||
+		slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta || idx.GroupDelta })
+	meta.updated = resolveUpdated(recordType, accessors, meta.isVersioned)
 	if len(schema.DataFrames) > 0 {
 		meta.createdVersion = resolveCreatedVersion(recordType, accessors)
 	}
@@ -221,7 +216,7 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 			var resolved arrayIndexMeta
 			switch {
 			case idx.Type == TypeDelta:
-				resolved = compileDeltaIndex(recordType, accessors, idx, *meta.writeVersion)
+				resolved = compileDeltaIndex(recordType, accessors, idx, *meta.updated)
 			case idx.Type == TypeLocal:
 				resolved = compileLocalIndex(recordType, accessors, idx)
 			default:
@@ -253,8 +248,8 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	meta.dataFrames = compileDataFrames(schema, recordType, accessors, meta)
 
 	pkDigits := len(meta.tableID) + meta.partitionDigits
-	// Fan-out rows, the slot-versions item, the GroupBy counters and the frame states append 3 digits to the base pk.
-	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || len(meta.dataFrames) > 0 || schema.SaveUpdatedVersion {
+	// Fan-out rows, the by-IDs slots item, the GroupBy counters and the frame states append 3 digits to the base pk.
+	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || len(meta.dataFrames) > 0 || schema.CacheByIDs {
 		pkDigits += arrayIndexColumnIDDigits
 	}
 	if pkDigits > maxNumericKeyDigits {
@@ -265,8 +260,8 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	if schema.UseAutoincrement {
 		meta.autoinc = resolveAutoincrement(schema, recordType, accessors, meta.tableID)
 	}
-	if schema.SaveUpdatedVersion {
-		meta.updatedVersion = resolveUpdatedVersion(recordType, accessors, meta.keys)
+	if schema.CacheByIDs {
+		meta.cacheByIDs = resolveCacheByIDs(recordType, meta.keys)
 	}
 
 	return meta
@@ -369,42 +364,6 @@ func (m *tableMeta) assignAutoIDs(ptrs []unsafe.Pointer) ([]unsafe.Pointer, erro
 		m.autoinc.set(p, m.autoinc.composeID(base+int64(i), m.autoinc.randDigits()))
 	}
 	return need, nil
-}
-
-// prepareWrite assigns the autoincrement IDs and stamps the managed columns, and
-// returns the records whose ID it assigned: a freshly reserved ID can't be stored
-// yet, so those records need no stored-version read. Each step reserves a value of
-// its own sequence item. The version is reserved per base pk, so the steps depend
-// on each other only when the ID is a Partition column; otherwise they run in
-// parallel and the write pays one round trip for both. A table with DataFrames
-// reserves the version after its stored read instead (Repo.prepareWriteReadingStored).
-func (m *tableMeta) prepareWrite(ptrs []unsafe.Pointer) (map[unsafe.Pointer]bool, error) {
-	var assignedPtrs []unsafe.Pointer
-	assignIDs := func() (err error) {
-		assignedPtrs, err = m.assignAutoIDs(ptrs)
-		return err
-	}
-	var err error
-	if slices.ContainsFunc(m.partition, func(column keyCol) bool { return column.fieldName == autoincFieldName }) {
-		if err = assignIDs(); err == nil {
-			err = m.stampManagedColumns(ptrs)
-		}
-	} else {
-		err = parallel.Run(2, func(step int) error {
-			if step == 0 {
-				return assignIDs()
-			}
-			return m.stampManagedColumns(ptrs)
-		})
-	}
-	if err != nil {
-		return nil, err
-	}
-	isAssigned := make(map[unsafe.Pointer]bool, len(assignedPtrs))
-	for _, assignedPtr := range assignedPtrs {
-		isAssigned[assignedPtr] = true
-	}
-	return isAssigned, nil
 }
 
 // buildAccessors precompiles one xunsafe accessor per exported record field.

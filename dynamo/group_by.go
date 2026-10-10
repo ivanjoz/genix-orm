@@ -22,12 +22,12 @@ import (
 // distinct value of its Keys (the group), one counter item with the number of
 // records in the group and the sum of each GroupBy column:
 //
-//	pk   = base pk ‖ 000                      (the bookkeeping pk of the slot versions, sk "v")
+//	pk   = base pk ‖ 000                      (the bookkeeping pk of the by-IDs slots, sk "v")
 //	sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
 //	c    = record count                       (native number)
 //	sNNN = sum of the column with cb id NNN   (native number; floats as round(v * 1e6))
 //	d    = colbin blob of a record holding only the group Keys, for Group.Key
-//	upv, upd = the last write that touched it (GroupDelta only)
+//	upd  = the Updated of the last write that touched it (GroupDelta only)
 //
 // A record with Status 0 is deleted and counts in no group. On a fan-out Index each
 // distinct element is a group, and the record's whole values count in each one.
@@ -169,11 +169,11 @@ func (m *tableMeta) groupSumValues(groupIndex *groupIndexMeta, ptr unsafe.Pointe
 
 // groupCounterDelta is the signed change one write call makes to one counter item.
 type groupCounterDelta struct {
-	groupIndex   *groupIndexMeta
-	basePK, sk   string
-	count        int64
-	sums         []int64 // parallel to groupIndex.sums
-	writeVersion int64   // the highest UpdatedVersion written into the group; 0 for a delete
+	groupIndex *groupIndexMeta
+	basePK, sk string
+	count      int64
+	sums       []int64 // parallel to groupIndex.sums
+	updated    int64   // the highest Updated written into the group; 0 for a delete
 	// keyRecordPtr is a record of the group (stored or written) the counter's key blob is
 	// built from, and elementIndex the element that put it there on a fan-out GroupBy.
 	keyRecordPtr unsafe.Pointer
@@ -202,9 +202,9 @@ func (m *tableMeta) addGroupCounterDeltas(deltas map[string]*groupCounterDelta, 
 	if keyPtr == nil {
 		keyPtr = storedPtr
 	}
-	writeVersion := int64(0)
-	if m.writeVersion != nil && writtenPtr != nil {
-		writeVersion = m.writeVersion.acc.getI64(writtenPtr)
+	writtenUpdated := int64(0)
+	if m.updated != nil && writtenPtr != nil {
+		writtenUpdated = m.updated.acc.getI64(writtenPtr)
 	}
 	for i := range m.groupIndexes {
 		groupIndex := &m.groupIndexes[i]
@@ -235,7 +235,7 @@ func (m *tableMeta) addGroupCounterDeltas(deltas map[string]*groupCounterDelta, 
 		for _, group := range writtenGroups {
 			isWrittenGroup[group.sk] = true
 			delta := groupCounterDeltaOf(deltas, groupIndex, basePK, group, writtenPtr)
-			delta.writeVersion = max(delta.writeVersion, writeVersion)
+			delta.updated = max(delta.updated, writtenUpdated)
 			if isStoredGroup[group.sk] {
 				for j := range delta.sums {
 					delta.sums[j] += writtenSums[j] - storedSums[j]
@@ -252,7 +252,7 @@ func (m *tableMeta) addGroupCounterDeltas(deltas map[string]*groupCounterDelta, 
 				continue
 			}
 			delta := groupCounterDeltaOf(deltas, groupIndex, basePK, group, storedPtr)
-			delta.writeVersion = max(delta.writeVersion, writeVersion)
+			delta.updated = max(delta.updated, writtenUpdated)
 			delta.count--
 			for j := range delta.sums {
 				delta.sums[j] -= storedSums[j]
@@ -288,7 +288,7 @@ func mergeGroupCounterDeltas(into, from map[string]*groupCounterDelta) {
 		for j := range merged.sums {
 			merged.sums[j] += delta.sums[j]
 		}
-		merged.writeVersion = max(merged.writeVersion, delta.writeVersion)
+		merged.updated = max(merged.updated, delta.updated)
 	}
 }
 
@@ -313,18 +313,16 @@ func (m *tableMeta) groupKeyBlob(groupIndex *groupIndexMeta, recordPtr unsafe.Po
 	return blob, nil
 }
 
-// groupCountersPK is the pk of a base partition's counters (and of its slot versions).
-func groupCountersPK(basePK string) string { return basePK + slotVersionsColumnID }
+// groupCountersPK is the pk of a base partition's counters (and of its by-IDs slots).
+func groupCountersPK(basePK string) string { return basePK + slotsColumnID }
 
 // applyGroupCounterDeltas ADDs every non-zero delta to its counter, one UpdateItem
-// each, and on a GroupDelta stamps upv/upd. It must run after the base items land.
-// A delete carries no write version, so it reserves one per base pk. The updates
-// run in parallel: each one touches its own counter item and an ADD commutes, so
-// their order never matters. The version reservations happen before, in the
-// sequential loop that builds them, so one base pk never reserves twice.
+// each, and on a GroupDelta stamps upd. It must run after the base items land. A
+// delete writes no Updated, so its counters get a fresh one. The updates run in
+// parallel: each one touches its own counter item and an ADD commutes, so their
+// order never matters.
 func (m *tableMeta) applyGroupCounterDeltas(client *dynamodb.Client, deltas map[string]*groupCounterDelta) error {
-	writeTime := (Now().Unix() - 1e9) / 2
-	reservedVersionByPK := map[string]int64{}
+	deleteUpdated := int64(0)
 	counterUpdates := make([]*dynamodb.UpdateItemInput, 0, len(deltas))
 	counterSKs := make([]string, 0, len(deltas))
 	for _, delta := range deltas {
@@ -348,19 +346,16 @@ func (m *tableMeta) applyGroupCounterDeltas(client *dynamodb.Client, deltas map[
 		}
 		setClauses := []string{"#d = if_not_exists(#d, :d)"}
 		if delta.groupIndex.isDelta {
-			version := delta.writeVersion
-			if version == 0 {
-				if version = reservedVersionByPK[delta.basePK]; version == 0 {
-					if version, err = reserveSequence(delta.basePK+updatedVersionSeqSuffix, 1); err != nil {
-						return err
-					}
-					reservedVersionByPK[delta.basePK] = version
+			counterUpdated := delta.updated
+			if counterUpdated == 0 {
+				if deleteUpdated == 0 {
+					deleteUpdated = nextUpdated()
 				}
+				counterUpdated = deleteUpdated
 			}
-			names["#upv"], names["#upd"] = versionColumn, groupUpdatedAttr
-			values[":upv"] = &types.AttributeValueMemberN{Value: strconv.FormatInt(version, 10)}
-			values[":upd"] = &types.AttributeValueMemberN{Value: strconv.FormatInt(writeTime, 10)}
-			setClauses = append(setClauses, "#upv = :upv", "#upd = :upd")
+			names["#upd"] = groupUpdatedAttr
+			values[":upd"] = numberAttr(counterUpdated)
+			setClauses = append(setClauses, "#upd = :upd")
 		}
 		counterUpdates = append(counterUpdates, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(tableName()),
@@ -389,11 +384,10 @@ type Group[E any] struct {
 	// Key is a record with only the group Keys set; on a fan-out GroupBy its slice holds the one element.
 	Key   E
 	Count int64
-	// Updated and UpdatedVersion are the last write that touched the group (GroupDelta only).
-	Updated        int32
-	UpdatedVersion int32
-	groupIndex     *groupIndexMeta
-	sums           []int64
+	// Updated is the Updated of the last write that touched the group (GroupDelta only).
+	Updated    int64
+	groupIndex *groupIndexMeta
+	sums       []int64
 }
 
 // Sum returns the sum of an integer GroupBy column.
@@ -425,7 +419,7 @@ type GroupQuery[E any] struct {
 	meta         *tableMeta
 	groupIndex   *groupIndexMeta
 	preds        []predicate
-	updatedSince int32
+	updatedSince int64
 	readsDelta   bool
 	planErr      error
 }
@@ -468,9 +462,11 @@ func (q *GroupQuery[E]) Between(column Coln, a, b any) *GroupQuery[E] {
 }
 
 // Since turns the read into a delta read on a GroupDelta: only the groups written
-// after updatedSince, the highest UpdatedVersion the client holds, emptied groups
+// after updatedSince, the highest Updated the client holds, emptied groups
 // included so the client drops them. A first sync (0) leaves the empty ones out.
-func (q *GroupQuery[E]) Since(updatedSince int32) *GroupQuery[E] {
+// Like Delta() it also resends the groups of the last DeltaOverlap below
+// updatedSince (a write in flight), with no fingerprint: a GroupBy holds few groups.
+func (q *GroupQuery[E]) Since(updatedSince int64) *GroupQuery[E] {
 	if q.planErr == nil && !q.groupIndex.isDelta {
 		q.planErr = fmt.Errorf("db: %s Since() needs GroupDelta on its GroupBy", q.meta.recordType.Name())
 	}
@@ -541,15 +537,14 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 				continue
 			}
 			group := Group[E]{
-				Count:          numberAttrValue(item, groupCountAttr),
-				Updated:        int32(numberAttrValue(item, groupUpdatedAttr)),
-				UpdatedVersion: int32(numberAttrValue(item, versionColumn)),
-				groupIndex:     q.groupIndex,
-				sums:           make([]int64, len(q.groupIndex.sums)),
+				Count:      numberAttrValue(item, groupCountAttr),
+				Updated:    numberAttrValue(item, groupUpdatedAttr),
+				groupIndex: q.groupIndex,
+				sums:       make([]int64, len(q.groupIndex.sums)),
 			}
 			// A later delta sync sends every changed group, emptied ones included; any other read skips them.
 			if q.readsDelta && q.updatedSince > 0 {
-				if group.UpdatedVersion <= q.updatedSince {
+				if group.Updated < q.updatedSince-DeltaOverlap.Milliseconds() {
 					continue
 				}
 			} else if group.Count == 0 {
@@ -656,8 +651,8 @@ func (r *Repo[T, E]) RebuildGroupsAll() (int, error) {
 			return 0, err
 		}
 		for _, item := range out.Items {
-			if counterPK := item["pk"].(*types.AttributeValueMemberN).Value; isSlotVersionsPK(counterPK) {
-				basePK := strings.TrimSuffix(counterPK, slotVersionsColumnID)
+			if counterPK := item["pk"].(*types.AttributeValueMemberN).Value; isSlotsPK(counterPK) {
+				basePK := strings.TrimSuffix(counterPK, slotsColumnID)
 				recordsByPK[basePK] = recordsByPK[basePK] // a partition with counters and no records
 			}
 		}
@@ -681,9 +676,8 @@ func (r *Repo[T, E]) RebuildGroupsAll() (int, error) {
 // rebuildPartitionGroups computes the counters of one partition from its records,
 // compares them with the stored ones and Puts only those that differ: a stored
 // counter no record produces anymore is zeroed, and one of a GroupBy no longer
-// declared is deleted. Every rewritten
-// counter of a GroupDelta gets one version freshly reserved for the partition, so
-// clients past their watermark still refetch the corrected groups.
+// declared is deleted. Every rewritten counter of a GroupDelta gets a fresh
+// Updated, so clients past their watermark still refetch the corrected groups.
 func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK string, records []E) (int, error) {
 	m := r.meta
 	expectedDeltas := map[string]*groupCounterDelta{}
@@ -716,21 +710,11 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		input.ExclusiveStartKey = out.LastEvaluatedKey
 	}
 
-	writeTime := (Now().Unix() - 1e9) / 2
-	rebuildVersion := int64(0)
-	stampVersion := func(counter map[string]types.AttributeValue, groupIndex *groupIndexMeta) error {
-		if groupIndex == nil || !groupIndex.isDelta {
-			return nil
+	rebuildUpdated := nextUpdated()
+	stampUpdated := func(counter map[string]types.AttributeValue, groupIndex *groupIndexMeta) {
+		if groupIndex != nil && groupIndex.isDelta {
+			counter[groupUpdatedAttr] = numberAttr(rebuildUpdated)
 		}
-		if rebuildVersion == 0 {
-			var err error
-			if rebuildVersion, err = reserveSequence(basePK+updatedVersionSeqSuffix, 1); err != nil {
-				return err
-			}
-		}
-		counter[versionColumn] = &types.AttributeValueMemberN{Value: strconv.FormatInt(rebuildVersion, 10)}
-		counter[groupUpdatedAttr] = &types.AttributeValueMemberN{Value: strconv.FormatInt(writeTime, 10)}
-		return nil
 	}
 
 	var counterWrites []types.WriteRequest
@@ -750,9 +734,7 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		for j, sum := range expected.groupIndex.sums {
 			counter[sum.attr] = &types.AttributeValueMemberN{Value: strconv.FormatInt(expected.sums[j], 10)}
 		}
-		if err := stampVersion(counter, expected.groupIndex); err != nil {
-			return 0, err
-		}
+		stampUpdated(counter, expected.groupIndex)
 		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
 	}
 	// What is left was produced by no record: an emptied group, or a GroupBy that changed its Keys or
@@ -773,9 +755,7 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		if keyBlob, hasKey := storedCounter[dataColumn]; hasKey {
 			counter[dataColumn] = keyBlob
 		}
-		if err := stampVersion(counter, groupIndex); err != nil {
-			return 0, err
-		}
+		stampUpdated(counter, groupIndex)
 		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
 	}
 	_, err := r.batchWriteAll(context.Background(), client, counterWrites)

@@ -58,11 +58,12 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.checkFrameValues([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
-	// Nothing is read: the write deadline counts from the version reservation.
+	// Nothing is read: the write deadline counts from here.
 	window := r.meta.frameWriteWindowFrom(Now())
-	if _, err := r.meta.prepareWrite([]unsafe.Pointer{ptr}); err != nil {
+	if _, err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
+	r.meta.stampManagedColumns([]unsafe.Pointer{ptr}, nil)
 	// Written only when absent, so an insert: it logs nothing to the frames.
 	r.meta.stampCreatedVersions([]unsafe.Pointer{ptr}, nil)
 	item, err := r.meta.marshalItem(ptr, record)
@@ -102,18 +103,17 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return true, err
 	}
-	return true, r.meta.bumpSlotVersions(client, []unsafe.Pointer{ptr})
+	return true, r.meta.setSlotsUpdated(client, []unsafe.Pointer{ptr})
 }
 
 // PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
 // entity uses autoincrement, every record whose ID is still zero is assigned one
 // in a single sequence reservation before the batch is written, and the managed
-// Updated / UpdatedVersion are stamped (delta.go). With array or delta indexes it
-// first reads the stored versions and writes in three passes: new rows, then the
-// base items, then stale rows (see array_index.go). GroupBy counters are ADDed
-// after that (group_by.go), and with SaveUpdatedVersion the touched slot versions
-// are bumped last. A record whose ID this call assigned is new by construction, so
-// its stored version is not read.
+// Updated is stamped (delta.go). With array or delta indexes it first reads the
+// stored versions and writes in three passes: new rows, then the base items, then
+// stale rows (see array_index.go). GroupBy counters are ADDed after that
+// (group_by.go), and with CacheByIDs the touched slots are set last. A record whose
+// ID this call assigned is new by construction, so its stored version is not read.
 func (r *Repo[T, E]) PutMany(records []E) error { return r.putMany(records, false) }
 
 // InsertMany is PutMany for records the caller knows are not stored yet, such as
@@ -146,12 +146,13 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	if err := r.meta.checkFrameValues(ptrs); err != nil {
 		return err
 	}
-	// The write deadline counts from the stored read, or from the version reservation when nothing is read.
+	// The write deadline counts from the stored read.
 	window := r.meta.frameWriteWindowFrom(Now())
-	storedByKey, err := r.prepareWriteReadingStored(client, ptrs, areAllNew)
+	storedByKey, err := r.assignIDsReadingStored(client, ptrs, areAllNew)
 	if err != nil {
 		return err
 	}
+	r.meta.stampManagedColumns(ptrs, r.meta.aboveStored(storedByKey))
 	r.meta.stampCreatedVersions(ptrs, storedByKey)
 
 	baseWrites := make([]types.WriteRequest, 0, len(records))
@@ -198,35 +199,20 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
 	}
-	return r.meta.bumpSlotVersions(client, ptrs)
+	return r.meta.setSlotsUpdated(client, ptrs)
 }
 
-// prepareWriteReadingStored assigns the autoincrement IDs, stamps the managed
-// columns (prepareWrite) and reads the stored version of every record whose ID this
-// call did not just assign. A table with DataFrames reserves the version after that
-// read, one round trip later: a frame's log entry says "the record held these
-// values right below my version", true only when that version is above the one the
-// write read. Records known to be new (InsertMany) have nothing to read.
-func (r *Repo[T, E]) prepareWriteReadingStored(client *dynamodb.Client, ptrs []unsafe.Pointer, areAllNew bool) (map[string]unsafe.Pointer, error) {
-	if areAllNew {
-		_, err := r.meta.prepareWrite(ptrs)
+// assignIDsReadingStored assigns the autoincrement IDs and reads the stored version of every record
+// whose ID this call did not just assign: a freshly reserved ID can't be stored yet. Records known to
+// be new (InsertMany) have nothing to read.
+func (r *Repo[T, E]) assignIDsReadingStored(client *dynamodb.Client, ptrs []unsafe.Pointer, areAllNew bool) (map[string]unsafe.Pointer, error) {
+	assignedPtrs, err := r.meta.assignAutoIDs(ptrs)
+	if err != nil || areAllNew {
 		return nil, err
 	}
-	var isAssignedNow map[unsafe.Pointer]bool
-	if len(r.meta.dataFrames) == 0 {
-		var err error
-		if isAssignedNow, err = r.meta.prepareWrite(ptrs); err != nil {
-			return nil, err
-		}
-	} else {
-		assignedPtrs, err := r.meta.assignAutoIDs(ptrs)
-		if err != nil {
-			return nil, err
-		}
-		isAssignedNow = map[unsafe.Pointer]bool{}
-		for _, assignedPtr := range assignedPtrs {
-			isAssignedNow[assignedPtr] = true
-		}
+	isAssignedNow := map[unsafe.Pointer]bool{}
+	for _, assignedPtr := range assignedPtrs {
+		isAssignedNow[assignedPtr] = true
 	}
 	var possiblyStoredPtrs []unsafe.Pointer
 	for _, ptr := range ptrs {
@@ -234,14 +220,7 @@ func (r *Repo[T, E]) prepareWriteReadingStored(client *dynamodb.Client, ptrs []u
 			possiblyStoredPtrs = append(possiblyStoredPtrs, ptr)
 		}
 	}
-	storedByKey, err := r.storedVersions(client, possiblyStoredPtrs)
-	if err != nil {
-		return nil, err
-	}
-	if len(r.meta.dataFrames) > 0 {
-		err = r.meta.stampManagedColumns(ptrs)
-	}
-	return storedByKey, err
+	return r.storedVersions(client, possiblyStoredPtrs)
 }
 
 // storedVersions reads (consistently) the stored version of each record, keyed
@@ -313,7 +292,7 @@ func (r *Repo[T, E]) batchWrite(ctx context.Context, client *dynamodb.Client, wr
 // Only the key fields of `record` need to be populated: with array indexes the
 // stored version is read to find its rows, which are deleted after the item. With
 // DataFrames its frame values go to the frames' logs before the item is deleted,
-// within the write deadline.
+// within the write deadline. The record's Updated is set to the delete's.
 func (r *Repo[T, E]) Delete(record *E) error {
 	client, err := Client()
 	if err != nil {
@@ -325,6 +304,8 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if err != nil {
 		return err
 	}
+	// The delete's Updated: the version of its frame log entries, and the value of its by-IDs slot.
+	r.meta.stampManagedColumns([]unsafe.Pointer{ptr}, r.meta.aboveStored(storedByKey))
 	ctx, cancel := window.LandingContext(Now())
 	defer cancel()
 	var arrayRowDeletes []types.WriteRequest
@@ -335,7 +316,7 @@ func (r *Repo[T, E]) Delete(record *E) error {
 		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, nil); err != nil {
 			return err
 		}
-		frameWrites, err = r.meta.appendFrameDeleteEntries(ctx, storedPtr)
+		frameWrites, err = r.meta.appendFrameDeleteEntries(ctx, storedPtr, ptr)
 	}
 	if err == nil {
 		err = ctx.Err()
@@ -357,7 +338,7 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
 	}
-	return r.meta.bumpSlotVersions(client, []unsafe.Pointer{ptr})
+	return r.meta.setSlotsUpdated(client, []unsafe.Pointer{ptr})
 }
 
 // Get fetches one item by its full key. `key` only needs its partition and sort

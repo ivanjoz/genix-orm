@@ -22,8 +22,8 @@ type CheckFrameLine struct {
 	Quantity       int32 `cb:"5"`
 	Amount         int32 `cb:"6"`
 	Status         int8  `cb:"7"`
-	UpdatedVersion int32 `cb:"8"`
-	CreatedVersion int32 `cb:"9"`
+	Updated        int64 `cb:"8"`
+	CreatedVersion int64 `cb:"9"`
 }
 
 type CheckFrameLineTable struct {
@@ -35,8 +35,8 @@ type CheckFrameLineTable struct {
 	Quantity       dynamo.Col[CheckFrameLineTable, int32]
 	Amount         dynamo.Col[CheckFrameLineTable, int32]
 	Status         dynamo.Col[CheckFrameLineTable, int8]
-	UpdatedVersion dynamo.Col[CheckFrameLineTable, int32]
-	CreatedVersion dynamo.Col[CheckFrameLineTable, int32]
+	Updated        dynamo.Col[CheckFrameLineTable, int64]
+	CreatedVersion dynamo.Col[CheckFrameLineTable, int64]
 }
 
 const (
@@ -88,7 +88,7 @@ func runDataFrameChecks(runner *checkRunner) error {
 	if err := runner.write("PutMany 3 lines: no stored version, so no log entry", func() error { return CheckFrameLines.PutMany(firstLines) }); err != nil {
 		return err
 	}
-	if err := materialize("Run 1: a new frame only records a checkpoint, the version sequence now"); err != nil {
+	if err := materialize("Run 1: a new frame only records a checkpoint, the Updated clock now"); err != nil {
 		return err
 	}
 	runner.expectOnce("QueryFrame before the first build", []string{"not built"}, queryFrame(CheckFrameLines.QueryFrame(checkFrameDayProduct).Eq(lines.Fecha, checkFrameDay)))
@@ -110,7 +110,7 @@ func runDataFrameChecks(runner *checkRunner) error {
 	if err := runner.write("PutMany: line 1 Quantity 2000 -> 5000, line 2 Status 0 (2 log entries per frame)", func() error { return CheckFrameLines.PutMany(firstLines[:2]) }); err != nil {
 		return err
 	}
-	if err := runner.write("Delete line 3: reserves a version for its log entries", func() error { return CheckFrameLines.Delete(&firstLines[2]) }); err != nil {
+	if err := runner.write("Delete line 3: its log entries take the Updated it stamps", func() error { return CheckFrameLines.Delete(&firstLines[2]) }); err != nil {
 		return err
 	}
 	passSettle()

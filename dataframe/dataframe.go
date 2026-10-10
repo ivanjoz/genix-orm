@@ -4,7 +4,7 @@
 // the write path's log entries and deadline (write.go), the runs, rebuilds and reads with their state
 // machine (materialize.go), the files and their formats, the lock. A driver (dynamo) resolves its
 // schema's declarations into Columns, feeds the write path, and implements Table (table.go): the
-// frame's state record, the write sequence, and the record reads.
+// frame's state record, the write clock, and the record reads.
 //
 //	<table>/<frame>/_log.<shape>          the old values of the writes that changed the frame
 //	<table>/<frame>/_lock                 the compaction holding the frame, and until when (lock.go)
@@ -16,7 +16,7 @@
 // <table> and <frame> are short names the driver gives (Frame.Folder); the Keys are decimal.
 //
 // Every file holds its frame at a snapshot: the sum of what each record held at that
-// UpdatedVersion. A compaction from snapshot W to a target takes out of the files what each record
+// Updated. A compaction from snapshot W to a target takes out of the files what each record
 // held at W and adds what it held at the target (run.go); the formats are in codec.go.
 package dataframe
 

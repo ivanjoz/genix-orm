@@ -243,10 +243,11 @@ type QueryBuilder[E any] struct {
 	// allowsMemoryFilter is set by Repo.QueryScan: predicates no key serves are
 	// filtered in memory instead of rejected.
 	allowsMemoryFilter bool
-	// Set by Delta (delta.go): the TypeDelta index it reads, and the first-sync
-	// filter on its sync filter column.
+	// Set by Delta (delta.go): the TypeDelta index it reads, the first-sync
+	// filter on its sync filter column, and what the client holds past a first sync.
 	deltaIndex *arrayIndexMeta
 	syncFilter *predicate
+	deltaSince DeltaSince
 	// consistentRead is set by Consistent.
 	consistentRead bool
 }
@@ -324,35 +325,20 @@ func (q *QueryBuilder[E]) Exec(dst *[]E) error {
 		return err
 	}
 
+	if q.deltaIndex != nil && q.deltaSince.Updated > 0 {
+		return q.execDeltaSince(client, plans, dst)
+	}
+
 	// A record holding several of the Contains values is returned once.
 	returnedSKs := map[string]bool{}
 	// A QueryScan counts what it reads (every page of every plan, and the base
 	// records of a keys-only Contains) against queryScanMaxReadUnits.
 	var readUnits float64
 	for _, plan := range plans {
-		input := &dynamodb.QueryInput{
-			TableName:                 aws.String(tableName()),
-			KeyConditionExpression:    aws.String(plan.keyCond),
-			ExpressionAttributeNames:  plan.names,
-			ExpressionAttributeValues: plan.values,
-			ScanIndexForward:          aws.Bool(!q.desc),
-			ConsistentRead:            aws.Bool(q.consistentRead),
+		input, err := q.queryInput(plan)
+		if err != nil {
+			return err
 		}
-		if plan.indexName != "" {
-			if q.consistentRead {
-				return fmt.Errorf("db: %s Consistent() query is planned on %s, and a GSI cannot read consistently", q.meta.recordType.Name(), plan.indexName)
-			}
-			input.IndexName = aws.String(plan.indexName)
-		}
-		if q.allowsMemoryFilter {
-			input.ReturnConsumedCapacity = types.ReturnConsumedCapacityTotal
-		}
-		// With an in-memory post-filter, page sizes no longer map 1:1 to results, so
-		// only push Limit to DynamoDB when there is nothing to filter out.
-		if q.limit > 0 && len(plan.postFilter) == 0 {
-			input.Limit = aws.Int32(q.limit)
-		}
-
 		for {
 			// Checked before every call (the next page, or the next Contains value):
 			// only a read that would go on past the budget fails; one that finished
@@ -376,28 +362,9 @@ func (q *QueryBuilder[E]) Exec(dst *[]E) error {
 				}
 				readUnits += baseReadUnits
 			}
-			for i, item := range items {
-				var record E
-				if err := q.meta.unmarshalItem(item, &record); err != nil {
-					return err
-				}
-				ptr := unsafe.Pointer(&record)
-				if plan.arrayIndex != nil {
-					recordSK := q.meta.skValue(ptr)
-					// A row left behind by a crash or a concurrent writer points at a
-					// record that would no longer write it: it is not a result.
-					if returnedSKs[recordSK] || !q.meta.writesArrayRow(plan.arrayIndex, ptr, rowSKs[i]) {
-						continue
-					}
-					returnedSKs[recordSK] = true
-				}
-				if !q.meta.matchesFilter(ptr, plan.keyFilter) || !q.meta.matchesFilter(ptr, plan.postFilter) {
-					continue
-				}
-				*dst = append(*dst, record)
-				if q.limit > 0 && int32(len(*dst)) >= q.limit {
-					return nil
-				}
+			isLimitReached, err := q.appendRecords(plan, items, rowSKs, returnedSKs, dst)
+			if err != nil || isLimitReached {
+				return err
 			}
 			if len(out.LastEvaluatedKey) == 0 {
 				break
@@ -406,6 +373,62 @@ func (q *QueryBuilder[E]) Exec(dst *[]E) error {
 		}
 	}
 	return nil
+}
+
+// queryInput is the DynamoDB Query of one plan, first page.
+func (q *QueryBuilder[E]) queryInput(plan *queryPlan) (*dynamodb.QueryInput, error) {
+	input := &dynamodb.QueryInput{
+		TableName:                 aws.String(tableName()),
+		KeyConditionExpression:    aws.String(plan.keyCond),
+		ExpressionAttributeNames:  plan.names,
+		ExpressionAttributeValues: plan.values,
+		ScanIndexForward:          aws.Bool(!q.desc),
+		ConsistentRead:            aws.Bool(q.consistentRead),
+	}
+	if plan.indexName != "" {
+		if q.consistentRead {
+			return nil, fmt.Errorf("db: %s Consistent() query is planned on %s, and a GSI cannot read consistently", q.meta.recordType.Name(), plan.indexName)
+		}
+		input.IndexName = aws.String(plan.indexName)
+	}
+	if q.allowsMemoryFilter {
+		input.ReturnConsumedCapacity = types.ReturnConsumedCapacityTotal
+	}
+	// With an in-memory post-filter, page sizes no longer map 1:1 to results, so
+	// only push Limit to DynamoDB when there is nothing to filter out.
+	if q.limit > 0 && len(plan.postFilter) == 0 {
+		input.Limit = aws.Int32(q.limit)
+	}
+	return input, nil
+}
+
+// appendRecords decodes the items one page of a plan led to into *dst, and reports whether the
+// query's limit was reached. rowSKs are the hidden rows the items came from (nil without them).
+func (q *QueryBuilder[E]) appendRecords(plan *queryPlan, items []map[string]types.AttributeValue, rowSKs []string, returnedSKs map[string]bool, dst *[]E) (bool, error) {
+	for i, item := range items {
+		var record E
+		if err := q.meta.unmarshalItem(item, &record); err != nil {
+			return false, err
+		}
+		ptr := unsafe.Pointer(&record)
+		if plan.arrayIndex != nil {
+			recordSK := q.meta.skValue(ptr)
+			// A row left behind by a crash or a concurrent writer points at a
+			// record that would no longer write it: it is not a result.
+			if returnedSKs[recordSK] || !q.meta.writesArrayRow(plan.arrayIndex, ptr, rowSKs[i]) {
+				continue
+			}
+			returnedSKs[recordSK] = true
+		}
+		if !q.meta.matchesFilter(ptr, plan.keyFilter) || !q.meta.matchesFilter(ptr, plan.postFilter) {
+			continue
+		}
+		*dst = append(*dst, record)
+		if q.limit > 0 && int32(len(*dst)) >= q.limit {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // First runs the query with limit 1 and unmarshals the single result, if any.

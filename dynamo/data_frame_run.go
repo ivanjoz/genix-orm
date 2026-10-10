@@ -15,19 +15,20 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// dataframe.Table on DynamoDB: the frame's state item, the upv sequence, and the
-// record reads of the runs, rebuilds and fresh reads, whose logic is the dataframe
-// module's (materialize.go there). The state item sits beside the GroupBy counters:
+// dataframe.Table on DynamoDB: the frame's state item and the record reads of the
+// runs, rebuilds and fresh reads, whose logic is the dataframe module's
+// (materialize.go there). A frame's versions are Updated values (delta.go). The
+// state item sits beside the GroupBy counters:
 //
-//	pk = base pk ‖ 000   (beside the GroupBy counters and slot versions)   sk = "f" + frame name
+//	pk = base pk ‖ 000   (beside the GroupBy counters and the by-IDs slots)   sk = "f" + frame name
 //	w        the snapshot of the files; absent: not built (a new frame, or a changed shape)
-//	nx, nxt  the newest checkpoint: an upv sequence value, and when it was read (unix seconds)
+//	nx, nxt  the newest checkpoint: an Updated value, and when it was read (unix seconds)
 //	px       the previous checkpoint, settled
 //	ix       the days whose _ixt holds blocks to merge into their _idx, a number set
 //	sh       the shape the files were built with
 //
-// Every read is consistent: the state item, the sequence, the delta index (a hidden
-// base-table row) and the records by key.
+// Every read is consistent: the state item, the delta index (a hidden base-table
+// row) and the records by key.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // frameTable is dataframe.Table over the Repo's entity.
@@ -157,23 +158,9 @@ func (table frameTable[E]) updateState(ctx context.Context, frame *dataframe.Fra
 	return err
 }
 
-// CurrentWriteVersion reads the base pk's upv sequence: the last version reserved.
-func (table frameTable[E]) CurrentWriteVersion() (int64, error) {
-	client, err := Client()
-	if err != nil {
-		return 0, err
-	}
-	sequenceName := table.meta.tableID + updatedVersionSeqSuffix
-	out, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName:      aws.String(tableName()),
-		Key:            sequenceKey(sequenceName),
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return 0, err
-	}
-	return sequenceCounterValue(sequenceName, out.Item)
-}
+// CurrentWriteVersion is the Updated clock now. A write stamped up to it by a Lambda whose clock
+// lags lands within its deadline, which the settle time (and its skew margin) waits out.
+func (table frameTable[E]) CurrentWriteVersion() (int64, error) { return UpdatedNow(), nil }
 
 func (m *tableMeta) frameRecordStates(frame *dataframe.Frame, ptrs []unsafe.Pointer) []dataframe.RecordState {
 	states := make([]dataframe.RecordState, len(ptrs))
@@ -206,7 +193,7 @@ func (table frameTable[E]) ReadRecordsInRange(frame *dataframe.Frame, fromKey, t
 	return table.meta.frameRecordStates(frame, recordPointers(records)), nil
 }
 
-// ReadRecordsWrittenAfter reads, consistently, every record whose UpdatedVersion is above snapshot,
+// ReadRecordsWrittenAfter reads, consistently, every record whose Updated is above snapshot,
 // through the whole-entity delta index. Unlike Query().Delta() it keeps a record whose row moved while
 // the read ran (a later write landed): it is still written after snapshot, and a run must not miss it.
 func (table frameTable[E]) ReadRecordsWrittenAfter(frame *dataframe.Frame, snapshot int64) ([]dataframe.RecordState, error) {
@@ -215,7 +202,7 @@ func (table frameTable[E]) ReadRecordsWrittenAfter(frame *dataframe.Frame, snaps
 	if err != nil {
 		return nil, err
 	}
-	plans, err := (&QueryBuilder[E]{meta: meta}).Delta(int32(snapshot)).Consistent().plans()
+	plans, err := (&QueryBuilder[E]{meta: meta}).deltaFrom(snapshot+1, false).Consistent().plans()
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +231,7 @@ func (table frameTable[E]) ReadRecordsWrittenAfter(frame *dataframe.Frame, snaps
 				return nil, err
 			}
 			ptr := unsafe.Pointer(&record)
-			if sk := meta.skValue(ptr); !isReturned[sk] && meta.writeVersion.acc.getI64(ptr) > snapshot {
+			if sk := meta.skValue(ptr); !isReturned[sk] && meta.updated.acc.getI64(ptr) > snapshot {
 				isReturned[sk] = true
 				records = append(records, record)
 			}

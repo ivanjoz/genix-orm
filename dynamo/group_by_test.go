@@ -13,28 +13,26 @@ import (
 // ── GroupBy test entity: a delta GroupBy on a GSI, a fan-out one, a slot-less one ──
 
 type groupSale struct {
-	StoreID        int32   `cb:"1"`
-	ID             int32   `cb:"2"`
-	Channel        string  `cb:"3"`
-	Status         int8    `cb:"4"`
-	ProductIDs     []int16 `cb:"5"`
-	Total          int64   `cb:"6"`
-	Weight         float64 `cb:"7"`
-	Updated        int32   `cb:"8"`
-	UpdatedVersion int32   `cb:"9"`
+	StoreID    int32   `cb:"1"`
+	ID         int32   `cb:"2"`
+	Channel    string  `cb:"3"`
+	Status     int8    `cb:"4"`
+	ProductIDs []int16 `cb:"5"`
+	Total      int64   `cb:"6"`
+	Weight     float64 `cb:"7"`
+	Updated    int64   `cb:"8"`
 }
 
 type groupSaleTable struct {
 	Model[groupSaleTable, groupSale]
-	StoreID        Col[*groupSaleTable, int32]
-	ID             Col[*groupSaleTable, int32]
-	Channel        Col[*groupSaleTable, string]
-	Status         Col[*groupSaleTable, int8]
-	ProductIDs     ColSlice[*groupSaleTable, int16]
-	Total          Col[*groupSaleTable, int64]
-	Weight         Col[*groupSaleTable, float64]
-	Updated        Col[*groupSaleTable, int32]
-	UpdatedVersion Col[*groupSaleTable, int32]
+	StoreID    Col[*groupSaleTable, int32]
+	ID         Col[*groupSaleTable, int32]
+	Channel    Col[*groupSaleTable, string]
+	Status     Col[*groupSaleTable, int8]
+	ProductIDs ColSlice[*groupSaleTable, int16]
+	Total      Col[*groupSaleTable, int64]
+	Weight     Col[*groupSaleTable, float64]
+	Updated    Col[*groupSaleTable, int64]
 }
 
 func (t groupSaleTable) GetSchema() Schema {
@@ -103,8 +101,8 @@ func TestGroupByCompiles(t *testing.T) {
 	if byChannel.tag != "g003" || byChannel.elementPosition != -1 {
 		t.Fatalf("channel GroupBy = %+v", byChannel)
 	}
-	if m.status == nil || m.writeVersion == nil {
-		t.Fatal("a GroupDelta table must resolve Status and UpdatedVersion")
+	if m.status == nil || m.updated == nil || !m.isVersioned {
+		t.Fatal("a GroupDelta table must resolve Status and Updated, and be versioned")
 	}
 }
 
@@ -176,9 +174,9 @@ func TestGroupDeltasOfADeletion(t *testing.T) {
 }
 
 func TestGroupDeltasMergeAcrossTheCall(t *testing.T) {
-	first := groupSale{StoreID: 1, ID: 1, Channel: "web", Status: 2, Total: 100, UpdatedVersion: 4}
-	second := groupSale{StoreID: 1, ID: 2, Channel: "web", Status: 2, Total: 50, UpdatedVersion: 4}
-	otherStore := groupSale{StoreID: 2, ID: 3, Channel: "web", Status: 2, Total: 10, UpdatedVersion: 9}
+	first := groupSale{StoreID: 1, ID: 1, Channel: "web", Status: 2, Total: 100, Updated: 4_000}
+	second := groupSale{StoreID: 1, ID: 2, Channel: "web", Status: 2, Total: 50, Updated: 4_500}
+	otherStore := groupSale{StoreID: 2, ID: 3, Channel: "web", Status: 2, Total: 10, Updated: 9_000}
 
 	callDeltas := map[string]*groupCounterDelta{}
 	for _, sale := range []*groupSale{&first, &second, &otherStore} {
@@ -194,7 +192,8 @@ func TestGroupDeltasMergeAcrossTheCall(t *testing.T) {
 	}
 	storeOnePK := groupSales.meta.pkValue(unsafe.Pointer(&first))
 	merged := callDeltas[storeOnePK+"#"+channelStatusGroupSK("web", 2)]
-	if merged == nil || merged.count != 2 || merged.sums[0] != 150 || merged.writeVersion != 4 {
+	// The counter carries the highest Updated written into it.
+	if merged == nil || merged.count != 2 || merged.sums[0] != 150 || merged.updated != 4_500 {
 		t.Fatalf("store 1 web/2 counter = %+v", merged)
 	}
 }
@@ -290,7 +289,7 @@ func TestGroupByDeclarationRules(t *testing.T) {
 		"GroupDelta without GroupBy": func(t badGroupTable) []Index {
 			return []Index{{Slot: G1, Keys: Cols(t.Channel), GroupDelta: true}}
 		},
-		"GroupDelta without UpdatedVersion": func(t badGroupTable) []Index {
+		"GroupDelta without Updated": func(t badGroupTable) []Index {
 			return []Index{{Keys: Cols(t.Channel), GroupBy: Cols(t.Total), GroupDelta: true}}
 		},
 		"GroupBy on a TypeDelta index": func(t badGroupTable) []Index {

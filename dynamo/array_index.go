@@ -55,14 +55,14 @@ type arrayIndexMeta struct {
 	elementPosition int
 	// columnID is the cb id that names the rows' pk, zero-padded to
 	// arrayIndexColumnIDDigits: the slice field's, or for a delta index without one,
-	// its first key's (UpdatedVersion's when it has none).
+	// its first key's (Updated's when it has none).
 	columnID string
 	fullCopy bool
 	// elements reads the slice straight from the record and returns one key part
 	// per element (duplicates included).
 	elements func(ptr unsafe.Pointer) []keyPart
 
-	// Delta indexes only: keys ends with the managed UpdatedVersion, and
+	// Delta indexes only: keys ends with the managed Updated, and
 	// syncFilterField is the field Delta()'s values filter on a first sync ("" for none).
 	isDelta         bool
 	syncFilterField string

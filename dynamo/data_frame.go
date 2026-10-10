@@ -23,8 +23,8 @@ import (
 // snapshot through the whole-entity delta index. Updates and deletes also need the
 // values the record held before, which only the write sees, so the write appends
 // them to the frame's log, before the base write, when the frame's values change.
-// CreatedVersion (the UpdatedVersion of the inserting write) tells a run whether its
-// snapshot already holds a record.
+// CreatedVersion (the Updated of the inserting write) tells a run whether its
+// snapshot already holds a record. A frame's versions are Updated values.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
@@ -33,8 +33,8 @@ const (
 )
 
 // frameWriteWindowFrom opens the window of a write to the table (dataframe.WriteWindow): at the stored
-// read the write diffs against, or at the version reservation when it reads nothing. A table without
-// frames has no bound.
+// read the write diffs against, or when it starts if it reads nothing. A table without frames has no
+// bound.
 func (m *tableMeta) frameWriteWindowFrom(start time.Time) dataframe.WriteWindow {
 	if len(m.dataFrames) == 0 {
 		return dataframe.WriteWindow{}
@@ -127,8 +127,8 @@ func FrameTableFolder(tableID int32) string { return EncodeOrderedInt(int64(tabl
 // resolveCreatedVersion validates the managed CreatedVersion field a table with frames needs.
 func resolveCreatedVersion(recordType reflect.Type, accessors map[string]*colAccessor) *colAccessor {
 	field, ok := recordType.FieldByName(createdVersionFieldName)
-	if !ok || field.Type.Kind() != reflect.Int32 {
-		panic(fmt.Sprintf("db: %s declares DataFrames and needs an int32 field %q (json \"crv\")", recordType.Name(), createdVersionFieldName))
+	if !ok || field.Type.Kind() != reflect.Int64 {
+		panic(fmt.Sprintf("db: %s declares DataFrames and needs an int64 field %q (json \"crv\")", recordType.Name(), createdVersionFieldName))
 	}
 	return accessors[createdVersionFieldName]
 }
@@ -153,13 +153,13 @@ func (m *tableMeta) checkFrameValues(ptrs []unsafe.Pointer) error {
 }
 
 // stampCreatedVersions sets the managed CreatedVersion of the records about to be written: the
-// stored version's, or this write's UpdatedVersion for a record with none stored (an insert).
+// stored version's, or this write's Updated for a record with none stored (an insert).
 func (m *tableMeta) stampCreatedVersions(ptrs []unsafe.Pointer, storedByKey map[string]unsafe.Pointer) {
 	if m.createdVersion == nil {
 		return
 	}
 	for _, ptr := range ptrs {
-		createdVersion := m.writeVersion.acc.getI64(ptr)
+		createdVersion := m.updated.acc.getI64(ptr)
 		if storedPtr := storedByKey[m.recordKey(ptr)]; storedPtr != nil {
 			createdVersion = m.createdVersion.getI64(storedPtr)
 		}
@@ -184,23 +184,19 @@ func (m *tableMeta) frameWritesOf(ptrs []unsafe.Pointer, storedByKey map[string]
 	var writes []dataframe.LoggedWrite
 	for _, ptr := range ptrs {
 		if storedPtr := storedByKey[m.recordKey(ptr)]; storedPtr != nil {
-			writes = append(writes, m.loggedWrite(storedPtr, ptr, m.writeVersion.acc.getI64(ptr)))
+			writes = append(writes, m.loggedWrite(storedPtr, ptr, m.updated.acc.getI64(ptr)))
 		}
 	}
 	return writes
 }
 
 // appendFrameDeleteEntries logs the values a record about to be deleted held in the frames it counts
-// in, and returns the write it logged. A delete stamps no version, so it reserves one for the entries,
-// above the version it read.
-func (m *tableMeta) appendFrameDeleteEntries(ctx context.Context, storedPtr unsafe.Pointer) ([]dataframe.LoggedWrite, error) {
+// in, and returns the write it logged. Its version is the Updated Delete stamped on keyPtr, above the
+// stored one.
+func (m *tableMeta) appendFrameDeleteEntries(ctx context.Context, storedPtr, keyPtr unsafe.Pointer) ([]dataframe.LoggedWrite, error) {
 	if len(m.dataFrames) == 0 || m.countedRecord(storedPtr) == nil {
 		return nil, nil
 	}
-	deleteVersion, err := reserveSequence(m.pkValue(storedPtr)+updatedVersionSeqSuffix, 1)
-	if err != nil {
-		return nil, err
-	}
-	writes := []dataframe.LoggedWrite{m.loggedWrite(storedPtr, nil, deleteVersion)}
+	writes := []dataframe.LoggedWrite{m.loggedWrite(storedPtr, nil, m.updated.acc.getI64(keyPtr))}
 	return writes, dataframe.AppendLogEntries(ctx, m.dataFrames, writes, false)
 }

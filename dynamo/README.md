@@ -13,11 +13,11 @@ into a project's `.claude/skills/genix-dynamo-orm`.
 Every item contains **only**: the key columns (`pk`, `sk`), the index columns
 (`h1`/`r1`..`h10`/`r10`), a single binary column **`d`** holding the whole
 record serialized with [`colbin`](https://github.com/ivanjoz/colbin) (a columnar binary codec),
-and on a versioned table the number **`upv`**, a copy of `UpdatedVersion` that
-`Modify`'s conditional write compares. Nothing else is a top-level attribute.
+and on a versioned table the number **`upd`**, a copy of the managed `Updated`
+that `Modify`'s conditional write compares. Nothing else is a top-level attribute.
 
 ```
-{ pk, sk, h1?/r1?..h10?/r10?, d, upv? }
+{ pk, sk, h1?/r1?..h10?/r10?, d, upd? }
 ```
 
 This keeps the table schemaless — adding a record field never changes the item
@@ -201,9 +201,10 @@ d  = the record blob, only with FullCopy: true
 ```
 
 ```go
-// orders of a store holding product 5, updated after 10000: one exact sk range
-Indexes: []dynamo.Index{{Keys: dynamo.Cols(t.ProductIDs.Size(32), t.Updated.Size(32))}},
-Orders.Query().Eq(Orders.T.StoreID, 7).Contains(Orders.T.ProductIDs, 5).Gt(Orders.T.Updated, 10000).Exec(&out)
+// orders of a store holding product 5, updated after a moment: one exact sk range
+// (an index keyed on the managed Updated declares Size(42), its full width)
+Indexes: []dynamo.Index{{Keys: dynamo.Cols(t.ProductIDs.Size(32), t.Updated.Size(42))}},
+Orders.Query().Eq(Orders.T.StoreID, 7).Contains(Orders.T.ProductIDs, 5).Gt(Orders.T.Updated, dynamo.UpdatedOfTime(since)).Exec(&out)
 Orders.Query().Eq(Orders.T.StoreID, 7).Eq(Orders.T.ProductIDs, 5).Exec(&out) // Eq on a ColSlice = Contains of one value
 ```
 
@@ -343,89 +344,117 @@ value, returning the previous one (genix's `SetCounterValue`). The next ID uses
 Requirements: the record/table must declare an integer field named `ID`; padding
 is `0..9`. Both are checked at compile time (`NewRepo` panics otherwise).
 
-## By-IDs cache (`cache_updated_version.go`)
+## By-IDs cache (`cache_by_ids.go`)
 
 Ported from genix-orm/scylla's slot versions. It answers "give me records
-[12, 87, 412]" with only the ones that changed since the version the client
-holds, which is what genix-ui's cache-by-ids sends (`ids`, `cc-ids`, `cc-ver`).
+[12, 87, 412]" with only the ones that changed since the value the client
+holds, which is what genix-ui's cache-by-ids sends (`ids`, `cc-ids`, `cc-upd`).
 
 ```go
 type Customer struct {
-    ID             int32  `cb:"1"`
-    Name           string `cb:"2"`
-    UpdatedVersion int32  `json:"upv,omitempty" cb:"3"` // managed by the ORM (delta.go)
+    ID      int32  `cb:"1"`
+    Name    string `cb:"2"`
+    Updated int64  `json:"upd" cb:"3"` // managed by the ORM (delta.go)
 }
 
 func (t CustomerTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
-        Entity:             "cust",
-        Keys:               dynamo.Cols(t.ID.Size(32)), // exactly one integer column
-        SaveUpdatedVersion: true,
+        Entity:     "cust",
+        Keys:       dynamo.Cols(t.ID.Size(32)), // exactly one integer column
+        CacheByIDs: true,
     }
 }
 
-changed, err := Customers.QueryCachedIDs([]dynamo.IDUpdatedVersion{{ID: 12}, {ID: 87, UpdatedVersion: 4}})
+changed, err := Customers.QueryCachedIDs([]dynamo.CachedID{{ID: 12}, {ID: 87, Updated: 51_840_000}})
 ```
 
-- A record belongs to slot `uint8(ID)`. Each base pk has one slot-versions
-  item, `pk = base pk ‖ 000`, `sk = "v"`, with one counter per slot
-  (`v0`..`v255`). `000` is the fan-out suffix no cb id takes, so no query or
-  Scan ever reads it, and `DeleteRecordsAll` keeps it.
+- A record belongs to slot `uint8(ID)`. Each base pk has one slot item,
+  `pk = base pk ‖ 000`, `sk = "v"`, holding per slot (`v0`..`v255`) the
+  `Updated` of its last write. `000` is the fan-out suffix no cb id takes, so no
+  query or Scan ever reads it; `DeleteRecordsAll` deletes it with the records
+  (a recreated record is stamped a later `Updated`, so no client can match it).
 - **Write:** `Put`/`PutMany`/`PutIfAbsent`/`Delete` write the records, then
-  one UpdateItem per touched pk `ADD`s 1 to each touched slot. The record's
-  `UpdatedVersion` is its write sequence (see Delta sync).
-- **Read:** one GetItem of the slot versions, then one consistent BatchGetItem
-  of the IDs whose client version differs (0 always differs). Returned records
-  carry the slot version in `UpdatedVersion` instead of their write sequence,
-  truncated to `uint16` (0 is reserved for "unknown"), as in genix.
-- Bumping after the write keeps it race-free: a reader that sees the new
-  version reads the new record (the read is consistent); one that sees the old
-  version only makes the client ask again.
+  one UpdateItem per touched pk `SET`s each touched slot to the write's
+  `Updated` (a `Delete` stamps its key record too). Nothing is read first.
+- **Read:** one GetItem of the slots, then one consistent BatchGetItem of the
+  IDs whose client value differs from their slot's (0 always differs).
+  Returned records carry the slot's `Updated` in `Updated`, the value the client
+  sends back next time — or **0 while the slot value is younger than
+  `DeltaOverlap`** (4 s): a value that young may still be stamped again by a
+  concurrent same-millisecond write or a late one, so it isn't trusted, and the
+  client's next revalidation reads the record again.
+- Setting the slot after the write keeps it race-free: a reader that sees the
+  new value reads the new record (the read is consistent); one that sees the old
+  value only makes the client ask again. A late write can set a slot back to an
+  older `Updated`; the client compares for equality, so it still refetches.
 - A write refetches the whole slot (IDs 256 apart). A record not written since
-  the flag was enabled has no slot version and is read on every request, until
+  the flag was enabled has no slot value and is read on every request, until
   it is written once.
 
 ## Delta sync (`delta.go`)
 
-The port of genix-orm's managed `updated` / `updated_version` columns, its
-`TypeDelta` index and `Delta()`. It answers "the records written since the
-watermark I hold", which is what genix-ui's delta cache (`GetHandler`, `?up=<upv>.<upd>`) asks.
+The port of genix-orm's managed `updated` column, its `TypeDelta` index and
+`Delta()`. It answers "the records written since the watermark I hold", which is
+what genix-ui's delta cache (`GetHandler`, `?up=<upd>.<fingerprint>`) asks.
 
 ```go
 type Customer struct {
-    ID             int32  `cb:"1"`
-    Status         int8   `json:"ss" cb:"2"`
-    Updated        int32  `json:"upd" cb:"3"`           // managed: write time, SUnixTime
-    UpdatedVersion int32  `json:"upv,omitempty" cb:"4"` // managed: write sequence
+    ID      int32 `cb:"1"`
+    Status  int8  `json:"ss" cb:"2"`
+    Updated int64 `json:"upd" cb:"3"` // managed: write time, ms since the UpdatedEpoch
 }
 
 Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)}},
 
-Customers.Query().Delta(watermark, 1).Exec(&out)  // active on a first sync, every status after
+dynamo.SetUpdatedEpoch(1791590400) // at boot, before the first write; permanent
+Customers.Query().Delta(dynamo.DeltaSince{Updated: w, Fingerprint: fp}, 1).Exec(&out) // active on a first sync, every status after
 ```
 
-- **Managed fields, stamped on every Put/PutMany/PutIfAbsent.** An integer
-  field named `Updated` gets the write time as a SUnixTime, `(unix - 1e9) / 2`,
-  read from `dynamo.Now`. On a table with a `TypeDelta` index or
-  `SaveUpdatedVersion`, the `int32` field `UpdatedVersion` gets the write
-  sequence: one value per write call per base pk, from the sequence item
-  `pk = 0, sk = "<base pk>#upv"`. It never repeats, so "> watermark" misses
-  nothing and resends nothing, which a 2-second timestamp can't promise.
+- **The managed `Updated`, stamped on every Put/PutMany/PutIfAbsent/Delete,** is
+  the write time in **milliseconds since the UpdatedEpoch**, an `int64`
+  (`json:"upd"`). `SetUpdatedEpoch(unixSeconds)` sets the epoch once at boot
+  (berryapps passes `config.toml` `[dynamo].unix_time_start`); changing it later
+  corrupts every stored value, row and client watermark. `UpdatedNow()`,
+  `UpdatedOfTime(t)` and `UpdatedToTime(upd)` convert; `dynamo.Now` is the clock.
+  An integer field named `Updated` must be an `int64` (compile panics
+  otherwise), and a versioned table (`CacheByIDs`, `VersionedWrites`,
+  DataFrames, a `TypeDelta` index or a `GroupDelta`) requires it.
+- **No round trip.** The stamp comes from the process clock, kept monotonic
+  (`max(now, last + 1)`): two write calls of one process never share a value.
+  A write that reads the stored record (a table with hidden rows, GroupBy or
+  frames; `PutManyIfVersion`/`Modify` always) also stamps it at least the stored
+  `Updated + 1`, so a rewrite moves even within one millisecond or over a value
+  a clock ahead stamped.
 - **A delta index lives in hidden rows**, like a fan-out index: `pk = base pk ‖
-  cb id`, `sk = <pinned Keys>#<UpdatedVersion>#<base sk>`. The cb id is the
-  ColSlice's, else the first Key's, else `UpdatedVersion`'s.
+  cb id`, `sk = <pinned Keys>#<Updated>#<base sk>`, `Updated` as 7
+  order-preserving Base64 digits (`Size(42)`, about 139 years). The cb id is the
+  ColSlice's, else the first Key's, else `Updated`'s. Any index of your own
+  keyed on `Updated` declares `Size(42)` too.
   - The **last Key, unless it is a ColSlice, is the sync filter column**. It is
-    not in the row sk. `Delta(W, values...)` keeps only those values on a first
-    sync (`W = 0`), in memory. A later sync returns every value, so soft-deleted
-    records reach the clients still caching them.
+    not in the row sk. `Delta(since, values...)` keeps only those values on a
+    first sync (`since.Updated = 0`), in memory. A later sync returns every
+    value, so soft-deleted records reach the clients still caching them.
   - The **other Keys are pinned**: Delta needs an Eq on each, or the Contains
     on its ColSlice, which fans the rows out per element.
     `Cols(t.ModuleIDs.Size(8), t.Status)` serves
-    `Query().Contains(ModuleIDs, 3).Delta(W, 1)`.
+    `Query().Contains(ModuleIDs, 3).Delta(since, 1)`.
 - **`Delta()` goes last.** It picks the delta index whose pinned Keys all have an
   Eq or a Contains, the most specific when several fit (a tie fails), and adds
-  `UpdatedVersion >= W+1`: one exact sk range per Contains value.
-- **Every write moves every delta row** (UpdatedVersion changed): a put and a
+  `Updated >= since.Updated - DeltaOverlap`: one exact sk range per Contains value.
+- **The overlap window and its fingerprint.** `Updated` is a clock, not a
+  sequence: two Lambdas can stamp the same millisecond, and a write stamped at
+  t can land after a client read past t (in flight, or from a lagging clock).
+  So a later sync re-reads the window `[W - DeltaOverlap, W]` (`DeltaOverlap` =
+  4 s) along with everything above W. Rows above W are always returned. The
+  window's rows are dropped **before any record is read** when
+  `DeltaFingerprint` of their `Updated` values (one per base sk and `Updated`)
+  equals `since.Fingerprint`, the client's fingerprint of the values it holds
+  in the same window; otherwise the whole window is resent and the client
+  upserts it by ID. The fingerprint is the sum mod 2^32 of each value's mix (its
+  two halves folded, then murmur3's finalizer); genix-ui's
+  `cache/delta-cache.watermark.ts` computes the same, pinned by the shared
+  vector in `delta_test.go`. A sync with nothing new costs one keys-only Query.
+- **Every write moves every delta row** (`Updated` changed): a put and a
   delete per row, with the fan-out sync and its read-side re-check. Keys-only
   rows read their base records with a BatchGetItem, so a first sync costs
   about 0.5 RCU per record.
@@ -449,11 +478,11 @@ groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].SumFloat(Orders.T.Weig
 ```
 
 ```text
-pk   = base pk ‖ 000                      (shared with the slot-versions item, sk "v")
+pk   = base pk ‖ 000                      (shared with the by-IDs slot item, sk "v")
 sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
 c    = record count            sNNN = sum of the column with cb id NNN
 d    = a record holding only the group Keys (Group.Key)
-upv, upd = the last write that touched it (GroupDelta only)
+upd  = the Updated of the last write that touched it (GroupDelta only)
 ```
 
 - **Diff on write.** Every write already reads the stored version. The groups
@@ -475,12 +504,15 @@ upv, upd = the last write that touched it (GroupDelta only)
   because their condition proves the stored read. `RebuildGroups(partition...)`
   and `RebuildGroupsAll()` recompute the counters, rewrite only those that
   differ, zero the ones no record produces and delete those of a GroupBy no
-  longer declared. On a `GroupDelta` the rewritten ones get a freshly reserved
-  version. They are the backfill after adding a GroupBy, a column or changing
-  its Keys, and the cleanup after removing one.
-- A `GroupDelta` counter's `upv` has `Delta()`'s window: a write reserving 9 can
-  land after one reserving 10, so a client synced at 10 misses it until the
-  group is written again.
+  longer declared. On a `GroupDelta` the rewritten ones get a fresh `Updated`.
+  They are the backfill after adding a GroupBy, a column or changing its Keys,
+  and the cleanup after removing one.
+- **`Since(W)` on a `GroupDelta`** returns the groups whose `upd` is at least
+  `W - DeltaOverlap`: the same overlap as `Delta()`, for a write stamped below W
+  that lands after the client's read, but with no fingerprint (a GroupBy holds
+  few groups, so the window is just resent). `Group.Updated` (`int64`) is the
+  value the client keeps as W. A delete stamps its counters with a fresh
+  `Updated`.
 
 ## DataFrames: group-by files kept by a cron (`data_frame*.go`, `../dataframe/`)
 
@@ -496,7 +528,7 @@ everything that works for any database: the compile rules, the write path's log
 entries and deadline, the runs, rebuilds and reads with their state machine, the
 files, codecs and lock. The `data_frame*.go` files of this package resolve the
 schema's declarations, hook the write path, and implement `dataframe.Table`: the
-state item, the upv sequence and the record reads.
+state item, the write version (`UpdatedNow()`) and the record reads.
 
 ```go
 DataFrames: []dynamo.DataFrame{
@@ -526,27 +558,28 @@ rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from,
 - **Rules (a violation panics at boot):** a kebab-case `Name`, unique in the
   entity; 1–3 integer `Keys`, an integer `Rows` and at least one integer `Sums`,
   scalar `Col`s with `cb` tags, none twice; `Keys[0]` leads the entity `Keys`, a
-  GSI or a local index (a rebuild ranges over it); the managed `int32`
-  `UpdatedVersion` and `CreatedVersion`; a whole-entity delta index
+  GSI or a local index (a rebuild ranges over it); the managed `int64`
+  `Updated` and `CreatedVersion`; a whole-entity delta index
   (`{Type: TypeDelta, Keys: Cols(t.Status)}`); no `Partition`.
 - **Values:** a write with a negative Keys or Rows value fails, and with a
   negative Sums value unless the frame sets `AllowNegativeSums`. A record with
   `Status == 0` counts in no frame. A row whose sums are all 0 is dropped.
-- **`CreatedVersion`** is the `UpdatedVersion` of the write that inserted the
-  record, copied by every later write: the ORM owns it. With it a run tells a
-  record the files already hold from a new one.
-- **The write path.** A table with frames reads its stored versions before it
-  reserves its version (one more sequential round trip on PutMany), then appends
-  to each frame's log, in parallel, the old values of every record whose frame
-  values change, **before** the base write. An insert logs nothing: the run reads
-  it. A `Delete` reserves a version for its entries. `PutManyIfVersion` appends
-  a cancel marker for each record that lost its condition. A write fails when no
-  store is set.
+- **Versions are `Updated` values.** `CreatedVersion` is the `Updated` of the
+  write that inserted the record, copied by every later write: the ORM owns it.
+  With it a run tells a record the files already hold from a new one.
+- **The write path.** A table with frames reads its stored versions, stamps
+  each record's `Updated` above the stored one, then appends to each frame's
+  log, in parallel, the old values of every record whose frame values change,
+  **before** the base write. An insert logs nothing: the run reads it. A
+  `Delete`'s entries carry the `Updated` it stamps on its key record.
+  `PutManyIfVersion` appends a cancel marker for each record that lost its
+  condition. A write fails when no store is set.
 - **A run** (`MaterializeDataFrames`, per frame, under a 10-minute lease in a
   state item beside the GroupBy counters) goes from the snapshot the files hold,
-  W, to the sequence value the previous run read, once that value is older than
-  the settle time: every write that reserved a version up to it has landed and
-  logged. It reads the records written after W (delta index), then the log, and
+  W, to the checkpoint the previous run took (`UpdatedNow()` then), once it is
+  older than the settle time: every write stamped up to it has landed and
+  logged (the settle margin covers a lagging Lambda clock). It reads the records
+  written after W (delta index, from W + 1), then the log, and
   applies to each touched file what each record held at the target less what it
   held at W. A crashed run is retried to the same target and skips the files it
   already wrote. The first run of a frame, or of a changed shape (format
@@ -590,10 +623,10 @@ lost, err := Accounts.PutManyIfVersion(accounts) // re-read, re-edit and retry t
 ```
 
 - **PutManyIfVersion** writes each record with a conditional PutItem: the item's
-  `upv` must still equal the record's `UpdatedVersion` (0: no item may exist).
-  Everything else is PutMany's: one version reserved per call and base pk,
+  `upd` must still equal the record's `Updated` (0: no item may exist), and the
+  record is stamped at least that value + 1. Everything else is PutMany's:
   hidden rows diffed against the stored versions (one consistent BatchGetItem)
-  and batched, the slot versions bumped once. Only the base items are single
+  and batched, the by-IDs slots set once. Only the base items are single
   PutItems (BatchWriteItem takes no condition), run 10 at a time. It returns the
   records that lost a race, unwritten; the caller re-reads, re-edits and retries
   them (`ConflictBackoff(attempt)` is the pause Modify uses).
@@ -602,7 +635,7 @@ lost, err := Accounts.PutManyIfVersion(accounts) // re-read, re-edit and retry t
 - **GetManyForUpdate** is GetMany that also keeps the stored blobs in the
   process **write cache** (`write_cache.go`), so the PutManyIfVersion that
   follows diffs the hidden rows without its own stored-version read. `Modify`
-  keeps its read there too. An entry (pk#sk → `upv`, blob) is used only at the
+  keeps its read there too. An entry (pk#sk → `upd`, blob) is used only at the
   exact version the write is conditioned on, which the condition then proves; a
   record expected new (version 0) needs no read at all. Entries live 15 s, up to
   10,000; a full cache drops expired ones, else stops taking new ones. Only
@@ -612,7 +645,7 @@ lost, err := Accounts.PutManyIfVersion(accounts) // re-read, re-edit and retry t
 For one record, `Modify` runs the whole loop:
 
 ```go
-Schema{..., VersionedWrites: true} // or SaveUpdatedVersion, or a TypeDelta index
+Schema{..., VersionedWrites: true} // or CacheByIDs, DataFrames, a GroupDelta or a TypeDelta index
 
 saved, err := Accounts.Modify(Account{ID: 7}, func(account *Account, exists bool) error {
     account.Balance += 100 // edit the record as stored right now
@@ -620,27 +653,28 @@ saved, err := Accounts.Modify(Account{ID: 7}, func(account *Account, exists bool
 })
 ```
 
-- **Versioned table:** `VersionedWrites`, `SaveUpdatedVersion` or a `TypeDelta`
-  index stamp the managed `int32` `UpdatedVersion` on every write and store it
-  as the item attribute `upv`. The version is reserved once per write call and
-  base pk (one atomic ADD on the sequence item, shared by every record of the
-  call), and that is enough: each write of a record still gives it a value no
-  earlier call had. A `Modify` writes one record, so it pays one ADD per record.
-  A record stored before its table was versioned has no `upv`:
-  `Modify` returns an error until it is `Put` once.
+- **Versioned table:** `VersionedWrites`, `CacheByIDs`, DataFrames, a
+  `GroupDelta` or a `TypeDelta` index store the managed `int64` `Updated` as the
+  item attribute `upd` too, the one value DynamoDB can compare (`#upd = :upd`).
+  The stamp costs no round trip, and a conditional write puts a record above the
+  `Updated` it replaces, so a value never comes back. A record stored before
+  its table was versioned has no `upd`: `Modify` returns an error until it is
+  `Put` once.
 - **Modify** reads the item consistently, runs the change, and writes it with
   `PutManyIfVersion`, conditioned on the version it read whatever the change did
-  to `UpdatedVersion`. If another write landed in between, it reads and runs the
+  to `Updated`. If another write landed in between, it reads and runs the
   change again: up to 8 attempts with a growing pause (about 2s in all), then
   `ErrWriteConflict`. **The change must be safe to run more than once.**
 - `exists` is false when nothing is stored: the change gets the bare key and may
   create the record. A change that leaves the record byte-identical writes
   nothing and moves no version. The change must not edit the Keys.
-- A lost race is still billed. A stored item with no `upv` fails with an error
+- A lost race is still billed. A stored item with no `upd` fails with an error
   naming it, instead of losing every attempt.
 - **Rows of a lost write:** the new hidden rows go before the conditional put.
-  On a lost race its delta rows are deleted (their sk holds a version only that
-  call reserved); its fan-out rows stay as extra rows, which reads re-check.
+  On a lost race its delta rows are deleted (their sk holds the `Updated` that
+  call stamped), unless the winner stamped the very same `Updated`, in which
+  case they are the winner's rows too and stay; its fan-out rows stay as extra
+  rows, which reads re-check.
   **FullCopy caveat:** a lost write may have rewritten a FullCopy row with its
   own, never-stored record, and a Contains returns that copy until the next
   successful write of the record. Modify always ends in one; a PutManyIfVersion
@@ -841,7 +875,9 @@ for _, c := range controllers {
 (`TableID ‖ 0…0` to `TableID ‖ 9…9`) and array index rows (3 digits longer) —
 projecting only the key attributes (it never decodes `d`), then deletes in
 `BatchWriteItem` batches of 25 with the same unprocessed-item retry as `PutMany`.
-The returned count includes array index rows. Sibling entities and the internal
+The returned count includes array index rows, GroupBy counters and frame states.
+The by-IDs slot items go too: a recreated record is stamped a later `Updated`, so
+it can't match a value a client still holds. Sibling entities and the internal
 sequence counters (pk 0) are outside those ranges and untouched.
 **Destructive, no undo.** Exposed on the CLI as `go run . wipe`.
 
@@ -870,12 +906,14 @@ Materialized/hash/radix views, `int64` packing, index groups, the generic-record
 by-IDs reads, and CQL deploy/homologation. DynamoDB's fixed physical schema and string
 keys make most of that unnecessary — so this is, as expected, a much smaller
 ORM. (Cached metadata, precompiled `xunsafe` accessors, autoincrement sequences,
-by-IDs slot versions and entity controllers are kept/ported — see above.)
+by-IDs slots and entity controllers are kept/ported — see above.)
 
 ## Config & tests
 
 - Table name from `dynamo.TableName` (set at startup); falls back to the
   `DYNAMO_TABLE` environment variable, then `demo-app`.
+- `dynamo.SetUpdatedEpoch(unixSeconds)` once at startup, before the first write:
+  the epoch every managed `Updated` counts milliseconds from (see Delta sync).
 - Client uses the standard AWS chain; set `DYNAMO_ENDPOINT` for a local DynamoDB.
   `ClientOptions` customize the client before its first call: an `HTTPClient`
   whose transport tunnels each request elsewhere (through a proxy that signs it)

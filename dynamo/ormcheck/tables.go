@@ -9,34 +9,34 @@ import "github.com/ivanjoz/genix-orm/dynamo"
 // Contains reads the matching base records in a second BatchGetItem. Three of its indexes keep
 // GroupBy counters: a delta one on a GSI, one per Tags element, and a slot-less one.
 type CheckOrder struct {
-	StoreID        int32    `cb:"1"`
-	Created        int32    `cb:"2"`
-	ID             int32    `cb:"3"`
-	CustomerID     int32    `cb:"4"`
-	Channel        string   `cb:"5"`
-	Status         int8     `cb:"6"`
-	Code           string   `cb:"7"`
-	ProductIDs     []int32  `cb:"8"`
-	Tags           []string `cb:"9"`
-	Total          int64    `cb:"10"`
-	Weight         float64  `cb:"11"`
-	UpdatedVersion int32    `cb:"12"`
+	StoreID    int32    `cb:"1"`
+	Created    int32    `cb:"2"`
+	ID         int32    `cb:"3"`
+	CustomerID int32    `cb:"4"`
+	Channel    string   `cb:"5"`
+	Status     int8     `cb:"6"`
+	Code       string   `cb:"7"`
+	ProductIDs []int32  `cb:"8"`
+	Tags       []string `cb:"9"`
+	Total      int64    `cb:"10"`
+	Weight     float64  `cb:"11"`
+	Updated    int64    `cb:"12"`
 }
 
 type CheckOrderTable struct {
 	dynamo.Model[CheckOrderTable, CheckOrder]
-	StoreID        dynamo.Col[CheckOrderTable, int32]
-	Created        dynamo.Col[CheckOrderTable, int32]
-	ID             dynamo.Col[CheckOrderTable, int32]
-	CustomerID     dynamo.Col[CheckOrderTable, int32]
-	Channel        dynamo.Col[CheckOrderTable, string]
-	Status         dynamo.Col[CheckOrderTable, int8]
-	Code           dynamo.Col[CheckOrderTable, string]
-	ProductIDs     dynamo.ColSlice[CheckOrderTable, int32]
-	Tags           dynamo.ColSlice[CheckOrderTable, string]
-	Total          dynamo.Col[CheckOrderTable, int64]
-	Weight         dynamo.Col[CheckOrderTable, float64]
-	UpdatedVersion dynamo.Col[CheckOrderTable, int32]
+	StoreID    dynamo.Col[CheckOrderTable, int32]
+	Created    dynamo.Col[CheckOrderTable, int32]
+	ID         dynamo.Col[CheckOrderTable, int32]
+	CustomerID dynamo.Col[CheckOrderTable, int32]
+	Channel    dynamo.Col[CheckOrderTable, string]
+	Status     dynamo.Col[CheckOrderTable, int8]
+	Code       dynamo.Col[CheckOrderTable, string]
+	ProductIDs dynamo.ColSlice[CheckOrderTable, int32]
+	Tags       dynamo.ColSlice[CheckOrderTable, string]
+	Total      dynamo.Col[CheckOrderTable, int64]
+	Weight     dynamo.Col[CheckOrderTable, float64]
+	Updated    dynamo.Col[CheckOrderTable, int64]
 }
 
 func (table CheckOrderTable) GetSchema() dynamo.Schema {
@@ -67,28 +67,26 @@ var CheckOrders = dynamo.NewRepo[CheckOrderTable, CheckOrder]()
 // index is FullCopy: every element row carries the record, so Contains is a single Query. Its two
 // delta indexes are keys-only: one row per record, and one per TeamIDs element.
 type CheckProduct struct {
-	ID             int32   `cb:"1"`
-	Brand          string  `cb:"2"`
-	Price          int32   `cb:"3"`
-	Name           string  `cb:"4"`
-	CategoryIDs    []int16 `cb:"5"`
-	Status         int8    `cb:"6"`
-	TeamIDs        []int16 `cb:"7"`
-	Updated        int32   `cb:"8"`
-	UpdatedVersion int32   `cb:"9"`
+	ID          int32   `cb:"1"`
+	Brand       string  `cb:"2"`
+	Price       int32   `cb:"3"`
+	Name        string  `cb:"4"`
+	CategoryIDs []int16 `cb:"5"`
+	Status      int8    `cb:"6"`
+	TeamIDs     []int16 `cb:"7"`
+	Updated     int64   `cb:"8"`
 }
 
 type CheckProductTable struct {
 	dynamo.Model[CheckProductTable, CheckProduct]
-	ID             dynamo.Col[CheckProductTable, int32]
-	Brand          dynamo.Col[CheckProductTable, string]
-	Price          dynamo.Col[CheckProductTable, int32]
-	Name           dynamo.Col[CheckProductTable, string]
-	CategoryIDs    dynamo.ColSlice[CheckProductTable, int16]
-	Status         dynamo.Col[CheckProductTable, int8]
-	TeamIDs        dynamo.ColSlice[CheckProductTable, int16]
-	Updated        dynamo.Col[CheckProductTable, int32]
-	UpdatedVersion dynamo.Col[CheckProductTable, int32]
+	ID          dynamo.Col[CheckProductTable, int32]
+	Brand       dynamo.Col[CheckProductTable, string]
+	Price       dynamo.Col[CheckProductTable, int32]
+	Name        dynamo.Col[CheckProductTable, string]
+	CategoryIDs dynamo.ColSlice[CheckProductTable, int16]
+	Status      dynamo.Col[CheckProductTable, int8]
+	TeamIDs     dynamo.ColSlice[CheckProductTable, int16]
+	Updated     dynamo.Col[CheckProductTable, int64]
 }
 
 func (table CheckProductTable) GetSchema() dynamo.Schema {

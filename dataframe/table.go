@@ -6,7 +6,7 @@ import (
 )
 
 // Table is what a frame's runs, rebuilds and reads need of the database that holds its records: the
-// frame's state record, the table's write sequence, and four record reads. A driver implements it once
+// frame's state record, the table's write clock, and four record reads. A driver implements it once
 // per table (dynamo: frameTable). Every read is consistent: a run that misses a write it should see
 // leaves the files wrong until a rebuild.
 type Table interface {
@@ -27,14 +27,14 @@ type Table interface {
 	// mergedDays from them (one of the two is empty). ctx is the lock's write context.
 	CommitSnapshot(ctx context.Context, frame *Frame, snapshot int64, addedDays, mergedDays []int64) error
 
-	// CurrentWriteVersion reads the table's UpdatedVersion sequence: the last version reserved.
+	// CurrentWriteVersion reads the table's write clock: the Updated a write would stamp now.
 	CurrentWriteVersion() (int64, error)
 
 	// ReadAllRecords reads every record of the table.
 	ReadAllRecords(frame *Frame) ([]RecordState, error)
 	// ReadRecordsInRange reads the records whose Keys[0] is in [fromKey, toKey].
 	ReadRecordsInRange(frame *Frame, fromKey, toKey int64) ([]RecordState, error)
-	// ReadRecordsWrittenAfter reads every record whose UpdatedVersion is above snapshot, including one
+	// ReadRecordsWrittenAfter reads every record whose Updated is above snapshot, including one
 	// rewritten while the read ran.
 	ReadRecordsWrittenAfter(frame *Frame, snapshot int64) ([]RecordState, error)
 	// ReadRecordsBySK reads records by their sk; missing ones are left out.
@@ -50,7 +50,7 @@ type State struct {
 	// Snapshot (w) is the snapshot every file holds; none: not built (a new frame, or a new shape).
 	HasSnapshot bool
 	Snapshot    int64
-	// Target (nx) is the newest checkpoint, a value of the write sequence, read at TargetTime (nxt, unix
+	// Target (nx) is the newest checkpoint, a value of the write clock, read at TargetTime (nxt, unix
 	// seconds).
 	HasTarget  bool
 	Target     int64
@@ -89,8 +89,8 @@ func readState(table Table, frame *Frame) (State, error) {
 }
 
 // pushCheckpoint pushes a checkpoint once the newest has settled, or when there is none: the write
-// sequence value now becomes the newest, and the newest the previous one. The sequence is read before
-// the clock, so every version up to the value was reserved by the time recorded. Of two concurrent
+// clock's value now becomes the newest, and the newest the previous one. Every write stamped a version
+// up to the value started by the time recorded (within the clock skew settle allows for). Of two concurrent
 // pushers one goes through, and the other keeps the state it read, whose checkpoints are as valid. It
 // returns the state after.
 func pushCheckpoint(table Table, frame *Frame, state State) (State, error) {

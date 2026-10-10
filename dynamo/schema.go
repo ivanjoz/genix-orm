@@ -250,18 +250,17 @@ type Schema struct {
 	// Ignored unless UseAutoincrement is true.
 	AutoincrementRandomPadding int
 
-	// SaveUpdatedVersion enables the by-IDs cache (cache_updated_version.go): every
-	// write bumps the version of the record's slot, and Repo.QueryCachedIDs returns
-	// only the requested records whose slot moved since the client's version. It
-	// needs exactly one integer Keys column (the ID) and the managed int32
-	// "UpdatedVersion" field (see delta.go), which a by-IDs read overwrites with
-	// the slot version.
-	SaveUpdatedVersion bool
+	// CacheByIDs enables the by-IDs cache (cache_by_ids.go): every write sets the
+	// record's slot to its Updated, and Repo.QueryCachedIDs returns only the
+	// requested records whose slot moved since the value the client holds. It needs
+	// exactly one integer Keys column (the ID) and the managed int64 "Updated" field
+	// (see delta.go), which a by-IDs read overwrites with the slot's.
+	CacheByIDs bool
 
 	// VersionedWrites enables Repo.Modify (modify.go) on a table that has neither
-	// SaveUpdatedVersion nor a TypeDelta index: every write stamps the managed int32
-	// "UpdatedVersion" field (delta.go) and stores it as the item attribute "upv".
-	// Those two already imply it.
+	// CacheByIDs, GroupDelta, DataFrames nor a TypeDelta index (those already imply
+	// it): the item carries the managed int64 "Updated" field (delta.go) as the
+	// attribute "upd" too, which the conditional write compares.
 	VersionedWrites bool
 
 	// DataFrames are aggregates of the records kept as files in the frame store
@@ -274,8 +273,8 @@ type Schema struct {
 // ascending, with the sum of each Sums column. Keys[0] is the reprocessing unit (a
 // day): RebuildDataFrames recomputes a range of it from the records.
 //
-// A table with frames needs the managed int32 fields "UpdatedVersion" (json "upv")
-// and "CreatedVersion" (json "crv"), a TypeDelta index without pinned Keys (the run
+// A table with frames needs the managed int64 fields "Updated" (json "upd") and
+// "CreatedVersion" (json "crv"), a TypeDelta index without pinned Keys (the run
 // reads the changed records through it), and no Partition.
 type DataFrame struct {
 	// Name is the frame's folder: lowercase letters, digits and '-', unique in the
@@ -300,8 +299,8 @@ type DataFrame struct {
 }
 
 // TypeDelta marks an Index as a delta index (delta.go): the ORM appends the
-// managed UpdatedVersion to its Keys, so Delta() reads "changed since the
-// client's watermark" as one exact sk range.
+// managed Updated to its Keys, so Delta() reads "changed since the client's
+// watermark" as one exact sk range.
 const TypeDelta int8 = 10
 
 // TypeLocal marks an Index as a local index (local_index.go): one hidden
@@ -381,9 +380,9 @@ type Index struct {
 	// each column, read with Repo.QueryGroups (group_by.go). Not on a TypeDelta
 	// index. An Index with a GroupBy may go without a Slot: counters only.
 	GroupBy []Coln
-	// GroupDelta (with GroupBy) also stamps each counter with the UpdatedVersion of
-	// the last write that touched it, so QueryGroups().Since() reads only changed
-	// groups. It needs the managed UpdatedVersion field (delta.go).
+	// GroupDelta (with GroupBy) also stamps each counter with the Updated of the
+	// last write that touched it, so QueryGroups().Since() reads only changed
+	// groups. It needs the managed Updated field (delta.go).
 	GroupDelta bool
 }
 

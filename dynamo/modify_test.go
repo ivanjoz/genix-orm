@@ -10,16 +10,16 @@ import (
 // ── Modify test entities: one versioned by the flag alone, one not versioned ──
 
 type versionedSecret struct {
-	ID             int32  `cb:"1"`
-	Secret         string `cb:"2"`
-	UpdatedVersion int32  `cb:"3"`
+	ID      int32  `cb:"1"`
+	Secret  string `cb:"2"`
+	Updated int64  `cb:"3"`
 }
 
 type versionedSecretTable struct {
 	Model[versionedSecretTable, versionedSecret]
-	ID             Col[*versionedSecretTable, int32]
-	Secret         Col[*versionedSecretTable, string]
-	UpdatedVersion Col[*versionedSecretTable, int32]
+	ID      Col[*versionedSecretTable, int32]
+	Secret  Col[*versionedSecretTable, string]
+	Updated Col[*versionedSecretTable, int64]
 }
 
 func (t versionedSecretTable) GetSchema() Schema {
@@ -41,17 +41,17 @@ func (t plainNoteTable) GetSchema() Schema {
 	return Schema{Entity: "plain_note", TableID: 78901241, Keys: Cols(t.ID.Size(30))}
 }
 
-// A versioned item carries UpdatedVersion outside the blob, where a condition can compare it.
+// A versioned item carries Updated outside the blob, where a condition can compare it.
 func TestVersionedItemsExposeTheirVersion(t *testing.T) {
 	secrets := NewRepo[versionedSecretTable, versionedSecret]()
-	secret := versionedSecret{ID: 7, Secret: "s", UpdatedVersion: 42}
+	secret := versionedSecret{ID: 7, Secret: "s", Updated: 1_234_567_890_123}
 	item, err := secrets.meta.marshalItem(unsafe.Pointer(&secret), &secret)
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, isNumber := item[versionColumn].(*types.AttributeValueMemberN)
-	if !isNumber || version.Value != "42" {
-		t.Fatalf("item %q = %#v, want the number 42", versionColumn, item[versionColumn])
+	updated, isNumber := item[updatedColumn].(*types.AttributeValueMemberN)
+	if !isNumber || updated.Value != "1234567890123" {
+		t.Fatalf("item %q = %#v, want the number 1234567890123", updatedColumn, item[updatedColumn])
 	}
 
 	notes := NewRepo[plainNoteTable, plainNote]()
@@ -59,8 +59,8 @@ func TestVersionedItemsExposeTheirVersion(t *testing.T) {
 	if item, err = notes.meta.marshalItem(unsafe.Pointer(&note), &note); err != nil {
 		t.Fatal(err)
 	}
-	if _, hasVersion := item[versionColumn]; hasVersion {
-		t.Fatalf("an unversioned item carries %q", versionColumn)
+	if _, hasUpdated := item[updatedColumn]; hasUpdated {
+		t.Fatalf("an unversioned item carries %q", updatedColumn)
 	}
 }
 
@@ -68,8 +68,8 @@ func TestVersionedItemsExposeTheirVersion(t *testing.T) {
 // indexes, that is every row its write diff put.
 func TestLostWriteDeletesItsDeltaRows(t *testing.T) {
 	members := NewRepo[deltaMemberTable, deltaMember]()
-	stored := deltaMember{ID: 9, TeamIDs: []int16{1, 2}, Status: 1, UpdatedVersion: 4}
-	lost := deltaMember{ID: 9, TeamIDs: []int16{2}, Status: 1, UpdatedVersion: 5}
+	stored := deltaMember{ID: 9, TeamIDs: []int16{1, 2}, Status: 1, Updated: 4_000}
+	lost := deltaMember{ID: 9, TeamIDs: []int16{2}, Status: 1, Updated: 5_000}
 	puts, _ := members.meta.arrayIndexWrites(unsafe.Pointer(&stored), unsafe.Pointer(&lost), nil)
 	deletes := members.meta.deltaRowDeletes(unsafe.Pointer(&lost))
 	if len(deletes) != len(puts) {

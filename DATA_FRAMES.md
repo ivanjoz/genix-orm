@@ -59,7 +59,7 @@ read sees a write 10 to 20 minutes later. `.Fresh()` returns the rows as the rec
 | `dataframe.go` | `Frame` (the compiled frame: folder, counts, shape, its `Column`s), `ValuesOf`, the object keys, `ShapeOf` |
 | `compile.go` | `Declaration` and `Compile`: the rules every driver shares (name, 1–3 Keys, Rows, Sums or Count, no column twice, folder collisions) and the shape |
 | `write.go` | `Configure` (store and write deadline), the settle, `WriteWindow`, `ErrWriteDeadline`, and the write path's logic: `CheckValues`, `LoggedWrite`, `AppendLogEntries`, `AppendCancelMarkers` |
-| `table.go` | `Table`, the interface a driver implements (state record, write sequence, four record reads), `State`, checkpoint push and `settledTarget` |
+| `table.go` | `Table`, the interface a driver implements (state record, current write version, four record reads), `State`, checkpoint push and `settledTarget` |
 | `materialize.go` | The state machine over a `Table`: `Materialize` (the run), `RebuildRange` / `RebuildAll`, `Read` (plain and fresh, with the express compaction), `FrameSource` (FrameSQL's read) |
 | `run.go`, `query.go`, `index.go`, `codec.go`, `lock.go`, `store.go` | The file work: incarnations, compactions, rebuilds and the log; selection and file reads; `_idx` / `_ixt`; formats; the frame lock; `Store`, `MemoryStore` |
 | `framesql/` | FrameSQL (`DATA_FRAMES_SQL.md`) |
@@ -69,7 +69,7 @@ read sees a write 10 to 20 minutes later. `.Fresh()` returns the rows as the rec
 | Where | What |
 |---|---|
 | `data_frame.go` | Resolving `Schema.DataFrames` into `dataframe.Declaration`s (`compileDataFrames`) and the rules that depend on the schema (no Partition, a whole-entity delta index, `Keys[0]` leads the Keys / a GSI / a local index, `CreatedVersion`), `frameFolder`, and the write-path hooks: `frameWriteWindowFrom`, `stampCreatedVersions`, `frameWritesOf`, `appendFrameDeleteEntries` |
-| `data_frame_run.go` | `frameTable`, the `dataframe.Table` on DynamoDB: the state item, the upv sequence, the record reads. `MaterializeDataFrames`, `RebuildDataFrames` / `RebuildDataFramesAll` |
+| `data_frame_run.go` | `frameTable`, the `dataframe.Table` on DynamoDB: the state item, `CurrentWriteVersion` (`UpdatedNow()`), the record reads. `MaterializeDataFrames`, `RebuildDataFrames` / `RebuildDataFramesAll` |
 | `data_frame_query.go` | `QueryFrame`, `FrameRow`, `.Fresh()`, `Repo.FrameSource` |
 | `repo.go`, `modify.go`, `controller.go` | The writes that call the hooks: `PutMany`, `InsertMany`, `PutIfAbsent`, `Delete`, `PutManyIfVersion`, `Modify`, `DecodeRecords`. `Controller` exposes the run and the rebuilds without the record type |
 
@@ -107,14 +107,16 @@ other part of the code (log, compactions, rebuilds, codec) sums it like any colu
 - The entity has a `TypeDelta` index with no pinned Keys (`{Type: TypeDelta, Keys: Cols(t.Status)}`):
   the run reads the records written since its snapshot through it.
 - The entity has no `Partition`.
-- The record has `UpdatedVersion` and `CreatedVersion`, both `int32`. A table with frames is
+- The record has `Updated` and `CreatedVersion`, both `int64`. A table with frames is
   versioned and reads its stored records before every write (`readsStoredVersion`).
 - Two frames of the entity whose folders collide (section 5) fail the boot.
 
 **Managed columns.** Handlers never set them:
 
-- `UpdatedVersion`: the write sequence of the base pk, stamped on every write.
-- `CreatedVersion`: the `UpdatedVersion` of the write that inserted the record, copied from the
+- `Updated`: the write time in milliseconds since the UpdatedEpoch (`dynamo/delta.go`), stamped on
+  every write after the stored read, above the stored record's. A frame's versions are `Updated`
+  values.
+- `CreatedVersion`: the `Updated` of the write that inserted the record, copied from the
   stored version on every later write (`stampCreatedVersions`). A record stored before the column
   existed reads 0: older than every snapshot.
 - `Status`: a record with `Status == 0` counts in no frame (soft delete).
@@ -125,7 +127,7 @@ name files and are delta-coded); a negative Sums value fails unless `AllowNegati
 ## 4. Versions and snapshots
 
 Everything hangs on one idea: **a file holds its frame at a snapshot**, the sum of what every
-record held at one `UpdatedVersion` X.
+record held at one `Updated` X.
 
 - Inserts are found in DynamoDB: a record whose `CreatedVersion > X` did not exist at X.
 - Updates and deletes destroy the old values, so **the write logs them**: before landing, it appends
@@ -138,30 +140,34 @@ record held at one `UpdatedVersion` X.
   `incarnations()` groups the records and log entries above W; a **cancel marker** (an entry with
   `IsCancel`) voids the entries of the same sk and `newVersion`: their write never landed.
 
-**Why the version is reserved after the stored read.** An entry claims "the record held these
+**Why the version is stamped above the stored one.** An entry claims "the record held these
 values right below my version". That is only true if the write's version is above the version of
-the record it replaced, so on a table with frames `putMany` assigns IDs, reads the stored records,
-and only then stamps the version (`prepareWriteReadingStored`). `PutManyIfVersion` and `Modify` read
-before they reserve by construction.
+the record it replaced, so `putMany` assigns IDs, reads the stored records (`assignIDsReadingStored`),
+and only then stamps each record `max(clock, stored Updated + 1)` (`aboveStored`): a clock that lags
+the one that stamped the stored record can't put the entry below it. `PutManyIfVersion` and
+`Modify` stamp at least the expected `Updated + 1`, which their condition proves is the stored one.
+A `Delete` stamps its key record the same way, and its entries carry that value.
 
-**Settling.** A version is reserved before its write lands, so a compaction may only target a
-version once every write that took a version up to it has landed (or given up and logged its cancel
-markers). The write deadline bounds that:
+**Settling.** A version is stamped before its write lands, so a compaction may only target a
+version once every write stamped up to it has landed (or given up and logged its cancel markers).
+The write deadline bounds that:
 
 - **Write deadline** (`dataframe.WriteDeadline()`, 10 s, `dataframe.Configure`): a write lands within 10 s of
-  the stored read it diffs against (or of its version reservation when it reads nothing). Its log
+  the stored read it diffs against (or of its start when it reads nothing); the stamp comes after
+  that moment. Its log
   append, new hidden rows and base items carry a context deadline; past it the write lands nothing
   more and returns `ErrWriteDeadline`.
 - **Cancel grace** (3 s): a write's cancel markers carry a deadline 3 s after its own.
 - **Settle** = 2 × 10 s + 3 s + 2 s margin = **25 s** (`settle`, `write.go`). A losing conditional write
   read the record before the winner landed, so it finishes one deadline plus the grace after that.
 
-**Checkpoints** (state item `nx`, `nxt`, `px`). A checkpoint is a value of the upv sequence and the
-time it was read, sequence first: every version up to it was reserved by then, so it is settled 25 s
-later.
+**Checkpoints** (state item `nx`, `nxt`, `px`). A checkpoint is the `Updated` clock
+(`Table.CurrentWriteVersion`; dynamo: `UpdatedNow()`, no read) and the time it was taken: every
+version up to it was stamped by then, give or take the clock skew between Lambdas, which the settle
+margin covers, so it is settled 25 s later.
 
 - `pushCheckpoint` (`table.go`): when the newest checkpoint is more than 25 s old (or there is
-  none), read the sequence, then the clock, and have the driver set `px = nx, nx = value, nxt = now`,
+  none), take the write version, then the time, and have the driver set `px = nx, nx = value, nxt = now`,
   conditioned on `nxt` being the one read (`Table.PushCheckpoint`). Of two pushers one wins; the
   other keeps its state, as valid.
 - `settledTarget(now)`: `nx` once `now − nxt > 25 s`, else `px` (settled by construction: a push
@@ -197,10 +203,10 @@ later.
 ### The state record (`State`; on DynamoDB, an item)
 
 ```text
-pk = base pk ‖ 000      beside the GroupBy counters (sk g…) and the slot versions (sk v)
+pk = base pk ‖ 000      beside the GroupBy counters (sk g…) and the by-IDs slots (sk v)
 sk = "f" + frame name
 w        the snapshot every file holds; absent: not built (a new frame, or a new shape)
-nx, nxt  the newest checkpoint and when it was read (unix seconds)
+nx, nxt  the newest checkpoint (an Updated value) and when it was taken (unix seconds)
 px       the previous checkpoint, settled
 ix       the days whose _ixt has entries to merge into their _idx (a number set)
 sh       the shape the files were built with
@@ -250,10 +256,10 @@ the driver: `dynamo/repo.go`, `modify.go`):
 
 1. **`CheckValues`** on the records to write.
 2. **The window opens** (`OpenWriteWindow`; dynamo: `frameWriteWindowFrom`): at the stored read the write diffs against, or at
-   the version reservation when it reads nothing.
-3. **Stored read, then version.** The stored records are read consistently, then the version is
-   reserved and stamped. `CreatedVersion` is stamped from the stored record, or set to the new
-   `UpdatedVersion` for an insert.
+   the write's start when it reads nothing.
+3. **Stored read, then version.** The stored records are read consistently, then `Updated` is
+   stamped, above each stored one (no DynamoDB call). `CreatedVersion` is stamped from the stored
+   record, or set to the new `Updated` for an insert.
 4. **Log append, before the base write** (`AppendLogEntries`). For every record with a stored
    version and, per frame, whose frame values change (`Frame.ValuesOf` differs, Status 0 = nil), one
    entry with the stored values. One `Append` per frame, frames in parallel. An insert logs nothing:
@@ -262,7 +268,7 @@ the driver: `dynamo/repo.go`, `modify.go`):
 6. **Cancel markers** (`AppendCancelMarkers`) for the records logged that did not land: never sent,
    or lost their condition. A record whose request failed without an answer may have landed: it
    keeps its entry. The markers have the 3 s grace.
-7. Stale hidden-row deletes, GroupBy counters and slot versions come after, outside the window:
+7. Stale hidden-row deletes, GroupBy counters and by-IDs slots come after, outside the window:
    frames don't read them.
 
 Per write call:
@@ -273,7 +279,7 @@ Per write call:
 | `InsertMany` | none: the caller says they are new | none. A record that was in fact stored counts twice until rebuilt |
 | `PutIfAbsent` | none: it only writes when absent | none (an insert); the hidden rows go after the base item, within the window |
 | `PutManyIfVersion`, `Modify` | the caller's read, or the write cache of `GetManyForUpdate` (the window starts at the oldest cached read) | as `PutMany`; a record that loses its condition gets a cancel marker |
-| `Delete` | consistent read of the record | when the record counts in a frame, it reserves a version for the delete and logs its values (`appendFrameDeleteEntries`); a delete not sent gets cancel markers |
+| `Delete` | consistent read of the record | when the record counts in a frame, it logs its values at the `Updated` the delete stamped on its key record (`appendFrameDeleteEntries`); a delete not sent gets cancel markers |
 | `DecodeRecords` (`Controller`, imports) | — | validates frame values only |
 
 A table with frames needs the store set (`dataframe.Configure`) before its first update or delete.
@@ -286,7 +292,7 @@ frame (`dataframe.Materialize` → `runFrame`, over the driver's `Table`):
 1. **Take the lock** (`dataframe.TakeLock`). Held by another compaction: skip the frame, no error.
    Then read the state item.
 2. **Reset** when there is no state or `sh` differs from the frame's shape: delete the old shape's
-   log, then set `sh`, `nx` = the sequence now, `nxt` = now, and remove `w`, `px`, `ix`. Stop. The
+   log, then set `sh`, `nx` = the write version now, `nxt` = now, and remove `w`, `px`, `ix`. Stop. The
    frame is not built: `QueryFrame` returns `ErrNotBuilt`.
 3. **Push a checkpoint** when the newest has settled, and take the target T = the newest settled
    checkpoint.
@@ -296,8 +302,9 @@ frame (`dataframe.Materialize` → `runFrame`, over the driver's `Table`):
      entity) and the log: write every file and `_idx`, delete every other object of the folder but
      the log and the lock. This happens on the second run after the reset.
    - Otherwise **compact** (`CompactFrame`) from W = `w` to max(W, T), merging the days in `ix`:
-     1. *Records*: a consistent Query of the whole-entity delta index for `UpdatedVersion > W`
-        (`Table.ReadRecordsWrittenAfter`, which keeps a record whose row moved during the read).
+     1. *Records*: a consistent Query of the whole-entity delta index for `Updated > W`, the rows
+        from W + 1 with no overlap window or fingerprint (`Table.ReadRecordsWrittenAfter`, which
+        keeps a record whose row moved during the read).
      2. *Log*: GET `_log.<shape>` after the records: an entry is appended before its write lands,
         so every change the record read saw is in the log.
      3. *Missing records*: the sks with entries above W that the read didn't return (deleted, or a
@@ -450,7 +457,7 @@ stored record, files edited by hand. Both take the frame's lock, waiting up to a
   and the grace), **`TestFrameCountColumn`** (the count's place, a soft delete counting nothing, a
   count-only frame, the shape).
 - **`TestDataFrameRunsMatchBruteForce`, the spec** (250 seeds; its `day-client-product` counts): writers go through the real write
-  path in steps (read, reserve, log, land / lose / crash), interleaved with runs, range and full
+  path in steps (read, stamp, log, land / lose / crash), interleaved with runs, range and full
   rebuilds, fresh reads and express compactions (half of them slow, holding the lock across steps,
   some losing it), on a lock clock of 2 s per step. Compactions crash at random writes and keep
   their lock. After every commit and rebuild, every file must equal a brute-force aggregate of the
@@ -478,8 +485,9 @@ inserts written into the files by an express compaction and merged by the next r
   deleted the key) can count twice for one run.
 - **A crashed compaction holds the frame 20 s**: runs skip it, express compactions skip their
   write, rebuilds wait.
-- **The lock relies on the clocks**: a skew past 2 s, or a request landing more than 2 s after its
-  deadline, could let two holders' writes overlap.
+- **The lock and the settle rely on the clocks**: a skew past 2 s, or a request landing more than
+  2 s after its deadline, could let two holders' writes overlap, or let a run target a checkpoint
+  before a write a lagging Lambda stamped below it has landed.
 - **Hand-edited files** are only caught by `RebuildDataFramesAll`.
 - **`DeleteRecordsAll` wipes the state item**: the frame restarts and its next build deletes the old
   files.
@@ -487,8 +495,8 @@ inserts written into the files by an express compaction and merged by the next r
 
 ## 14. Invariants to keep when changing this code
 
-- A write appends its log entry **before** its base write lands, and reserves its version **after**
-  the stored read.
+- A write appends its log entry **before** its base write lands, and stamps its version **after**
+  the stored read, above the stored record's.
 - A compaction targets only a **settled** checkpoint, and reads the records **before** the log.
 - Only the lock holder writes files, indexes, `w`, `ix` and `sh`, and **every** such write goes
   through the lock (`lock.put` / `append` / `Delete` / `WriteContext`).

@@ -8,7 +8,7 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The runs, rebuilds and reads of a frame, over a driver's Table (../DATA_FRAMES.md,
-// sections 4 and 7 to 10). A version is reserved before its write lands, so a
+// sections 4 and 7 to 10). A version is stamped before its write lands, so a
 // compaction targets a checkpoint only once it is settle old: every write that took
 // a version up to it has landed or given up (write.go). Every compaction (the
 // scheduled run, a rebuild, the express compaction of a fresh read) holds the

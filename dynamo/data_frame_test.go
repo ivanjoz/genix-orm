@@ -33,9 +33,8 @@ type frameLine struct {
 	Discount       int32  `cb:"8"`
 	Note           string `cb:"9"`
 	Status         int8   `cb:"10"`
-	Updated        int32  `cb:"11"`
-	UpdatedVersion int32  `cb:"12"`
-	CreatedVersion int32  `cb:"13"`
+	Updated        int64  `cb:"11"`
+	CreatedVersion int64  `cb:"13"`
 }
 
 type frameLineTable struct {
@@ -50,9 +49,8 @@ type frameLineTable struct {
 	Discount       Col[*frameLineTable, int32]
 	Note           Col[*frameLineTable, string]
 	Status         Col[*frameLineTable, int8]
-	Updated        Col[*frameLineTable, int32]
-	UpdatedVersion Col[*frameLineTable, int32]
-	CreatedVersion Col[*frameLineTable, int32]
+	Updated        Col[*frameLineTable, int64]
+	CreatedVersion Col[*frameLineTable, int64]
 }
 
 func (t frameLineTable) GetSchema() Schema {
@@ -163,20 +161,20 @@ func TestFrameCountColumn(t *testing.T) {
 }
 
 type uncreatedLine struct {
-	Fecha          int16 `cb:"1"`
-	ProductID      int32 `cb:"2"`
-	Quantity       int32 `cb:"3"`
-	Status         int8  `cb:"4"`
-	UpdatedVersion int32 `cb:"5"`
+	Fecha     int16 `cb:"1"`
+	ProductID int32 `cb:"2"`
+	Quantity  int32 `cb:"3"`
+	Status    int8  `cb:"4"`
+	Updated   int64 `cb:"5"`
 }
 
 type uncreatedLineTable struct {
 	Model[uncreatedLineTable, uncreatedLine]
-	Fecha          Col[*uncreatedLineTable, int16]
-	ProductID      Col[*uncreatedLineTable, int32]
-	Quantity       Col[*uncreatedLineTable, int32]
-	Status         Col[*uncreatedLineTable, int8]
-	UpdatedVersion Col[*uncreatedLineTable, int32]
+	Fecha     Col[*uncreatedLineTable, int16]
+	ProductID Col[*uncreatedLineTable, int32]
+	Quantity  Col[*uncreatedLineTable, int32]
+	Status    Col[*uncreatedLineTable, int8]
+	Updated   Col[*uncreatedLineTable, int64]
 }
 
 func TestDataFrameNeedsCreatedVersion(t *testing.T) {
@@ -221,7 +219,7 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 	dataframe.Configure(store, dataframe.WriteDeadline())
 	defer dataframe.Configure(nil, dataframe.WriteDeadline())
 
-	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, ClientID: 9, Quantity: 2000, Amount: 500, Status: 1, UpdatedVersion: 10, CreatedVersion: 4}
+	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, ClientID: 9, Quantity: 2000, Amount: 500, Status: 1, Updated: 10_000, CreatedVersion: 4_000}
 	logFrames := func(written *frameLine) []string {
 		store.Delete(context.Background(), slices.Collect(func(yield func(string) bool) {
 			keys, _ := store.List("")
@@ -229,8 +227,8 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 				yield(key)
 			}
 		})...)
-		written.UpdatedVersion = 11
-		write := frameLines.meta.loggedWrite(unsafe.Pointer(stored), unsafe.Pointer(written), 11)
+		written.Updated = 11_000
+		write := frameLines.meta.loggedWrite(unsafe.Pointer(stored), unsafe.Pointer(written), 11_000)
 		if err := dataframe.AppendLogEntries(context.Background(), frameLines.meta.dataFrames, []dataframe.LoggedWrite{write}, false); err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +243,7 @@ func TestFrameLogEntriesOfWrites(t *testing.T) {
 				continue
 			}
 			entry := entries[0]
-			if entry.NewVersion != 11 || entry.CreatedVersion != 4 || entry.SK != frameLines.meta.skValue(unsafe.Pointer(stored)) {
+			if entry.NewVersion != 11_000 || entry.CreatedVersion != 4_000 || entry.SK != frameLines.meta.skValue(unsafe.Pointer(stored)) {
 				t.Fatalf("%s: entry %+v", frame.Name, entry)
 			}
 			if !dataframe.EqualValues(entry.OldValues, frameLines.meta.frameValuesOf(frame, unsafe.Pointer(stored))) {
@@ -284,10 +282,10 @@ func TestFrameWriteWindow(t *testing.T) {
 	defer dataframe.Configure(nil, dataframe.WriteDeadline())
 	frame := &frameLines.meta.dataFrames[0]
 
-	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, Quantity: 2000, Status: 1, UpdatedVersion: 10, CreatedVersion: 4}
+	stored := &frameLine{Fecha: 20730, SaleID: 7, Line: 1, ProductID: 3, Quantity: 2000, Status: 1, Updated: 10_000, CreatedVersion: 4_000}
 	written := *stored
-	written.Quantity, written.UpdatedVersion = 3000, 11
-	writes := []dataframe.LoggedWrite{frameLines.meta.loggedWrite(unsafe.Pointer(stored), unsafe.Pointer(&written), 11)}
+	written.Quantity, written.Updated = 3000, 11_000
+	writes := []dataframe.LoggedWrite{frameLines.meta.loggedWrite(unsafe.Pointer(stored), unsafe.Pointer(&written), 11_000)}
 	frames := frameLines.meta.dataFrames
 
 	expiredWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-dataframe.WriteDeadline()))
@@ -299,8 +297,8 @@ func TestFrameWriteWindow(t *testing.T) {
 	if err := dataframe.AppendCancelMarkers(expiredWindow, Now(), frames, writes); err != nil {
 		t.Fatalf("cancel markers within the grace: %v", err)
 	}
-	if entries, _ := dataframe.ReadLog(store, frame); len(entries) != 1 || !entries[0].IsCancel || entries[0].NewVersion != 11 {
-		t.Fatalf("the log holds %+v, want one cancel marker of version 11", entries)
+	if entries, _ := dataframe.ReadLog(store, frame); len(entries) != 1 || !entries[0].IsCancel || entries[0].NewVersion != 11_000 {
+		t.Fatalf("the log holds %+v, want one cancel marker of version 11000", entries)
 	}
 	pastGraceWindow := frameLines.meta.frameWriteWindowFrom(Now().Add(-dataframe.WriteDeadline() - dataframe.CancelGrace))
 	if err := dataframe.AppendCancelMarkers(pastGraceWindow, Now(), frames, writes); !errors.Is(err, context.DeadlineExceeded) {
@@ -312,7 +310,7 @@ func TestFrameWriteWindow(t *testing.T) {
 // The randomized compaction test: the spec of the runs and of the express
 // compactions. Writers race on a small table through the real write-path code
 // (stampCreatedVersions, frameWritesOf, appendFrameLogEntries) in steps (read,
-// reserve, log, land), interleaved with runs, fresh reads, express compactions and
+// stamp, log, land), interleaved with runs, fresh reads, express compactions and
 // rebuilds, which crash at random points. After every commit and rebuild each file
 // must equal a brute-force aggregate of the records at its own snapshot (the
 // frame's, when older), and every fresh read the records as they are.
@@ -414,7 +412,7 @@ type frameSimWriter struct {
 	stored, written *frameLine // stored nil: an insert; written nil: a delete
 	writes          []dataframe.LoggedWrite
 	version         int64
-	step            int // 1: read, 2: reserved, 3: logged
+	step            int // 1: read, 2: stamped, 3: logged
 	crashes         bool
 }
 
@@ -468,7 +466,7 @@ type frameSimulation struct {
 	store     *crashingFrameStore
 	records   map[string]*frameLine
 	history   map[string][]frameSimLanding
-	sequence  int64
+	sequence  int64 // the Updated clock, as one process's nextUpdated: the last value handed out
 	writers   []*frameSimWriter
 	expresses []*frameSimExpress // the slow ones in flight
 	states    []frameSimState
@@ -647,7 +645,7 @@ func (sim *frameSimulation) startWriter() {
 	sim.writers = append(sim.writers, writer)
 }
 
-// advanceWriter takes the writer's next step: reserve its version, append its log
+// advanceWriter takes the writer's next step: stamp its Updated, append its log
 // entries, then land, lose (and cancel) or crash.
 func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 	meta := frameLines.meta
@@ -658,7 +656,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 		if writer.written == nil {
 			writer.writes = []dataframe.LoggedWrite{meta.loggedWrite(unsafe.Pointer(writer.stored), nil, writer.version)}
 		} else {
-			writer.written.UpdatedVersion = int32(writer.version)
+			writer.written.Updated = writer.version
 			writtenPtrs := []unsafe.Pointer{unsafe.Pointer(writer.written)}
 			storedByKey := map[string]unsafe.Pointer{}
 			if writer.stored != nil {
@@ -667,7 +665,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 			meta.stampCreatedVersions(writtenPtrs, storedByKey)
 			writer.writes = meta.frameWritesOf(writtenPtrs, storedByKey)
 		}
-		sim.tracef("writer v%d on %q reserved: stored %+v written %+v", writer.version, writer.sk, writer.stored, writer.written)
+		sim.tracef("writer v%d on %q stamped: stored %+v written %+v", writer.version, writer.sk, writer.stored, writer.written)
 	case 2:
 		if err := dataframe.AppendLogEntries(context.Background(), meta.dataFrames, writer.writes, false); err != nil {
 			sim.t.Fatal(err)
@@ -675,7 +673,7 @@ func (sim *frameSimulation) advanceWriter(writer *frameSimWriter) {
 		sim.tracef("writer v%d logged", writer.version)
 	case 3:
 		current := sim.records[writer.sk]
-		isUnchanged := (current == nil) == (writer.stored == nil) && (current == nil || current.UpdatedVersion == writer.stored.UpdatedVersion)
+		isUnchanged := (current == nil) == (writer.stored == nil) && (current == nil || current.Updated == writer.stored.Updated)
 		isAlone := !slices.ContainsFunc(sim.writers, func(other *frameSimWriter) bool { return other != writer && other.sk == writer.sk })
 		switch {
 		case writer.crashes && isUnchanged && isAlone:
@@ -717,7 +715,7 @@ func (sim *frameSimulation) readRecords(frame *dataframe.Frame, matches func(lin
 // recordReaders are the record reads of a compaction: the records written after a snapshot, and by sk.
 func (sim *frameSimulation) recordReaders(frame *dataframe.Frame) (func(snapshot int64) ([]dataframe.RecordState, error), func(sks []string) ([]dataframe.RecordState, error)) {
 	readWrittenAfter := func(snapshot int64) ([]dataframe.RecordState, error) {
-		return sim.readRecords(frame, func(line *frameLine) bool { return int64(line.UpdatedVersion) > snapshot }), nil
+		return sim.readRecords(frame, func(line *frameLine) bool { return line.Updated > snapshot }), nil
 	}
 	readBySK := func(sks []string) ([]dataframe.RecordState, error) {
 		return sim.readRecords(frame, func(line *frameLine) bool {
@@ -861,7 +859,7 @@ func (sim *frameSimulation) rebuildFrame(frameIndex int, isRange bool) {
 
 // freshReadFrame checks a fresh read of a built frame, over a random range of days and maybe a pinned
 // ClientID, against a brute-force aggregate of the records as they are now, while writers are
-// reserved, logged, about to lose or crashed. Then, as expressCompactFrame, it pushes a checkpoint,
+// stamped, logged, about to lose or crashed. Then, as expressCompactFrame, it pushes a checkpoint,
 // and may start an express compaction to the newest checkpoint settled when the read began: half of
 // them finish now, the slow ones over later steps.
 func (sim *frameSimulation) freshReadFrame(frameIndex int) {

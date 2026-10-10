@@ -117,20 +117,25 @@ A violation makes `NewRepo` panic at boot:
   - pin it when renaming an `Entity` without moving its data.
 - **Autoincrement** needs an integer field named `ID`. `AutoincrementRandomPadding` (0..9) adds
   random low digits.
-- **`SaveUpdatedVersion`** needs exactly one integer `Keys` column and an `int32` field named
-  `UpdatedVersion` (`json:"upv"`) in the record and the table struct. See section 3b.
-- **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need the same `int32` `UpdatedVersion`, and
-  a `cb` tag on their first Key (on `UpdatedVersion` when they have none). See section 3c.
+- **The managed `Updated`:** an integer field named `Updated` must be an `int64` (`json:"upd"`),
+  in the record and the table struct. A **versioned table** needs it: `CacheByIDs`,
+  `VersionedWrites`, DataFrames, a delta index or a `GroupDelta`.
+- **`CacheByIDs`** needs exactly one integer `Keys` column and the `int64` `Updated`. See section 3b.
+- **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need the `int64` `Updated`, and a `cb` tag on
+  their first Key (on `Updated` when they have none). See section 3c.
 - **Local indexes** (`{Type: TypeLocal, Keys: ...}`) take scalar Keys only, the first one with a
   `cb` tag, and no Slot or GroupBy. See section 3c'.
-- **`VersionedWrites`** needs the same `int32` `UpdatedVersion`; it only enables `Modify` (section 2)
-  on a table that has neither `SaveUpdatedVersion` nor a delta index (those imply it).
-- **DataFrames** need the `int32` `UpdatedVersion` and `CreatedVersion`, a whole-entity delta
-  index and no `Partition`. See section 3e.
-- **Managed fields:** every Put stamps an integer field named `Updated` with the write time
-  (SUnixTime) and, on a versioned table (a delta index, `SaveUpdatedVersion` or `VersionedWrites`),
-  `UpdatedVersion` with the write sequence, also stored as the item attribute `upv`. On a table
-  with DataFrames, `CreatedVersion` is the `UpdatedVersion` of the insert. Never set them yourself.
+- **`VersionedWrites`** needs the `int64` `Updated`; it only enables `Modify` (section 2) on a table
+  that is not versioned otherwise (the others imply it).
+- **DataFrames** need the `int64` `Updated` and `CreatedVersion`, a whole-entity delta index and no
+  `Partition`. See section 3e.
+- **An index of your own keyed on `Updated`** declares `.Size(42)`, its full width.
+- **Managed fields:** every write stamps `Updated` with the write time in **milliseconds since the
+  UpdatedEpoch** (`dynamo.SetUpdatedEpoch`, set once at boot; berryapps: `[dynamo].unix_time_start`),
+  with no round trip, and above the record's stored value whenever the write reads it (hidden rows,
+  GroupBy, frames, `Modify`/`PutManyIfVersion`). A versioned table also stores it
+  as the item attribute `upd`. On a table with DataFrames, `CreatedVersion` is the `Updated` of the
+  insert. Never set them yourself. Convert with `dynamo.UpdatedOfTime(t)` / `UpdatedToTime(upd)`.
 
 ## 2. Writing and reading by key
 
@@ -162,12 +167,12 @@ all, err := Orders.Scan(100)           // admin/debug only: reads the whole enti
   })
   ```
 
-  It reads consistently and writes only if `upv` still holds the version read, re-running the
+  It reads consistently and writes only if `upd` still holds the `Updated` read, re-running the
   change on a race (8 attempts, then `dynamo.ErrWriteConflict`). An unchanged record writes nothing.
-  Records stored before the table was versioned have no `upv`: `Put` them once.
+  Records stored before the table was versioned have no `upd`: `Put` them once.
 - **Many records → `GetMany` + `PutManyIfVersion`.** `GetMany(keys)` reads consistently;
-  `PutManyIfVersion(records)` writes each one only if its `UpdatedVersion` is still the stored one,
-  with one version reservation for the call, and returns the ones that lost a race: re-read, re-edit
+  `PutManyIfVersion(records)` writes each one only if its `Updated` is still the stored one,
+  and returns the ones that lost a race: re-read, re-edit
   and retry those (pause with `ConflictBackoff(attempt)`). On a table with fan-out or delta indexes,
   read with `GetManyForUpdate` instead: it keeps the stored blobs in the process write cache (15 s),
   so the write diffs the index rows without reading them again.
@@ -238,32 +243,34 @@ Operators: `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, `BeginsWith`, `Contains`, 
   Query but rewrites every element row on every `Put`. Choose FullCopy for read-heavy, rarely
   written records with short slices.
 
-## 3b. By-IDs cache (`SaveUpdatedVersion`, `QueryCachedIDs`)
+## 3b. By-IDs cache (`CacheByIDs`, `QueryCachedIDs`)
 
 Use it for "give me records [12, 87, 412], skip the ones I already have unchanged". It backs
 genix-ui's cache-by-ids (`getRecordByID`, `RecordByIDText`, `GetHandler.routeByID`).
 
 ```go
 // schema: Cols(t.ID.Size(32)) and nothing else in Keys, plus
-SaveUpdatedVersion: true,
+CacheByIDs: true,
 // record and table struct:
-UpdatedVersion int32 `json:"upv,omitempty" cb:"N"`
-UpdatedVersion dynamo.Col[OrderTable, int32]
+Updated int64 `json:"upd" cb:"N"`
+Updated dynamo.Col[OrderTable, int64]
 
-changed, err := Orders.QueryCachedIDs(cachedIDs)          // []dynamo.IDUpdatedVersion{ID, UpdatedVersion}
+changed, err := Orders.QueryCachedIDs(cachedIDs)          // []dynamo.CachedID{ID, Updated}
 changed, err  = Orders.QueryCachedIDs(cachedIDs, storeID) // one value per Partition column
 ```
 
-- A record is in slot `uint8(ID)`. Each partition has one hidden slot-versions item
-  (`pk = base pk ‖ 000`), where every write ADDs 1 to the slots it touched, after the record is
+- A record is in slot `uint8(ID)`. Each partition has one hidden slot item (`pk = base pk ‖ 000`,
+  `sk = "v"`), where every write SETs the slots it touched to its `Updated`, after the record is
   written.
-- `QueryCachedIDs` does one GetItem for the slot versions, then one consistent BatchGetItem for
-  the IDs whose client version (0 = none) differs. Unchanged and missing IDs are left out, and the
-  returned records carry the **slot** version in `UpdatedVersion`.
-- The ORM owns `UpdatedVersion`. As stored it is the write sequence (section 3c). Only a by-IDs
-  read overwrites it with the slot version, as in genix.
+- `QueryCachedIDs` does one GetItem for the slots, then one consistent BatchGetItem for the IDs
+  whose client value (0 = none) differs from the slot's. Unchanged and missing IDs are left out,
+  and the returned records carry the **slot's** `Updated` in `Updated` — or **0 while the slot value
+  is younger than `DeltaOverlap`** (4 s; a concurrent or late write could still stamp it again),
+  so the client reads that record again on its next revalidation.
+- Everywhere else `Updated` is the record's own write time (section 3c); only a by-IDs read
+  overwrites it with the slot's.
 - A write to one record makes the other records of its slot (IDs 256 apart) come back once too.
-- A record never written since the flag was turned on has no slot version, so it is read on every
+- A record never written since the flag was turned on has no slot value, so it is read on every
   request. Re-`Put` the existing records once after enabling the flag.
 
 ## 3c. Delta sync (`TypeDelta`, `Delta()`)
@@ -277,19 +284,27 @@ Indexes: []dynamo.Index{
     {Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.TeamIDs.Size(8), t.Status)},    // per team, fan-out
 },
 
-Orders.Query().Delta(watermark, 1).Exec(&out)                          // W = the client's highest upv
-Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(watermark, 1).Exec(&out)
+// since = dynamo.DeltaSince{Updated: W, Fingerprint: fp}: what the client holds (zero on a first sync)
+Orders.Query().Delta(since, 1).Exec(&out)
+Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(since, 1).Exec(&out)
 ```
 
 - **The last Key, unless it is a ColSlice, is the sync filter column.** It is not in the row sk.
-  `Delta(W, values...)` keeps only those values on a first sync (`W = 0`) and every value on a
-  later one, so soft-deleted records reach the clients caching them.
+  `Delta(since, values...)` keeps only those values on a first sync (`since.Updated = 0`) and every
+  value on a later one, so soft-deleted records reach the clients caching them.
 - **The other Keys are pinned:** `Eq` on each, or `Contains` on the ColSlice (rows per element).
   Partition columns need their `Eq` too.
 - **Call `Delta()` last.** It picks the delta index whose pinned Keys the query pins (the most
-  specific wins, a tie fails), and adds `UpdatedVersion >= W+1`: one exact range.
+  specific wins, a tie fails), and adds `Updated >= W - DeltaOverlap`: one exact range.
+- **The overlap window.** `Updated` is a clock, so two Lambdas can stamp the same millisecond and
+  a write stamped below W can land after the client's read. A later sync re-reads the last
+  `DeltaOverlap` (4 s) below W; rows above W always come back. The window's rows are dropped,
+  before any record is read, when `DeltaFingerprint` of their `Updated` values equals
+  `since.Fingerprint` (the client's fingerprint of what it holds there); otherwise the whole window
+  is resent. genix-ui computes the same fingerprint (`cache/delta-cache.watermark.ts`); berryapps
+  reads `since` from `?up=<upd>.<fingerprint>` (`req.GetDeltaSince()`).
 - Rows are hidden base-table rows (`pk = base pk ‖ cb id`), keys-only unless `FullCopy`. Every
-  write moves all of them, because `UpdatedVersion` changed. A slice field takes either a fan-out
+  write moves all of them, because `Updated` changed. A slice field takes either a fan-out
   index or a delta index, not both.
 - A record written before the index was declared has no delta row: re-`Put` existing records once.
 
@@ -340,8 +355,9 @@ Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Si
 - **`QueryGroups(keys...)`** picks the GroupBy with exactly those Keys, in order. It needs an `Eq` on
   every Partition column, then `Eq` on a leading run of the Keys and one range, as `Keys` do.
   Groups whose count fell to 0 are skipped.
-- **`GroupDelta: true`** stamps each counter with the `upv`/`upd` of the last write that touched it
-  (needs the managed `UpdatedVersion`). `Since(W)` returns only the groups changed after W, emptied
+- **`GroupDelta: true`** stamps each counter with the `upd` of the last write that touched it
+  (needs the managed `Updated`; `Group.Updated` is an `int64`). `Since(W)` returns only the groups
+  with `Updated >= W - DeltaOverlap` (the window is resent, no fingerprint: groups are few), emptied
   ones included (count 0) so the client drops them; `Since(0)` skips them.
 - **Best-effort:** the counters are ADDed after the base write, from the diff against the stored
   version. Two plain `Put`s racing on one record, or a crash in between, drift a counter.
@@ -359,8 +375,8 @@ A write shows up 10–20 minutes later. GroupBy counters are live; frames are ch
 
 ```go
 // record and table struct:
-UpdatedVersion int32 `json:"upv,omitempty" cb:"12"`
-CreatedVersion int32 `json:"crv,omitempty" cb:"13"`
+Updated        int64 `json:"upd" cb:"12"`
+CreatedVersion int64 `json:"crv,omitempty" cb:"13"`
 // schema:
 Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)}}, // the run reads through it
 DataFrames: []dynamo.DataFrame{
@@ -416,9 +432,9 @@ rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from,
   write diffs both versions with the new shape, so the old-shape rows stay and keys-only rows are
   not rewritten.
 - A field referenced by a **GSI or `Keys`** must be set on every write. A zero value is still a key.
-- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows, its GroupBy counters
-  and its DataFrame states (the frames then rebuild). It is destructive and there is no undo. It
-  keeps the slot-versions items.
+- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows, its GroupBy counters,
+  its by-IDs slot items and its DataFrame states (the frames then rebuild). It is destructive and
+  there is no undo.
 
 ## 5. Checking your work
 

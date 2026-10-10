@@ -13,7 +13,7 @@ import (
 // DataFrame file codec (../DATA_FRAMES.md, section 5, "Formats"): raw bytes, columnar.
 //
 //	u8        format version
-//	uvarint   snapshot: the UpdatedVersion whose state the file holds
+//	uvarint   snapshot: the Updated whose state the file holds
 //	uvarint   row count n (no columns follow when n = 0)
 //	column    Rows: uvarint first, uvarint minStep, residuals of the n − 1 steps
 //	column    each Sums column: varint min, residuals of the n values
@@ -490,7 +490,7 @@ func FileHash(content []byte) uint32 {
 // It is row-wise and short-lived, truncated by every run, so it uses Go's varints:
 //
 //	uvarint   entry length (the bytes after this field)
-//	uvarint   newVersion      UpdatedVersion of the write that replaced the record
+//	uvarint   newVersion      Updated of the write that replaced the record
 //	uvarint   createdVersion  of the record replaced
 //	uvarint   sk length, then the record's sk
 //	u8        0: the old version counted nowhere (Status 0)

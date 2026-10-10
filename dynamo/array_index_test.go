@@ -250,7 +250,7 @@ func TestArrayIndexSyncLive(t *testing.T) {
 type fanOutOrder struct {
 	StoreID    int32    `cb:"1"`
 	ID         int32    `cb:"2"`
-	Updated    int32    `cb:"3"`
+	Updated    int64    `cb:"3"`
 	Channel    string   `cb:"4"`
 	ProductIDs []int32  `cb:"5"`
 	Tags       []string `cb:"6"`
@@ -260,7 +260,7 @@ type fanOutOrderTable struct {
 	Model[fanOutOrderTable, fanOutOrder]
 	StoreID    Col[*fanOutOrderTable, int32]
 	ID         Col[*fanOutOrderTable, int32]
-	Updated    Col[*fanOutOrderTable, int32]
+	Updated    Col[*fanOutOrderTable, int64]
 	Channel    Col[*fanOutOrderTable, string]
 	ProductIDs ColSlice[*fanOutOrderTable, int32]
 	Tags       ColSlice[*fanOutOrderTable, string]
@@ -273,14 +273,14 @@ func (t fanOutOrderTable) GetSchema() Schema {
 		Partition: Cols(t.StoreID.Size(16)),
 		Keys:      Cols(t.ID.Size(32)),
 		Indexes: []Index{
-			{Keys: Cols(t.ProductIDs.Size(32), t.Updated.Size(32))}, // slice first, range on Updated
+			{Keys: Cols(t.ProductIDs.Size(32), t.Updated.Size(42))}, // slice first, range on the managed Updated
 			{Keys: Cols(t.Channel, t.Tags)},                         // slice after a scalar
 		},
 	}
 }
 
 func fanOutOrderRowSK(productID, updated, id uint64) string {
-	return EncodeOrderedUint(productID, 6) + "#" + EncodeOrderedUint(updated, 6) + "#" + EncodeOrderedUint(id, 6)
+	return EncodeOrderedUint(productID, 6) + "#" + EncodeOrderedUint(updated, 7) + "#" + EncodeOrderedUint(id, 6)
 }
 
 func TestCompositeFanOutRowsCarryTheScalarKeys(t *testing.T) {
@@ -324,8 +324,8 @@ func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
 	orders := NewRepo[fanOutOrderTable, fanOutOrder]()
 	product5 := EncodeOrderedUint(5, 6)
 	for name, query := range map[string]*QueryBuilder[fanOutOrder]{
-		"Contains": orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int32(10_000)),
-		"Eq":       orders.Query().Eq(orders.T.StoreID, int32(7)).Eq(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int32(10_000)),
+		"Contains": orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int64(10_000)),
+		"Eq":       orders.Query().Eq(orders.T.StoreID, int32(7)).Eq(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int64(10_000)),
 	} {
 		plan := onlyPlan(t, query)
 		if plan.keyCond != "#pk = :pk AND #sk BETWEEN :lo AND :hi" {
@@ -334,7 +334,7 @@ func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
 		if s(plan.values[":pk"]) != "23456789"+"00007"+"005" {
 			t.Fatalf("%s: pk = %q", name, s(plan.values[":pk"]))
 		}
-		if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(10_000, 6)+"$" || s(plan.values[":hi"]) != product5+"$" {
+		if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(10_000, 7)+"$" || s(plan.values[":hi"]) != product5+"$" {
 			t.Fatalf("%s: range = [%q, %q]", name, s(plan.values[":lo"]), s(plan.values[":hi"]))
 		}
 		if len(plan.postFilter) != 0 || len(plan.keyFilter) != 0 {
@@ -343,8 +343,8 @@ func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
 	}
 
 	// Every index column pinned: the range goes on to the base Keys.
-	plan := onlyPlan(t, orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Eq(orders.T.Updated, int32(100)).Gte(orders.T.ID, int32(3)))
-	if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(100, 6)+"#"+EncodeOrderedUint(3, 6) {
+	plan := onlyPlan(t, orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Eq(orders.T.Updated, int64(100)).Gte(orders.T.ID, int32(3)))
+	if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(100, 7)+"#"+EncodeOrderedUint(3, 6) {
 		t.Fatalf("lo = %q", s(plan.values[":lo"]))
 	}
 }

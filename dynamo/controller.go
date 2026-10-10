@@ -85,8 +85,9 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 //
 // It is scoped to this entity's pk ranges (its base rows and its array index
 // rows), so sibling entities (and the internal sequence counters) in the shared
-// table are untouched, and it keeps the by-IDs slot-versions items that share the
-// array range. The returned count includes array index rows and GroupBy counters.
+// table are untouched. The by-IDs slots go too: a recreated record is stamped a
+// later Updated, so it can't match a value a client holds. The returned count
+// includes array index rows, GroupBy counters and frame states.
 // This is a destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	client, err := Client()
@@ -129,12 +130,6 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 			return deleted, err
 		}
 		for _, item := range res.Items {
-			// Slot versions survive a wipe: counting again from 0 could hand a
-			// recreated record a version a client still holds for the old one. The
-			// GroupBy counters sharing their pk go with the records they count.
-			if isSlotVersionsPK(item["pk"].(*types.AttributeValueMemberN).Value) && item["sk"].(*types.AttributeValueMemberS).Value == slotVersionsSK {
-				continue
-			}
 			batch = append(batch, types.WriteRequest{
 				DeleteRequest: &types.DeleteRequest{
 					Key: map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]},
