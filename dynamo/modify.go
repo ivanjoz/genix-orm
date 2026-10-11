@@ -188,7 +188,7 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return nil, err
 	}
-	return lostRecords, r.meta.setSlotsUpdated(client, writtenPtrs)
+	return lostRecords, r.meta.setSlotsUpdated(writtenPtrs)
 }
 
 // deltaRowDeletes deletes the delta rows a record that lost its conditional write

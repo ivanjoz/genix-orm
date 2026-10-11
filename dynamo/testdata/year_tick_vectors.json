@@ -1,0 +1,44 @@
+{
+  "comment": "Shared by cache_by_ids_test.go (Go) and genix-ui's cache-by-ids.wire.test.ts (TypeScript): both sides of the by-IDs cache must agree on every value. Updated units are milliseconds since epochSeconds; 2024 is a leap year.",
+  "epochSeconds": 1704067200,
+  "cycles": [
+    { "updated": -1, "cycleYear": 2023 },
+    { "updated": 25199999, "cycleYear": 2023 },
+    { "updated": 25200000, "cycleYear": 2024, "cycleStart": 25200000 },
+    { "updated": 31647599999, "cycleYear": 2024 },
+    { "updated": 31647600000, "cycleYear": 2025, "cycleStart": 31647600000 }
+  ],
+  "writtenTicks": [
+    { "updated": 25200000, "tick": 2, "heldUpdated": 25202000 },
+    { "updated": 25201999, "tick": 2, "heldUpdated": 25202000 },
+    { "updated": 25202000, "tick": 3, "heldUpdated": 25204000 },
+    { "updated": 31647599999, "tick": 15811201, "heldUpdated": 31647600000 }
+  ],
+  "heldTicks": [
+    { "cycleYear": 2024, "upd": 0, "tick": 0 },
+    { "cycleYear": 2024, "upd": 25199999, "tick": 0 },
+    { "cycleYear": 2024, "upd": 25200000, "tick": 1 },
+    { "cycleYear": 2024, "upd": 25202000, "tick": 2 },
+    { "cycleYear": 2024, "upd": 25204000, "tick": 3 },
+    { "cycleYear": 2024, "upd": 31647600000, "tick": 15811201 },
+    { "cycleYear": 2025, "upd": 31647599999, "tick": 0 },
+    { "cycleYear": 2025, "upd": 31647600000, "tick": 1 }
+  ],
+  "requests": [
+    {
+      "cycleYear": 2024,
+      "partitions": [
+        { "partition": 5, "idTicks": [[12, 100], [268, 100], [300, 0], [524, 150]] },
+        { "partition": 200, "idTicks": [[100, 0]] }
+      ],
+      "encoded": "GAIFAQxkAAAEDIACIOABwwEAAWQ",
+      "decoded": [[5, 12, 100], [5, 268, 100], [5, 300, 0], [5, 524, 100], [200, 100, 0]]
+    },
+    {
+      "cycleYear": 2024,
+      "partitions": [{ "partition": 0, "idTicks": [[7, 0]] }],
+      "encoded": "GAEAAAEH",
+      "decoded": [[0, 7, 0]]
+    }
+  ]
+}

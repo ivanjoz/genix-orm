@@ -346,50 +346,65 @@ is `0..9`. Both are checked at compile time (`NewRepo` panics otherwise).
 
 ## By-IDs cache (`cache_by_ids.go`)
 
-Ported from genix-orm/scylla's slot versions. It answers "give me records
-[12, 87, 412]" with only the ones that changed since the value the client
-holds, which is what genix-ui's cache-by-ids sends (`ids`, `cc-ids`, `cc-upd`).
+It answers "give me records [12, 87, 412] of partition 5" with only the ones
+that changed since the value the client holds, which is what genix-ui's
+cache-by-ids sends (the `cc` parameter, `DecodeCachedIDsRequest`).
 
 ```go
-type Customer struct {
-    ID      int32  `cb:"1"`
-    Name    string `cb:"2"`
-    Updated int64  `json:"upd" cb:"3"` // managed by the ORM (delta.go)
+type Story struct {
+    ProjectID int32  `cb:"1"`
+    ID        int32  `cb:"2"`
+    Name      string `cb:"3"`
+    Updated   int64  `json:"upd" cb:"4"` // managed by the ORM (delta.go)
 }
 
-func (t CustomerTable) GetSchema() dynamo.Schema {
+func (t StoryTable) GetSchema() dynamo.Schema {
     return dynamo.Schema{
-        Entity:     "cust",
-        Keys:       dynamo.Cols(t.ID.Size(32)), // exactly one integer column
+        Entity:     "story",
+        Partition:  dynamo.Cols(t.ProjectID.Size(32)), // none, or one integer column
+        Keys:       dynamo.Cols(t.ID.Size(32)),        // exactly one integer column
         CacheByIDs: true,
     }
 }
 
-changed, err := Customers.QueryCachedIDs([]dynamo.CachedID{{ID: 12}, {ID: 87, Updated: 51_840_000}})
+dynamo.SetIDsCacheStore(store) // at boot: where the slot files live (an S3 bucket)
+request, err := dynamo.DecodeCachedIDsRequest(ccParameter)
+changed, err := Stories.QueryCachedIDs(request) // []CachedPartition[Story]{{Partition, Records}}
 ```
 
-- A record belongs to slot `uint8(ID)`. Each base pk has one slot item,
-  `pk = base pk ‖ 000`, `sk = "v"`, holding per slot (`v0`..`v255`) the
-  `Updated` of its last write. `000` is the fan-out suffix no cb id takes, so no
-  query or Scan ever reads it; `DeleteRecordsAll` deletes it with the records
-  (a recreated record is stamped a later `Updated`, so no client can match it).
-- **Write:** `Put`/`PutMany`/`PutIfAbsent`/`Delete` write the records, then
-  one UpdateItem per touched pk `SET`s each touched slot to the write's
-  `Updated` (a `Delete` stamps its key record too). Nothing is read first.
-- **Read:** one GetItem of the slots, then one consistent BatchGetItem of the
-  IDs whose client value differs from their slot's (0 always differs).
-  Returned records carry the slot's `Updated` in `Updated`, the value the client
-  sends back next time — or **0 while the slot value is younger than
-  `DeltaOverlap`** (4 s): a value that young may still be stamped again by a
-  concurrent same-millisecond write or a late one, so it isn't trusted, and the
-  client's next revalidation reads the record again.
-- Setting the slot after the write keeps it race-free: a reader that sees the
-  new value reads the new record (the read is consistent); one that sees the old
-  value only makes the client ask again. A late write can set a slot back to an
-  older `Updated`; the client compares for equality, so it still refetches.
-- A write refetches the whole slot (IDs 256 apart). A record not written since
-  the flag was enabled has no slot value and is read on every request, until
-  it is written once.
+- **Slots and files.** A record belongs to slot `uint8(ID)`. Each partition has,
+  per year cycle, one 768-byte file in the `IDsCacheStore`, key
+  `<cycle year>/<base pk>`, holding 256 uint24 year ticks: the last write to each
+  slot. A missing file reads as zeros.
+- **Year ticks.** A cycle starts on January 1 at 07:00 UTC. A tick counts
+  2 seconds from it: 0 unknown, 1 no write this cycle (stored 0), ≥ 2
+  `floor((Updated − cycleStart) / 2000) + 2`. A leap year fits a uint24. The
+  client holds a tick as an Updated value (`cycleStart + (t − 1) × 2000`, the end
+  of its window) and converts it back; a value of a past cycle converts to 0, so
+  every record is read once more each January 1, with no job.
+- **Write:** `Put`/`PutMany`/`PutIfAbsent`/`Delete`/`Modify` write the records,
+  then each touched file is read with its ETag, its slots raised to
+  `max(stored, tick)`, and written back with `If-Match` (`If-None-Match: *`
+  when missing), retried with jitter on a lost race. A file already that new
+  isn't written. A write stamped in the previous cycle lands in that cycle's file.
+- **Read:** one GET per requested partition (10 in parallel), then one
+  consistent BatchGetItem of the IDs whose held tick differs from their slot's.
+  Returned records carry `toUpdated(slot tick)` in `Updated` — or **0 while the
+  tick's window ended less than `DeltaOverlap` (4 s) ago**: a write stamped
+  inside it may still land, so it isn't trusted, and the client's next
+  revalidation reads the record again. A request whose cycle year isn't the
+  server's has every tick ignored.
+- Raising the slot after the write keeps it race-free: a reader that sees the
+  new tick reads the new record (the read is consistent); one that sees the old
+  tick only makes the client ask again.
+- A write refetches the whole slot (IDs 256 apart, in that partition). The
+  client sends one tick per slot, the lowest it holds, so a slot whose records
+  disagree is read whole once and then agrees.
+- **Wire format** (`DecodeCachedIDsRequest`), base64url: `[cycle year − 2000: u8]`
+  `[partition count: uvarint]`, then per partition, ascending: `[partition
+  delta: uvarint] [slot count: uvarint] ([slot: u8][tick: u24 LE])* [ID count:
+  uvarint] [ID delta: uvarint]*`. `testdata/year_tick_vectors.json` pins it for
+  both sides (genix-ui's `cache-by-ids.wire.ts`).
 
 ## Delta sync (`delta.go`)
 
@@ -478,7 +493,7 @@ groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].SumFloat(Orders.T.Weig
 ```
 
 ```text
-pk   = base pk ‖ 000                      (shared with the by-IDs slot item, sk "v")
+pk   = base pk ‖ 000                      (shared with the DataFrame states, sk "f…")
 sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
 c    = record count            sNNN = sum of the column with cb id NNN
 d    = a record holding only the group Keys (Group.Key)
@@ -626,7 +641,7 @@ lost, err := Accounts.PutManyIfVersion(accounts) // re-read, re-edit and retry t
   `upd` must still equal the record's `Updated` (0: no item may exist), and the
   record is stamped at least that value + 1. Everything else is PutMany's:
   hidden rows diffed against the stored versions (one consistent BatchGetItem)
-  and batched, the by-IDs slots set once. Only the base items are single
+  and batched, the by-IDs slots raised once. Only the base items are single
   PutItems (BatchWriteItem takes no condition), run 10 at a time. It returns the
   records that lost a race, unwritten; the caller re-reads, re-edits and retries
   them (`ConflictBackoff(attempt)` is the pause Modify uses).
@@ -878,8 +893,8 @@ for _, c := range controllers {
 projecting only the key attributes (it never decodes `d`), then deletes in
 `BatchWriteItem` batches of 25 with the same unprocessed-item retry as `PutMany`.
 The returned count includes array index rows, GroupBy counters and frame states.
-The by-IDs slot items go too: a recreated record is stamped a later `Updated`, so
-it can't match a value a client still holds. Sibling entities and the internal
+The by-IDs slot files (S3) stay: a recreated record raises its slot to a later
+tick. Sibling entities and the internal
 sequence counters (pk 0) are outside those ranges and untouched.
 **Destructive, no undo.** Exposed on the CLI as `go run . wipe`.
 

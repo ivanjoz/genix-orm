@@ -22,7 +22,7 @@ import (
 // distinct value of its Keys (the group), one counter item with the number of
 // records in the group and the sum of each GroupBy column:
 //
-//	pk   = base pk ‖ 000                      (the bookkeeping pk of the by-IDs slots, sk "v")
+//	pk   = base pk ‖ 000                      (the bookkeeping pk, beside the DataFrame states)
 //	sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
 //	c    = record count                       (native number)
 //	sNNN = sum of the column with cb id NNN   (native number; floats as round(v * 1e6))
@@ -313,8 +313,13 @@ func (m *tableMeta) groupKeyBlob(groupIndex *groupIndexMeta, recordPtr unsafe.Po
 	return blob, nil
 }
 
-// groupCountersPK is the pk of a base partition's counters (and of its by-IDs slots).
-func groupCountersPK(basePK string) string { return basePK + slotsColumnID }
+// countersColumnID is appended to the base pk for the partition's bookkeeping items (GroupBy
+// counters, DataFrame states), where a fan-out index appends its cb id: no cb id is 000, so no query
+// or Scan of the records reads them.
+const countersColumnID = "000"
+
+// groupCountersPK is the pk of a base partition's counters (and of its DataFrame states).
+func groupCountersPK(basePK string) string { return basePK + countersColumnID }
 
 // applyGroupCounterDeltas ADDs every non-zero delta to its counter, one UpdateItem
 // each, and on a GroupDelta stamps upd. It must run after the base items land. A
@@ -651,8 +656,8 @@ func (r *Repo[T, E]) RebuildGroupsAll() (int, error) {
 			return 0, err
 		}
 		for _, item := range out.Items {
-			if counterPK := item["pk"].(*types.AttributeValueMemberN).Value; isSlotsPK(counterPK) {
-				basePK := strings.TrimSuffix(counterPK, slotsColumnID)
+			if counterPK := item["pk"].(*types.AttributeValueMemberN).Value; strings.HasSuffix(counterPK, countersColumnID) {
+				basePK := strings.TrimSuffix(counterPK, countersColumnID)
 				recordsByPK[basePK] = recordsByPK[basePK] // a partition with counters and no records
 			}
 		}

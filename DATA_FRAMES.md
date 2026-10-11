@@ -203,7 +203,7 @@ margin covers, so it is settled 25 s later.
 ### The state record (`State`; on DynamoDB, an item)
 
 ```text
-pk = base pk ‖ 000      beside the GroupBy counters (sk g…) and the by-IDs slots (sk v)
+pk = base pk ‖ 000      beside the GroupBy counters (sk g…)
 sk = "f" + frame name
 w        the snapshot every file holds; absent: not built (a new frame, or a new shape)
 nx, nxt  the newest checkpoint (an Updated value) and when it was taken (unix seconds)
@@ -268,7 +268,7 @@ the driver: `dynamo/repo.go`, `modify.go`):
 6. **Cancel markers** (`AppendCancelMarkers`) for the records logged that did not land: never sent,
    or lost their condition. A record whose request failed without an answer may have landed: it
    keeps its entry. The markers have the 3 s grace.
-7. Stale hidden-row deletes, GroupBy counters and by-IDs slots come after, outside the window:
+7. Stale hidden-row deletes, GroupBy counters and the by-IDs slot files come after, outside the window:
    frames don't read them.
 
 Per write call:

@@ -6,8 +6,8 @@ import (
 	"unsafe"
 )
 
-// TestEntityOfItemKey maps the items an entity writes back to it: base rows, the by-IDs slots item
-// (beside the GroupBy counters) and the autoincrement sequence (pk 0), and refuses named sequences
+// TestEntityOfItemKey maps the items an entity writes back to it: base rows, a GroupBy counter and
+// the autoincrement sequence (pk 0), and refuses named sequences
 // and unknown TableIDs.
 func TestEntityOfItemKey(t *testing.T) {
 	ticketRepo := NewRepo[TicketTable, Ticket]()
@@ -17,7 +17,7 @@ func TestEntityOfItemKey(t *testing.T) {
 
 	ownedKeys := [][2]string{
 		{basePK, ticketRepo.meta.skValue(unsafe.Pointer(&ticket))},
-		{basePK + slotsColumnID, slotsSK},
+		{groupCountersPK(basePK), groupCountersSKPrefix + "005#web"},
 		{sequencePartitionKey, tableID},
 	}
 	for _, ownedKey := range ownedKeys {

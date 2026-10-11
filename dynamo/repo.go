@@ -103,7 +103,7 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return true, err
 	}
-	return true, r.meta.setSlotsUpdated(client, []unsafe.Pointer{ptr})
+	return true, r.meta.setSlotsUpdated([]unsafe.Pointer{ptr})
 }
 
 // PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
@@ -199,7 +199,7 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
 	}
-	return r.meta.setSlotsUpdated(client, ptrs)
+	return r.meta.setSlotsUpdated(ptrs)
 }
 
 // assignIDsReadingStored assigns the autoincrement IDs and reads the stored version of every record
@@ -338,7 +338,7 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
 	}
-	return r.meta.setSlotsUpdated(client, []unsafe.Pointer{ptr})
+	return r.meta.setSlotsUpdated([]unsafe.Pointer{ptr})
 }
 
 // Get fetches one item by its full key. `key` only needs its partition and sort

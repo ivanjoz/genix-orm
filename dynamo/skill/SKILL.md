@@ -249,29 +249,32 @@ Use it for "give me records [12, 87, 412], skip the ones I already have unchange
 genix-ui's cache-by-ids (`getRecordByID`, `RecordByIDText`, `GetHandler.routeByID`).
 
 ```go
-// schema: Cols(t.ID.Size(32)) and nothing else in Keys, plus
+// schema: Cols(t.ID.Size(32)) and nothing else in Keys, at most one Partition column, plus
 CacheByIDs: true,
 // record and table struct:
 Updated int64 `json:"upd" cb:"N"`
 Updated dynamo.Col[OrderTable, int64]
 
-changed, err := Orders.QueryCachedIDs(cachedIDs)          // []dynamo.CachedID{ID, Updated}
-changed, err  = Orders.QueryCachedIDs(cachedIDs, storeID) // one value per Partition column
+dynamo.SetIDsCacheStore(store)                         // at boot: the slot files' store (S3)
+request, err := dynamo.DecodeCachedIDsRequest(cc)      // genix-ui's "cc" parameter
+changed, err := Orders.QueryCachedIDs(request)         // []dynamo.CachedPartition[Order]{{Partition, Records}}
 ```
 
-- A record is in slot `uint8(ID)`. Each partition has one hidden slot item (`pk = base pk ‖ 000`,
-  `sk = "v"`), where every write SETs the slots it touched to its `Updated`, after the record is
-  written.
-- `QueryCachedIDs` does one GetItem for the slots, then one consistent BatchGetItem for the IDs
-  whose client value (0 = none) differs from the slot's. Unchanged and missing IDs are left out,
-  and the returned records carry the **slot's** `Updated` in `Updated` — or **0 while the slot value
-  is younger than `DeltaOverlap`** (4 s; a concurrent or late write could still stamp it again),
-  so the client reads that record again on its next revalidation.
+- A record is in slot `uint8(ID)`. Each partition has, per year cycle (from January 1, 07:00 UTC),
+  one 768-byte file in the `IDsCacheStore` (`<cycle year>/<base pk>`): 256 uint24 **year ticks**
+  (2 seconds each). Every write raises the slots it touched to its tick, after the record is
+  written, with a GET + `If-Match` PUT retried on a lost race.
+- Ticks: 0 unknown (always read), 1 no write this cycle, ≥ 2 `floor((Updated − cycleStart) / 2000) + 2`.
+- `QueryCachedIDs` does one GET per requested partition, then one consistent BatchGetItem for the
+  IDs whose held tick differs from the slot's. Unchanged and missing IDs are left out, and the
+  returned records carry the **slot's** tick as an Updated value (`cycleStart + (t − 1) × 2000`) in
+  `Updated` — or **0 while the tick's window ended less than `DeltaOverlap` ago** (4 s; a late
+  write could still land), so the client reads that record again on its next revalidation. A
+  request from another cycle year has every tick ignored: each January 1 every record is read once.
 - Everywhere else `Updated` is the record's own write time (section 3c); only a by-IDs read
   overwrites it with the slot's.
-- A write to one record makes the other records of its slot (IDs 256 apart) come back once too.
-- A record never written since the flag was turned on has no slot value, so it is read on every
-  request. Re-`Put` the existing records once after enabling the flag.
+- A write to one record makes the other records of its slot (IDs 256 apart, same partition) come
+  back once too.
 
 ## 3c. Delta sync (`TypeDelta`, `Delta()`)
 
@@ -432,8 +435,8 @@ rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from,
   write diffs both versions with the new shape, so the old-shape rows stay and keys-only rows are
   not rewritten.
 - A field referenced by a **GSI or `Keys`** must be set on every write. A zero value is still a key.
-- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows, its GroupBy counters,
-  its by-IDs slot items and its DataFrame states (the frames then rebuild). It is destructive and
+- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows, its GroupBy counters
+  and its DataFrame states (the frames then rebuild). It is destructive and
   there is no undo.
 
 ## 5. Checking your work

@@ -250,11 +250,12 @@ type Schema struct {
 	// Ignored unless UseAutoincrement is true.
 	AutoincrementRandomPadding int
 
-	// CacheByIDs enables the by-IDs cache (cache_by_ids.go): every write sets the
-	// record's slot to its Updated, and Repo.QueryCachedIDs returns only the
-	// requested records whose slot moved since the value the client holds. It needs
-	// exactly one integer Keys column (the ID) and the managed int64 "Updated" field
-	// (see delta.go), which a by-IDs read overwrites with the slot's.
+	// CacheByIDs enables the by-IDs cache (cache_by_ids.go): every write raises the
+	// record's slot to the year tick of its Updated, in a slot file per partition
+	// (SetIDsCacheStore), and Repo.QueryCachedIDs returns only the requested records
+	// whose slot moved since the tick the client holds. It needs exactly one integer
+	// Keys column (the ID), at most one Partition column, and the managed int64
+	// "Updated" field (see delta.go), which a by-IDs read overwrites with the slot's.
 	CacheByIDs bool
 
 	// VersionedWrites enables Repo.Modify (modify.go) on a table that has neither

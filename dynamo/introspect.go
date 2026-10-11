@@ -78,6 +78,9 @@ type TableSchema struct {
 	Autoincrement  bool `json:"autoincrement"`
 	AutoincPadding int  `json:"autoincPadding,omitempty"`
 
+	// CacheByIDs reports the schema's CacheByIDs setting: its writes need the IDs cache store.
+	CacheByIDs bool `json:"cacheByIDs,omitempty"`
+
 	// DataFrames are the entity's DataFrames: their names, for the rebuild commands, and their folders
 	// in the frame store, which name them by hashes.
 	DataFrames []DataFrameInfo `json:"dataFrames,omitempty"`
@@ -115,6 +118,7 @@ func GetSchema[T any]() TableSchema {
 
 		Autoincrement:  schema.UseAutoincrement,
 		AutoincPadding: schema.AutoincrementRandomPadding,
+		CacheByIDs:     schema.CacheByIDs,
 	}
 	if !schema.UseAutoincrement {
 		out.AutoincPadding = 0

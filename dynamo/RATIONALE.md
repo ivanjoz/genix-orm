@@ -1,5 +1,17 @@
 # RATIONALE — dynamo
 
+## By-IDs slots: S3 files of uint24 year ticks, one per partition and cycle
+**Context** — The user replaced the DynamoDB slot item (`v0..v255` of full `Updated` values) with a 768-byte S3 file of 2-second year ticks, reset each January 1 at 07:00 UTC, with partitioned tables and a compact request (one tick per slot, sorted delta IDs). Left open: the tick values, where the decoder lives, how a write updates a file safely, and the response shape.
+**Decision**
+- Ticks: 0 unknown, 1 "no write this cycle" (stored 0), ≥ 2 a write. 0 and 1 must differ: an untouched slot returned as "unknown" would be read on every request. A client holds a tick as `cycleStart + (t − 1) × 2000`, which converts back exactly, and a past cycle's value converts to 0, so the yearly reset needs no job and no browser clear.
+- A write picks its file by the cycle of the record's own `Updated`, like the old slot item used the record's `Updated`. The 4-second trust window covers a late write; it runs on the end of the tick's window.
+- Files are raised with GET + `If-Match` PUT, retried with jitter (30 attempts, like the frame log append). S3 can't set part of an object, and a lost update would leave a client holding stale data forever. `IDsCacheStore` is the `Get`/`PutIfMatch` half of `dataframe.Store`, so `MemoryStore` tests it and berryapps reuses the frames S3 store.
+- `DecodeCachedIDsRequest` lives here, next to the tick semantics, so the format and its vectors (`testdata/year_tick_vectors.json`, read by genix-ui's test too) sit in one place; a malformed payload is an error, not a partial read.
+- `QueryCachedIDs` answers `[]CachedPartition{Partition "p", Records "r"}`. The first proposal was `[[5, [...]]]`, but minijson encodes struct slices and has no tuple form.
+- `CacheByIDs` allows at most one Partition column: a request names its partition with one integer.
+
+**Rationale** — Every rule above trades a little work (a GET before each write, one refetch per record each January 1) for the one guarantee that matters: a held value equal to the slot's means the record is current. The cost: a write to a CacheByIDs table takes two S3 calls instead of one UpdateItem, more under contention on one partition. And while `unix_time_start` falls inside the current cycle (berryapps: until 2027-01-01), tick 1 is a negative `Updated`.
+
 ## `ReprocessBlobs`: rewrite only `d`, and leave a blob both colbin versions read alone
 **Context** — colbin 0.6 made every blob written by 0.3.1 unreadable. Each entity needed a way to decode with the old version and re-encode with the new one, saving only what changed. Left open: how to write it back, how to stay safe on a rerun, and how to get the old decoder into a module that can import one colbin version.
 **Decision**

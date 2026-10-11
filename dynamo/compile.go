@@ -261,7 +261,7 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		meta.autoinc = resolveAutoincrement(schema, recordType, accessors, meta.tableID)
 	}
 	if schema.CacheByIDs {
-		meta.cacheByIDs = resolveCacheByIDs(recordType, meta.keys)
+		meta.cacheByIDs = resolveCacheByIDs(recordType, meta.partition, meta.keys)
 	}
 
 	return meta

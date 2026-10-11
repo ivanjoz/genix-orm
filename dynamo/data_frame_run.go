@@ -20,7 +20,7 @@ import (
 // (materialize.go there). A frame's versions are Updated values (delta.go). The
 // state item sits beside the GroupBy counters:
 //
-//	pk = base pk ‖ 000   (beside the GroupBy counters and the by-IDs slots)   sk = "f" + frame name
+//	pk = base pk ‖ 000   (beside the GroupBy counters)   sk = "f" + frame name
 //	w        the snapshot of the files; absent: not built (a new frame, or a changed shape)
 //	nx, nxt  the newest checkpoint: an Updated value, and when it was read (unix seconds)
 //	px       the previous checkpoint, settled
