@@ -15,7 +15,6 @@ import (
 	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,22 +22,23 @@ import (
 // of partition 5" and gets back only the ones that moved since the value it holds.
 //
 // It works on slots, not records: a record belongs to slot uint8(ID), and each
-// partition (base pk) has, per year cycle, one 768-byte file in the IDs cache
-// store (S3) holding per slot the year tick of its last write:
+// partition (base pk) has, per year cycle, one 768-byte file in the file store
+// (file_store.go, S3) holding per slot the year tick of its last write:
 //
-//	key = <cycle year>/<base pk>   256 × uint24 LE, slot i at [3i, 3i+3); missing = zeros
+//	key = ids-cache/<cycle year>/<base pk>   256 × uint24 LE, slot i at [3i, 3i+3); missing = zeros
 //
 // A year cycle starts on January 1 at 07:00 UTC. A year tick counts 2 seconds
-// from it (a leap year is 15,811,200 ticks, under uint24's 16,777,215):
+// from it, one Updated (SUnixTime) unit (a leap year is 15,811,200 ticks, under
+// uint24's 16,777,215):
 //
 //	0   unknown: nothing held, or a slot too young to trust. Always forces a read
 //	1   no write to the slot in this cycle (the file stores 0)
-//	≥2  floor((Updated − cycleStart) / 2000) + 2, from the written record's Updated
+//	≥2  Updated − cycleStart + 2, from the written record's Updated
 //
-// The client holds ticks as Updated values: toUpdated(t) = cycleStart + (t−1)×2000,
-// the end of the tick's window, and converts them back with
-// floor((upd − cycleStart) / 2000) + 1. A value of a past cycle converts to 0, so on
-// January 1 every record is read once more: that is the yearly reset, with no job.
+// The client holds ticks as Updated values: toUpdated(t) = cycleStart + t − 1, the
+// end of the tick's window, and converts them back with upd − cycleStart + 1. A
+// value of a past cycle converts to 0, so on January 1 every record is read once
+// more: that is the yearly reset, with no job.
 //
 // Write path: after the records are written, each touched file is read with its
 // ETag, its touched slots raised to max(stored, tick), and written back with
@@ -51,36 +51,23 @@ import (
 //
 // A tick is a 2-second window, and a late write lands after a read that already
 // returned its tick. So a slot tick is trusted only once its window ended
-// DeltaOverlap ago: a younger one is returned as 0, which forces a read on the
+// slotTrustTicks ago: a younger one is returned as 0, which forces a read on the
 // client's next revalidation.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	yearTickMillis = 2000
+	// slotTrustTicks covers a write still in flight and the clock skew between Lambdas: 8 seconds.
+	slotTrustTicks = 4
 	slotFileSize   = 256 * 3
 	// A slot file is raised by a GET + conditional PUT, one winner per round: 30 jittered attempts
-	// serialize 20 concurrent writers of one partition, like the frame log appends.
+	// serialize 20 concurrent writers of one partition.
 	slotPutAttempts  = 30
 	slotPutPauseStep = 50 * time.Millisecond
 	// slotReadConcurrency caps the parallel slot file GETs of one request.
 	slotReadConcurrency = 10
+	// slotFilesFolder is the slot files' folder in the file store (file_store.go).
+	slotFilesFolder = "ids-cache/"
 )
-
-// IDsCacheStore is where the slot files live: an S3 bucket in berryapps (core/idscache). Keys are
-// relative to the store, which prefixes its own root. dataframe.MemoryStore implements it for tests.
-type IDsCacheStore interface {
-	// Get returns the object and its ETag, or an error wrapping dataframe.ErrObjectNotFound.
-	Get(key string) (content []byte, etag string, err error)
-	// PutIfMatch writes the object only while its ETag is still etag, or while it doesn't exist when
-	// etag is "". Otherwise it returns an error wrapping dataframe.ErrPreconditionFailed.
-	PutIfMatch(ctx context.Context, key string, content []byte, etag string) (newETag string, err error)
-}
-
-var idsCacheStore IDsCacheStore
-
-// SetIDsCacheStore installs the slot files' store. Call it once at boot, before the first write to a
-// CacheByIDs table.
-func SetIDsCacheStore(store IDsCacheStore) { idsCacheStore = store }
 
 // CachedID is one ID of a by-IDs request, with the year tick the client holds for its slot. 0 means
 // "nothing held" and always forces a read. Partition is the value of the table's single Partition
@@ -142,7 +129,7 @@ func CurrentYearCycle() int { return yearCycleOf(Now()) }
 // writtenYearTick is the tick a write stamped updated sets on its slot, in the cycle starting at
 // cycleStart (Updated units).
 func writtenYearTick(updated, cycleStart int64) uint32 {
-	return uint32((updated-cycleStart)/yearTickMillis) + 2
+	return uint32(updated-cycleStart) + 2
 }
 
 // yearTickToUpdated is the Updated value a client holds for a tick: the end of its window, the cycle
@@ -151,10 +138,12 @@ func yearTickToUpdated(tick uint32, cycleStart int64) int64 {
 	if tick == 0 {
 		return 0
 	}
-	return cycleStart + int64(tick-1)*yearTickMillis
+	return cycleStart + int64(tick) - 1
 }
 
-func slotFileKey(cycleYear int, basePK string) string { return fmt.Sprintf("%d/%s", cycleYear, basePK) }
+func slotFileKey(cycleYear int, basePK string) string {
+	return fmt.Sprintf("%s%d/%s", slotFilesFolder, cycleYear, basePK)
+}
 
 func slotTickOf(slotFile []byte, slot uint8) uint32 {
 	offset := int(slot) * 3
@@ -168,8 +157,8 @@ func setSlotTick(slotFile []byte, slot uint8, tick uint32) {
 
 // readSlotFile returns a partition's slot file and its ETag; a missing one is all zeros with no ETag.
 func readSlotFile(key string) ([]byte, string, error) {
-	content, etag, err := idsCacheStore.Get(key)
-	if errors.Is(err, dataframe.ErrObjectNotFound) {
+	content, etag, err := fileStore.GetFile(key)
+	if errors.Is(err, ErrFileNotFound) {
 		return make([]byte, slotFileSize), "", nil
 	}
 	if err != nil {
@@ -187,19 +176,19 @@ func (m *tableMeta) setSlotsUpdated(ptrs []unsafe.Pointer) error {
 	if m.cacheByIDs == nil {
 		return nil
 	}
-	if idsCacheStore == nil {
-		return fmt.Errorf("db: %s uses CacheByIDs and no IDs cache store is set (SetIDsCacheStore)", m.recordType.Name())
+	if fileStore == nil {
+		return fmt.Errorf("db: %s uses CacheByIDs and no file store is set (SetFileStore)", m.recordType.Name())
 	}
 	ticksByFile := map[string]map[uint8]uint32{}
 	for _, ptr := range ptrs {
 		updated := m.updated.acc.getI64(ptr)
-		cycleYear := yearCycleOf(UpdatedToTime(updated))
+		cycleYear := yearCycleOf(sUnixTimeToTime(updated))
 		key := slotFileKey(cycleYear, m.pkValue(ptr))
 		if ticksByFile[key] == nil {
 			ticksByFile[key] = map[uint8]uint32{}
 		}
 		slot := slotOfRecordID(m.cacheByIDs.idColumn.acc.getI64(ptr))
-		tick := writtenYearTick(updated, UpdatedOfTime(cycleStartTime(cycleYear)))
+		tick := writtenYearTick(updated, sUnixTimeOf(cycleStartTime(cycleYear)))
 		ticksByFile[key][slot] = max(ticksByFile[key][slot], tick)
 	}
 	for key, ticksBySlot := range ticksByFile {
@@ -228,8 +217,8 @@ func raiseSlotTicks(key string, ticksBySlot map[uint8]uint32) error {
 		if !isRaised {
 			return nil
 		}
-		_, err = idsCacheStore.PutIfMatch(context.Background(), key, slotFile, etag)
-		if !errors.Is(err, dataframe.ErrPreconditionFailed) || attempt == slotPutAttempts {
+		_, err = fileStore.PutFileIfMatch(context.Background(), key, slotFile, etag)
+		if !errors.Is(err, ErrFilePreconditionFailed) || attempt == slotPutAttempts {
 			return err
 		}
 		time.Sleep(time.Duration(rand.Int64N(int64(attempt) * int64(slotPutPauseStep))))
@@ -239,14 +228,14 @@ func raiseSlotTicks(key string, ticksBySlot map[uint8]uint32) error {
 // QueryCachedIDs resolves records by ID for a CacheByIDs entity, skipping every ID whose held tick
 // still equals its slot's. IDs that don't exist are left out, like the unchanged ones. The records
 // come grouped by partition, ascending, and carry toUpdated(slot tick) in Updated, or 0 while the
-// tick is younger than DeltaOverlap.
+// tick is younger than slotTrustTicks.
 func (r *Repo[T, E]) QueryCachedIDs(request CachedIDsRequest) ([]CachedPartition[E], error) {
 	m := r.meta
 	if m.cacheByIDs == nil {
 		return nil, fmt.Errorf("db: %s QueryCachedIDs needs CacheByIDs in its schema", m.recordType.Name())
 	}
-	if idsCacheStore == nil {
-		return nil, fmt.Errorf("db: %s uses CacheByIDs and no IDs cache store is set (SetIDsCacheStore)", m.recordType.Name())
+	if fileStore == nil {
+		return nil, fmt.Errorf("db: %s uses CacheByIDs and no file store is set (SetFileStore)", m.recordType.Name())
 	}
 	if len(request.IDs) == 0 {
 		return nil, nil
@@ -280,14 +269,14 @@ func (r *Repo[T, E]) QueryCachedIDs(request CachedIDsRequest) ([]CachedPartition
 	}
 
 	cycleYear := CurrentYearCycle()
-	cycleStart := UpdatedOfTime(cycleStartTime(cycleYear))
+	cycleStart := sUnixTimeOf(cycleStartTime(cycleYear))
 	slotFileByPartition, err := readSlotFiles(cycleYear, basePKByPartition)
 	if err != nil {
 		return nil, err
 	}
 
 	// Ticks at or above it may still be raised by a write stamped inside their window.
-	trustedBelow := UpdatedNow() - DeltaOverlap.Milliseconds()
+	trustedBelow := sUnixTimeOf(Now()) - slotTrustTicks
 	trustedSlotTick := func(partition int64, slot uint8) uint32 {
 		tick := max(slotTickOf(slotFileByPartition[partition], slot), 1) // stored 0: no write this cycle
 		if yearTickToUpdated(tick, cycleStart) <= trustedBelow {

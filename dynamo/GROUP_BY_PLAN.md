@@ -170,7 +170,7 @@ func (g Group[E]) SumFloat(column Coln) float64 // float columns: stored / 1e6
 
 ```go
 func (r *Repo[T, E]) RebuildGroups(partitionValues ...any) error // one base partition
-func (r *Repo[T, E]) RebuildGroupsAll() (int, error)             // every partition; returns counters written
+func (r *Repo[T, E]) Reprocess(true) (int, error)             // every partition; returns counters written
 ```
 
 1. **Read.** `RebuildGroups` reads the whole partition (paginated `Query`).

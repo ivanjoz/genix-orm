@@ -1,0 +1,59 @@
+{
+  "entries": [
+    {
+      "name": "one 16-bit ID",
+      "is64BitScale": false,
+      "entries": [{ "logID": 1234, "version": 7, "isDeleted": false }],
+      "hex": "009a4007"
+    },
+    {
+      "name": "one deleted 24-bit ID at the top version",
+      "is64BitScale": false,
+      "entries": [{ "logID": 70000, "version": 8191, "isDeleted": true }],
+      "hex": "60222e1fff"
+    },
+    {
+      "name": "a group of three new records",
+      "is64BitScale": false,
+      "entries": [
+        { "logID": 300, "version": 1, "isDeleted": false },
+        { "logID": 5, "version": 1, "isDeleted": false },
+        { "logID": 9, "version": 1, "isDeleted": false }
+      ],
+      "hex": "c001030504a302"
+    },
+    {
+      "name": "two far-apart IDs at one version: a 9-byte group beats 10 bytes of entries",
+      "is64BitScale": false,
+      "entries": [
+        { "logID": 1, "version": 2, "isDeleted": false },
+        { "logID": 4000000000, "version": 2, "isDeleted": false }
+      ],
+      "hex": "c0020201ffcfacf30e"
+    },
+    {
+      "name": "a 32-bit ID",
+      "is64BitScale": false,
+      "entries": [{ "logID": 4294967295, "version": 300, "isDeleted": false }],
+      "hex": "9fffffffe12c"
+    },
+    {
+      "name": "64-bit scale: a 48-bit packed ID and a small one",
+      "is64BitScale": true,
+      "entries": [
+        { "logID": 81604378747, "version": 12, "isDeleted": false },
+        { "logID": 3, "version": 13, "isDeleted": true }
+      ],
+      "hex": "40026000000f600c20000000600d"
+    }
+  ],
+  "wireVersions": [[1, 1], [8191, 8191], [8192, 1], [32767, 3]],
+  "logIDs": [
+    { "values": [77], "columnBits": [32], "logID": 77 },
+    { "values": [19, 123], "columnBits": [16, 32], "logID": 81604378747 }
+  ],
+  "metadata": [
+    { "flags": 0, "bucket": 2943360, "columnBits": [32], "fileHex": "009a4007", "safe85": "!4iX.!DD1p(>q" },
+    { "flags": 7, "bucket": 5, "columnBits": [16, 32], "fileHex": "", "safe85": "(=k5G!I" }
+  ]
+}

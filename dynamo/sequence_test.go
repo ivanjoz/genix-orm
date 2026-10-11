@@ -12,6 +12,7 @@ type Ticket struct {
 	ID      int64
 	Subject string
 	Created int64
+	Version int16 `json:"ver,omitempty" cb:"-"`
 }
 
 type TicketTable struct {
@@ -134,6 +135,7 @@ func TestAutoincrementRejectsStringID(t *testing.T) {
 type badAutoinc struct {
 	ID      string
 	Created int64
+	Version int16 `json:"ver,omitempty" cb:"-"`
 }
 
 type badAutoincTable struct {

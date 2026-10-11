@@ -24,12 +24,11 @@ const checkStoreID int32 = 7
 // Run works on the ORM's configured table. It wipes the check entities, writes records into
 // each, reads them back through every access path (and once more after updating them), wipes
 // them again, and prints one line per step with its result and consumed capacity. It returns an
-// error when any check failed. It sets an in-memory DataFrame store (dataframe.Configure): run it from a
-// process that serves no writes.
+// error when any check failed.
 func Run(output io.Writer) error {
 	runner := &checkRunner{output: output}
 	// Leftovers of an interrupted run would change every expected result.
-	for _, checkEntity := range []dynamo.Controller{CheckOrders, CheckProducts, CheckFrameLines} {
+	for _, checkEntity := range []dynamo.Controller{CheckOrders, CheckProducts} {
 		if _, err := checkEntity.DeleteRecordsAll(); err != nil {
 			return err
 		}
@@ -47,12 +46,10 @@ func Run(output io.Writer) error {
 	if err := runner.write("Put order: base + 3 ProductIDs + 2 Tags rows, 4 GroupBy counters", func() error { return CheckOrders.Put(&order) }); err != nil {
 		return err
 	}
-	if err := runner.write("Put product: base + 2 CategoryIDs rows (FullCopy) + 1 + 2 TeamIDs delta rows", func() error { return CheckProducts.Put(&product) }); err != nil {
+	if err := runner.write("Put product: base + 2 CategoryIDs rows (FullCopy) + 2 TeamIDs delta rows", func() error { return CheckProducts.Put(&product) }); err != nil {
 		return err
 	}
-	// What a client holds after syncing the first version: its Updated, and the window's fingerprint.
 	firstUpdated := product.Updated
-	heldFirstVersion := dynamo.DeltaSince{Updated: firstUpdated, Fingerprint: dynamo.DeltaFingerprint([]int64{firstUpdated})}
 
 	orders := CheckOrders.T
 	storeOrders := func() *dynamo.QueryBuilder[CheckOrder] { return CheckOrders.Query().Eq(orders.StoreID, checkStoreID) }
@@ -125,14 +122,13 @@ func Run(output io.Writer) error {
 	runner.expect("Managed: Updated stamped by the Put", []string{"true"}, func() ([]string, error) {
 		return []string{strconv.FormatBool(firstUpdated > 0)}, nil
 	})
-	runner.expect("Delta: first sync, Status 1", []string{"5 Widget"}, queryProducts(CheckProducts.Query().Delta(dynamo.DeltaSince{}, 1)))
-	runner.expect("Delta: first sync, Status 3", nil, queryProducts(CheckProducts.Query().Delta(dynamo.DeltaSince{}, 3)))
-	runner.expect("Delta: since the product's own version, window held", nil, queryProducts(CheckProducts.Query().Delta(heldFirstVersion, 1)))
-	runner.expect("Delta: since its own version, window fingerprint off (resent)", []string{"5 Widget"},
-		queryProducts(CheckProducts.Query().Delta(dynamo.DeltaSince{Updated: firstUpdated}, 1)))
-	runner.expect("Delta: since the Updated before it", []string{"5 Widget"}, queryProducts(CheckProducts.Query().Delta(dynamo.DeltaSince{Updated: firstUpdated - 1}, 1)))
-	runner.expect("Delta + Contains: TeamIDs contains 2, first sync", []string{"5 Widget"}, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 2).Delta(dynamo.DeltaSince{}, 1)))
-	runner.expect("Delta + Contains: TeamIDs contains 9, first sync", nil, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 9).Delta(dynamo.DeltaSince{}, 1)))
+	runner.expect("Managed: Version 1 after the first Put", []string{"1"}, func() ([]string, error) {
+		return []string{strconv.Itoa(int(product.Version))}, nil
+	})
+	runner.expect("DeltaList: Status 1 (base table)", []string{"5 Widget"}, queryProducts(CheckProducts.Query().DeltaList(1)))
+	runner.expect("DeltaList: Status 3", nil, queryProducts(CheckProducts.Query().DeltaList(3)))
+	runner.expect("DeltaList + Contains: TeamIDs contains 2", []string{"5 Widget"}, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 2).DeltaList(1)))
+	runner.expect("DeltaList + Contains: TeamIDs contains 9", nil, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 9).DeltaList(1)))
 
 	runner.section("Updates: only keys-only rows that changed are written; FullCopy rewrites every row")
 	order.ProductIDs, order.Total = []int32{20, 30, 40}, 5_200
@@ -148,8 +144,6 @@ func Run(output io.Writer) error {
 	runner.expect("Product: CategoryIDs contains 3 (removed)", nil, queryProducts(CheckProducts.Query().Contains(products.CategoryIDs, 3)))
 	runner.expect("Product: CategoryIDs contains 9 (added)", []string{"5 Widget v2"}, queryProducts(CheckProducts.Query().Contains(products.CategoryIDs, 9)))
 	runner.expect("Product: CategoryIDs contains 4 (kept, copy rewritten)", []string{"5 Widget v2"}, queryProducts(CheckProducts.Query().Contains(products.CategoryIDs, 4)))
-	runner.expect("Delta: since the first version (moved rows)", []string{"5 Widget v2"}, queryProducts(CheckProducts.Query().Delta(heldFirstVersion, 1)))
-	runner.expect("Delta + Contains: TeamIDs contains 1, since the first version", []string{"5 Widget v2"}, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 1).Delta(heldFirstVersion, 1)))
 
 	if err := runGroupByChecks(runner, &order); err != nil {
 		return err
@@ -186,24 +180,20 @@ func Run(output io.Writer) error {
 		if err != nil || modified == nil {
 			return nil, err
 		}
-		if modified.Updated != storedProduct.Updated {
-			return []string{fmt.Sprintf("version %d -> %d", storedProduct.Updated, modified.Updated)}, nil
+		if modified.Version != storedProduct.Version {
+			return []string{fmt.Sprintf("version %d -> %d", storedProduct.Version, modified.Version)}, nil
 		}
 		return []string{"same version"}, nil
 	})
 
-	runner.section("Soft delete: a first sync drops it, a later sync still sends it")
+	runner.section("Soft delete: a first sync with Status 1 drops it")
 	product.Status, product.Name, product.TeamIDs = 0, "Widget deleted", []int16{2}
-	if err := runner.write("Put product: Status 0, TeamIDs 1,2 -> 2 (every delta row moves)", func() error { return CheckProducts.Put(&product) }); err != nil {
+	if err := runner.write("Put product: Status 0, TeamIDs 1,2 -> 2 (-1 TeamIDs row)", func() error { return CheckProducts.Put(&product) }); err != nil {
 		return err
 	}
-	runner.expect("Delta: first sync, Status 1", nil, queryProducts(CheckProducts.Query().Delta(dynamo.DeltaSince{}, 1)))
-	runner.expect("Delta: since the first version, every status", []string{"5 Widget deleted"}, queryProducts(CheckProducts.Query().Delta(heldFirstVersion, 1)))
-	runner.expect("Delta + Contains: TeamIDs contains 1 (removed)", nil, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 1).Delta(heldFirstVersion, 1)))
-
-	if err := runDataFrameChecks(runner); err != nil {
-		return err
-	}
+	runner.expect("DeltaList: Status 1", nil, queryProducts(CheckProducts.Query().DeltaList(1)))
+	runner.expect("DeltaList: Status 0", []string{"5 Widget deleted"}, queryProducts(CheckProducts.Query().DeltaList(0)))
+	runner.expect("DeltaList + Contains: TeamIDs contains 1 (removed)", nil, queryProducts(CheckProducts.Query().Contains(products.TeamIDs, 1).DeltaList(0)))
 
 	// DeleteRecordsAll is not repeatable (a second run deletes nothing), so it is checked once.
 	runner.section("Cleanup: the row counts prove no stale array rows were left behind")
@@ -211,12 +201,8 @@ func Run(output io.Writer) error {
 		deleted, err := CheckOrders.DeleteRecordsAll()
 		return []string{strconv.Itoa(deleted)}, err
 	})
-	runner.expectOnce("DeleteRecordsAll products: base + 2 CategoryIDs + 1 delta + 1 TeamIDs delta rows", []string{"5"}, func() ([]string, error) {
+	runner.expectOnce("DeleteRecordsAll products: base + 2 CategoryIDs + 1 TeamIDs delta row", []string{"4"}, func() ([]string, error) {
 		deleted, err := CheckProducts.DeleteRecordsAll()
-		return []string{strconv.Itoa(deleted)}, err
-	})
-	runner.expectOnce("DeleteRecordsAll frame lines: 104 base + 104 delta rows + 2 frame states", []string{"210"}, func() ([]string, error) {
-		deleted, err := CheckFrameLines.DeleteRecordsAll()
 		return []string{strconv.Itoa(deleted)}, err
 	})
 
@@ -332,12 +318,6 @@ func runGroupByChecks(runner *checkRunner, order *CheckOrder) error {
 	runner.expect("Fan-out: one group per Tags element", []string{"express c1 total 5200", "gift c1 total 5200"}, queryGroups(byTag()))
 	runner.expect("Fan-out: Tags = gift", []string{"gift c1 total 5200"}, queryGroups(byTag().Eq(orders.Tags, "gift")))
 	runner.expect("Slot-less: per CustomerID, float sum", []string{"55 c1 weight 1.25"}, queryGroups(byCustomer()))
-	// Since resends the groups of the last DeltaOverlap below the watermark: a write may still be in flight.
-	runner.expect("Since: the order's own Updated (resent from the overlap)", []string{"web/2 c1 total 5200 weight 1.25"},
-		queryGroups(byChannelStatus().Since(order.Updated)))
-	runner.expect("Since: a DeltaOverlap past the order's Updated", nil, queryGroups(byChannelStatus().Since(order.Updated+dynamo.DeltaOverlap.Milliseconds()+1)))
-	runner.expect("Since: first sync", []string{"web/2 c1 total 5200 weight 1.25"}, queryGroups(byChannelStatus().Since(0)))
-	runner.expectRejected("Since on a GroupBy without GroupDelta", queryGroups(byTag().Since(0)))
 
 	secondOrder := CheckOrder{
 		StoreID: checkStoreID, Created: 1_001, ID: 2, CustomerID: 56, Channel: "web", Status: 2,
@@ -355,29 +335,22 @@ func runGroupByChecks(runner *checkRunner, order *CheckOrder) error {
 	}
 	runner.expect("Channel+Status: the order moved", []string{"web/2 c1 total 5200 weight 1.25", "web/3 c1 total 300 weight 0.5"}, queryGroups(byChannelStatus()))
 
-	updatedBeforeSoftDelete := secondOrder.Updated
 	secondOrder.Status = 0
 	if err := runner.write("Put order 2: Status 0 (soft delete: leaves every group)", func() error { return CheckOrders.Put(&secondOrder) }); err != nil {
 		return err
 	}
 	runner.expect("Channel+Status: the emptied web/3 is left out", []string{"web/2 c1 total 5200 weight 1.25"}, queryGroups(byChannelStatus()))
-	// web/2 comes too: the move it lost order 2 in was stamped updatedBeforeSoftDelete, inside the overlap.
-	runner.expect("Since: the emptied group still reaches a later sync", []string{"web/2 c1 total 5200 weight 1.25", "web/3 c0 total 0 weight 0"},
-		queryGroups(byChannelStatus().Since(updatedBeforeSoftDelete)))
 	runner.expect("Fan-out: gift is back to order 1", []string{"express c1 total 5200", "gift c1 total 5200"}, queryGroups(byTag()))
 	runner.expect("Slot-less: customer 56 emptied", []string{"55 c1 weight 1.25"}, queryGroups(byCustomer()))
 
 	if err := runner.write("Delete order 2: it counted in no group anymore", func() error { return CheckOrders.Delete(&secondOrder) }); err != nil {
 		return err
 	}
-	// A rebuild Puts only the counters that differ from the records: 0 proves every ADD above was exact.
-	runner.expectOnce("RebuildGroups StoreID 7: counters rewritten", []string{"0"}, func() ([]string, error) {
-		rewritten, err := CheckOrders.RebuildGroups(checkStoreID)
-		return []string{strconv.Itoa(rewritten)}, err
-	})
-	runner.expectOnce("RebuildGroupsAll: counters rewritten", []string{"0"}, func() ([]string, error) {
-		rewritten, err := CheckOrders.RebuildGroupsAll()
-		return []string{strconv.Itoa(rewritten)}, err
+	// Reprocess writes only the derived data that differs from the records: 0 proves every ADD and
+	// every hidden row above was exact.
+	runner.expectOnce("Reprocess: counters rewritten, hidden rows put, deleted", []string{"0 0 0"}, func() ([]string, error) {
+		report, err := CheckOrders.Reprocess(true)
+		return []string{fmt.Sprint(report.CountersRewritten, report.HiddenRowsPut, report.HiddenRowsDeleted)}, err
 	})
 	return nil
 }

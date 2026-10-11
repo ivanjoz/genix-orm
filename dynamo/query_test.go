@@ -20,6 +20,7 @@ type Product struct {
 	Name       string   `cb:"7"`
 	TagIDs     []int32  `cb:"8"`
 	Labels     []string `cb:"9"`
+	Version    int16    `json:"ver,omitempty" cb:"-"`
 }
 
 type ProductTable struct {
@@ -125,15 +126,18 @@ func TestMarshalItemDerivesKeys(t *testing.T) {
 	if got := s(item["r3"]); got != wantSK {
 		t.Fatalf("r3 = %q want %q", got, wantSK)
 	}
-	// The whole record lives in the binary column "d"; nothing else leaks.
+	// The whole record lives in the binary column "d", but Version, a number DynamoDB compares.
 	blob, ok := item["d"].(*types.AttributeValueMemberB)
 	if !ok || len(blob.Value) == 0 {
 		t.Fatalf("expected non-empty binary column d, got %T", item["d"])
 	}
-	allowed := map[string]bool{"pk": true, "sk": true, "h1": true, "r1": true, "h2": true, "r2": true, "h3": true, "r3": true, "d": true}
+	if _, isNumber := item["ver"].(*types.AttributeValueMemberN); !isNumber {
+		t.Fatalf("ver = %#v, want a number", item["ver"])
+	}
+	allowed := map[string]bool{"pk": true, "sk": true, "h1": true, "r1": true, "h2": true, "r2": true, "h3": true, "r3": true, "d": true, "ver": true}
 	for k := range item {
 		if !allowed[k] {
-			t.Fatalf("unexpected attribute %q in item (only keys/index/d allowed)", k)
+			t.Fatalf("unexpected attribute %q in item (only keys/index/d/ver allowed)", k)
 		}
 	}
 	// Round-trip the blob back into a record.
@@ -276,6 +280,7 @@ func TestQueryScanFiltersANonKeyFieldInMemory(t *testing.T) {
 type account struct {
 	ID       int32  `cb:"1"`
 	Username string `cb:"2"`
+	Version  int16  `json:"ver,omitempty" cb:"-"`
 }
 
 type accountTable struct {
@@ -338,12 +343,13 @@ func TestPostFilterEval(t *testing.T) {
 // ── Accessor width coverage ──────────────────────────────────────────────────
 
 type widths struct {
-	PK  int32
-	A8  int8
-	A16 int16
-	A32 int32
-	A64 int64
-	U32 uint32
+	PK      int32
+	A8      int8
+	A16     int16
+	A32     int32
+	A64     int64
+	U32     uint32
+	Version int16 `json:"ver,omitempty" cb:"-"`
 }
 
 type widthsTable struct {

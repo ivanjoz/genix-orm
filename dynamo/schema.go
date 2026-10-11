@@ -252,56 +252,15 @@ type Schema struct {
 
 	// CacheByIDs enables the by-IDs cache (cache_by_ids.go): every write raises the
 	// record's slot to the year tick of its Updated, in a slot file per partition
-	// (SetIDsCacheStore), and Repo.QueryCachedIDs returns only the requested records
+	// (in the FileStore, file_store.go), and Repo.QueryCachedIDs returns only the requested records
 	// whose slot moved since the tick the client holds. It needs exactly one integer
-	// Keys column (the ID), at most one Partition column, and the managed int64
+	// Keys column (the ID), at most one Partition column, and the managed int32
 	// "Updated" field (see delta.go), which a by-IDs read overwrites with the slot's.
 	CacheByIDs bool
-
-	// VersionedWrites enables Repo.Modify (modify.go) on a table that has neither
-	// CacheByIDs, GroupDelta, DataFrames nor a TypeDelta index (those already imply
-	// it): the item carries the managed int64 "Updated" field (delta.go) as the
-	// attribute "upd" too, which the conditional write compares.
-	VersionedWrites bool
-
-	// DataFrames are aggregates of the records kept as files in the frame store
-	// (data_frame.go), brought up to date by MaterializeDataFrames.
-	DataFrames []DataFrame
 }
 
-// DataFrame is an aggregate of the records kept as files in the frame store: one
-// file per distinct value of Keys, holding one row per distinct value of Rows,
-// ascending, with the sum of each Sums column. Keys[0] is the reprocessing unit (a
-// day): RebuildDataFrames recomputes a range of it from the records.
-//
-// A table with frames needs the managed int64 fields "Updated" (json "upd") and
-// "CreatedVersion" (json "crv"), a TypeDelta index without pinned Keys (the run
-// reads the changed records through it), and no Partition.
-type DataFrame struct {
-	// Name is the frame's folder: lowercase letters, digits and '-', unique in the
-	// entity. Renaming it orphans the files.
-	Name string
-	// Keys name the file, 1 to 3 integer Cols with a cb tag. With 1, Keys[0] is the
-	// file; with 2–3, Keys[0] is a folder and the rest name the file inside it.
-	// Keys[0] must lead the entity's Keys, a GSI or a local index.
-	Keys []Coln
-	// Rows is the integer Col each file lists, ascending.
-	Rows Coln
-	// Sums are the integer Cols summed per row, one column each in the file. A write
-	// with a negative value fails, unless AllowNegativeSums.
-	Sums []Coln
-	// AllowNegativeSums accepts negative Sums values. It only changes that
-	// validation: the file format stores any int64.
-	AllowNegativeSums bool
-	// Count adds one more summed column after the Sums, which every record (Status
-	// ≠ 0) adds 1 to: how many records a row sums, read with FrameRow.Count. With it
-	// the Sums may be empty.
-	Count bool
-}
-
-// TypeDelta marks an Index as a delta index (delta.go): the ORM appends the
-// managed Updated to its Keys, so Delta() reads "changed since the client's
-// watermark" as one exact sk range.
+// TypeDelta marks an Index as a delta index (delta.go): every write appends to its
+// change log, and Delta() reads the log past the client's cursor.
 const TypeDelta int8 = 10
 
 // TypeLocal marks an Index as a local index (local_index.go): one hidden
@@ -360,8 +319,8 @@ var (
 //     so a slice field takes one fan-out index. The rows are kept in sync by
 //     Put/PutMany/PutIfAbsent/Delete (see array_index.go); a scalar column in
 //     Keys that changes on a write rewrites every element row.
-//   - A delta index: Type is TypeDelta (see delta.go). It lives in hidden rows
-//     like a fan-out index, with or without a ColSlice among its Keys.
+//   - A delta index: Type is TypeDelta (see delta.go): a change log in the
+//     FileStore, plus hidden rows when a pinned Key is not a base key column.
 //   - A local index: Type is TypeLocal (see local_index.go). Scalar Keys, no
 //     Slot: one hidden row per record, read like a GSI but consistently.
 type Index struct {
@@ -381,10 +340,6 @@ type Index struct {
 	// each column, read with Repo.QueryGroups (group_by.go). Not on a TypeDelta
 	// index. An Index with a GroupBy may go without a Slot: counters only.
 	GroupBy []Coln
-	// GroupDelta (with GroupBy) also stamps each counter with the Updated of the
-	// last write that touched it, so QueryGroups().Since() reads only changed
-	// groups. It needs the managed Updated field (delta.go).
-	GroupDelta bool
 }
 
 // holdsSliceColumn reports whether the index is a fan-out index: one of its Keys is a ColSlice.

@@ -15,7 +15,7 @@ import (
 //
 // PutManyIfVersion diffs a record's hidden rows (fan-out, delta) against the
 // record as stored. GetManyForUpdate and Modify keep the blob they read, keyed by
-// the record's pk#sk and tagged with its "upd". A write uses an entry only when
+// the record's pk#sk and tagged with its "ver". A write uses an entry only when
 // that version equals the one it is conditioned on, and the condition then
 // proves the entry: if the write succeeds, the stored item was exactly that
 // version, so the cached blob was the stored state. A stale entry is just a miss.
@@ -49,7 +49,7 @@ func rememberStoredItems(items []map[string]types.AttributeValue) {
 	writeCache.Lock()
 	defer writeCache.Unlock()
 	for _, item := range items {
-		versionAttr, hasVersion := item[updatedColumn].(*types.AttributeValueMemberN)
+		versionAttr, hasVersion := item[versionColumn].(*types.AttributeValueMemberN)
 		blobAttr, hasBlob := item[dataColumn].(*types.AttributeValueMemberB)
 		if !hasVersion || !hasBlob {
 			continue
@@ -73,15 +73,15 @@ func refreshStoredItem(item map[string]types.AttributeValue, version int64) {
 	}
 }
 
-// cachedStoredBlob returns the stored blob of a record at exactly expectedVersion, and when it was read.
-func cachedStoredBlob(cacheKey string, expectedVersion int64) ([]byte, time.Time, bool) {
+// cachedStoredBlob returns the stored blob of a record at exactly expectedVersion.
+func cachedStoredBlob(cacheKey string, expectedVersion int64) ([]byte, bool) {
 	writeCache.Lock()
 	defer writeCache.Unlock()
 	entry, isCached := writeCache.entriesByKey[cacheKey]
 	if !isCached || entry.version != expectedVersion || Now().Sub(entry.cachedAt) > writeCacheTTL {
-		return nil, time.Time{}, false
+		return nil, false
 	}
-	return entry.blob, entry.cachedAt, true
+	return entry.blob, true
 }
 
 // storeWriteCacheEntry must run under the lock. The blob is copied: an SDK

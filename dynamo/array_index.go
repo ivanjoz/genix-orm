@@ -54,18 +54,13 @@ type arrayIndexMeta struct {
 	keys            []keyCol
 	elementPosition int
 	// columnID is the cb id that names the rows' pk, zero-padded to
-	// arrayIndexColumnIDDigits: the slice field's, or for a delta index without one,
-	// its first key's (Updated's when it has none).
+	// arrayIndexColumnIDDigits: the slice field's, or for the rows of a delta index
+	// without one, its first key's.
 	columnID string
 	fullCopy bool
 	// elements reads the slice straight from the record and returns one key part
 	// per element (duplicates included).
 	elements func(ptr unsafe.Pointer) []keyPart
-
-	// Delta indexes only: keys ends with the managed Updated, and
-	// syncFilterField is the field Delta()'s values filter on a first sync ("" for none).
-	isDelta         bool
-	syncFilterField string
 
 	// isLocal marks a TypeLocal index (local_index.go): the planner offers it as an
 	// access path for Eq and ranges on its Keys.
@@ -199,11 +194,11 @@ func (m *tableMeta) writesArrayRow(arrayIndex *arrayIndexMeta, ptr unsafe.Pointe
 
 // arrayIndexWrites diffs the fan-out rows of a record's stored version
 // (storedPtr, nil when there is none) against the version being written
-// (writtenPtr, nil for a delete) and returns the rows to put and to delete. Both
-// versions share the same key. Keys-only rows are put only when their sk is new
-// (a new element, or a changed scalar index column); FullCopy rows are put for
-// every element, because the blob they copy changed.
-func (m *tableMeta) arrayIndexWrites(storedPtr, writtenPtr unsafe.Pointer, blob []byte) (puts, deletes []types.WriteRequest) {
+// (writtenPtr, nil for a delete; item is its base item) and returns the rows to put
+// and to delete. Both versions share the same key. Keys-only rows are put only when
+// their sk is new (a new element, or a changed scalar index column); FullCopy rows
+// are put for every element, because the blob and Version they copy changed.
+func (m *tableMeta) arrayIndexWrites(storedPtr, writtenPtr unsafe.Pointer, item map[string]types.AttributeValue) (puts, deletes []types.WriteRequest) {
 	keyPtr := writtenPtr
 	if keyPtr == nil {
 		keyPtr = storedPtr
@@ -228,7 +223,7 @@ func (m *tableMeta) arrayIndexWrites(storedPtr, writtenPtr unsafe.Pointer, blob 
 			}
 			row := itemKey(rowPK, rowSK)
 			if arrayIndex.fullCopy {
-				row[dataColumn] = &types.AttributeValueMemberB{Value: blob}
+				row[dataColumn], row[versionColumn] = item[dataColumn], item[versionColumn]
 			}
 			puts = append(puts, types.WriteRequest{PutRequest: &types.PutRequest{Item: row}})
 		}

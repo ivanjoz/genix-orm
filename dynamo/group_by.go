@@ -22,12 +22,11 @@ import (
 // distinct value of its Keys (the group), one counter item with the number of
 // records in the group and the sum of each GroupBy column:
 //
-//	pk   = base pk ‖ 000                      (the bookkeeping pk, beside the DataFrame states)
+//	pk   = base pk ‖ 000                      (the bookkeeping pk)
 //	sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
 //	c    = record count                       (native number)
 //	sNNN = sum of the column with cb id NNN   (native number; floats as round(v * 1e6))
 //	d    = colbin blob of a record holding only the group Keys, for Group.Key
-//	upd  = the Updated of the last write that touched it (GroupDelta only)
 //
 // A record with Status 0 is deleted and counts in no group. On a fan-out Index each
 // distinct element is a group, and the record's whole values count in each one.
@@ -37,14 +36,12 @@ import (
 // (groupCounterDeltas), merged per counter over the whole call, and ADDed after
 // the base items land, one UpdateItem per counter. It is best-effort: two plain
 // Puts racing on one record, a crash between the base write and the ADD, or a
-// retried ADD drift a counter, and RebuildGroups recomputes them from the records.
-// A counter that reaches 0 is kept, so a GroupDelta client sees its group empty out.
+// retried ADD drift a counter, and Reprocess recomputes them from the records.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
 	groupCountersSKPrefix = "g"
 	groupCountAttr        = "c"
-	groupUpdatedAttr      = "upd"
 	// floatSumScale turns a float into the int64 its sums are kept in: 6 decimals, and adding
 	// then subtracting the same value lands back on the exact previous sum.
 	floatSumScale = 1e6
@@ -70,14 +67,10 @@ type groupIndexMeta struct {
 	elementPosition int
 	elements        func(ptr unsafe.Pointer) []keyPart
 	sums            []groupSumColumn
-	isDelta         bool
 }
 
 // compileGroupIndex resolves the GroupBy of an Index.
 func compileGroupIndex(recordType reflect.Type, accessors map[string]*colAccessor, index Index) groupIndexMeta {
-	if index.Type == TypeDelta {
-		panic(fmt.Sprintf("db: %s declares GroupBy on a TypeDelta index: declare it on a GSI, a fan-out or a slot-less Index", recordType.Name()))
-	}
 	resolved := resolveArrayIndex(recordType, accessors, Index{Keys: index.Keys})
 	keyColumnIDs := make([]string, len(index.Keys))
 	for i, column := range index.Keys {
@@ -88,7 +81,6 @@ func compileGroupIndex(recordType reflect.Type, accessors map[string]*colAccesso
 		keys:            resolved.keys,
 		elementPosition: resolved.elementPosition,
 		elements:        resolved.elements,
-		isDelta:         index.GroupDelta,
 	}
 	isSummed := map[string]bool{}
 	for _, column := range index.GroupBy {
@@ -173,7 +165,6 @@ type groupCounterDelta struct {
 	basePK, sk string
 	count      int64
 	sums       []int64 // parallel to groupIndex.sums
-	updated    int64   // the highest Updated written into the group; 0 for a delete
 	// keyRecordPtr is a record of the group (stored or written) the counter's key blob is
 	// built from, and elementIndex the element that put it there on a fan-out GroupBy.
 	keyRecordPtr unsafe.Pointer
@@ -201,10 +192,6 @@ func (m *tableMeta) addGroupCounterDeltas(deltas map[string]*groupCounterDelta, 
 	keyPtr := writtenPtr
 	if keyPtr == nil {
 		keyPtr = storedPtr
-	}
-	writtenUpdated := int64(0)
-	if m.updated != nil && writtenPtr != nil {
-		writtenUpdated = m.updated.acc.getI64(writtenPtr)
 	}
 	for i := range m.groupIndexes {
 		groupIndex := &m.groupIndexes[i]
@@ -235,7 +222,6 @@ func (m *tableMeta) addGroupCounterDeltas(deltas map[string]*groupCounterDelta, 
 		for _, group := range writtenGroups {
 			isWrittenGroup[group.sk] = true
 			delta := groupCounterDeltaOf(deltas, groupIndex, basePK, group, writtenPtr)
-			delta.updated = max(delta.updated, writtenUpdated)
 			if isStoredGroup[group.sk] {
 				for j := range delta.sums {
 					delta.sums[j] += writtenSums[j] - storedSums[j]
@@ -252,7 +238,6 @@ func (m *tableMeta) addGroupCounterDeltas(deltas map[string]*groupCounterDelta, 
 				continue
 			}
 			delta := groupCounterDeltaOf(deltas, groupIndex, basePK, group, storedPtr)
-			delta.updated = max(delta.updated, writtenUpdated)
 			delta.count--
 			for j := range delta.sums {
 				delta.sums[j] -= storedSums[j]
@@ -288,7 +273,6 @@ func mergeGroupCounterDeltas(into, from map[string]*groupCounterDelta) {
 		for j := range merged.sums {
 			merged.sums[j] += delta.sums[j]
 		}
-		merged.updated = max(merged.updated, delta.updated)
 	}
 }
 
@@ -314,20 +298,17 @@ func (m *tableMeta) groupKeyBlob(groupIndex *groupIndexMeta, recordPtr unsafe.Po
 }
 
 // countersColumnID is appended to the base pk for the partition's bookkeeping items (GroupBy
-// counters, DataFrame states), where a fan-out index appends its cb id: no cb id is 000, so no query
+// counters), where a fan-out index appends its cb id: no cb id is 000, so no query
 // or Scan of the records reads them.
 const countersColumnID = "000"
 
-// groupCountersPK is the pk of a base partition's counters (and of its DataFrame states).
+// groupCountersPK is the pk of a base partition's counters.
 func groupCountersPK(basePK string) string { return basePK + countersColumnID }
 
 // applyGroupCounterDeltas ADDs every non-zero delta to its counter, one UpdateItem
-// each, and on a GroupDelta stamps upd. It must run after the base items land. A
-// delete writes no Updated, so its counters get a fresh one. The updates run in
-// parallel: each one touches its own counter item and an ADD commutes, so their
-// order never matters.
+// each. It must run after the base items land. The updates run in parallel: each
+// one touches its own counter item and an ADD commutes, so their order never matters.
 func (m *tableMeta) applyGroupCounterDeltas(client *dynamodb.Client, deltas map[string]*groupCounterDelta) error {
-	deleteUpdated := int64(0)
 	counterUpdates := make([]*dynamodb.UpdateItemInput, 0, len(deltas))
 	counterSKs := make([]string, 0, len(deltas))
 	for _, delta := range deltas {
@@ -350,18 +331,6 @@ func (m *tableMeta) applyGroupCounterDeltas(client *dynamodb.Client, deltas map[
 			addClauses = append(addClauses, "#"+sum.attr+" :"+sum.attr)
 		}
 		setClauses := []string{"#d = if_not_exists(#d, :d)"}
-		if delta.groupIndex.isDelta {
-			counterUpdated := delta.updated
-			if counterUpdated == 0 {
-				if deleteUpdated == 0 {
-					deleteUpdated = nextUpdated()
-				}
-				counterUpdated = deleteUpdated
-			}
-			names["#upd"] = groupUpdatedAttr
-			values[":upd"] = numberAttr(counterUpdated)
-			setClauses = append(setClauses, "#upd = :upd")
-		}
 		counterUpdates = append(counterUpdates, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(tableName()),
 			Key:                       itemKey(groupCountersPK(delta.basePK), delta.sk),
@@ -387,10 +356,8 @@ func (m *tableMeta) applyGroupCounterDeltas(client *dynamodb.Client, deltas map[
 // and, through Sum / SumFloat, the sum of each GroupBy column.
 type Group[E any] struct {
 	// Key is a record with only the group Keys set; on a fan-out GroupBy its slice holds the one element.
-	Key   E
-	Count int64
-	// Updated is the Updated of the last write that touched the group (GroupDelta only).
-	Updated    int64
+	Key        E
+	Count      int64
 	groupIndex *groupIndexMeta
 	sums       []int64
 }
@@ -421,18 +388,16 @@ func (g Group[E]) sumPosition(column Coln, isFloat bool) int {
 
 // GroupQuery reads the counters of one GroupBy in one base partition.
 type GroupQuery[E any] struct {
-	meta         *tableMeta
-	groupIndex   *groupIndexMeta
-	preds        []predicate
-	updatedSince int64
-	readsDelta   bool
-	planErr      error
+	meta       *tableMeta
+	groupIndex *groupIndexMeta
+	preds      []predicate
+	planErr    error
 }
 
 // QueryGroups reads the counters of the GroupBy whose Keys are exactly groupKeys,
 // in order. It needs an Eq on every Partition column (counters are per partition);
 // the group Keys take an Eq on a leading run, then one range, as Keys do in Query.
-// Without Since, groups whose count fell to 0 are left out.
+// Groups whose count fell to 0 are left out.
 func (r *Repo[T, E]) QueryGroups(groupKeys ...Coln) *GroupQuery[E] {
 	query := &GroupQuery[E]{meta: r.meta}
 	for i := range r.meta.groupIndexes {
@@ -466,21 +431,7 @@ func (q *GroupQuery[E]) Between(column Coln, a, b any) *GroupQuery[E] {
 	return q.add(column, opBetween, a, b)
 }
 
-// Since turns the read into a delta read on a GroupDelta: only the groups written
-// after updatedSince, the highest Updated the client holds, emptied groups
-// included so the client drops them. A first sync (0) leaves the empty ones out.
-// Like Delta() it also resends the groups of the last DeltaOverlap below
-// updatedSince (a write in flight), with no fingerprint: a GroupBy holds few groups.
-func (q *GroupQuery[E]) Since(updatedSince int64) *GroupQuery[E] {
-	if q.planErr == nil && !q.groupIndex.isDelta {
-		q.planErr = fmt.Errorf("db: %s Since() needs GroupDelta on its GroupBy", q.meta.recordType.Name())
-	}
-	q.updatedSince, q.readsDelta = updatedSince, true
-	return q
-}
-
-// Exec reads the groups in group key order. A GroupBy holds few groups, so Since
-// filters them in memory after reading the range.
+// Exec reads the groups in group key order.
 func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 	if q.planErr != nil {
 		return nil, q.planErr
@@ -543,22 +494,16 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 			}
 			group := Group[E]{
 				Count:      numberAttrValue(item, groupCountAttr),
-				Updated:    numberAttrValue(item, groupUpdatedAttr),
 				groupIndex: q.groupIndex,
 				sums:       make([]int64, len(q.groupIndex.sums)),
 			}
-			// A later delta sync sends every changed group, emptied ones included; any other read skips them.
-			if q.readsDelta && q.updatedSince > 0 {
-				if group.Updated < q.updatedSince-DeltaOverlap.Milliseconds() {
-					continue
-				}
-			} else if group.Count == 0 {
+			if group.Count == 0 {
 				continue
 			}
 			if err := m.unmarshalItem(item, &group.Key); err != nil {
 				return nil, err
 			}
-			// A column added to the GroupBy after the counter was written reads 0 until RebuildGroups.
+			// A column added to the GroupBy after the counter was written reads 0 until Reprocess.
 			for j, sum := range q.groupIndex.sums {
 				group.sums[j] = numberAttrValue(item, sum.attr)
 			}
@@ -581,109 +526,20 @@ func numberAttrValue(item map[string]types.AttributeValue, attr string) int64 {
 	return value
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Backfill: RebuildGroups / RebuildGroupsAll
-// ─────────────────────────────────────────────────────────────────────────────
-
-// RebuildGroups recomputes every GroupBy counter of one base partition from its
-// records (pass one value per Partition column, none without Partition) and
-// returns how many counters it rewrote. It is the fix for drift, and the backfill
-// after adding a GroupBy, a GroupBy column or changing its Keys. Writes landing
-// while it runs can be lost from it or counted twice: run it when the partition
-// is quiet, and a second run converges.
-func (r *Repo[T, E]) RebuildGroups(partitionValues ...any) (int, error) {
-	m := r.meta
-	if len(m.groupIndexes) == 0 {
-		return 0, fmt.Errorf("db: %s declares no GroupBy", m.recordType.Name())
-	}
-	if len(partitionValues) != len(m.partition) {
-		return 0, fmt.Errorf("db: %s has %d partition column(s), got %d value(s)", m.recordType.Name(), len(m.partition), len(partitionValues))
-	}
-	query := r.Query().Consistent()
-	values := make([]uint64, len(m.partition))
-	for i, kc := range m.partition {
-		query.preds = append(query.preds, predicate{field: kc.fieldName, op: opEq, v1: partitionValues[i]})
-		values[i] = uint64(valueToInt64(partitionValues[i], kc.fieldName))
-	}
-	var records []E
-	if err := query.Exec(&records); err != nil {
-		return 0, err
-	}
-	client, err := Client()
-	if err != nil {
-		return 0, err
-	}
-	return r.rebuildPartitionGroups(client, m.numericKey(values, m.partition), records)
+// numberAttr is an integer as a DynamoDB number attribute.
+func numberAttr(value int64) types.AttributeValue {
+	return &types.AttributeValueMemberN{Value: strconv.FormatInt(value, 10)}
 }
 
-// RebuildGroupsAll is RebuildGroups for every base partition of the entity: it
-// scans its records, and its counters too, so a partition left without records
-// gets its counters zeroed. It returns how many counters it rewrote.
-func (r *Repo[T, E]) RebuildGroupsAll() (int, error) {
-	m := r.meta
-	if len(m.groupIndexes) == 0 {
-		return 0, fmt.Errorf("db: %s declares no GroupBy", m.recordType.Name())
-	}
-	records, err := r.Scan(0)
-	if err != nil {
-		return 0, err
-	}
-	recordsByPK := map[string][]E{}
-	for i := range records {
-		basePK := m.pkValue(unsafe.Pointer(&records[i]))
-		recordsByPK[basePK] = append(recordsByPK[basePK], records[i])
-	}
-	client, err := Client()
-	if err != nil {
-		return 0, err
-	}
-
-	lowestPK, highestPK := m.partitionRange(arrayIndexColumnIDDigits)
-	input := &dynamodb.ScanInput{
-		TableName:                aws.String(tableName()),
-		FilterExpression:         aws.String("#pk BETWEEN :lo AND :hi AND begins_with(#sk, :g)"),
-		ProjectionExpression:     aws.String("#pk"),
-		ExpressionAttributeNames: map[string]string{"#pk": "pk", "#sk": "sk"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":lo": &types.AttributeValueMemberN{Value: lowestPK},
-			":hi": &types.AttributeValueMemberN{Value: highestPK},
-			":g":  &types.AttributeValueMemberS{Value: groupCountersSKPrefix},
-		},
-	}
-	for {
-		out, err := client.Scan(context.Background(), input)
-		if err != nil {
-			return 0, err
-		}
-		for _, item := range out.Items {
-			if counterPK := item["pk"].(*types.AttributeValueMemberN).Value; strings.HasSuffix(counterPK, countersColumnID) {
-				basePK := strings.TrimSuffix(counterPK, countersColumnID)
-				recordsByPK[basePK] = recordsByPK[basePK] // a partition with counters and no records
-			}
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			break
-		}
-		input.ExclusiveStartKey = out.LastEvaluatedKey
-	}
-
-	rewrittenCount := 0
-	for basePK, partitionRecords := range recordsByPK {
-		rewritten, err := r.rebuildPartitionGroups(client, basePK, partitionRecords)
-		rewrittenCount += rewritten
-		if err != nil {
-			return rewrittenCount, err
-		}
-	}
-	return rewrittenCount, nil
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Backfill: Reprocess (reprocess_derived.go) recomputes the counters
+// ─────────────────────────────────────────────────────────────────────────────
 
 // rebuildPartitionGroups computes the counters of one partition from its records,
 // compares them with the stored ones and Puts only those that differ: a stored
-// counter no record produces anymore is zeroed, and one of a GroupBy no longer
-// declared is deleted. Every rewritten counter of a GroupDelta gets a fresh
-// Updated, so clients past their watermark still refetch the corrected groups.
-func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK string, records []E) (int, error) {
+// counter no record produces anymore is deleted, unless the writes already zeroed it.
+// With write false it only counts the counters it would write.
+func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK string, records []E, write bool) (int, error) {
 	m := r.meta
 	expectedDeltas := map[string]*groupCounterDelta{}
 	for i := range records {
@@ -715,13 +571,6 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		input.ExclusiveStartKey = out.LastEvaluatedKey
 	}
 
-	rebuildUpdated := nextUpdated()
-	stampUpdated := func(counter map[string]types.AttributeValue, groupIndex *groupIndexMeta) {
-		if groupIndex != nil && groupIndex.isDelta {
-			counter[groupUpdatedAttr] = numberAttr(rebuildUpdated)
-		}
-	}
-
 	var counterWrites []types.WriteRequest
 	for _, expected := range expectedDeltas {
 		storedCounter := storedCounterBySK[expected.sk]
@@ -739,32 +588,33 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		for j, sum := range expected.groupIndex.sums {
 			counter[sum.attr] = &types.AttributeValueMemberN{Value: strconv.FormatInt(expected.sums[j], 10)}
 		}
-		stampUpdated(counter, expected.groupIndex)
 		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
 	}
 	// What is left was produced by no record: an emptied group, or a GroupBy that changed its Keys or
-	// was removed. A counter of an undeclared GroupBy is deleted: no query can read it anymore. An
-	// emptied group of a declared one is zeroed, so Since(W) still tells the clients to drop it.
+	// was removed. Either way no query needs it anymore. An emptied group the writes already zeroed
+	// stays as it is.
 	for groupSK, storedCounter := range storedCounterBySK {
-		groupIndex := m.groupIndexOfSK(groupSK)
-		if groupIndex == nil {
-			counterDelete := &types.DeleteRequest{Key: itemKey(counterPK, groupSK)}
-			counterWrites = append(counterWrites, types.WriteRequest{DeleteRequest: counterDelete})
-			continue
-		}
 		if numberAttrValue(storedCounter, groupCountAttr) == 0 && !holdsNonZeroSum(storedCounter) {
 			continue
 		}
-		counter := itemKey(counterPK, groupSK)
-		counter[groupCountAttr] = &types.AttributeValueMemberN{Value: "0"}
-		if keyBlob, hasKey := storedCounter[dataColumn]; hasKey {
-			counter[dataColumn] = keyBlob
-		}
-		stampUpdated(counter, groupIndex)
-		counterWrites = append(counterWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: counter}})
+		counterDelete := &types.DeleteRequest{Key: itemKey(counterPK, groupSK)}
+		counterWrites = append(counterWrites, types.WriteRequest{DeleteRequest: counterDelete})
 	}
-	_, err := r.batchWriteAll(context.Background(), client, counterWrites)
+	if !write {
+		return len(counterWrites), nil
+	}
+	err := r.batchWriteAll(context.Background(), client, counterWrites)
 	return len(counterWrites), err
+}
+
+// holdsNonZeroSum reports whether any sum attribute (sNNN) of a counter is not 0.
+func holdsNonZeroSum(counter map[string]types.AttributeValue) bool {
+	for attr := range counter {
+		if strings.HasPrefix(attr, "s") && attr != "sk" && numberAttrValue(counter, attr) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // storedCounterMatches reports whether a stored counter already holds the expected count and sums.
@@ -778,25 +628,4 @@ func storedCounterMatches(storedCounter map[string]types.AttributeValue, expecte
 		}
 	}
 	return true
-}
-
-// holdsNonZeroSum reports whether any sum attribute (sNNN) of a counter is not 0.
-func holdsNonZeroSum(counter map[string]types.AttributeValue) bool {
-	for attr := range counter {
-		if strings.HasPrefix(attr, "s") && attr != "sk" && numberAttrValue(counter, attr) != 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// groupIndexOfSK returns the GroupBy a counter sk belongs to, nil when its tag is no longer declared.
-func (m *tableMeta) groupIndexOfSK(groupSK string) *groupIndexMeta {
-	tag, _, _ := strings.Cut(groupSK, keySeparator)
-	for i := range m.groupIndexes {
-		if m.groupIndexes[i].tag == tag {
-			return &m.groupIndexes[i]
-		}
-	}
-	return nil
 }

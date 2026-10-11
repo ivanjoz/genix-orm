@@ -1,5 +1,4 @@
-// Package parallel runs the independent calls of one ORM step at once, bounded. The dataframe module
-// keeps its own copy: it imports nothing of dynamo.
+// Package parallel runs the independent calls of one ORM step at once, bounded.
 package parallel
 
 import (
@@ -8,7 +7,7 @@ import (
 )
 
 // maxConcurrentTasks bounds the concurrent calls of one step (the conditional puts of
-// PutManyIfVersion, the GroupBy counter updates, the DataFrame file reads and writes). It matches
+// PutManyIfVersion, the GroupBy counter updates, the ReprocessBlobs rewrites). It matches
 // the AWS SDK's default of 10 idle connections per host, so a parallel step reuses warm connections
 // instead of opening new TLS ones.
 const maxConcurrentTasks = 10

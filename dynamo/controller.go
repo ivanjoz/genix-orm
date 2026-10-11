@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
@@ -54,18 +52,12 @@ type Controller interface {
 	// PutRecords upserts E values (from DecodeRecords or QueryRecords) through
 	// PutMany and returns them as written, autoincrement IDs assigned.
 	PutRecords(records []any) ([]any, error)
-	// RebuildGroupsAll recomputes every GroupBy counter from the records and returns
-	// how many it rewrote; an error when the entity declares no GroupBy (group_by.go).
-	RebuildGroupsAll() (int, error)
-	// MaterializeDataFrames brings every DataFrame of the entity up to date
-	// (data_frame_run.go). Without frames it does nothing.
-	MaterializeDataFrames() error
-	// RebuildDataFrames recomputes from the records the files of a frame ("" for
-	// every frame) whose first key is in [fromKey, toKey].
-	RebuildDataFrames(frameName string, fromKey, toKey int64) error
-	// RebuildDataFramesAll recomputes every file of a frame ("" for every frame) and
-	// deletes the files no record produces.
-	RebuildDataFramesAll(frameName string) error
+	// Reprocess rebuilds the hidden rows, GroupBy counters and by-IDs slots from the
+	// records, writing only what differs; write false is a dry run (reprocess_derived.go).
+	Reprocess(write bool) (DerivedReport, error)
+	// ReprocessRecordsAny runs transform (record is the *E) over every record and writes
+	// back the ones it changed, silently; write false is a dry run (reprocess_records.go).
+	ReprocessRecordsAny(transform func(record any) (bool, error), write bool) (RecordsReport, error)
 	// ReprocessBlobs re-encodes in the current colbin every stored blob written by the previous
 	// one, which decodeLegacy reads; write false is a dry run (reprocess.go).
 	ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error)
@@ -90,69 +82,26 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 // rows), so sibling entities (and the internal sequence counters) in the shared
 // table are untouched. The by-IDs slots go too: a recreated record is stamped a
 // later Updated, so it can't match a value a client holds. The returned count
-// includes array index rows, GroupBy counters and frame states.
+// includes array index rows and GroupBy counters.
 // This is a destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	client, err := Client()
 	if err != nil {
 		return 0, err
 	}
-
-	lowestPK, highestPK := r.meta.partitionRange(0)
-	lowestArrayPK, highestArrayPK := r.meta.partitionRange(arrayIndexColumnIDDigits)
-	input := &dynamodb.ScanInput{
-		TableName:                aws.String(tableName()),
-		FilterExpression:         aws.String("#pk BETWEEN :lo AND :hi OR #pk BETWEEN :arrayLo AND :arrayHi"),
-		ProjectionExpression:     aws.String("#pk, #sk"),
-		ExpressionAttributeNames: map[string]string{"#pk": "pk", "#sk": "sk"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":lo":      &types.AttributeValueMemberN{Value: lowestPK},
-			":hi":      &types.AttributeValueMemberN{Value: highestPK},
-			":arrayLo": &types.AttributeValueMemberN{Value: lowestArrayPK},
-			":arrayHi": &types.AttributeValueMemberN{Value: highestArrayPK},
-		},
-	}
-
 	deleted := 0
-	var batch []types.WriteRequest
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
+	err = scanItems(client, []pkRange{r.meta.baseRowsRange(), r.meta.hiddenRowsRange()}, []string{"pk", "sk"}, func(items []map[string]types.AttributeValue) error {
+		deletes := make([]types.WriteRequest, len(items))
+		for i, item := range items {
+			deletes[i] = types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: itemKeyOf(item)}}
 		}
-		if err := r.batchWrite(context.Background(), client, batch); err != nil {
+		if err := r.batchWriteAll(context.Background(), client, deletes); err != nil {
 			return err
 		}
-		deleted += len(batch)
-		batch = batch[:0]
+		deleted += len(deletes)
 		return nil
-	}
-
-	for {
-		res, err := client.Scan(context.Background(), input)
-		if err != nil {
-			return deleted, err
-		}
-		for _, item := range res.Items {
-			batch = append(batch, types.WriteRequest{
-				DeleteRequest: &types.DeleteRequest{
-					Key: map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]},
-				},
-			})
-			if len(batch) == 25 {
-				if err := flush(); err != nil {
-					return deleted, err
-				}
-			}
-		}
-		if len(res.LastEvaluatedKey) == 0 {
-			break
-		}
-		input.ExclusiveStartKey = res.LastEvaluatedKey
-	}
-	if err := flush(); err != nil {
-		return deleted, err
-	}
-	return deleted, nil
+	})
+	return deleted, err
 }
 
 // DecodeRecords decodes a JSON array of records (keyed by the record's json
@@ -181,9 +130,6 @@ func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error
 		}
 		// Builds the group keys and checks every float GroupBy value fits its sum.
 		if err := r.meta.addGroupCounterDeltas(map[string]*groupCounterDelta{}, nil, ptr); err != nil {
-			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
-		}
-		if err := r.meta.checkFrameValues([]unsafe.Pointer{ptr}); err != nil {
 			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
 		}
 		records[i] = decodedRecords[i]

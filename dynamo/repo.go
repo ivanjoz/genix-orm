@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/ivanjoz/genix-orm/dataframe"
+
+	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,24 +54,18 @@ func (r *Repo[T, E]) Put(record *E) error {
 	return err
 }
 
-// PutIfAbsent writes the record only when no item with its key exists yet, and
-// reports false (without an error) when the key was already taken. The check and
-// the write are one conditional PutItem, so of two concurrent writers of the same
-// key exactly one wins — the primitive for "enqueue once" and "claim once".
-// Autoincrement IDs are assigned as in Put.
+// PutIfAbsent writes the record, at Version 1, only when no item with its key
+// exists yet, and reports false (without an error) when the key was already taken.
+// The check and the write are one conditional PutItem, so of two concurrent writers
+// of the same key exactly one wins — the primitive for "enqueue once" and "claim
+// once". Autoincrement IDs are assigned as in Put.
 func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	ptr := unsafe.Pointer(record)
-	if err := r.meta.checkFrameValues([]unsafe.Pointer{ptr}); err != nil {
-		return false, err
-	}
-	// Nothing is read: the write deadline counts from here.
-	window := r.meta.frameWriteWindowFrom(Now())
 	if _, err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
-	r.meta.stampManagedColumns([]unsafe.Pointer{ptr}, nil)
-	// Written only when absent, so an insert: it logs nothing to the frames.
-	r.meta.stampCreatedVersions([]unsafe.Pointer{ptr}, nil)
+	r.meta.stampUpdated([]unsafe.Pointer{ptr})
+	r.meta.version.setI64(ptr, 1)
 	item, err := r.meta.marshalItem(ptr, record)
 	if err != nil {
 		return false, err
@@ -79,9 +79,7 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	ctx, cancel := window.LandingContext(Now())
-	defer cancel()
-	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
 		TableName:           aws.String(tableName()),
 		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(pk)"),
@@ -91,35 +89,44 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
-		return false, dataframe.LandingError(err)
+		return false, err
 	}
 	// Unlike PutMany, the array index rows go after the base item: written first,
-	// they would index a record that then loses the race for its key. The deadline
-	// covers them too: a frame run reads inserts through the delta row.
-	arrayRowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item[dataColumn].(*types.AttributeValueMemberB).Value)
-	if _, err := r.batchWriteAll(ctx, client, arrayRowPuts); err != nil {
-		return true, dataframe.LandingError(err)
+	// they would index a record that then loses the race for its key.
+	arrayRowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item)
+	if err := r.batchWriteAll(context.Background(), client, arrayRowPuts); err != nil {
+		return true, err
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
+		return true, err
+	}
+	if err := r.meta.appendDeltaLogs([]deltaLogWrite{{writtenPtr: ptr, version: 1}}); err != nil {
 		return true, err
 	}
 	return true, r.meta.setSlotsUpdated([]unsafe.Pointer{ptr})
 }
 
-// PutMany upserts records in batches of 25 (the BatchWriteItem limit). When the
-// entity uses autoincrement, every record whose ID is still zero is assigned one
-// in a single sequence reservation before the batch is written, and the managed
-// Updated is stamped (delta.go). With array or delta indexes it first reads the
-// stored versions and writes in three passes: new rows, then the base items, then
-// stale rows (see array_index.go). GroupBy counters are ADDed after that
-// (group_by.go), and with CacheByIDs the touched slots are set last. A record whose
-// ID this call assigned is new by construction, so its stored version is not read.
+// PutMany upserts records. When the entity uses autoincrement, every record whose
+// ID is still zero is assigned one in a single sequence reservation, and the
+// managed Updated is stamped (delta.go). Each record's Version is raised:
+//
+//   - A table without hidden rows or GroupBy reads nothing: each record is one
+//     UpdateItem raising "ver" inside DynamoDB, run in parallel.
+//   - Otherwise the stored versions are read to diff the hidden rows and counters,
+//     and the records are written as PutManyIfVersion over the versions read, a
+//     record that lost to a concurrent write being read and written again (a plain
+//     Put is last-writer-wins). A record whose ID this call assigned is new by
+//     construction, so it is not read.
+//
+// Then the delta logs are appended (delta_log.go), and with CacheByIDs the touched
+// slots are set last.
 func (r *Repo[T, E]) PutMany(records []E) error { return r.putMany(records, false) }
 
 // InsertMany is PutMany for records the caller knows are not stored yet, such as
-// rows keyed by an ID reserved in the same operation (AssignIDs): it skips the read
-// of the stored versions, one round trip. A record that was in fact stored keeps
-// its old hidden rows and counts twice in its GroupBy groups until RebuildGroups.
+// rows keyed by an ID reserved in the same operation (AssignIDs): it writes them at
+// Version 1 with BatchWriteItem, reading nothing. A record that was in fact stored
+// is overwritten at Version 1, keeps its old hidden rows and counts twice in its
+// GroupBy groups until Reprocess.
 func (r *Repo[T, E]) InsertMany(records []E) error { return r.putMany(records, true) }
 
 // AssignIDs reserves and sets the autoincrement ID of every record whose ID is
@@ -135,6 +142,9 @@ func (r *Repo[T, E]) AssignIDs(records []E) error {
 }
 
 func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
+	if len(records) == 0 {
+		return nil
+	}
 	client, err := Client()
 	if err != nil {
 		return err
@@ -143,89 +153,183 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	for i := range records {
 		ptrs[i] = unsafe.Pointer(&records[i])
 	}
-	if err := r.meta.checkFrameValues(ptrs); err != nil {
-		return err
-	}
-	// The write deadline counts from the stored read.
-	window := r.meta.frameWriteWindowFrom(Now())
-	storedByKey, err := r.assignIDsReadingStored(client, ptrs, areAllNew)
+	assignedPtrs, err := r.meta.assignAutoIDs(ptrs)
 	if err != nil {
 		return err
 	}
-	r.meta.stampManagedColumns(ptrs, r.meta.aboveStored(storedByKey))
-	r.meta.stampCreatedVersions(ptrs, storedByKey)
+	r.meta.stampUpdated(ptrs)
+	switch {
+	case areAllNew:
+		return r.insertNew(client, ptrs)
+	case !r.meta.readsStoredVersion():
+		return r.putRaisingVersions(client, ptrs)
+	default:
+		return r.putOverStoredVersions(client, records, assignedPtrs)
+	}
+}
 
-	baseWrites := make([]types.WriteRequest, 0, len(records))
-	var arrayRowPuts, arrayRowDeletes []types.WriteRequest
+// insertNew writes records known to be new at Version 1, with BatchWriteItem: the new hidden rows
+// first, then the base items (array_index.go), then the GroupBy counters, the logs and the slots.
+func (r *Repo[T, E]) insertNew(client *dynamodb.Client, ptrs []unsafe.Pointer) error {
+	baseWrites := make([]types.WriteRequest, 0, len(ptrs))
+	var arrayRowPuts []types.WriteRequest
+	logWrites := make([]deltaLogWrite, len(ptrs))
 	groupDeltas := map[string]*groupCounterDelta{}
-	for i := range records {
-		item, err := r.meta.marshalItem(ptrs[i], &records[i])
+	for i, ptr := range ptrs {
+		r.meta.version.setI64(ptr, 1)
+		item, err := r.meta.marshalItem(ptr, (*E)(ptr))
 		if err != nil {
 			return err
 		}
 		baseWrites = append(baseWrites, types.WriteRequest{PutRequest: &types.PutRequest{Item: item}})
-		storedPtr := storedByKey[r.meta.recordKey(ptrs[i])]
-		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, ptrs[i]); err != nil {
+		rowPuts, _ := r.meta.arrayIndexWrites(nil, ptr, item)
+		arrayRowPuts = append(arrayRowPuts, rowPuts...)
+		if err := r.meta.addGroupCounterDeltas(groupDeltas, nil, ptr); err != nil {
 			return err
 		}
-		if len(r.meta.arrayIndexes) == 0 {
-			continue
-		}
-		blob := item[dataColumn].(*types.AttributeValueMemberB).Value
-		puts, deletes := r.meta.arrayIndexWrites(storedPtr, ptrs[i], blob)
-		arrayRowPuts = append(arrayRowPuts, puts...)
-		arrayRowDeletes = append(arrayRowDeletes, deletes...)
+		logWrites[i] = deltaLogWrite{writtenPtr: ptr, version: 1}
 	}
-
-	// The log entries, the new hidden rows and the base items land within the window. The base items
-	// go in record order, so the records from the first one not sent on did not land: their entries
-	// are voided.
-	ctx, cancel := window.LandingContext(Now())
-	defer cancel()
-	sentBaseCount := 0
-	err = dataframe.AppendLogEntries(ctx, r.meta.dataFrames, r.meta.frameWritesOf(ptrs, storedByKey), false)
-	if err == nil {
-		_, err = r.batchWriteAll(ctx, client, arrayRowPuts)
+	ctx := context.Background()
+	if err := r.batchWriteAll(ctx, client, arrayRowPuts); err != nil {
+		return err
 	}
-	if err == nil {
-		sentBaseCount, err = r.batchWriteAll(ctx, client, baseWrites)
-	}
-	if err != nil {
-		return errors.Join(dataframe.LandingError(err), dataframe.AppendCancelMarkers(window, Now(), r.meta.dataFrames, r.meta.frameWritesOf(ptrs[sentBaseCount:], storedByKey)))
-	}
-	if _, err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
+	if err := r.batchWriteAll(ctx, client, baseWrites); err != nil {
 		return err
 	}
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return err
 	}
+	if err := r.meta.appendDeltaLogs(logWrites); err != nil {
+		return err
+	}
 	return r.meta.setSlotsUpdated(ptrs)
 }
 
-// assignIDsReadingStored assigns the autoincrement IDs and reads the stored version of every record
-// whose ID this call did not just assign: a freshly reserved ID can't be stored yet. Records known to
-// be new (InsertMany) have nothing to read.
-func (r *Repo[T, E]) assignIDsReadingStored(client *dynamodb.Client, ptrs []unsafe.Pointer, areAllNew bool) (map[string]unsafe.Pointer, error) {
-	assignedPtrs, err := r.meta.assignAutoIDs(ptrs)
-	if err != nil || areAllNew {
-		return nil, err
+// putRaisingVersions writes records of a table that diffs nothing (no hidden rows, no GroupBy): one
+// UpdateItem each, in parallel, raising its Version with no read.
+func (r *Repo[T, E]) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) error {
+	items := make([]map[string]types.AttributeValue, len(ptrs))
+	for i, ptr := range ptrs {
+		var err error
+		if items[i], err = r.meta.marshalItem(ptr, (*E)(ptr)); err != nil {
+			return err
+		}
 	}
+	logWrites := make([]deltaLogWrite, len(ptrs))
+	err := parallel.Run(len(ptrs), func(recordIndex int) error {
+		writtenVersion, err := putItemRaisingVersion(context.Background(), client, items[recordIndex])
+		r.meta.version.setI64(ptrs[recordIndex], writtenVersion)
+		logWrites[recordIndex] = deltaLogWrite{writtenPtr: ptrs[recordIndex], version: writtenVersion}
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if err := r.meta.appendDeltaLogs(logWrites); err != nil {
+		return err
+	}
+	return r.meta.setSlotsUpdated(ptrs)
+}
+
+// putItemRaisingVersion writes item with one UpdateItem that SETs every attribute and raises "ver"
+// inside DynamoDB: 1 for a new item, one above the stored one, and 1 again after maxVersion, where the
+// conditional raise fails and the write is issued again starting over. It returns the Version written.
+func putItemRaisingVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue) (int64, error) {
+	names := map[string]string{"#ver": versionColumn}
+	values := map[string]types.AttributeValue{":one": numberAttr(1), ":zero": numberAttr(0), ":max": numberAttr(maxVersion)}
+	var setClauses []string
+	attrNames := slices.Sorted(maps.Keys(item))
+	for i, attrName := range attrNames {
+		if attrName == "pk" || attrName == "sk" || attrName == versionColumn {
+			continue
+		}
+		placeholder := strconv.Itoa(i)
+		names["#a"+placeholder], values[":a"+placeholder] = attrName, item[attrName]
+		setClauses = append(setClauses, "#a"+placeholder+" = :a"+placeholder)
+	}
+	input := &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(tableName()),
+		Key:                       map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]},
+		UpdateExpression:          aws.String("SET " + strings.Join(append(setClauses, "#ver = if_not_exists(#ver, :zero) + :one"), ", ")),
+		ConditionExpression:       aws.String("attribute_not_exists(#ver) OR #ver < :max"),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
+		ReturnValues:              types.ReturnValueUpdatedNew,
+	}
+	out, err := client.UpdateItem(ctx, input)
+	var atMaxVersionErr *types.ConditionalCheckFailedException
+	if errors.As(err, &atMaxVersionErr) {
+		delete(values, ":zero")
+		delete(values, ":max")
+		input.UpdateExpression = aws.String("SET " + strings.Join(append(setClauses, "#ver = :one"), ", "))
+		input.ConditionExpression = nil
+		out, err = client.UpdateItem(ctx, input)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return numberAttrValue(out.Attributes, versionColumn), nil
+}
+
+// putOverStoredVersions writes records of a table that diffs its hidden rows or counters: each one is
+// conditioned on the version just read, and the ones that lost to a concurrent write are read and
+// written again, up to modifyMaxAttempts rounds. A record whose ID this call assigned is not read.
+func (r *Repo[T, E]) putOverStoredVersions(client *dynamodb.Client, records []E, assignedPtrs []unsafe.Pointer) error {
 	isAssignedNow := map[unsafe.Pointer]bool{}
 	for _, assignedPtr := range assignedPtrs {
 		isAssignedNow[assignedPtr] = true
 	}
-	var possiblyStoredPtrs []unsafe.Pointer
-	for _, ptr := range ptrs {
-		if !isAssignedNow[ptr] {
-			possiblyStoredPtrs = append(possiblyStoredPtrs, ptr)
-		}
+	pendingIndexes := make([]int, len(records))
+	for i := range pendingIndexes {
+		pendingIndexes[i] = i
 	}
-	return r.storedVersions(client, possiblyStoredPtrs)
+	for attempt := 1; ; attempt++ {
+		round := make([]E, len(pendingIndexes))
+		roundPtrs := make([]unsafe.Pointer, len(pendingIndexes))
+		var possiblyStoredPtrs []unsafe.Pointer
+		for i, recordIndex := range pendingIndexes {
+			round[i] = records[recordIndex]
+			roundPtrs[i] = unsafe.Pointer(&round[i])
+			if !isAssignedNow[unsafe.Pointer(&records[recordIndex])] {
+				possiblyStoredPtrs = append(possiblyStoredPtrs, roundPtrs[i])
+			}
+		}
+		storedByKey, err := r.storedVersions(client, possiblyStoredPtrs)
+		if err != nil {
+			return err
+		}
+		for _, ptr := range roundPtrs {
+			storedVersion := int64(0)
+			if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
+				storedVersion = r.meta.version.getI64(storedPtr)
+			}
+			r.meta.version.setI64(ptr, storedVersion)
+		}
+		lostIndexes, err := r.putIfVersion(client, round, storedByKey)
+		if err != nil {
+			return err
+		}
+		var nextPendingIndexes []int
+		for i, recordIndex := range pendingIndexes {
+			if slices.Contains(lostIndexes, i) {
+				nextPendingIndexes = append(nextPendingIndexes, recordIndex)
+				continue
+			}
+			records[recordIndex] = round[i]
+		}
+		if len(nextPendingIndexes) == 0 {
+			return nil
+		}
+		if attempt == modifyMaxAttempts {
+			return fmt.Errorf("%w: %s, %d records, %d attempts", ErrWriteConflict, r.meta.recordType.Name(), len(nextPendingIndexes), modifyMaxAttempts)
+		}
+		pendingIndexes = nextPendingIndexes
+		time.Sleep(ConflictBackoff(attempt))
+	}
 }
 
 // storedVersions reads (consistently) the stored version of each record, keyed
-// by recordKey, so its hidden rows, GroupBy counters and frame values can be
-// diffed. Nil without them.
+// by recordKey, so its hidden rows and GroupBy counters can be diffed. Nil without them.
 func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]unsafe.Pointer, error) {
 	if !r.meta.readsStoredVersion() {
 		return nil, nil
@@ -254,19 +358,14 @@ func (m *tableMeta) recordKey(ptr unsafe.Pointer) string {
 	return m.pkValue(ptr) + keySeparator + m.skValue(ptr)
 }
 
-// batchWriteAll writes any number of requests in BatchWriteItem chunks of 25, in order. sentCount is
-// how many it sent before it stopped: the chunk that failed was sent, and may have landed.
-func (r *Repo[T, E]) batchWriteAll(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) (sentCount int, err error) {
+// batchWriteAll writes any number of requests in BatchWriteItem chunks of 25, in order.
+func (r *Repo[T, E]) batchWriteAll(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) error {
 	for start := 0; start < len(writes); start += 25 {
-		if err := ctx.Err(); err != nil {
-			return start, err
-		}
-		end := min(start+25, len(writes))
-		if err := r.batchWrite(ctx, client, writes[start:end]); err != nil {
-			return end, err
+		if err := r.batchWrite(ctx, client, writes[start:min(start+25, len(writes))]); err != nil {
+			return err
 		}
 	}
-	return len(writes), nil
+	return nil
 }
 
 // batchWrite issues one BatchWriteItem and retries any unprocessed items.
@@ -289,54 +388,47 @@ func (r *Repo[T, E]) batchWrite(ctx context.Context, client *dynamodb.Client, wr
 }
 
 // Delete removes the item identified by the record's partition + sort fields.
-// Only the key fields of `record` need to be populated: with array indexes the
-// stored version is read to find its rows, which are deleted after the item. With
-// DataFrames its frame values go to the frames' logs before the item is deleted,
-// within the write deadline. The record's Updated is set to the delete's.
+// Only the key fields of `record` need to be populated. The item comes back from
+// the DeleteItem (ALL_OLD), with no read before it: its hidden rows are deleted
+// after it, its GroupBy counters move, and its logs get a deleted entry one
+// Version above it. The record's Updated is set to the delete's.
 func (r *Repo[T, E]) Delete(record *E) error {
 	client, err := Client()
 	if err != nil {
 		return err
 	}
 	ptr := unsafe.Pointer(record)
-	window := r.meta.frameWriteWindowFrom(Now())
-	storedByKey, err := r.storedVersions(client, []unsafe.Pointer{ptr})
+	out, err := client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName:    aws.String(tableName()),
+		Key:          r.meta.keyOnly(ptr),
+		ReturnValues: types.ReturnValueAllOld,
+	})
 	if err != nil {
 		return err
 	}
-	// The delete's Updated: the version of its frame log entries, and the value of its by-IDs slot.
-	r.meta.stampManagedColumns([]unsafe.Pointer{ptr}, r.meta.aboveStored(storedByKey))
-	ctx, cancel := window.LandingContext(Now())
-	defer cancel()
-	var arrayRowDeletes []types.WriteRequest
-	var frameWrites []dataframe.LoggedWrite
-	groupDeltas := map[string]*groupCounterDelta{}
-	if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
-		_, arrayRowDeletes = r.meta.arrayIndexWrites(storedPtr, nil, nil)
+	// The delete's Updated: the value of its by-IDs slot.
+	r.meta.stampUpdated([]unsafe.Pointer{ptr})
+	if len(out.Attributes) > 0 {
+		storedRecord := new(E)
+		if err := r.meta.unmarshalItem(out.Attributes, storedRecord); err != nil {
+			return err
+		}
+		storedPtr := unsafe.Pointer(storedRecord)
+		_, arrayRowDeletes := r.meta.arrayIndexWrites(storedPtr, nil, nil)
+		if err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
+			return err
+		}
+		groupDeltas := map[string]*groupCounterDelta{}
 		if err := r.meta.addGroupCounterDeltas(groupDeltas, storedPtr, nil); err != nil {
 			return err
 		}
-		frameWrites, err = r.meta.appendFrameDeleteEntries(ctx, storedPtr, ptr)
-	}
-	if err == nil {
-		err = ctx.Err()
-	}
-	// Not sent: the entries of the delete are voided.
-	if err != nil {
-		return errors.Join(dataframe.LandingError(err), dataframe.AppendCancelMarkers(window, Now(), r.meta.dataFrames, frameWrites))
-	}
-	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: aws.String(tableName()),
-		Key:       r.meta.keyOnly(ptr),
-	})
-	if err != nil {
-		return dataframe.LandingError(err)
-	}
-	if _, err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
-		return err
-	}
-	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
-		return err
+		if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
+			return err
+		}
+		deleteVersion := nextVersion(r.meta.version.getI64(storedPtr))
+		if err := r.meta.appendDeltaLogs([]deltaLogWrite{{storedPtr: storedPtr, version: deleteVersion}}); err != nil {
+			return err
+		}
 	}
 	return r.meta.setSlotsUpdated([]unsafe.Pointer{ptr})
 }
@@ -448,51 +540,124 @@ func (r *Repo[T, E]) TopN(n int32, partitionValues ...any) ([]E, error) {
 }
 
 // Scan returns up to limit records of this entity from the base table,
-// regardless of partition. It is a table Scan filtered to the entity's pk
-// range — handy for admin/debug listings, not for hot paths. Order is
-// unspecified (physical). limit <= 0 means no cap.
+// regardless of partition (scanItems) — handy for admin/debug listings, not for
+// hot paths. Order is unspecified (physical). limit <= 0 means no cap.
 func (r *Repo[T, E]) Scan(limit int32) ([]E, error) {
-	// Without partition columns the whole entity is the single pk TableID: a Query.
-	if len(r.meta.partition) == 0 {
-		var out []E
-		err := r.Query().Limit(limit).Exec(&out)
-		return out, err
-	}
 	client, err := Client()
 	if err != nil {
 		return nil, err
 	}
-
-	lowestPK, highestPK := r.meta.partitionRange(0)
-	input := &dynamodb.ScanInput{
-		TableName:                aws.String(tableName()),
-		FilterExpression:         aws.String("#pk BETWEEN :lo AND :hi"),
-		ExpressionAttributeNames: map[string]string{"#pk": "pk"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":lo": &types.AttributeValueMemberN{Value: lowestPK},
-			":hi": &types.AttributeValueMemberN{Value: highestPK},
-		},
-	}
-
 	var out []E
-	for {
-		res, err := client.Scan(context.Background(), input)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range res.Items {
+	err = scanItems(client, []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
+		for _, item := range items {
 			var record E
 			if err := r.meta.unmarshalItem(item, &record); err != nil {
-				return nil, err
+				return err
 			}
 			out = append(out, record)
 			if limit > 0 && int32(len(out)) >= limit {
-				return out, nil
+				return errStopScan
 			}
 		}
-		if len(res.LastEvaluatedKey) == 0 {
-			return out, nil
+		return nil
+	})
+	return out, err
+}
+
+// pkRange is a span of pks one read covers: an entity's base rows, or its hidden rows (the fan-out,
+// delta and local index rows and the GroupBy counters).
+type pkRange struct{ lowest, highest string }
+
+// baseRowsRange spans the pks of the entity's records: the single pk TableID without partition columns.
+func (m *tableMeta) baseRowsRange() pkRange {
+	lowestPK, highestPK := m.partitionRange(0)
+	return pkRange{lowestPK, highestPK}
+}
+
+// hiddenRowsRange spans the pks of the entity's hidden rows: a base pk ‖ 3 digits.
+func (m *tableMeta) hiddenRowsRange() pkRange {
+	lowestPK, highestPK := m.partitionRange(arrayIndexColumnIDDigits)
+	return pkRange{lowestPK, highestPK}
+}
+
+// errStopScan, returned by an onPage of scanItems, ends the read early without an error.
+var errStopScan = errors.New("db: scan stopped")
+
+// scanItems reads every item whose pk falls in one of the ranges and hands them to onPage a page at
+// a time, with only the projected attributes (all of them when projection is empty). A single range
+// of one pk (an entity without partition columns) is a Query; anything else is a table Scan filtered
+// on the ranges, which DynamoDB bills for the whole shared table, filtered or not.
+func scanItems(client *dynamodb.Client, ranges []pkRange, projection []string, onPage func(items []map[string]types.AttributeValue) error) error {
+	names := map[string]string{"#pk": "pk"}
+	values := map[string]types.AttributeValue{}
+	var projectionExpression *string
+	if len(projection) > 0 {
+		placeholders := make([]string, len(projection))
+		for i, attrName := range projection {
+			placeholders[i] = "#p" + strconv.Itoa(i)
+			names[placeholders[i]] = attrName
 		}
-		input.ExclusiveStartKey = res.LastEvaluatedKey
+		projectionExpression = aws.String(strings.Join(placeholders, ", "))
+	}
+
+	var readPage func(startKey map[string]types.AttributeValue) ([]map[string]types.AttributeValue, map[string]types.AttributeValue, error)
+	if len(ranges) == 1 && ranges[0].lowest == ranges[0].highest {
+		values[":pk"] = &types.AttributeValueMemberN{Value: ranges[0].lowest}
+		input := &dynamodb.QueryInput{
+			TableName:                 aws.String(tableName()),
+			KeyConditionExpression:    aws.String("#pk = :pk"),
+			ProjectionExpression:      projectionExpression,
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+		}
+		readPage = func(startKey map[string]types.AttributeValue) ([]map[string]types.AttributeValue, map[string]types.AttributeValue, error) {
+			input.ExclusiveStartKey = startKey
+			out, err := client.Query(context.Background(), input)
+			if err != nil {
+				return nil, nil, err
+			}
+			return out.Items, out.LastEvaluatedKey, nil
+		}
+	} else {
+		rangeConditions := make([]string, len(ranges))
+		for i, span := range ranges {
+			placeholder := strconv.Itoa(i)
+			values[":lo"+placeholder] = &types.AttributeValueMemberN{Value: span.lowest}
+			values[":hi"+placeholder] = &types.AttributeValueMemberN{Value: span.highest}
+			rangeConditions[i] = "#pk BETWEEN :lo" + placeholder + " AND :hi" + placeholder
+		}
+		input := &dynamodb.ScanInput{
+			TableName:                 aws.String(tableName()),
+			FilterExpression:          aws.String(strings.Join(rangeConditions, " OR ")),
+			ProjectionExpression:      projectionExpression,
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+		}
+		readPage = func(startKey map[string]types.AttributeValue) ([]map[string]types.AttributeValue, map[string]types.AttributeValue, error) {
+			input.ExclusiveStartKey = startKey
+			out, err := client.Scan(context.Background(), input)
+			if err != nil {
+				return nil, nil, err
+			}
+			return out.Items, out.LastEvaluatedKey, nil
+		}
+	}
+
+	var startKey map[string]types.AttributeValue
+	for {
+		items, lastKey, err := readPage(startKey)
+		if err != nil {
+			return err
+		}
+		if err := onPage(items); err != nil {
+			if errors.Is(err, errStopScan) {
+				return nil
+			}
+			return err
+		}
+		if len(lastKey) == 0 {
+			return nil
+		}
+		startKey = lastKey
 	}
 }

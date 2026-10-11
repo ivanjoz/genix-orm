@@ -8,7 +8,7 @@ description: Declare tables, design keys and indexes, and read/write DynamoDB re
 A statically typed single-table DynamoDB ORM. Every entity shares one physical table:
 
 ```
-{ pk (Number), sk (String), h1/r1..h10/r10 (GSI hash Number / range String), d (colbin blob of the whole record) }
+{ pk (Number), sk (String), h1/r1..h10/r10 (GSI hash Number / range String), d (colbin blob of the whole record), ver (Number) }
 ```
 
 DynamoDB can only use the **key attributes**. Every field lives inside `d`, so a field that is
@@ -33,6 +33,7 @@ type Order struct {
     Status     string  `json:"Status" cb:"4"`
     ProductIDs []int32 `json:"ProductIDs" cb:"5"`
     Total      int64   `json:"Total" cb:"6"`   // in no key: only QueryScan can filter it
+    Version    int16   `json:"ver,omitempty" cb:"-"` // required, managed by the ORM: the item's "ver"
 }
 
 type OrderTable struct {
@@ -117,25 +118,19 @@ A violation makes `NewRepo` panic at boot:
   - pin it when renaming an `Entity` without moving its data.
 - **Autoincrement** needs an integer field named `ID`. `AutoincrementRandomPadding` (0..9) adds
   random low digits.
-- **The managed `Updated`:** an integer field named `Updated` must be an `int64` (`json:"upd"`),
-  in the record and the table struct. A **versioned table** needs it: `CacheByIDs`,
-  `VersionedWrites`, DataFrames, a delta index or a `GroupDelta`.
-- **`CacheByIDs`** needs exactly one integer `Keys` column and the `int64` `Updated`. See section 3b.
-- **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need the `int64` `Updated`, and a `cb` tag on
-  their first Key (on `Updated` when they have none). See section 3c.
+- **The managed `Version`:** every record declares `Version int16 json:"ver,omitempty" cb:"-"`. It
+  lives outside the blob, as the item attribute `ver`: every write raises it by one (wrapping at
+  32767), inside DynamoDB when the write reads nothing. `Modify`/`PutManyIfVersion` compare it.
+- **The managed `Updated`** (optional; required by `CacheByIDs`): an `int32` field named `Updated`
+  (`json:"upd"`), in the record and the table struct. Every write stamps it with the write's
+  **SUnixTime** (`(unix − 1e9) / 2`, 2-second ticks). Never set it yourself.
+- **`CacheByIDs`** needs exactly one integer `Keys` column and the `Updated`. See section 3b.
+- **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need `Metadata *string json:"mdt,omitempty"
+  cb:"-"` in the record, a `cb` tag on their first Key, and integer unpinned Keys within 53 bits
+  (the log ID). See section 3c.
 - **Local indexes** (`{Type: TypeLocal, Keys: ...}`) take scalar Keys only, the first one with a
   `cb` tag, and no Slot or GroupBy. See section 3c'.
-- **`VersionedWrites`** needs the `int64` `Updated`; it only enables `Modify` (section 2) on a table
-  that is not versioned otherwise (the others imply it).
-- **DataFrames** need the `int64` `Updated` and `CreatedVersion`, a whole-entity delta index and no
-  `Partition`. See section 3e.
-- **An index of your own keyed on `Updated`** declares `.Size(42)`, its full width.
-- **Managed fields:** every write stamps `Updated` with the write time in **milliseconds since the
-  UpdatedEpoch** (`dynamo.SetUpdatedEpoch`, set once at boot; berryapps: `unix_time_start`),
-  with no round trip, and above the record's stored value whenever the write reads it (hidden rows,
-  GroupBy, frames, `Modify`/`PutManyIfVersion`). A versioned table also stores it
-  as the item attribute `upd`. On a table with DataFrames, `CreatedVersion` is the `Updated` of the
-  insert. Never set them yourself. Convert with `dynamo.UpdatedOfTime(t)` / `UpdatedToTime(upd)`.
+- **An index of your own keyed on `Updated`** declares `.Size(32)`.
 
 ## 2. Writing and reading by key
 
@@ -158,7 +153,7 @@ all, err := Orders.Scan(100)           // admin/debug only: reads the whole enti
   every element row (a delete + a put each) on the write that changes it.
 - Soft delete (a status field set to 0) is a normal `Put`. `Delete` removes the item and its array rows.
 - **Read-modify-write → `Modify`, never Get + Put.** A Put replaces the whole record, so a Get + Put
-  loses any write that landed in between. On a versioned table:
+  loses any write that landed in between:
 
   ```go
   saved, err := Orders.Modify(Order{ID: 9}, func(order *Order, exists bool) error {
@@ -167,13 +162,13 @@ all, err := Orders.Scan(100)           // admin/debug only: reads the whole enti
   })
   ```
 
-  It reads consistently and writes only if `upd` still holds the `Updated` read, re-running the
+  It reads consistently and writes only if `ver` still holds the `Version` read, re-running the
   change on a race (8 attempts, then `dynamo.ErrWriteConflict`). An unchanged record writes nothing.
-  Records stored before the table was versioned have no `upd`: `Put` them once.
+  An item with no `ver` attribute (stored before Version existed) is an error: migrate the data.
 - **Many records → `GetMany` + `PutManyIfVersion`.** `GetMany(keys)` reads consistently;
-  `PutManyIfVersion(records)` writes each one only if its `Updated` is still the stored one,
+  `PutManyIfVersion(records)` writes each one only if its `Version` is still the stored one,
   and returns the ones that lost a race: re-read, re-edit
-  and retry those (pause with `ConflictBackoff(attempt)`). On a table with fan-out or delta indexes,
+  and retry those (pause with `ConflictBackoff(attempt)`). On a table with fan-out or hidden delta rows,
   read with `GetManyForUpdate` instead: it keeps the stored blobs in the process write cache (15 s),
   so the write diffs the index rows without reading them again.
 - **Derived data** (a record computed from others): read the derived records first, then their
@@ -252,64 +247,76 @@ genix-ui's cache-by-ids (`getRecordByID`, `RecordByIDText`, `GetHandler.routeByI
 // schema: Cols(t.ID.Size(32)) and nothing else in Keys, at most one Partition column, plus
 CacheByIDs: true,
 // record and table struct:
-Updated int64 `json:"upd" cb:"N"`
-Updated dynamo.Col[OrderTable, int64]
+Updated int32 `json:"upd" cb:"N"`
+Updated dynamo.Col[OrderTable, int32]
 
-dynamo.SetIDsCacheStore(store)                         // at boot: the slot files' store (S3)
+dynamo.SetFileStore(store)                             // at boot: the ORM file store (S3)
 request, err := dynamo.DecodeCachedIDsRequest(cc)      // genix-ui's "cc" parameter
 changed, err := Orders.QueryCachedIDs(request)         // []dynamo.CachedPartition[Order]{{Partition, Records}}
 ```
 
 - A record is in slot `uint8(ID)`. Each partition has, per year cycle (from January 1, 07:00 UTC),
-  one 768-byte file in the `IDsCacheStore` (`<cycle year>/<base pk>`): 256 uint24 **year ticks**
+  one 768-byte file in the `FileStore` (`ids-cache/<cycle year>/<base pk>`): 256 uint24 **year ticks**
   (2 seconds each). Every write raises the slots it touched to its tick, after the record is
   written, with a GET + `If-Match` PUT retried on a lost race.
-- Ticks: 0 unknown (always read), 1 no write this cycle, ≥ 2 `floor((Updated − cycleStart) / 2000) + 2`.
+- Ticks: 0 unknown (always read), 1 no write this cycle, ≥ 2 `Updated − cycleStart + 2` (cycleStart
+  as a SUnixTime: one tick per SUnixTime unit).
 - `QueryCachedIDs` does one GET per requested partition, then one consistent BatchGetItem for the
   IDs whose held tick differs from the slot's. Unchanged and missing IDs are left out, and the
-  returned records carry the **slot's** tick as an Updated value (`cycleStart + (t − 1) × 2000`) in
-  `Updated` — or **0 while the tick's window ended less than `DeltaOverlap` ago** (4 s; a late
-  write could still land), so the client reads that record again on its next revalidation. A
-  request from another cycle year has every tick ignored: each January 1 every record is read once.
-- Everywhere else `Updated` is the record's own write time (section 3c); only a by-IDs read
-  overwrites it with the slot's.
+  returned records carry the **slot's** tick as an Updated value (`cycleStart + t − 1`) in
+  `Updated` — or **0 while the tick is less than 4 ticks old** (8 s; a late write could still
+  land), so the client reads that record again on its next revalidation. A request from another
+  cycle year has every tick ignored: each January 1 every record is read once.
+- Everywhere else `Updated` is the record's own write time; only a by-IDs read overwrites it with
+  the slot's.
 - A write to one record makes the other records of its slot (IDs 256 apart, same partition) come
   back once too.
 
 ## 3c. Delta sync (`TypeDelta`, `Delta()`)
 
-Use it for "the records written since watermark W": genix-ui's delta cache (skill `delta-cache-api`).
+Use it for "the records written since the client last synced": genix-ui's delta cache (skill
+`delta-cache-api`).
 
 ```go
-// schema:
+// schema (and the record declares Metadata *string `json:"mdt,omitempty" cb:"-"`):
 Indexes: []dynamo.Index{
     {Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)},                       // the whole entity
     {Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.TeamIDs.Size(8), t.Status)},    // per team, fan-out
 },
 
-// since = dynamo.DeltaSince{Updated: W, Fingerprint: fp}: what the client holds (zero on a first sync)
-Orders.Query().Delta(since, 1).Exec(&out)
-Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(since, 1).Exec(&out)
+dynamo.SetFileStore(store)                    // at boot: the logs live in the ORM file store (S3)
+// cursor = dynamo.DeltaCursor{bucket: bytes held}: what the client holds (empty on a first sync)
+Orders.Query().Delta(cursor, 1).Exec(&out)
+Orders.Query().Contains(Orders.T.TeamIDs, 3).Delta(cursor, 1).Exec(&out)
+Orders.Query().DeltaList(1).Exec(&out)        // the same listing, no Metadata records
 ```
 
-- **The last Key, unless it is a ColSlice, is the sync filter column.** It is not in the row sk.
-  `Delta(since, values...)` keeps only those values on a first sync (`since.Updated = 0`) and every
-  value on a later one, so soft-deleted records reach the clients caching them.
-- **The other Keys are pinned:** `Eq` on each, or `Contains` on the ColSlice (rows per element).
+- **The change log.** Every write (Put, PutMany, Modify, Delete...) appends one entry per record to
+  an S3 file per delta index, pinned value and 10-minute bucket
+  (`delta-log/<base pk>/<index tag>/<pinned values>/<bucket>`), after the records are written. An
+  entry is the record's **log ID** and a deleted bit (Status set to 0; a hard Delete; a pinned value
+  the record left). The client drops a deleted entry's record with no read.
+- **The log ID** is the Keys that are not pinned (all of them when every Key is pinned), signed
+  integers packed into at most 53 bits: `Cols(t.Date.Size(16), t.ID.Size(32))` packs 48. A string
+  Key or more bits fail the boot.
+- **The last Key, unless it is a ColSlice, is the sync filter column.** `Delta(cursor, values...)`
+  keeps only those values on a first sync; a later one reads the log, where Status 0 is a deleted
+  entry. A view that keeps deactivated records lists itself whole: `DeltaList` plus a
+  `DeltaReplaceMetadata()` record.
+- **The other Keys are pinned:** `Eq` on each, or `Contains` on the ColSlice with exactly one value.
   Partition columns need their `Eq` too.
 - **Call `Delta()` last.** It picks the delta index whose pinned Keys the query pins (the most
-  specific wins, a tie fails), and adds `Updated >= W - DeltaOverlap`: one exact range.
-- **The overlap window.** `Updated` is a clock, so two Lambdas can stamp the same millisecond and
-  a write stamped below W can land after the client's read. A later sync re-reads the last
-  `DeltaOverlap` (4 s) below W; rows above W always come back. The window's rows are dropped,
-  before any record is read, when `DeltaFingerprint` of their `Updated` values equals
-  `since.Fingerprint` (the client's fingerprint of what it holds there); otherwise the whole window
-  is resent. genix-ui computes the same fingerprint (`cache/delta-cache.watermark.ts`); berryapps
-  reads `since` from `?up=<upd>.<fingerprint>` (`req.GetDeltaSince()`).
-- Rows are hidden base-table rows (`pk = base pk ‖ cb id`), keys-only unless `FullCopy`. Every
-  write moves all of them, because `Updated` changed. A slice field takes either a fan-out
-  index or a delta index, not both.
-- A record written before the index was declared has no delta row: re-`Put` existing records once.
+  specific wins, a tie fails).
+- **First sync / replace** (empty cursor, a cursor more than 7 days behind, or more than 144 files to
+  read): the view is listed (the base table, or hidden rows when a pinned column is neither a
+  partition column nor a leading Keys prefix), plus the current log file.
+- **Later sync:** the held files are read past their held bytes, plus any newer file; the last entry
+  per log ID wins, and the named records come from one consistent BatchGetItem.
+- **Metadata records.** The result ends with one record per file read: the last log ID column holds
+  −bucket and `Metadata` the file (flags 64-bit / replace / sealed, bucket, log ID bits, content) in
+  Safe85. The client keeps them as its cursor. `DeltaReplaceMetadata()` is the marker of a route
+  with no log behind it, which answers its whole view every time.
+- A table nobody delta-syncs needs no delta index: Version makes every table `Modify`-safe.
 
 ## 3c'. Local indexes (`TypeLocal`)
 
@@ -341,14 +348,13 @@ partition and per distinct value of the Index Keys.
 ```go
 // schema: on a GSI (counters over its Keys), a fan-out Index, or a slot-less Index (counters only)
 {Slot: dynamo.G1, Keys: dynamo.Cols(t.Channel, t.Status.Size(8)),
-    GroupBy: dynamo.Cols(t.Total, t.Weight), GroupDelta: true},
+    GroupBy: dynamo.Cols(t.Total, t.Weight)},
 {Keys: dynamo.Cols(t.Tags), GroupBy: dynamo.Cols(t.Total)},                 // one group per element
 {Keys: dynamo.Cols(t.CustomerID.Size(32)), GroupBy: dynamo.Cols(t.Total)},  // no GSI used
 
 groups, err := Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).
     Eq(Orders.T.StoreID, 7).Eq(Orders.T.Channel, "web").Exec()
 groups[0].Key.Status; groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].SumFloat(Orders.T.Weight)
-Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Since(watermark).Exec()
 ```
 
 - **`GroupBy` columns are integer or float `Col`s**; the count is always kept. Floats are summed as
@@ -358,63 +364,15 @@ Orders.QueryGroups(Orders.T.Channel, Orders.T.Status).Eq(Orders.T.StoreID, 7).Si
 - **`QueryGroups(keys...)`** picks the GroupBy with exactly those Keys, in order. It needs an `Eq` on
   every Partition column, then `Eq` on a leading run of the Keys and one range, as `Keys` do.
   Groups whose count fell to 0 are skipped.
-- **`GroupDelta: true`** stamps each counter with the `upd` of the last write that touched it
-  (needs the managed `Updated`; `Group.Updated` is an `int64`). `Since(W)` returns only the groups
-  with `Updated >= W - DeltaOverlap` (the window is resent, no fingerprint: groups are few), emptied
-  ones included (count 0) so the client drops them; `Since(0)` skips them.
+- **Counters write no change log.** A client cache of counters gets them all on every sync, with
+  the replace marker (`DeltaReplaceMetadata()`, section 3c).
 - **Best-effort:** the counters are ADDed after the base write, from the diff against the stored
   version. Two plain `Put`s racing on one record, or a crash in between, drift a counter.
-  `Repo.RebuildGroups(partition...)` / `RebuildGroupsAll()` (berryapps: `fn-db rebuild-groups`)
-  recompute them. Run it too after adding a GroupBy to a table with records, and after removing one:
-  the rebuild deletes the counters of a GroupBy no longer declared.
+  `Repo.Reprocess(true)` (berryapps: `fn-db reprocess`) recomputes them. Run it too after adding a
+  GroupBy to a table with records, and after removing one: it deletes the counters of a GroupBy no
+  longer declared.
 - Every write pays one `UpdateItem` per touched group (merged over the call), and a hot group is a
   hot item.
-
-## 3e. DataFrames (`DataFrames`, `QueryFrame`)
-
-Use it for "totals per day and product (and client)" over long ranges without reading DynamoDB:
-compact files in S3, one per distinct value of the frame Keys, kept up to date by a 10-minute run.
-A write shows up 10–20 minutes later. GroupBy counters are live; frames are cheaper to read in bulk.
-
-```go
-// record and table struct:
-Updated        int64 `json:"upd" cb:"12"`
-CreatedVersion int64 `json:"crv,omitempty" cb:"13"`
-// schema:
-Indexes: []dynamo.Index{{Type: dynamo.TypeDelta, Keys: dynamo.Cols(t.Status)}}, // the run reads through it
-DataFrames: []dynamo.DataFrame{
-    {Name: "day-product", Keys: dynamo.Cols(t.Fecha), Rows: t.ProductID, Sums: dynamo.Cols(t.Quantity)},
-    {Name: "day-client-product", Keys: dynamo.Cols(t.Fecha, t.ClientID), Rows: t.ProductID,
-        Sums: dynamo.Cols(t.Quantity, t.Amount)},
-},
-
-rows, err := SaleLines.QueryFrame("day-client-product").
-    Eq(SaleLines.T.ClientID, 412).Between(SaleLines.T.Fecha, from, to).Exec()
-rows[0].Key.Fecha; rows[0].Key.ClientID; rows[0].Key.ProductID; rows[0].Sum(SaleLines.T.Amount)
-
-// up to the last landed write, not the last run:
-rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from, to).Fresh().Exec()
-```
-
-- **Keys** (1–3), **Rows** and **Sums** are integer `Col`s with `cb` tags. `Keys[0]` (usually the
-  day) must lead the entity `Keys`, a GSI or a local index: it is the rebuild unit.
-- **Values must be ≥ 0:** a negative Keys/Rows value fails the write, and a negative Sums value
-  too unless the frame sets `AllowNegativeSums`. `Status == 0` counts in no frame.
-- **`QueryFrame`:** `Eq` or `Between` (≤ 400 values) on `Keys[0]`, then `Eq` on a leading run of
-  the later Keys. `dataframe.ErrNotBuilt` (berryapps: `db.ErrFrameNotBuilt`) until the frame's
-  first build (two runs after it is declared). Rows lag the records by 10 to 30 minutes.
-- **`.Fresh()`** before `Exec()` returns the rows as the records hold them now: the files plus the
-  changes since the last run, computed in memory. It costs a consistent read of every record of
-  the entity written in the last 10 to 30 minutes. Use it when a screen or report must include the
-  sale just made; leave it off for history and dashboards.
-- **Writes** read the stored version and append the old values to S3 before the base write: an
-  update or delete of a frame table costs an S3 append per changed frame. A write fails when no
-  frame store is set (berryapps sets it at boot).
-- **Repair:** `RebuildDataFrames(frame, fromDay, toDay)` / `RebuildDataFramesAll(frame)`
-  (berryapps: `fn-db rebuild-frames`). Needed after an `InsertMany` of records already stored and
-  after editing files by hand.
-- Changing a frame's Keys, Rows or Sums rebuilds it automatically on the next two runs. Renaming
-  a frame orphans its old files.
 
 ## 4. Pitfalls
 
@@ -429,22 +387,52 @@ rows, err = SaleLines.QueryFrame("day-product").Between(SaleLines.T.Fecha, from,
   Fan-out sync reads use consistent reads internally.
 - **A `Size(bits)` is part of the stored key.** Changing it, changing the `Keys`/`Partition`
   columns, changing a slot's columns or changing the `Entity` (with no pinned TableID) orphans
-  the stored keys. Reprocess the data (a script re-`Put`s every record, and the old items get
-  deleted). Never add a read-time fallback.
-- **Changing a fan-out index's `Keys` has no rebuild yet.** Re-`Put`ting does not fix it: the
-  write diffs both versions with the new shape, so the old-shape rows stay and keys-only rows are
-  not rewritten.
+  the stored keys. Reprocess the data: `ReprocessRecords` moves every record stored under a key the
+  schema no longer builds (section 4b). Never add a read-time fallback.
+- **Changing a hidden-rows index (fan-out, delta, local) leaves the old rows.** Re-`Put`ting does
+  not fix it, since the write diffs both versions with the new shape: run `Reprocess(true)`.
 - A field referenced by a **GSI or `Keys`** must be set on every write. A zero value is still a key.
-- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows, its GroupBy counters
-  and its DataFrame states (the frames then rebuild). It is destructive and
-  there is no undo.
+- `Controller.DeleteRecordsAll()` wipes the entity's base and fan-out rows and its GroupBy
+  counters. It is destructive and there is no undo.
+
+## 4b. Reprocessing stored data (`ReprocessRecords`, `Reprocess`)
+
+Fix the data, never the read path. Two passes, both idempotent, both a dry run with `false`:
+
+```go
+// Change records: edit in place, return whether it changed. Unchanged records cost only the read.
+report, err := types.Stories.ReprocessRecords(func(story *types.Story) (bool, error) {
+	if story.Points >= 0 {
+		return false, nil
+	}
+	story.Points = 0
+	return true, nil
+}, true) // report: Scanned, Changed, Moved, Written, Samples (before → after), Failures
+
+// Then rebuild what derives from the records: hidden rows, GroupBy counters, by-IDs slots.
+derived, err := types.Stories.Reprocess(true)
+```
+
+- **Silent writes:** the base item only, conditioned on the blob read; `Updated` and `Version` as the
+  record holds them, no log append (clients aren't notified). Hence the `Reprocess` after it.
+- **Key moves:** a record whose key changed, or stored under a key the schema no longer builds, is
+  written at the new key (autoincrement ID assigned if 0) and its old item deleted.
+- **Idempotent transforms only:** return false for a record already changed, so a rerun writes
+  nothing and resumes a broken run.
+- **A field changing type** (`int64` → `int32`) can't decode old values that don't fit: keep the old
+  field on its old `cb` id under a new name (`UpdatedMillis`), give the new one a `cb` id no field of
+  the file ever used (old blobs may hold a removed field's), and let the transform carry the value
+  over and zero the old field. Delete the old field once every environment ran it.
+- `Controller.ReprocessRecordsAny(func(record any) (bool, error), write)` runs one transform over
+  every table (`record` is the `*E`). berryapps: `fn-reprocess-records <migration>` (the
+  `database-records` skill).
 
 ## 5. Checking your work
 
 - `go test ./...` in `genix-orm/dynamo` runs offline: encoding, marshaling and query planning. To
   assert which index a query picks, follow the plan tests in `query_test.go`.
-- `ormcheck/` is a live check against a real table: three entities, every access path, the
-  DataFrame runs, and the capacity used. In berryapps: action 4 of `./app.sh deploy` (that table is
+- `ormcheck/` is a live check against a real table: two entities, every access path, and the
+  capacity used. In berryapps: action 4 of `./app.sh deploy` (that table is
   production — pre-alpha, single environment).
 - Introspect a schema with `dynamo.GetSchema[OrderTable]()` / `Orders.Schema()` (JSON:
   `partition`, `keys`, every index).

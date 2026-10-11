@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
+	"reflect"
 	"sync"
 	"unsafe"
 
@@ -109,10 +109,8 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	}
 	item := m.keyOnly(ptr)
 	item[dataColumn] = &types.AttributeValueMemberB{Value: blob}
-	// A versioned table exposes Updated outside the blob: Modify's conditional write compares it.
-	if m.isVersioned {
-		item[updatedColumn] = &types.AttributeValueMemberN{Value: strconv.FormatInt(m.updated.acc.getI64(ptr), 10)}
-	}
+	// Version lives outside the blob: a write can raise it in DynamoDB, and a conditional write compares it.
+	item[versionColumn] = numberAttr(m.version.getI64(ptr))
 	for _, idx := range m.indexes {
 		item[idx.slot.hashAttr] = &types.AttributeValueMemberN{Value: m.partitionValue(ptr, idx.partition)}
 		item[idx.slot.rangeAttr] = &types.AttributeValueMemberS{Value: buildCompositeKey(m.keyPartsFor(ptr, idx.sortColumns))}
@@ -120,7 +118,7 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	return item, nil
 }
 
-// unmarshalItem decodes the "d" blob of an item into dst (a *E).
+// unmarshalItem decodes the "d" blob of an item into dst (a *E), and its Version.
 func (m *tableMeta) unmarshalItem(item map[string]types.AttributeValue, dst any) error {
 	blob, ok := item[dataColumn].(*types.AttributeValueMemberB)
 	if !ok {
@@ -129,12 +127,20 @@ func (m *tableMeta) unmarshalItem(item map[string]types.AttributeValue, dst any)
 	if err := colbin.Unmarshal(blob.Value, dst); err != nil {
 		return fmt.Errorf("db: colbin unmarshaling %s: %w", m.recordType.Name(), err)
 	}
+	if _, hasVersion := item[versionColumn]; hasVersion && m.version != nil {
+		m.version.setI64(reflect.ValueOf(dst).UnsafePointer(), numberAttrValue(item, versionColumn))
+	}
 	return nil
 }
 
 // keyOnly builds just the {pk, sk} key map for Get/Delete.
 func (m *tableMeta) keyOnly(ptr unsafe.Pointer) map[string]types.AttributeValue {
 	return itemKey(m.pkValue(ptr), m.skValue(ptr))
+}
+
+// itemKeyOf is the {pk, sk} map of a stored item, to write or delete it by key.
+func itemKeyOf(item map[string]types.AttributeValue) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]}
 }
 
 // itemKey is the {pk, sk} map of any row: pk is a number, sk a string.

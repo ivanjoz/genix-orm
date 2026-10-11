@@ -1,21 +1,23 @@
 package dynamo
 
 import (
+	"bytes"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 	"unsafe"
-
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// ── Delta test entity: one partition, a keyless delta and a fan-out delta ────
+// ── Delta test entity: no partition, a keyless delta and a fan-out delta ─────
 
 type deltaMember struct {
-	ID      int32   `cb:"1"`
-	TeamIDs []int16 `cb:"2"`
-	Status  int8    `cb:"3"`
-	Updated int64   `cb:"4"`
+	ID       int32   `cb:"1"`
+	TeamIDs  []int16 `cb:"2"`
+	Status   int8    `cb:"3"`
+	Updated  int32   `cb:"4"`
+	Version  int16   `json:"ver,omitempty" cb:"-"`
+	Metadata *string `json:"mdt,omitempty" cb:"-"`
 }
 
 type deltaMemberTable struct {
@@ -23,10 +25,8 @@ type deltaMemberTable struct {
 	ID      Col[*deltaMemberTable, int32]
 	TeamIDs ColSlice[*deltaMemberTable, int16]
 	Status  Col[*deltaMemberTable, int8]
-	Updated Col[*deltaMemberTable, int64]
+	Updated Col[*deltaMemberTable, int32]
 }
-
-const deltaMemberTableID = "78901234"
 
 func (t deltaMemberTable) GetSchema() Schema {
 	return Schema{
@@ -40,273 +40,368 @@ func (t deltaMemberTable) GetSchema() Schema {
 	}
 }
 
-func deltaUpdatedPart(updated uint64) string { return EncodeOrderedUint(updated, 7) } // Size(42) = 7 digits
+// ── A composite-key entity: one index pinned off the Keys, one on their prefix ─
 
-func TestDeltaIndexesCompileWithTheManagedUpdatedLast(t *testing.T) {
-	members := NewRepo[deltaMemberTable, deltaMember]()
-	keyless, byTeam := members.meta.arrayIndexes[0], members.meta.arrayIndexes[1]
+type deltaVisit struct {
+	Date      int16   `cb:"1"`
+	ID        int32   `cb:"2"`
+	CreatedBy int32   `cb:"3"`
+	Status    int8    `cb:"4"`
+	Version   int16   `json:"ver,omitempty" cb:"-"`
+	Metadata  *string `json:"mdt,omitempty" cb:"-"`
+}
 
-	// Cols(Status): Status is the sync filter, so the row sk is only Updated, named by its cb id.
-	if keyless.columnID != "004" || keyless.elementPosition != -1 || keyless.syncFilterField != "Status" ||
-		len(keyless.keys) != 1 || keyless.keys[0].fieldName != "Updated" {
+type deltaVisitTable struct {
+	Model[deltaVisitTable, deltaVisit]
+	Date      Col[*deltaVisitTable, int16]
+	ID        Col[*deltaVisitTable, int32]
+	CreatedBy Col[*deltaVisitTable, int32]
+	Status    Col[*deltaVisitTable, int8]
+}
+
+func (t deltaVisitTable) GetSchema() Schema {
+	return Schema{
+		Entity:  "delta_visit",
+		TableID: 78901260,
+		Keys:    Cols(t.Date.Size(16), t.ID.Size(32)),
+		Indexes: []Index{
+			{Type: TypeDelta, Keys: Cols(t.CreatedBy.Size(32), t.Status)},
+			{Type: TypeDelta, Keys: Cols(t.Date.Size(16), t.Status)},
+		},
+	}
+}
+
+// withDeltaClock pins Now to a moment in bucket 5000 (SUnixTime 1_500_010) and installs an empty
+// memory file store, both restored after the test.
+func withDeltaClock(t *testing.T) *MemoryFileStore {
+	t.Helper()
+	originalNow, originalStore := Now, fileStore
+	t.Cleanup(func() { Now, fileStore = originalNow, originalStore })
+	Now = func() time.Time { return sUnixTimeToTime(1_500_010) }
+	store := NewMemoryFileStore()
+	SetFileStore(store)
+	return store
+}
+
+func readDeltaLogFile(t *testing.T, store *MemoryFileStore, fileKey string, is64BitScale bool) []DeltaLogEntry {
+	t.Helper()
+	content, _, err := store.GetFile(fileKey)
+	if err != nil {
+		t.Fatalf("%s: %v", fileKey, err)
+	}
+	entries, err := decodeDeltaLogEntries(content, is64BitScale)
+	if err != nil {
+		t.Fatalf("%s: %v", fileKey, err)
+	}
+	return entries
+}
+
+func TestDeltaIndexesCompile(t *testing.T) {
+	members := NewRepo[deltaMemberTable, deltaMember]().meta
+	keyless, byTeam := members.deltaIndexes[0], members.deltaIndexes[1]
+	// Cols(Status): nothing pinned, the base table lists the view, the log ID is the ID.
+	if keyless.tag != "003" || len(keyless.pinned) != 0 || keyless.syncFilterField != "Status" || keyless.rowsIndex != -1 ||
+		len(keyless.logIDColumns) != 1 || keyless.logIDColumns[0].fieldName != "ID" || len(keyless.logIDColumnBits) != 0 {
 		t.Fatalf("keyless delta = %+v", keyless)
 	}
-	// Cols(TeamIDs, Status): rows per team, named by the slice's cb id.
-	if byTeam.columnID != "002" || byTeam.elementPosition != 0 || byTeam.syncFilterField != "Status" ||
-		len(byTeam.keys) != 2 || byTeam.keys[1].fieldName != "Updated" {
+	// Cols(TeamIDs, Status): pinned per team, listed through hidden rows named by the slice's cb id.
+	if byTeam.tag != "002-003" || len(byTeam.pinned) != 1 || byTeam.pinned[0].fieldName != "TeamIDs" || byTeam.rowsIndex < 0 ||
+		members.arrayIndexes[byTeam.rowsIndex].columnID != "002" {
 		t.Fatalf("team delta = %+v", byTeam)
 	}
-}
 
-func TestDeltaRowsMoveOnEveryWrite(t *testing.T) {
-	members := NewRepo[deltaMemberTable, deltaMember]()
-	stored := deltaMember{ID: 9, TeamIDs: []int16{1, 2}, Status: 1, Updated: 4000}
-	written := deltaMember{ID: 9, TeamIDs: []int16{2}, Status: 1, Updated: 5000}
-	basePK := members.meta.pkValue(unsafe.Pointer(&written))
-	baseSK := members.meta.skValue(unsafe.Pointer(&written))
-
-	puts, deletes := members.meta.arrayIndexWrites(unsafe.Pointer(&stored), unsafe.Pointer(&written), nil)
-	wantPuts := []string{
-		basePK + "004 " + deltaUpdatedPart(5000) + "#" + baseSK,
-		basePK + "002 " + EncodeOrderedUint(2, 2) + "#" + deltaUpdatedPart(5000) + "#" + baseSK,
+	visits := NewRepo[deltaVisitTable, deltaVisit]().meta
+	byCreator, byDate := visits.deltaIndexes[0], visits.deltaIndexes[1]
+	// CreatedBy is no Keys column: hidden rows, and both Keys pack into a 48-bit log ID.
+	if byCreator.rowsIndex < 0 || len(byCreator.logIDColumns) != 2 || !slices.Equal(byCreator.logIDColumnBits, []int8{16, 32}) || !byCreator.is64BitScale {
+		t.Fatalf("creator delta = %+v", byCreator)
 	}
-	wantDeletes := []string{
-		basePK + "004 " + deltaUpdatedPart(4000) + "#" + baseSK,
-		basePK + "002 " + EncodeOrderedUint(1, 2) + "#" + deltaUpdatedPart(4000) + "#" + baseSK,
-		basePK + "002 " + EncodeOrderedUint(2, 2) + "#" + deltaUpdatedPart(4000) + "#" + baseSK,
-	}
-	if got := writeKeys(puts); !equalStrings(got, wantPuts) {
-		t.Fatalf("puts = %v\nwant %v", got, wantPuts)
-	}
-	if got := writeKeys(deletes); !equalStrings(got, wantDeletes) {
-		t.Fatalf("deletes = %v\nwant %v", got, wantDeletes)
+	// Date leads the Keys: the base table lists the view by sk prefix, and the log ID is the ID alone.
+	if byDate.rowsIndex != -1 || len(byDate.logIDColumns) != 1 || byDate.logIDColumns[0].fieldName != "ID" || byDate.is64BitScale {
+		t.Fatalf("date delta = %+v", byDate)
 	}
 }
 
-func TestPlanDeltaReadsTheWindowBelowTheWatermark(t *testing.T) {
-	members := NewRepo[deltaMemberTable, deltaMember]()
+// ── Schemas the boot refuses ─────────────────────────────────────────────────
 
-	// A later sync: every status, from DeltaOverlap below the watermark, no filter.
-	query := members.Query().Delta(DeltaSince{Updated: 10_000, Fingerprint: 77}, 1)
-	plan := onlyPlan(t, query)
-	if plan.basePK != deltaMemberTableID || s(plan.values[":pk"]) != deltaMemberTableID+"004" {
-		t.Fatalf("pk = %s, basePK = %s", s(plan.values[":pk"]), plan.basePK)
-	}
-	if plan.keyCond != "#pk = :pk AND #sk >= :sk" || s(plan.values[":sk"]) != deltaUpdatedPart(6_000) {
-		t.Fatalf("keyCond = %q, :sk = %q", plan.keyCond, s(plan.values[":sk"]))
-	}
-	if len(plan.keyFilter) != 0 || query.deltaSince.Fingerprint != 77 {
-		t.Fatalf("a later sync must not filter the status and must keep the fingerprint: %+v %+v", plan.keyFilter, query.deltaSince)
-	}
-
-	// A watermark younger than the overlap reads from 0.
-	if plan = onlyPlan(t, members.Query().Delta(DeltaSince{Updated: 1_000}, 1)); s(plan.values[":sk"]) != deltaUpdatedPart(0) {
-		t.Fatalf(":sk = %q", s(plan.values[":sk"]))
-	}
-
-	// A first sync: every row, the requested statuses only, filtered in memory.
-	query = members.Query().Delta(DeltaSince{}, 1)
-	plan = onlyPlan(t, query)
-	if len(plan.keyFilter) != 1 || plan.keyFilter[0].field != "Status" || plan.keyFilter[0].op != opIn || query.deltaSince.Updated != 0 {
-		t.Fatalf("first sync keyFilter = %+v", plan.keyFilter)
-	}
+type deltaStringKey struct {
+	Code     string  `cb:"1"`
+	Status   int8    `cb:"2"`
+	Version  int16   `json:"ver,omitempty" cb:"-"`
+	Metadata *string `json:"mdt,omitempty" cb:"-"`
 }
 
-func TestPlanDeltaWithContainsRangesInsideTheElement(t *testing.T) {
-	members := NewRepo[deltaMemberTable, deltaMember]()
-	plan := onlyPlan(t, members.Query().Contains(members.T.TeamIDs, 3).Delta(DeltaSince{Updated: 10_000}, 1))
-	element := EncodeOrderedUint(3, 2)
-	if s(plan.values[":pk"]) != deltaMemberTableID+"002" || plan.keyCond != "#pk = :pk AND #sk BETWEEN :lo AND :hi" {
-		t.Fatalf("pk = %s, keyCond = %q", s(plan.values[":pk"]), plan.keyCond)
-	}
-	if s(plan.values[":lo"]) != element+"#"+deltaUpdatedPart(6_000) || s(plan.values[":hi"]) != element+keySeparatorSuccessor {
-		t.Fatalf(":lo = %q, :hi = %q", s(plan.values[":lo"]), s(plan.values[":hi"]))
-	}
+type deltaStringKeyTable struct {
+	Model[deltaStringKeyTable, deltaStringKey]
+	Code   Col[*deltaStringKeyTable, string]
+	Status Col[*deltaStringKeyTable, int8]
 }
 
-func TestDeltaFirstSyncFilterKeepsTheRequestedValues(t *testing.T) {
-	members := NewRepo[deltaMemberTable, deltaMember]()
-	syncFilter := predicate{field: "Status", op: opIn, v1: []any{1, 2}}
-	for status, wantKept := range map[int8]bool{0: false, 1: true, 2: true} {
-		member := deltaMember{Status: status}
-		if kept := members.meta.matchesFilter(unsafe.Pointer(&member), []predicate{syncFilter}); kept != wantKept {
-			t.Fatalf("status %d: kept = %v, want %v", status, kept, wantKept)
-		}
-	}
+func (t deltaStringKeyTable) GetSchema() Schema {
+	return Schema{Entity: "delta_string_key", TableID: 78901261, Keys: Cols(t.Code),
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(t.Status)}}}
 }
 
-// The values genix-ui's delta cache must reproduce (cache/delta-cache.watermark.test.ts).
-func TestDeltaFingerprintSharedVector(t *testing.T) {
-	for _, testCase := range []struct {
-		updatedValues   []int64
-		wantFingerprint uint32
+type deltaWideKey struct {
+	Date     int16   `cb:"1"`
+	SaleID   int32   `cb:"2"`
+	Line     int16   `cb:"3"`
+	Status   int8    `cb:"4"`
+	Version  int16   `json:"ver,omitempty" cb:"-"`
+	Metadata *string `json:"mdt,omitempty" cb:"-"`
+}
+
+type deltaWideKeyTable struct {
+	Model[deltaWideKeyTable, deltaWideKey]
+	Date   Col[*deltaWideKeyTable, int16]
+	SaleID Col[*deltaWideKeyTable, int32]
+	Line   Col[*deltaWideKeyTable, int16]
+	Status Col[*deltaWideKeyTable, int8]
+}
+
+func (t deltaWideKeyTable) GetSchema() Schema {
+	return Schema{Entity: "delta_wide_key", TableID: 78901262, Keys: Cols(t.Date.Size(16), t.SaleID.Size(32), t.Line.Size(8)),
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(t.Status)}}}
+}
+
+type deltaWithoutMetadata struct {
+	ID      int32 `cb:"1"`
+	Status  int8  `cb:"2"`
+	Version int16 `json:"ver,omitempty" cb:"-"`
+}
+
+type deltaWithoutMetadataTable struct {
+	Model[deltaWithoutMetadataTable, deltaWithoutMetadata]
+	ID     Col[*deltaWithoutMetadataTable, int32]
+	Status Col[*deltaWithoutMetadataTable, int8]
+}
+
+func (t deltaWithoutMetadataTable) GetSchema() Schema {
+	return Schema{Entity: "delta_without_metadata", TableID: 78901263, Keys: Cols(t.ID.Size(30)),
+		Indexes: []Index{{Type: TypeDelta, Keys: Cols(t.Status)}}}
+}
+
+type withoutVersion struct {
+	ID int32 `cb:"1"`
+}
+
+type withoutVersionTable struct {
+	Model[withoutVersionTable, withoutVersion]
+	ID Col[*withoutVersionTable, int32]
+}
+
+func (t withoutVersionTable) GetSchema() Schema {
+	return Schema{Entity: "without_version", TableID: 78901264, Keys: Cols(t.ID.Size(30))}
+}
+
+type int64Updated struct {
+	ID      int32 `cb:"1"`
+	Updated int64 `cb:"2"`
+	Version int16 `json:"ver,omitempty" cb:"-"`
+}
+
+type int64UpdatedTable struct {
+	Model[int64UpdatedTable, int64Updated]
+	ID      Col[*int64UpdatedTable, int32]
+	Updated Col[*int64UpdatedTable, int64]
+}
+
+func (t int64UpdatedTable) GetSchema() Schema {
+	return Schema{Entity: "int64_updated", TableID: 78901265, Keys: Cols(t.ID.Size(30))}
+}
+
+func TestSchemasTheBootRefuses(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		build       func()
+		wantMessage string
 	}{
-		{nil, 0},
-		{[]int64{0}, 0},
-		{[]int64{1}, 1364076727},
-		{[]int64{1_234_567_890_123}, 2401458028},
-		{[]int64{4_398_046_511_103}, 3230535694}, // the largest Updated of Size(42)
-		{[]int64{1, 1_234_567_890_123, 4_398_046_511_103}, 2701103153},
-		{[]int64{4_398_046_511_103, 1, 1_234_567_890_123}, 2701103153}, // order-independent
+		"a string log ID":       {func() { NewRepo[deltaStringKeyTable, deltaStringKey]() }, "must be a signed integer"},
+		"a log ID over 53 bits": {func() { NewRepo[deltaWideKeyTable, deltaWideKey]() }, "packs 56 bits"},
+		"no Metadata field":     {func() { NewRepo[deltaWithoutMetadataTable, deltaWithoutMetadata]() }, "mdt"},
+		"no Version field":      {func() { NewRepo[withoutVersionTable, withoutVersion]() }, "Version int16"},
+		"an int64 Updated":      {func() { NewRepo[int64UpdatedTable, int64Updated]() }, "must be an int32"},
 	} {
-		if got := DeltaFingerprint(testCase.updatedValues); got != testCase.wantFingerprint {
-			t.Fatalf("DeltaFingerprint(%v) = %d, want %d", testCase.updatedValues, got, testCase.wantFingerprint)
-		}
+		func() {
+			defer func() {
+				recovered, _ := recover().(string)
+				if !strings.Contains(recovered, testCase.wantMessage) {
+					t.Fatalf("%s: want a panic with %q, got %q", name, testCase.wantMessage, recovered)
+				}
+			}()
+			testCase.build()
+		}()
 	}
 }
 
-func TestDropHeldWindowSendsTheWindowOnlyOnAMismatch(t *testing.T) {
+// ── Write side: the appends ──────────────────────────────────────────────────
+
+func TestAppendDeltaLogsFollowsTheRecordAcrossFolders(t *testing.T) {
+	store := withDeltaClock(t)
+	meta := NewRepo[deltaMemberTable, deltaMember]().meta
+	created := deltaMember{ID: 7, TeamIDs: []int16{1, 2}, Status: 1}
+	moved := deltaMember{ID: 7, TeamIDs: []int16{2, 3}, Status: 1}
+
+	writes := [][]deltaLogWrite{
+		{{writtenPtr: unsafe.Pointer(&created), version: 1}},                                    // new
+		{{storedPtr: unsafe.Pointer(&created), writtenPtr: unsafe.Pointer(&moved), version: 2}}, // left team 1, joined 3
+		{{storedPtr: unsafe.Pointer(&moved), version: 3}},                                       // hard delete
+	}
+	for _, write := range writes {
+		if err := meta.appendDeltaLogs(write); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	folder := deltaLogFolder + meta.pkValue(unsafe.Pointer(&created)) + "/"
+	expectedEntriesByFile := map[string][]DeltaLogEntry{
+		"003/5000":       {{LogID: 7, Version: 1}, {LogID: 7, Version: 2}, {LogID: 7, Version: 3, IsDeleted: true}},
+		"002-003/1/5000": {{LogID: 7, Version: 1}, {LogID: 7, Version: 2, IsDeleted: true}},
+		"002-003/2/5000": {{LogID: 7, Version: 1}, {LogID: 7, Version: 2}, {LogID: 7, Version: 3, IsDeleted: true}},
+		"002-003/3/5000": {{LogID: 7, Version: 2}, {LogID: 7, Version: 3, IsDeleted: true}},
+	}
+	for file, expectedEntries := range expectedEntriesByFile {
+		if entries := readDeltaLogFile(t, store, folder+file, false); !slices.Equal(entries, expectedEntries) {
+			t.Errorf("%s = %+v, want %+v", file, entries, expectedEntries)
+		}
+	}
+	if fileKeys, _ := store.ListFiles(deltaLogFolder); len(fileKeys) != len(expectedEntriesByFile) {
+		t.Errorf("files = %v, want only %d", fileKeys, len(expectedEntriesByFile))
+	}
+}
+
+func TestAppendDeltaLogsKeepsTheLastWriteOfARecordInOneCall(t *testing.T) {
+	store := withDeltaClock(t)
+	meta := NewRepo[deltaMemberTable, deltaMember]().meta
+	first, second, other := deltaMember{ID: 7, Status: 1}, deltaMember{ID: 7, Status: 0}, deltaMember{ID: 8, Status: 1}
+	err := meta.appendDeltaLogs([]deltaLogWrite{
+		{writtenPtr: unsafe.Pointer(&first), version: 4},
+		{writtenPtr: unsafe.Pointer(&other), version: 1},
+		{writtenPtr: unsafe.Pointer(&second), version: 5}, // a soft delete is a deleted entry
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := readDeltaLogFile(t, store, deltaLogFolder+meta.pkValue(unsafe.Pointer(&first))+"/003/5000", false)
+	if want := []DeltaLogEntry{{LogID: 7, Version: 5, IsDeleted: true}, {LogID: 8, Version: 1}}; !slices.Equal(entries, want) {
+		t.Fatalf("entries = %+v, want %+v", entries, want)
+	}
+}
+
+func TestAppendDeltaLogsPacksACompositeLogID(t *testing.T) {
+	store := withDeltaClock(t)
+	meta := NewRepo[deltaVisitTable, deltaVisit]().meta
+	visit := deltaVisit{Date: 20_000, ID: 41, CreatedBy: 9, Status: 1}
+	if err := meta.appendDeltaLogs([]deltaLogWrite{{writtenPtr: unsafe.Pointer(&visit), version: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	folder := deltaLogFolder + meta.pkValue(unsafe.Pointer(&visit)) + "/"
+	packedLogID := packDeltaLogID([]uint64{20_000, 41}, []int8{16, 32})
+	if entries := readDeltaLogFile(t, store, folder+"003-004/9/5000", true); len(entries) != 1 || entries[0].LogID != packedLogID {
+		t.Fatalf("creator log = %+v, want log ID %d", entries, packedLogID)
+	}
+	if entries := readDeltaLogFile(t, store, folder+"001-004/20000/5000", false); len(entries) != 1 || entries[0].LogID != 41 {
+		t.Fatalf("date log = %+v, want log ID 41", entries)
+	}
+	if unpacked := unpackDeltaLogID(packedLogID, []int8{16, 32}); !slices.Equal(unpacked, []uint64{20_000, 41}) {
+		t.Fatalf("unpacked = %v", unpacked)
+	}
+}
+
+func TestAppendDeltaLogsNeedsAFileStore(t *testing.T) {
+	withDeltaClock(t)
+	fileStore = nil
+	meta := NewRepo[deltaMemberTable, deltaMember]().meta
+	member := deltaMember{ID: 7, Status: 1}
+	if err := meta.appendDeltaLogs([]deltaLogWrite{{writtenPtr: unsafe.Pointer(&member), version: 1}}); err == nil ||
+		!strings.Contains(err.Error(), "SetFileStore") {
+		t.Fatalf("err = %v, want the SetFileStore error", err)
+	}
+}
+
+// ── Read side ────────────────────────────────────────────────────────────────
+
+func TestDeltaBucketsAndSealing(t *testing.T) {
+	if bucket := deltaBucketOf(sUnixTimeToTime(1_500_299)); bucket != 5000 {
+		t.Fatalf("bucket = %d, want 5000", bucket)
+	}
+	bucketEnd := sUnixTimeToTime(1_500_300)
+	if isDeltaBucketSealed(5000, bucketEnd.Add(deltaBucketSealDelay-time.Second)) {
+		t.Error("a bucket still takes appends until deltaBucketSealDelay after its end")
+	}
+	if !isDeltaBucketSealed(5000, bucketEnd.Add(deltaBucketSealDelay)) {
+		t.Error("a bucket is sealed deltaBucketSealDelay after its end")
+	}
+}
+
+func TestDeltaLogFilesAreListedAndReadByBucket(t *testing.T) {
+	store := withDeltaClock(t)
+	folder := deltaLogFolder + "1/003/"
+	for _, fileKey := range []string{folder + "4998", folder + "5000", folder + "4990", deltaLogFolder + "1/002-003/1/4999"} {
+		store.write(fileKey, []byte{byte(len(fileKey))})
+	}
+	buckets, err := listDeltaLogBuckets(folder, 4995)
+	if slices.Sort(buckets); err != nil || !slices.Equal(buckets, []int64{4998, 5000}) {
+		t.Fatalf("buckets = %v, err %v; want [4998 5000]", buckets, err)
+	}
+	contents, err := readDeltaLogFiles(folder, []int64{4998, 4999})
+	if err != nil || len(contents[0]) != 1 || contents[1] != nil {
+		t.Fatalf("contents = %v, err %v; want the 4998 file and an empty 4999", contents, err)
+	}
+}
+
+func TestDeltaIndexSelection(t *testing.T) {
 	members := NewRepo[deltaMemberTable, deltaMember]()
-	keyless, byTeam := &members.meta.arrayIndexes[0], &members.meta.arrayIndexes[1]
-	row := func(deltaIndex *arrayIndexMeta, member deltaMember) map[string]types.AttributeValue {
-		return map[string]types.AttributeValue{"sk": &types.AttributeValueMemberS{Value: members.meta.arrayRowSKs(deltaIndex, unsafe.Pointer(&member))[0]}}
+	if query := members.Query().Delta(DeltaCursor{}, 1); query.planErr != nil || query.deltaIndex != &members.meta.deltaIndexes[0] {
+		t.Fatalf("no Contains: index %+v, err %v; want the keyless one", query.deltaIndex, query.planErr)
 	}
-	updatedOfRows := func(deltaIndex *arrayIndexMeta, rowsByPlan [][]map[string]types.AttributeValue) []int64 {
-		var updatedValues []int64
-		for _, rows := range rowsByPlan {
-			for _, row := range rows {
-				updatedValues = append(updatedValues, deltaIndex.updatedOfDeltaRow(row["sk"].(*types.AttributeValueMemberS).Value))
-			}
-		}
-		return updatedValues
+	if query := members.Query().Contains(members.T.TeamIDs, 3).Delta(DeltaCursor{}, 1); query.deltaIndex != &members.meta.deltaIndexes[1] {
+		t.Fatalf("one-value Contains: index %+v; want the team one", query.deltaIndex)
 	}
-	since := DeltaSince{Updated: 9_000, Fingerprint: DeltaFingerprint([]int64{7_000, 9_000})}
-	windowAndNew := func() [][]map[string]types.AttributeValue {
-		return [][]map[string]types.AttributeValue{{
-			row(keyless, deltaMember{ID: 1, Updated: 7_000}),
-			row(keyless, deltaMember{ID: 2, Updated: 9_000}),
-			row(keyless, deltaMember{ID: 3, Updated: 9_500}),
-		}}
+	if query := members.Query().Contains(members.T.TeamIDs, 3).Delta(DeltaCursor{1: 0}, 1); query.syncFilter != nil || !query.readsDeltaLog {
+		t.Fatalf("a later sync reads the log with no sync filter: %+v", query)
 	}
 
-	// The client holds the window: only the new row stays.
-	if got := updatedOfRows(keyless, keyless.dropHeldWindow(windowAndNew(), since)); !equalInt64s(got, []int64{9_500}) {
-		t.Fatalf("held window: kept %v", got)
-	}
-	// A write that landed late in the window (8_000) changes the fingerprint: everything is sent.
-	lateWrite := windowAndNew()
-	lateWrite[0] = append(lateWrite[0], row(keyless, deltaMember{ID: 4, Updated: 8_000}))
-	if got := updatedOfRows(keyless, keyless.dropHeldWindow(lateWrite, since)); len(got) != 4 {
-		t.Fatalf("late write: kept %v, want all 4 rows", got)
-	}
-	// A record the client holds at 7_000 that was rewritten at 8_500: same count, other value.
-	rewritten := [][]map[string]types.AttributeValue{{
-		row(keyless, deltaMember{ID: 1, Updated: 8_500}),
-		row(keyless, deltaMember{ID: 2, Updated: 9_000}),
-	}}
-	if got := updatedOfRows(keyless, keyless.dropHeldWindow(rewritten, since)); len(got) != 2 {
-		t.Fatalf("rewritten record: kept %v, want both rows", got)
-	}
-	// A record in two teams of a Contains counts once.
-	twoTeams := deltaMember{ID: 5, TeamIDs: []int16{1, 2}, Updated: 7_000}
-	teamRows := [][]map[string]types.AttributeValue{
-		{{"sk": &types.AttributeValueMemberS{Value: members.meta.arrayRowSKs(byTeam, unsafe.Pointer(&twoTeams))[0]}}},
-		{{"sk": &types.AttributeValueMemberS{Value: members.meta.arrayRowSKs(byTeam, unsafe.Pointer(&twoTeams))[1]}}},
-	}
-	if got := updatedOfRows(byTeam, byTeam.dropHeldWindow(teamRows, DeltaSince{Updated: 7_000, Fingerprint: DeltaFingerprint([]int64{7_000})})); len(got) != 0 {
-		t.Fatalf("one record in two teams: kept %v, want none", got)
-	}
-}
-
-func equalInt64s(a, b []int64) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// Without a delta index holding a sync filter, or with two that fit equally, Delta fails to plan.
-func TestDeltaIndexSelectionRejections(t *testing.T) {
 	products := newProducts(t)
-	if _, err := products.Query().Eq(products.T.CategoryID, 7).Delta(DeltaSince{}).plans(); err == nil || !strings.Contains(err.Error(), "no TypeDelta index") {
+	if err := products.Query().Eq(products.T.CategoryID, 7).Delta(DeltaCursor{}).planErr; err == nil || !strings.Contains(err.Error(), "no TypeDelta index") {
 		t.Fatalf("a table without delta indexes: err = %v", err)
 	}
-	ambiguous := &tableMeta{recordType: products.meta.recordType, arrayIndexes: []arrayIndexMeta{
-		{isDelta: true, keys: []keyCol{{fieldName: "Updated"}}},
-		{isDelta: true, keys: []keyCol{{fieldName: "Updated"}}},
-	}}
+	ambiguous := &tableMeta{recordType: products.meta.recordType, deltaIndexes: []deltaIndexMeta{{}, {}}}
 	if _, err := ambiguous.selectDeltaIndex(nil, false); err == nil || !strings.Contains(err.Error(), "several") {
 		t.Fatalf("two equal fits: err = %v", err)
 	}
 }
 
-func TestStampManagedColumnsCountsMillisecondsFromTheEpoch(t *testing.T) {
-	originalNow, originalEpoch := Now, updatedEpochMillis
-	t.Cleanup(func() { Now, updatedEpochMillis = originalNow, originalEpoch })
-	SetUpdatedEpoch(1_800_000_000)
-	Now = func() time.Time { return time.UnixMilli(1_800_000_000_250) }
-	lastStampedUpdated.Store(0)
+func TestDeltaMetadataRecords(t *testing.T) {
+	visits := NewRepo[deltaVisitTable, deltaVisit]()
+	query := visits.Query().Eq(visits.T.CreatedBy, 9).Delta(DeltaCursor{5000: 3}, 1)
+	content := []byte{1, 2, 3}
+	record := query.deltaMetadataRecord(5000, deltaMetadataFlag64BitScale|deltaMetadataFlagSealed, content)
+	// −bucket goes in the log ID's last column; the rest of the key stays zero.
+	if record.ID != -5000 || record.Date != 0 || record.Metadata == nil {
+		t.Fatalf("record = %+v", record)
+	}
+	decoded, err := DecodeSafe85(*record.Metadata)
+	want := deltaMetadataBytes(deltaMetadataFlag64BitScale|deltaMetadataFlagSealed, 5000, []int8{16, 32}, content)
+	if err != nil || !bytes.Equal(decoded, want) {
+		t.Fatalf("metadata = %v, err %v; want %v", decoded, err, want)
+	}
 
-	// Products have no Updated field and no delta index: nothing to stamp.
-	newProducts(t).meta.stampManagedColumns([]unsafe.Pointer{unsafe.Pointer(&Product{})}, nil)
+	replace, err := DecodeSafe85(DeltaReplaceMetadata())
+	if err != nil || !bytes.Equal(replace, deltaMetadataBytes(deltaMetadataFlagReplace|deltaMetadataFlagSealed, 0, nil, nil)) {
+		t.Fatalf("replace metadata = %v, err %v", replace, err)
+	}
+}
 
+// ── Managed fields ───────────────────────────────────────────────────────────
+
+func TestStampUpdatedWritesTheSUnixTime(t *testing.T) {
+	withDeltaClock(t)
 	meta := NewRepo[deltaMemberTable, deltaMember]().meta
-	first, second := deltaMember{}, deltaMember{}
-	meta.stampManagedColumns([]unsafe.Pointer{unsafe.Pointer(&first), unsafe.Pointer(&second)}, nil)
-	if first.Updated != 250 || second.Updated != 250 {
-		t.Fatalf("one call stamps one Updated: %d, %d; want 250", first.Updated, second.Updated)
+	first, second := deltaMember{}, deltaMember{Updated: 9}
+	meta.stampUpdated([]unsafe.Pointer{unsafe.Pointer(&first), unsafe.Pointer(&second)})
+	if first.Updated != 1_500_010 || second.Updated != 1_500_010 {
+		t.Fatalf("Updated = %d, %d; want 1500010", first.Updated, second.Updated)
 	}
-	// A second call in the same millisecond still moves, and a stored Updated ahead of the clock is passed.
-	again, aheadOfClock := deltaMember{}, deltaMember{ID: 1}
-	stored := deltaMember{ID: 1, Updated: 900}
-	storedByKey := map[string]unsafe.Pointer{meta.recordKey(unsafe.Pointer(&stored)): unsafe.Pointer(&stored)}
-	meta.stampManagedColumns([]unsafe.Pointer{unsafe.Pointer(&again), unsafe.Pointer(&aheadOfClock)}, meta.aboveStored(storedByKey))
-	if again.Updated != 251 || aheadOfClock.Updated != 901 {
-		t.Fatalf("again = %d (want 251), aheadOfClock = %d (want 901)", again.Updated, aheadOfClock.Updated)
-	}
-	if got := UpdatedToTime(250); !got.Equal(time.UnixMilli(1_800_000_000_250)) {
-		t.Fatalf("UpdatedToTime(250) = %v", got)
-	}
-}
-
-type deltaWithoutUpdated struct {
-	ID     int32 `cb:"1"`
-	Status int8  `cb:"2"`
-}
-
-type deltaWithoutUpdatedTable struct {
-	Model[deltaWithoutUpdatedTable, deltaWithoutUpdated]
-	ID     Col[*deltaWithoutUpdatedTable, int32]
-	Status Col[*deltaWithoutUpdatedTable, int8]
-}
-
-func (t deltaWithoutUpdatedTable) GetSchema() Schema {
-	return Schema{Entity: "delta_without_updated", TableID: 78901235, Keys: Cols(t.ID.Size(30)),
-		Indexes: []Index{{Type: TypeDelta, Keys: Cols(t.Status)}}}
-}
-
-type int32Updated struct {
-	ID      int32 `cb:"1"`
-	Updated int32 `cb:"2"`
-}
-
-type int32UpdatedTable struct {
-	Model[int32UpdatedTable, int32Updated]
-	ID      Col[*int32UpdatedTable, int32]
-	Updated Col[*int32UpdatedTable, int32]
-}
-
-func (t int32UpdatedTable) GetSchema() Schema {
-	return Schema{Entity: "int32_updated", TableID: 78901236, Keys: Cols(t.ID.Size(30))}
-}
-
-func TestManagedUpdatedMustBeAnInt64(t *testing.T) {
-	for name, build := range map[string]func(){
-		"a delta index without Updated": func() { NewRepo[deltaWithoutUpdatedTable, deltaWithoutUpdated]() },
-		"an int32 Updated":              func() { NewRepo[int32UpdatedTable, int32Updated]() },
-	} {
-		func() {
-			defer func() {
-				if recovered := recover(); recovered == nil || !strings.Contains(recovered.(string), "int64") {
-					t.Fatalf("%s: expected the int64 panic, got %v", name, recovered)
-				}
-			}()
-			build()
-		}()
-	}
+	// A table without Updated stamps nothing.
+	newProducts(t).meta.stampUpdated([]unsafe.Pointer{unsafe.Pointer(&Product{})})
 }

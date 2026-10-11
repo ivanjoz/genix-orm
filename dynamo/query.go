@@ -243,11 +243,12 @@ type QueryBuilder[E any] struct {
 	// allowsMemoryFilter is set by Repo.QueryScan: predicates no key serves are
 	// filtered in memory instead of rejected.
 	allowsMemoryFilter bool
-	// Set by Delta (delta.go): the TypeDelta index it reads, the first-sync
-	// filter on its sync filter column, and what the client holds past a first sync.
-	deltaIndex *arrayIndexMeta
-	syncFilter *predicate
-	deltaSince DeltaSince
+	// Set by Delta and DeltaList (delta.go): the TypeDelta index read, the first-sync
+	// filter on its sync filter column, and, for Delta, what the client holds of the log.
+	deltaIndex    *deltaIndexMeta
+	syncFilter    *predicate
+	deltaCursor   DeltaCursor
+	readsDeltaLog bool
 	// consistentRead is set by Consistent.
 	consistentRead bool
 }
@@ -316,19 +317,22 @@ type queryPlan struct {
 
 // Exec runs the query and appends results into *dst.
 func (q *QueryBuilder[E]) Exec(dst *[]E) error {
-	plans, err := q.plans()
-	if err != nil {
-		return err
-	}
 	client, err := Client()
 	if err != nil {
 		return err
 	}
-
-	if q.deltaIndex != nil && q.deltaSince.Updated > 0 {
-		return q.execDeltaSince(client, plans, dst)
+	if q.readsDeltaLog {
+		return q.execDelta(client, dst)
 	}
+	return q.execPlans(client, dst)
+}
 
+// execPlans runs the query's plans, appending what they read to *dst.
+func (q *QueryBuilder[E]) execPlans(client *dynamodb.Client, dst *[]E) error {
+	plans, err := q.plans()
+	if err != nil {
+		return err
+	}
 	// A record holding several of the Contains values is returned once.
 	returnedSKs := map[string]bool{}
 	// A QueryScan counts what it reads (every page of every plan, and the base
@@ -461,26 +465,26 @@ func (q *QueryBuilder[E]) plans() ([]*queryPlan, error) {
 		containsPredicate = &q.preds[i]
 	}
 	if containsPredicate == nil {
-		// A Delta read without a Contains reads its delta index's single rows.
-		plan, err := q.plan(q.deltaIndex, nil)
+		// A delta listing reads its delta index's rows, or the base table when it has none.
+		plan, err := q.plan(q.deltaRows(), nil)
 		if err != nil {
 			return nil, err
 		}
 		return []*queryPlan{plan}, nil
 	}
 
-	var arrayIndex *arrayIndexMeta
-	for i := range q.meta.arrayIndexes {
-		if q.meta.arrayIndexes[i].elementPosition >= 0 && q.meta.arrayIndexes[i].element.fieldName == containsPredicate.field {
-			arrayIndex = &q.meta.arrayIndexes[i]
+	// A delta listing reads its own index's rows; any other Contains, the fan-out index of its slice.
+	arrayIndex := q.deltaRows()
+	if arrayIndex == nil || arrayIndex.elementPosition < 0 || arrayIndex.element.fieldName != containsPredicate.field {
+		arrayIndex = nil
+		for i := range q.meta.arrayIndexes {
+			if q.meta.arrayIndexes[i].elementPosition >= 0 && q.meta.arrayIndexes[i].element.fieldName == containsPredicate.field {
+				arrayIndex = &q.meta.arrayIndexes[i]
+			}
 		}
 	}
 	if arrayIndex == nil {
 		return nil, fmt.Errorf("db: Contains on %s.%s needs an Index whose Keys hold that ColSlice",
-			q.meta.recordType.Name(), containsPredicate.field)
-	}
-	if q.deltaIndex != nil && q.deltaIndex != arrayIndex {
-		return nil, fmt.Errorf("db: %s Delta() with a Contains on %s needs a TypeDelta index holding that ColSlice",
 			q.meta.recordType.Name(), containsPredicate.field)
 	}
 	values := containsPredicate.v1.([]any)

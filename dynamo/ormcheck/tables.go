@@ -7,7 +7,7 @@ import "github.com/ivanjoz/genix-orm/dynamo"
 
 // CheckOrder exercises every key shape on a partitioned entity. Its fan-out indexes are keys-only:
 // Contains reads the matching base records in a second BatchGetItem. Three of its indexes keep
-// GroupBy counters: a delta one on a GSI, one per Tags element, and a slot-less one.
+// GroupBy counters: one on a GSI, one per Tags element, and a slot-less one.
 type CheckOrder struct {
 	StoreID    int32    `cb:"1"`
 	Created    int32    `cb:"2"`
@@ -20,7 +20,8 @@ type CheckOrder struct {
 	Tags       []string `cb:"9"`
 	Total      int64    `cb:"10"`
 	Weight     float64  `cb:"11"`
-	Updated    int64    `cb:"12"`
+	Updated    int32    `cb:"12"`
+	Version    int16    `json:"ver,omitempty" cb:"-"`
 }
 
 type CheckOrderTable struct {
@@ -36,7 +37,7 @@ type CheckOrderTable struct {
 	Tags       dynamo.ColSlice[CheckOrderTable, string]
 	Total      dynamo.Col[CheckOrderTable, int64]
 	Weight     dynamo.Col[CheckOrderTable, float64]
-	Updated    dynamo.Col[CheckOrderTable, int64]
+	Updated    dynamo.Col[CheckOrderTable, int32]
 }
 
 func (table CheckOrderTable) GetSchema() dynamo.Schema {
@@ -49,9 +50,9 @@ func (table CheckOrderTable) GetSchema() dynamo.Schema {
 		Indexes: []dynamo.Index{
 			// A GSI with its own partition: one customer across every store, ranged on Created.
 			{Slot: dynamo.G1, Partition: dynamo.Cols(table.CustomerID.Size(32)), Keys: dynamo.Cols(table.Created.Size(32))},
-			// A GSI under the store sorted by Channel+Status, with delta counters: count, sum(Total),
+			// A GSI under the store sorted by Channel+Status, with counters: count, sum(Total),
 			// sum(Weight) per Channel+Status.
-			{Slot: dynamo.G2, Keys: dynamo.Cols(table.Channel, table.Status.Size(8)), GroupBy: dynamo.Cols(table.Total, table.Weight), GroupDelta: true},
+			{Slot: dynamo.G2, Keys: dynamo.Cols(table.Channel, table.Status.Size(8)), GroupBy: dynamo.Cols(table.Total, table.Weight)},
 			{Slot: dynamo.G3, Keys: dynamo.Cols(table.Code)}, // a string lookup under the store
 			// Fan-out: row sk = ProductID ‖ Created ‖ base sk, so a product ranges on Created.
 			{Keys: dynamo.Cols(table.ProductIDs.Size(32), table.Created.Size(32))},
@@ -65,7 +66,8 @@ var CheckOrders = dynamo.NewRepo[CheckOrderTable, CheckOrder]()
 
 // CheckProduct is an entity without Partition (the whole entity is the pk TableID). Its fan-out
 // index is FullCopy: every element row carries the record, so Contains is a single Query. Its two
-// delta indexes are keys-only: one row per record, and one per TeamIDs element.
+// delta indexes log every write: the one on Status lists from the base table, the one pinned on
+// TeamIDs keeps one keys-only row per element.
 type CheckProduct struct {
 	ID          int32   `cb:"1"`
 	Brand       string  `cb:"2"`
@@ -74,7 +76,9 @@ type CheckProduct struct {
 	CategoryIDs []int16 `cb:"5"`
 	Status      int8    `cb:"6"`
 	TeamIDs     []int16 `cb:"7"`
-	Updated     int64   `cb:"8"`
+	Updated     int32   `cb:"8"`
+	Version     int16   `json:"ver,omitempty" cb:"-"`
+	Metadata    *string `json:"mdt,omitempty" cb:"-"`
 }
 
 type CheckProductTable struct {
@@ -86,7 +90,7 @@ type CheckProductTable struct {
 	CategoryIDs dynamo.ColSlice[CheckProductTable, int16]
 	Status      dynamo.Col[CheckProductTable, int8]
 	TeamIDs     dynamo.ColSlice[CheckProductTable, int16]
-	Updated     dynamo.Col[CheckProductTable, int64]
+	Updated     dynamo.Col[CheckProductTable, int32]
 }
 
 func (table CheckProductTable) GetSchema() dynamo.Schema {

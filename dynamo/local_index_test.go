@@ -12,6 +12,7 @@ type localItem struct {
 	ID       int32  `cb:"1"`
 	NameHash int32  `cb:"2"`
 	Name     string `cb:"3"`
+	Version  int16  `json:"ver,omitempty" cb:"-"`
 }
 
 type localItemTable struct {
@@ -81,10 +82,12 @@ func TestPlanEqOnALocalIndexReadsItsRowsConsistently(t *testing.T) {
 
 func TestLocalIndexDeclarationRules(t *testing.T) {
 	for name, index := range map[string]func(t badFanOutTable) Index{
-		"a Slot":    func(t badFanOutTable) Index { return Index{Type: TypeLocal, Slot: G1, Keys: Cols(t.Price.Size(32))} },
-		"no Keys":   func(t badFanOutTable) Index { return Index{Type: TypeLocal} },
-		"a slice":   func(t badFanOutTable) Index { return Index{Type: TypeLocal, Keys: Cols(t.TagIDs.Size(32))} },
-		"a GroupBy": func(t badFanOutTable) Index { return Index{Type: TypeLocal, Keys: Cols(t.Price.Size(32)), GroupBy: Cols(t.ID)} },
+		"a Slot":  func(t badFanOutTable) Index { return Index{Type: TypeLocal, Slot: G1, Keys: Cols(t.Price.Size(32))} },
+		"no Keys": func(t badFanOutTable) Index { return Index{Type: TypeLocal} },
+		"a slice": func(t badFanOutTable) Index { return Index{Type: TypeLocal, Keys: Cols(t.TagIDs.Size(32))} },
+		"a GroupBy": func(t badFanOutTable) Index {
+			return Index{Type: TypeLocal, Keys: Cols(t.Price.Size(32)), GroupBy: Cols(t.ID)}
+		},
 	} {
 		func() {
 			defer func() {

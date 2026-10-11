@@ -78,17 +78,8 @@ type TableSchema struct {
 	Autoincrement  bool `json:"autoincrement"`
 	AutoincPadding int  `json:"autoincPadding,omitempty"`
 
-	// CacheByIDs reports the schema's CacheByIDs setting: its writes need the IDs cache store.
+	// CacheByIDs reports the schema's CacheByIDs setting: its writes need the file store.
 	CacheByIDs bool `json:"cacheByIDs,omitempty"`
-
-	// DataFrames are the entity's DataFrames: their names, for the rebuild commands, and their folders
-	// in the frame store, which name them by hashes.
-	DataFrames []DataFrameInfo `json:"dataFrames,omitempty"`
-}
-
-type DataFrameInfo struct {
-	Name   string `json:"name"`
-	Folder string `json:"folder"` // "<table>/<frame>/", under the store's root
 }
 
 // GetSchema returns the serializable schema of a table type. T is the table
@@ -122,9 +113,6 @@ func GetSchema[T any]() TableSchema {
 	}
 	if !schema.UseAutoincrement {
 		out.AutoincPadding = 0
-	}
-	for _, frame := range schema.DataFrames {
-		out.DataFrames = append(out.DataFrames, DataFrameInfo{Name: frame.Name, Folder: frameFolder(out.TableID, frame.Name)})
 	}
 
 	// The primary key is an access path too — list it first so a visualizer can

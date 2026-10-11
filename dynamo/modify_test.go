@@ -5,92 +5,61 @@ import (
 	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/ivanjoz/colbin"
 )
 
-// ── Modify test entities: one versioned by the flag alone, one not versioned ──
-
-type versionedSecret struct {
-	ID      int32  `cb:"1"`
-	Secret  string `cb:"2"`
-	Updated int64  `cb:"3"`
-}
-
-type versionedSecretTable struct {
-	Model[versionedSecretTable, versionedSecret]
-	ID      Col[*versionedSecretTable, int32]
-	Secret  Col[*versionedSecretTable, string]
-	Updated Col[*versionedSecretTable, int64]
-}
-
-func (t versionedSecretTable) GetSchema() Schema {
-	return Schema{Entity: "versioned_secret", TableID: 78901240, Keys: Cols(t.ID.Size(30)), VersionedWrites: true}
-}
+// ── Modify test entity: a plain table, which conditions its writes on Version too ──
 
 type plainNote struct {
-	ID   int32  `cb:"1"`
-	Text string `cb:"2"`
+	ID      int32  `cb:"1"`
+	Text    string `cb:"2"`
+	Updated int32  `cb:"3"`
+	Version int16  `json:"ver,omitempty" cb:"-"`
 }
 
 type plainNoteTable struct {
 	Model[plainNoteTable, plainNote]
-	ID   Col[*plainNoteTable, int32]
-	Text Col[*plainNoteTable, string]
+	ID      Col[*plainNoteTable, int32]
+	Text    Col[*plainNoteTable, string]
+	Updated Col[*plainNoteTable, int32]
 }
 
 func (t plainNoteTable) GetSchema() Schema {
 	return Schema{Entity: "plain_note", TableID: 78901241, Keys: Cols(t.ID.Size(30))}
 }
 
-// A versioned item carries Updated outside the blob, where a condition can compare it.
-func TestVersionedItemsExposeTheirVersion(t *testing.T) {
-	secrets := NewRepo[versionedSecretTable, versionedSecret]()
-	secret := versionedSecret{ID: 7, Secret: "s", Updated: 1_234_567_890_123}
-	item, err := secrets.meta.marshalItem(unsafe.Pointer(&secret), &secret)
+// Every item carries Version as the number "ver", outside the blob, where a condition can compare it.
+func TestItemsCarryTheirVersionOutsideTheBlob(t *testing.T) {
+	notes := NewRepo[plainNoteTable, plainNote]()
+	note := plainNote{ID: 7, Text: "t", Updated: 400_000_000, Version: 5}
+	item, err := notes.meta.marshalItem(unsafe.Pointer(&note), &note)
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, isNumber := item[updatedColumn].(*types.AttributeValueMemberN)
-	if !isNumber || updated.Value != "1234567890123" {
-		t.Fatalf("item %q = %#v, want the number 1234567890123", updatedColumn, item[updatedColumn])
+	if version, isNumber := item[versionColumn].(*types.AttributeValueMemberN); !isNumber || version.Value != "5" {
+		t.Fatalf("item %q = %#v, want the number 5", versionColumn, item[versionColumn])
+	}
+	if _, hasUpdated := item["upd"]; hasUpdated {
+		t.Fatal("Updated lives in the blob only")
+	}
+	var fromBlob plainNote
+	if err := colbin.Unmarshal(item[dataColumn].(*types.AttributeValueMemberB).Value, &fromBlob); err != nil || fromBlob.Version != 0 {
+		t.Fatalf("the blob holds Version %d (%v), want none", fromBlob.Version, err)
 	}
 
-	notes := NewRepo[plainNoteTable, plainNote]()
-	note := plainNote{ID: 7, Text: "t"}
-	if item, err = notes.meta.marshalItem(unsafe.Pointer(&note), &note); err != nil {
-		t.Fatal(err)
-	}
-	if _, hasUpdated := item[updatedColumn]; hasUpdated {
-		t.Fatalf("an unversioned item carries %q", updatedColumn)
+	// unmarshalItem fills Version back from the attribute.
+	item[versionColumn] = numberAttr(9)
+	var read plainNote
+	if err := notes.meta.unmarshalItem(item, &read); err != nil || read.Version != 9 || read.Text != "t" {
+		t.Fatalf("read %+v (%v), want Version 9", read, err)
 	}
 }
 
-// A lost write deletes exactly the delta rows it put: on a table with only delta
-// indexes, that is every row its write diff put.
-func TestLostWriteDeletesItsDeltaRows(t *testing.T) {
-	members := NewRepo[deltaMemberTable, deltaMember]()
-	stored := deltaMember{ID: 9, TeamIDs: []int16{1, 2}, Status: 1, Updated: 4_000}
-	lost := deltaMember{ID: 9, TeamIDs: []int16{2}, Status: 1, Updated: 5_000}
-	puts, _ := members.meta.arrayIndexWrites(unsafe.Pointer(&stored), unsafe.Pointer(&lost), nil)
-	deletes := members.meta.deltaRowDeletes(unsafe.Pointer(&lost))
-	if len(deletes) != len(puts) {
-		t.Fatalf("lost write deletes %d rows, put %d", len(deletes), len(puts))
-	}
-	for i := range puts {
-		putSK := puts[i].PutRequest.Item["sk"].(*types.AttributeValueMemberS).Value
-		deleteSK := deletes[i].DeleteRequest.Key["sk"].(*types.AttributeValueMemberS).Value
-		if putSK != deleteSK {
-			t.Fatalf("row %d: put %s, delete %s", i, putSK, deleteSK)
+// A write raises Version by one and starts over at 1 after the highest.
+func TestNextVersionWrapsAfterTheHighest(t *testing.T) {
+	for stored, want := range map[int64]int64{0: 1, 1: 2, maxVersion - 1: maxVersion, maxVersion: 1} {
+		if got := nextVersion(stored); got != want {
+			t.Fatalf("nextVersion(%d) = %d, want %d", stored, got, want)
 		}
-	}
-}
-
-// The conditional writes refuse an unversioned table before reaching DynamoDB.
-func TestConditionalWritesNeedAVersionedTable(t *testing.T) {
-	notes := NewRepo[plainNoteTable, plainNote]()
-	if _, err := notes.Modify(plainNote{ID: 7}, func(*plainNote, bool) error { return nil }); err == nil {
-		t.Fatal("Modify ran on a table without VersionedWrites")
-	}
-	if _, err := notes.PutManyIfVersion([]plainNote{{ID: 7}}); err == nil {
-		t.Fatal("PutManyIfVersion ran on a table without VersionedWrites")
 	}
 }

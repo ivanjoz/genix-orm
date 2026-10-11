@@ -57,88 +57,76 @@ func (r *Repo[T, E]) ReprocessBlobs(decodeLegacy func(data []byte, dst any) erro
 		return report, err
 	}
 
-	lowestPK, highestPK := r.meta.partitionRange(0)
-	lowestArrayPK, highestArrayPK := r.meta.partitionRange(arrayIndexColumnIDDigits)
-	input := &dynamodb.ScanInput{
-		TableName:                aws.String(tableName()),
-		FilterExpression:         aws.String("(#pk BETWEEN :lo AND :hi OR #pk BETWEEN :arrayLo AND :arrayHi) AND attribute_exists(#d)"),
-		ProjectionExpression:     aws.String("#pk, #sk, #d"),
-		ExpressionAttributeNames: map[string]string{"#pk": "pk", "#sk": "sk", "#d": dataColumn},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":lo":      &types.AttributeValueMemberN{Value: lowestPK},
-			":hi":      &types.AttributeValueMemberN{Value: highestPK},
-			":arrayLo": &types.AttributeValueMemberN{Value: lowestArrayPK},
-			":arrayHi": &types.AttributeValueMemberN{Value: highestArrayPK},
-		},
-	}
-
 	type pendingRewrite struct {
 		item                      map[string]types.AttributeValue
 		itemName                  string
 		storedBlob, reencodedBlob []byte
 	}
-	for {
-		res, err := client.Scan(context.Background(), input)
-		if err != nil {
-			return report, err
-		}
+	ranges := []pkRange{r.meta.baseRowsRange(), r.meta.hiddenRowsRange()}
+	err = scanItems(client, ranges, []string{"pk", "sk", dataColumn}, func(items []map[string]types.AttributeValue) error {
 		var pageRewrites []pendingRewrite
-		for _, item := range res.Items {
+		for _, item := range items {
 			storedBlob, isBinary := item[dataColumn].(*types.AttributeValueMemberB)
 			if !isBinary {
 				continue
 			}
 			report.Scanned++
-			itemName := fmt.Sprintf("pk=%s sk=%s", attrText(item["pk"]), attrText(item["sk"]))
-
 			reencodedBlob, err := r.meta.reencodeBlob(storedBlob.Value, decodeLegacy)
 			if errors.Is(err, errAmbiguousBlob) {
 				report.Ambiguous++
 				continue
 			}
 			if err != nil {
-				report.Failures = append(report.Failures, itemName+": "+err.Error())
+				report.Failures = append(report.Failures, itemName(item)+": "+err.Error())
 				continue
 			}
 			if reencodedBlob == nil {
 				report.Current++
 				continue
 			}
-			pageRewrites = append(pageRewrites, pendingRewrite{item, itemName, storedBlob.Value, reencodedBlob})
+			pageRewrites = append(pageRewrites, pendingRewrite{item, itemName(item), storedBlob.Value, reencodedBlob})
 		}
 
 		if !write {
 			report.Rewritten += len(pageRewrites)
-		} else {
-			// Each UpdateItem touches its own item, so a page's writes run in parallel: one at a
-			// time is a network round trip per record.
-			wasWrittenConcurrently := make([]bool, len(pageRewrites))
-			err := parallel.Run(len(pageRewrites), func(rewriteIndex int) error {
-				rewrite := pageRewrites[rewriteIndex]
-				err := writeReencodedBlob(client, rewrite.item, rewrite.storedBlob, rewrite.reencodedBlob)
-				var conditionFailed *types.ConditionalCheckFailedException
-				if errors.As(err, &conditionFailed) {
-					wasWrittenConcurrently[rewriteIndex] = true
-					return nil
-				}
-				return err
-			})
-			if err != nil {
-				return report, err
-			}
-			for rewriteIndex, rewrite := range pageRewrites {
-				if wasWrittenConcurrently[rewriteIndex] {
-					report.Failures = append(report.Failures, rewrite.itemName+": written while reprocessing, run it again")
-					continue
-				}
-				report.Rewritten++
-			}
+			return nil
 		}
-		if len(res.LastEvaluatedKey) == 0 {
-			return report, nil
+		// Each UpdateItem touches its own item, so a page's writes run in parallel: one at a
+		// time is a network round trip per record.
+		wasWrittenConcurrently := make([]bool, len(pageRewrites))
+		err := parallel.Run(len(pageRewrites), func(rewriteIndex int) error {
+			rewrite := pageRewrites[rewriteIndex]
+			err := writeReencodedBlob(client, rewrite.item, rewrite.storedBlob, rewrite.reencodedBlob)
+			if isConditionFailed(err) {
+				wasWrittenConcurrently[rewriteIndex] = true
+				return nil
+			}
+			return err
+		})
+		if err != nil {
+			return err
 		}
-		input.ExclusiveStartKey = res.LastEvaluatedKey
-	}
+		for rewriteIndex, rewrite := range pageRewrites {
+			if wasWrittenConcurrently[rewriteIndex] {
+				report.Failures = append(report.Failures, rewrite.itemName+": written while reprocessing, run it again")
+				continue
+			}
+			report.Rewritten++
+		}
+		return nil
+	})
+	return report, err
+}
+
+// isConditionFailed reports whether a conditional write lost: the item is no longer what was read.
+func isConditionFailed(err error) bool {
+	var conditionFailed *types.ConditionalCheckFailedException
+	return errors.As(err, &conditionFailed)
+}
+
+// itemName names a stored item in a failure line, by its pk and sk.
+func itemName(item map[string]types.AttributeValue) string {
+	return fmt.Sprintf("pk=%s sk=%s", attrText(item["pk"]), attrText(item["sk"]))
 }
 
 var errAmbiguousBlob = errors.New("both colbin versions read it, as different records")

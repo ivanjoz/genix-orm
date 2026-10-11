@@ -9,8 +9,6 @@ import (
 	"unsafe"
 
 	"github.com/viant/xunsafe"
-
-	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,28 +69,23 @@ type tableMeta struct {
 	keys            []keyCol
 	indexes         []indexMeta
 	arrayIndexes    []arrayIndexMeta
+	deltaIndexes    []deltaIndexMeta        // the TypeDelta indexes (delta.go)
 	groupIndexes    []groupIndexMeta        // the Indexes declaring GroupBy (group_by.go)
 	accessors       map[string]*colAccessor // record field name -> precompiled accessor
 	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
 	cacheByIDs      *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
-	// The managed "Updated" field (delta.go), nil without one. isVersioned: a TypeDelta
-	// index, GroupDelta, CacheByIDs, VersionedWrites or DataFrames consume it, and the
-	// item also carries it as the attribute "upd", which Modify's conditional write compares.
-	updated     *keyCol
-	isVersioned bool
+	// The managed fields (delta.go): Version, on every table, and Updated, nil without one.
+	version *colAccessor
+	updated *keyCol
 	// status is the record's integer "Status" field (nil without one): 0 marks a
-	// soft-deleted record, which counts in no GroupBy group or DataFrame.
+	// soft-deleted record, which counts in no GroupBy group.
 	status *colAccessor
-	// dataFrames are the schema's DataFrames (data_frame.go), and createdVersion the
-	// managed int64 "CreatedVersion" they need (nil without frames).
-	dataFrames     []dataframe.Frame
-	createdVersion *colAccessor
 }
 
 // readsStoredVersion reports whether a write needs the record as stored first: to
-// diff its hidden rows or its GroupBy counters, or to log its frame values.
+// diff its hidden rows or its GroupBy counters.
 func (m *tableMeta) readsStoredVersion() bool {
-	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0 || len(m.dataFrames) > 0
+	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -183,16 +176,13 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	if statusAccessor := accessors[statusFieldName]; statusAccessor != nil && statusAccessor.kind.isInteger() {
 		meta.status = statusAccessor
 	}
-	meta.isVersioned = schema.CacheByIDs || schema.VersionedWrites || len(schema.DataFrames) > 0 ||
-		slices.ContainsFunc(schema.Indexes, func(idx Index) bool { return idx.Type == TypeDelta || idx.GroupDelta })
-	meta.updated = resolveUpdated(recordType, accessors, meta.isVersioned)
-	if len(schema.DataFrames) > 0 {
-		meta.createdVersion = resolveCreatedVersion(recordType, accessors)
-	}
+	meta.version = resolveVersion(recordType, accessors)
+	meta.updated = resolveUpdated(recordType, accessors, schema.CacheByIDs)
 
 	usedSlots := map[string]bool{}
 	usedRowColumnIDs := map[string]bool{}
 	usedGroupTags := map[string]bool{}
+	usedDeltaTags := map[string]bool{}
 	for _, idx := range schema.Indexes {
 		if idx.Type != 0 && idx.Type != TypeDelta && idx.Type != TypeLocal {
 			panic(fmt.Sprintf("db: %s has an index of unknown Type %d", recordType.Name(), idx.Type))
@@ -200,8 +190,23 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		if len(idx.Partition) > 0 && idx.Slot.index == "" {
 			panic(fmt.Sprintf("db: %s declares a Partition on an index with no Slot: only a GSI takes one", recordType.Name()))
 		}
-		if idx.GroupDelta && len(idx.GroupBy) == 0 {
-			panic(fmt.Sprintf("db: %s sets GroupDelta on an index without GroupBy columns", recordType.Name()))
+		if idx.Type == TypeDelta {
+			deltaIndex, rows := compileDeltaIndex(recordType, accessors, idx, meta)
+			if usedDeltaTags[deltaIndex.tag] {
+				panic(fmt.Sprintf("db: %s declares two TypeDelta indexes on the same Keys", recordType.Name()))
+			}
+			usedDeltaTags[deltaIndex.tag] = true
+			if rows != nil {
+				if usedRowColumnIDs[rows.columnID] {
+					panic(fmt.Sprintf("db: %s declares two hidden-rows indexes named by cb id %s: a slice field takes one, and so does the first key of a delta or local index",
+						recordType.Name(), rows.columnID))
+				}
+				usedRowColumnIDs[rows.columnID] = true
+				deltaIndex.rowsIndex = len(meta.arrayIndexes)
+				meta.arrayIndexes = append(meta.arrayIndexes, *rows)
+			}
+			meta.deltaIndexes = append(meta.deltaIndexes, deltaIndex)
+			continue
 		}
 		if len(idx.GroupBy) > 0 && idx.Type != TypeLocal {
 			groupIndex := compileGroupIndex(recordType, accessors, idx)
@@ -211,12 +216,10 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 			usedGroupTags[groupIndex.tag] = true
 			meta.groupIndexes = append(meta.groupIndexes, groupIndex)
 		}
-		// A delta, local or fan-out index lives in hidden base-table rows, with no GSI slot.
-		if idx.Type == TypeDelta || idx.Type == TypeLocal || holdsSliceColumn(idx) {
+		// A local or fan-out index lives in hidden base-table rows, with no GSI slot.
+		if idx.Type == TypeLocal || holdsSliceColumn(idx) {
 			var resolved arrayIndexMeta
 			switch {
-			case idx.Type == TypeDelta:
-				resolved = compileDeltaIndex(recordType, accessors, idx, *meta.updated)
 			case idx.Type == TypeLocal:
 				resolved = compileLocalIndex(recordType, accessors, idx)
 			default:
@@ -245,11 +248,10 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		usedSlots[idx.Slot.index] = true
 		meta.indexes = append(meta.indexes, compileGSI(recordType, accessors, idx, meta))
 	}
-	meta.dataFrames = compileDataFrames(schema, recordType, accessors, meta)
 
 	pkDigits := len(meta.tableID) + meta.partitionDigits
-	// Fan-out rows, the by-IDs slots item, the GroupBy counters and the frame states append 3 digits to the base pk.
-	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || len(meta.dataFrames) > 0 || schema.CacheByIDs {
+	// Fan-out rows, the by-IDs slots item and the GroupBy counters append 3 digits to the base pk.
+	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || schema.CacheByIDs {
 		pkDigits += arrayIndexColumnIDDigits
 	}
 	if pkDigits > maxNumericKeyDigits {
@@ -262,6 +264,11 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	}
 	if schema.CacheByIDs {
 		meta.cacheByIDs = resolveCacheByIDs(recordType, meta.partition, meta.keys)
+	}
+	// A delta read returns the log's Metadata records as records of the table.
+	if metadataField, hasField := recordType.FieldByName(metadataFieldName); len(meta.deltaIndexes) > 0 &&
+		(!hasField || metadataField.Type != reflect.TypeFor[*string]() || metadataField.Tag.Get("cb") != "-") {
+		panic(fmt.Sprintf("db: %s has a TypeDelta index and needs the field `%s *string `json:\"mdt,omitempty\" cb:\"-\"``", recordType.Name(), metadataFieldName))
 	}
 
 	return meta

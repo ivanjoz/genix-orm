@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unsafe"
-
-	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ── By-IDs test entity: partitioned by store, one integer ID ─────────────────
@@ -19,7 +18,8 @@ type cachedItem struct {
 	StoreID int32  `cb:"1"`
 	ID      int64  `cb:"2"`
 	Name    string `cb:"3"`
-	Updated int64  `cb:"4"`
+	Updated int32  `cb:"4"`
+	Version int16  `json:"ver,omitempty" cb:"-"`
 }
 
 type cachedItemTable struct {
@@ -27,7 +27,7 @@ type cachedItemTable struct {
 	StoreID Col[*cachedItemTable, int32]
 	ID      Col[*cachedItemTable, int64]
 	Name    Col[*cachedItemTable, string]
-	Updated Col[*cachedItemTable, int64]
+	Updated Col[*cachedItemTable, int32]
 }
 
 func (t cachedItemTable) GetSchema() Schema {
@@ -40,10 +40,10 @@ func (t cachedItemTable) GetSchema() Schema {
 	}
 }
 
-// yearTickVectors is testdata/year_tick_vectors.json, which genix-ui's wire test reads too.
+// yearTickVectors is testdata/year_tick_vectors.json, which genix-ui's wire test reads too. Updated
+// values are SUnixTime.
 type yearTickVectors struct {
-	EpochSeconds int64 `json:"epochSeconds"`
-	Cycles       []struct {
+	Cycles []struct {
 		Updated    int64  `json:"updated"`
 		CycleYear  int    `json:"cycleYear"`
 		CycleStart *int64 `json:"cycleStart"`
@@ -59,8 +59,9 @@ type yearTickVectors struct {
 	} `json:"requests"`
 }
 
-// withYearTickVectors loads the shared vectors and runs fn with their epoch, restoring the previous one.
-func withYearTickVectors(t *testing.T, fn func(vectors yearTickVectors)) {
+// readYearTickVectors loads the shared vectors.
+func readYearTickVectors(t *testing.T) yearTickVectors {
+	t.Helper()
 	content, err := os.ReadFile("testdata/year_tick_vectors.json")
 	if err != nil {
 		t.Fatal(err)
@@ -69,52 +70,46 @@ func withYearTickVectors(t *testing.T, fn func(vectors yearTickVectors)) {
 	if err := json.Unmarshal(content, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	previousEpochMillis := updatedEpochMillis
-	SetUpdatedEpoch(vectors.EpochSeconds)
-	defer func() { updatedEpochMillis = previousEpochMillis }()
-	fn(vectors)
+	return vectors
 }
 
 func TestYearTickVectors(t *testing.T) {
-	withYearTickVectors(t, func(vectors yearTickVectors) {
-		for _, cycle := range vectors.Cycles {
-			if got := yearCycleOf(UpdatedToTime(cycle.Updated)); got != cycle.CycleYear {
-				t.Fatalf("Updated %d: cycle %d, want %d", cycle.Updated, got, cycle.CycleYear)
-			}
-			if cycle.CycleStart != nil && UpdatedOfTime(cycleStartTime(cycle.CycleYear)) != *cycle.CycleStart {
-				t.Fatalf("cycle %d starts at %d, want %d", cycle.CycleYear, UpdatedOfTime(cycleStartTime(cycle.CycleYear)), *cycle.CycleStart)
-			}
+	vectors := readYearTickVectors(t)
+	for _, cycle := range vectors.Cycles {
+		if got := yearCycleOf(sUnixTimeToTime(cycle.Updated)); got != cycle.CycleYear {
+			t.Fatalf("Updated %d: cycle %d, want %d", cycle.Updated, got, cycle.CycleYear)
 		}
-		for _, written := range vectors.WrittenTicks {
-			cycleStart := UpdatedOfTime(cycleStartTime(yearCycleOf(UpdatedToTime(written.Updated))))
-			tick := writtenYearTick(written.Updated, cycleStart)
-			if tick != written.Tick || yearTickToUpdated(tick, cycleStart) != written.HeldUpdated {
-				t.Fatalf("Updated %d: tick %d held as %d, want %d held as %d",
-					written.Updated, tick, yearTickToUpdated(tick, cycleStart), written.Tick, written.HeldUpdated)
-			}
-			if tick >= 1<<24 {
-				t.Fatalf("tick %d does not fit a uint24", tick)
-			}
+		if cycle.CycleStart != nil && sUnixTimeOf(cycleStartTime(cycle.CycleYear)) != *cycle.CycleStart {
+			t.Fatalf("cycle %d starts at %d, want %d", cycle.CycleYear, sUnixTimeOf(cycleStartTime(cycle.CycleYear)), *cycle.CycleStart)
 		}
-	})
+	}
+	for _, written := range vectors.WrittenTicks {
+		cycleStart := sUnixTimeOf(cycleStartTime(yearCycleOf(sUnixTimeToTime(written.Updated))))
+		tick := writtenYearTick(written.Updated, cycleStart)
+		if tick != written.Tick || yearTickToUpdated(tick, cycleStart) != written.HeldUpdated {
+			t.Fatalf("Updated %d: tick %d held as %d, want %d held as %d",
+				written.Updated, tick, yearTickToUpdated(tick, cycleStart), written.Tick, written.HeldUpdated)
+		}
+		if tick >= 1<<24 {
+			t.Fatalf("tick %d does not fit a uint24", tick)
+		}
+	}
 }
 
 func TestDecodeCachedIDsRequest(t *testing.T) {
-	withYearTickVectors(t, func(vectors yearTickVectors) {
-		for _, vector := range vectors.Requests {
-			request, err := DecodeCachedIDsRequest(vector.Encoded)
-			if err != nil {
-				t.Fatalf("%s: %v", vector.Encoded, err)
-			}
-			var decoded [][3]int64
-			for _, cachedID := range request.IDs {
-				decoded = append(decoded, [3]int64{cachedID.Partition, cachedID.ID, int64(cachedID.YearTick)})
-			}
-			if request.CycleYear != 2024 || fmt.Sprint(decoded) != fmt.Sprint(vector.Decoded) {
-				t.Fatalf("%s: cycle %d, IDs %v; want 2024, %v", vector.Encoded, request.CycleYear, decoded, vector.Decoded)
-			}
+	for _, vector := range readYearTickVectors(t).Requests {
+		request, err := DecodeCachedIDsRequest(vector.Encoded)
+		if err != nil {
+			t.Fatalf("%s: %v", vector.Encoded, err)
 		}
-	})
+		var decoded [][3]int64
+		for _, cachedID := range request.IDs {
+			decoded = append(decoded, [3]int64{cachedID.Partition, cachedID.ID, int64(cachedID.YearTick)})
+		}
+		if request.CycleYear != 2024 || fmt.Sprint(decoded) != fmt.Sprint(vector.Decoded) {
+			t.Fatalf("%s: cycle %d, IDs %v; want 2024, %v", vector.Encoded, request.CycleYear, decoded, vector.Decoded)
+		}
+	}
 
 	for name, encoded := range map[string]string{
 		"empty":                "",
@@ -132,16 +127,15 @@ func TestDecodeCachedIDsRequest(t *testing.T) {
 }
 
 func TestSlotFileWrites(t *testing.T) {
-	store := dataframe.NewMemoryStore()
-	SetIDsCacheStore(store)
-	defer SetIDsCacheStore(nil)
+	SetFileStore(NewMemoryFileStore())
+	defer SetFileStore(nil)
 	items := NewRepo[cachedItemTable, cachedItem]()
-	cycleStart := UpdatedOfTime(cycleStartTime(2026))
+	cycleStart := int32(sUnixTimeOf(cycleStartTime(2026)))
 
 	written := []cachedItem{
-		{StoreID: 7, ID: 300, Updated: cycleStart + 10_000}, // slot 44, tick 7
+		{StoreID: 7, ID: 300, Updated: cycleStart + 10_000}, // slot 44, tick 10002
 		{StoreID: 7, ID: 556, Updated: cycleStart + 4_000},  // slot 44 too, a lower tick
-		{StoreID: 7, ID: 1, Updated: cycleStart + 2_000},    // slot 1, tick 3
+		{StoreID: 7, ID: 1, Updated: cycleStart + 2_000},    // slot 1, tick 2002
 		{StoreID: 8, ID: 300, Updated: cycleStart - 1},      // another partition, the previous cycle
 	}
 	ptrs := make([]unsafe.Pointer, len(written))
@@ -155,8 +149,8 @@ func TestSlotFileWrites(t *testing.T) {
 		return items.meta.pkValue(unsafe.Pointer(&cachedItem{StoreID: storeID}))
 	}
 	slotFile, _, err := readSlotFile(slotFileKey(2026, basePKOf(7)))
-	if err != nil || slotTickOf(slotFile, 44) != 7 || slotTickOf(slotFile, 1) != 3 || slotTickOf(slotFile, 2) != 0 {
-		t.Fatalf("store 7: slot 44 = %d, slot 1 = %d, slot 2 = %d, err %v; want 7, 3, 0",
+	if err != nil || slotTickOf(slotFile, 44) != 10_002 || slotTickOf(slotFile, 1) != 2_002 || slotTickOf(slotFile, 2) != 0 {
+		t.Fatalf("store 7: slot 44 = %d, slot 1 = %d, slot 2 = %d, err %v; want 10002, 2002, 0",
 			slotTickOf(slotFile, 44), slotTickOf(slotFile, 1), slotTickOf(slotFile, 2), err)
 	}
 	lastCycleFile, _, _ := readSlotFile(slotFileKey(2025, basePKOf(8)))
@@ -169,8 +163,8 @@ func TestSlotFileWrites(t *testing.T) {
 	if err := items.meta.setSlotsUpdated([]unsafe.Pointer{unsafe.Pointer(&late)}); err != nil {
 		t.Fatal(err)
 	}
-	if slotFile, _, _ = readSlotFile(slotFileKey(2026, basePKOf(7))); slotTickOf(slotFile, 44) != 7 {
-		t.Fatalf("slot 44 = %d after a late write, want it kept at 7", slotTickOf(slotFile, 44))
+	if slotFile, _, _ = readSlotFile(slotFileKey(2026, basePKOf(7))); slotTickOf(slotFile, 44) != 10_002 {
+		t.Fatalf("slot 44 = %d after a late write, want it kept at 10002", slotTickOf(slotFile, 44))
 	}
 
 	// Concurrent writers of one file, each to its own slot: the conditional PUT keeps every one.
@@ -179,13 +173,13 @@ func TestSlotFileWrites(t *testing.T) {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			if err := raiseSlotTicks("2026/concurrent", map[uint8]uint32{uint8(slot): uint32(slot) + 2}); err != nil {
+			if err := raiseSlotTicks("ids-cache/2026/concurrent", map[uint8]uint32{uint8(slot): uint32(slot) + 2}); err != nil {
 				t.Error(err)
 			}
 		}()
 	}
 	waitGroup.Wait()
-	slotFile, _, _ = readSlotFile("2026/concurrent")
+	slotFile, _, _ = readSlotFile("ids-cache/2026/concurrent")
 	for slot := range 20 {
 		if slotTickOf(slotFile, uint8(slot)) != uint32(slot)+2 {
 			t.Fatalf("slot %d = %d after concurrent writes, want %d", slot, slotTickOf(slotFile, uint8(slot)), slot+2)
@@ -197,7 +191,8 @@ type badCachedRecord struct {
 	StoreID int32
 	ID      int32
 	Code    string
-	Updated int64
+	Updated int32
+	Version int16 `json:"ver,omitempty" cb:"-"`
 }
 
 type badCachedTable struct {
@@ -205,52 +200,62 @@ type badCachedTable struct {
 	StoreID Col[*badCachedTable, int32]
 	ID      Col[*badCachedTable, int32]
 	Code    Col[*badCachedTable, string]
-	Updated Col[*badCachedTable, int64]
+	Updated Col[*badCachedTable, int32]
 }
 
 type uncachedRecord struct {
-	ID int32
+	ID      int32
+	Version int16 `json:"ver,omitempty" cb:"-"`
 }
 
-type int32UpdatedCachedRecord struct {
+type int64UpdatedCachedRecord struct {
 	ID      int32
-	Updated int32
+	Updated int64
+	Version int16 `json:"ver,omitempty" cb:"-"`
 }
 
 func TestCacheByIDsDeclarationRules(t *testing.T) {
 	tablePtr := new(badCachedTable)
 	populateColumnNames(tablePtr)
-	for name, build := range map[string]func(){
-		"two Keys columns": func() {
+	for name, testCase := range map[string]struct {
+		build     func()
+		wantPanic string
+	}{
+		"two Keys columns": {func() {
 			buildTableMeta(Schema{Entity: "bad_cached", TableID: 56789012, Keys: Cols(tablePtr.ID.Size(32), tablePtr.Code), CacheByIDs: true},
 				reflect.TypeFor[badCachedRecord]())
-		},
-		"a string key": func() {
+		}, "exactly one integer Keys column"},
+		"a string key": {func() {
 			buildTableMeta(Schema{Entity: "bad_cached", TableID: 56789012, Keys: Cols(tablePtr.Code), CacheByIDs: true},
 				reflect.TypeFor[badCachedRecord]())
-		},
-		"two Partition columns": func() {
-			buildTableMeta(Schema{Entity: "bad_cached", TableID: 56789012, Partition: Cols(tablePtr.StoreID.Size(16), tablePtr.Updated.Size(42)),
+		}, "exactly one integer Keys column"},
+		"two Partition columns": {func() {
+			buildTableMeta(Schema{Entity: "bad_cached", TableID: 56789012, Partition: Cols(tablePtr.StoreID.Size(16), tablePtr.Updated.Size(32)),
 				Keys: Cols(tablePtr.ID.Size(32)), CacheByIDs: true}, reflect.TypeFor[badCachedRecord]())
-		},
-		"an int32 Updated": func() {
-			buildTableMeta(Schema{Entity: "int32_updated_cached", TableID: 67890124, Keys: Cols(tablePtr.ID.Size(32)), CacheByIDs: true},
-				reflect.TypeFor[int32UpdatedCachedRecord]())
-		},
-		"no Updated field": func() {
+		}, "at most one Partition column"},
+		"an int64 Updated": {func() {
+			buildTableMeta(Schema{Entity: "int64_updated_cached", TableID: 67890124, Keys: Cols(tablePtr.ID.Size(32)), CacheByIDs: true},
+				reflect.TypeFor[int64UpdatedCachedRecord]())
+		}, "must be an int32"},
+		"no Updated field": {func() {
 			buildTableMeta(Schema{Entity: "uncached", TableID: 67890123, Keys: Cols(tablePtr.ID.Size(32)), CacheByIDs: true},
 				reflect.TypeFor[uncachedRecord]())
-		},
+		}, "needs an int32 field"},
 	} {
-		func() {
-			defer func() {
-				if recover() == nil {
-					t.Fatalf("%s: expected a panic", name)
-				}
-			}()
-			build()
-		}()
+		expectPanic(t, name, testCase.wantPanic, testCase.build)
 	}
+}
+
+// expectPanic runs build and fails unless it panics with a message holding wantPanic.
+func expectPanic(t *testing.T, name, wantPanic string, build func()) {
+	t.Helper()
+	defer func() {
+		t.Helper()
+		if recovered, _ := recover().(string); !strings.Contains(recovered, wantPanic) || recovered == "" {
+			t.Fatalf("%s: panic %q, want one holding %q", name, recovered, wantPanic)
+		}
+	}()
+	build()
 }
 
 // TestQueryCachedIDs needs a live DynamoDB whose table already exists, so it only runs when
@@ -259,8 +264,8 @@ func TestQueryCachedIDs(t *testing.T) {
 	if os.Getenv("DYNAMO_ENDPOINT") == "" {
 		t.Skip("DYNAMO_ENDPOINT not set: QueryCachedIDs needs a live DynamoDB")
 	}
-	SetIDsCacheStore(dataframe.NewMemoryStore())
-	defer SetIDsCacheStore(nil)
+	SetFileStore(NewMemoryFileStore())
+	defer SetFileStore(nil)
 	items := NewRepo[cachedItemTable, cachedItem]()
 	// A fresh ID per run; ID+256 shares its slot, ID+1 does not. Store 9 holds the same ID as store 7.
 	firstID := time.Now().UnixMilli() % 1_000_000_000 * 1000
@@ -292,19 +297,20 @@ func TestQueryCachedIDs(t *testing.T) {
 	allIDs := request(CachedID{Partition: 7, ID: firstID}, CachedID{Partition: 7, ID: firstID + 1},
 		CachedID{Partition: 7, ID: firstID + 256}, CachedID{Partition: 9, ID: firstID})
 
-	// A slot younger than DeltaOverlap is not trusted yet: the records come back with Updated 0.
+	// A slot younger than slotTrustTicks is not trusted yet: the records come back with Updated 0.
 	fetched, err := items.QueryCachedIDs(allIDs)
 	if err != nil || countRecords(fetched) != 4 || fetched[0].Records[0].Updated != 0 {
 		t.Fatalf("fresh read: got %d records, err %v; want 4 with Updated 0", countRecords(fetched), err)
 	}
 
-	// The reads below run as if the overlap had passed since every write.
+	// The reads below run as if the trust window had passed since every write: a tick is held as the
+	// end of its 2-second window, trusted slotTrustTicks after it.
 	readAfterOverlap := func(request CachedIDsRequest) ([]CachedPartition[cachedItem], error) {
-		Now = func() time.Time { return time.Now().Add(DeltaOverlap + 3*time.Second) }
+		Now = func() time.Time { return time.Now().Add((slotTrustTicks + 2) * 2 * time.Second) }
 		defer func() { Now = time.Now }()
 		return items.QueryCachedIDs(request)
 	}
-	cycleStart := UpdatedOfTime(cycleStartTime(cycleYear))
+	cycleStart := sUnixTimeOf(cycleStartTime(cycleYear))
 
 	// Nothing held: every record comes back, grouped by partition, stamped with its slot's tick.
 	fetched, err = readAfterOverlap(allIDs)
@@ -317,7 +323,7 @@ func TestQueryCachedIDs(t *testing.T) {
 			if record.Updated == 0 {
 				t.Fatalf("record %d came back without its slot's tick", record.ID)
 			}
-			heldTick := uint32((record.Updated-cycleStart)/yearTickMillis) + 1 // what the client computes
+			heldTick := uint32(int64(record.Updated)-cycleStart) + 1 // what the client computes
 			held.IDs = append(held.IDs, CachedID{Partition: partition.Partition, ID: record.ID, YearTick: heldTick})
 		}
 	}
@@ -332,8 +338,12 @@ func TestQueryCachedIDs(t *testing.T) {
 	}
 
 	// A write to the first record moves its slot, which it shares with firstID+256, in store 7 only.
+	// It is stamped 4 seconds on, past the ticks held, as a write after them would be.
 	written[0].Name = "a2"
-	if err := items.Put(&written[0]); err != nil {
+	Now = func() time.Time { return time.Now().Add(4 * time.Second) }
+	err = items.Put(&written[0])
+	Now = time.Now
+	if err != nil {
 		t.Fatal(err)
 	}
 	fetched, err = readAfterOverlap(held)
