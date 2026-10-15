@@ -15,8 +15,7 @@ DynamoDB can only use the **key attributes**. Every field lives inside `d`, so a
 not a key can't be queried by DynamoDB, only filtered in memory after the read. **Design the keys
 from the queries you need, before writing the table.**
 
-The full reference is `README.md` next to this skill, and the design decisions are in
-`RATIONALE.md`. Read the README before designing a non-trivial key.
+The full reference is `README.md` next to this skill. Read the README before designing a non-trivial key.
 
 > **A project may wrap the ORM.** In berryapps, modules import `"app/db"` (aliases: `db.Schema`,
 > `db.Col`, `db.ColSlice`, `db.Keys`, `db.G1`…, `db.NewRepo`) and never
