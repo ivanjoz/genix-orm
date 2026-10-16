@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.31
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.0
 	github.com/aws/smithy-go v1.27.3
-	github.com/ivanjoz/colbin v0.6.1
+	github.com/ivanjoz/colbin v0.6.2
 	github.com/viant/xunsafe v0.11.0
 )
 
