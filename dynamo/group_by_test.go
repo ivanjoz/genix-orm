@@ -54,10 +54,10 @@ var groupSales = NewRepo[groupSaleTable, groupSale]()
 
 // Counter sks, built the way the ORM documents them.
 func channelStatusGroupSK(channel string, status uint64) string {
-	return "g003.004#" + channel + "#" + EncodeOrderedUint(status, 2)
+	return "g003.004\x00" + channel + "\x00" + EncodeOrderedUint(status, 1)
 }
-func productGroupSK(productID uint64) string { return "g005#" + EncodeOrderedUint(productID, 3) }
-func channelGroupSK(channel string) string   { return "g003#" + channel }
+func productGroupSK(productID uint64) string { return "g005\x00" + EncodeOrderedUint(productID, 2) }
+func channelGroupSK(channel string) string   { return "g003\x00" + channel }
 
 // describeGroupDeltas renders the non-zero deltas as "sk: c<count> <sums>", sorted by sk.
 func describeGroupDeltas(deltas map[string]*groupCounterDelta) map[string]string {
@@ -192,7 +192,7 @@ func TestGroupDeltasMergeAcrossTheCall(t *testing.T) {
 		t.Fatalf("%d counters, want 4", len(callDeltas))
 	}
 	storeOnePK := groupSales.meta.pkValue(unsafe.Pointer(&first))
-	merged := callDeltas[storeOnePK+"#"+channelStatusGroupSK("web", 2)]
+	merged := callDeltas[storeOnePK+"\x00"+channelStatusGroupSK("web", 2)]
 	if merged == nil || merged.count != 2 || merged.sums[0] != 150 {
 		t.Fatalf("store 1 web/2 counter = %+v", merged)
 	}

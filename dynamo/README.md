@@ -28,10 +28,10 @@ non-key field is applied **in memory after decode** (see the planner below).
 ## The physical table it targets
 
 One table, created by the application (the ORM never creates tables; `Slots`
-lists the GSIs to declare): base key `pk` (**Number**) + `sk` (String) and ten
+lists the GSIs to declare): base key `pk` (**Number**) + `sk` (**Binary**) and ten
 **sparse GSIs**, each with its own hash and range attribute:
 
-| Slot          | GSI                    | Hash (Number)  | Range (String) |
+| Slot          | GSI                    | Hash (Number)  | Range (Binary) |
 | ------------- | ---------------------- | -------------- | -------------- |
 | `G1`..`G10`   | `gsi-1`..`gsi-10`      | `h1`..`h10`    | `r1`..`r10`    |
 
@@ -69,29 +69,30 @@ that sees DynamoDB requests rather than records (a proxy authorizing writes per
 entity). Sequence items (pk 0) are attributed by the TableID their sk starts with;
 `ReserveIDs` sequences belong to no entity.
 
-## The core idea: order-preserving Base64
+## The core idea: order-preserving binary keys
 
-A composite key concatenates several columns into one string. Strings go in
-verbatim; **numbers are encoded to fixed-width, order-preserving Base64** so that
-for equal-length strings, lexicographic comparison equals numeric comparison —
-which is what makes `BETWEEN` / `>` / `<` work on a string sort key.
+A composite range key concatenates several columns into one DynamoDB binary,
+which DynamoDB compares byte by byte as unsigned values. Strings go in verbatim
+(UTF-8); **numbers are encoded as fixed-width big-endian bytes**, so for equal
+widths bytewise comparison equals numeric comparison — which is what makes
+`BETWEEN` / `>` / `<` work on a composite sort key.
 
-Two things make it work (`encoding.go`):
-
-1. **Fixed width** per column, declared with `.Size(bits)` (1..64, the same unit
-   as genix-orm/db's `Size(bits)`). The key stores `ceil(bits/6)` Base64 chars,
-   and values `>= 2^bits` are rejected: `Size(32)` is 6 chars that still cap at
-   2^32 - 1.
-2. An **alphabet in ascending ASCII order** (`-` `0-9` `A-Z` `_` `a-z`), so a
-   bigger digit is also a bigger byte.
+**Fixed width** per column, declared with `.Size(bits)` (1..64, the same unit as
+genix-orm/db's `Size(bits)`): the key stores `ceil(bits/8)` bytes, and values
+`>= 2^bits` are rejected: `Size(20)` is 3 bytes that still cap at 2^20 - 1.
 
 ```
-EncodeOrderedUint(1700000000, 8) < EncodeOrderedUint(1800000000, 8)   // as strings
+EncodeOrderedUint(1700000000, 4) < EncodeOrderedUint(1800000000, 4)   // bytewise
 ```
 
-Genix packs numbers into a 19-digit `int64`; here we pack into an
-arbitrary-length Base64 string that lives inside the DynamoDB string key (no
-2^63 ceiling). Key numbers must be `>= 0` (negatives panic, as in genix).
+Parts are joined with the byte `0x00`, the lowest one, so a shorter string sorts
+before a longer one that extends it; a number part may hold any byte, its fixed
+width delimits it. **String key parts must not contain `0x00` nor `0x01`** (the
+byte after the separator, the upper bound of a prefix range): `buildCompositeKey`
+panics on them. Key numbers must be `>= 0` (negatives panic, as in genix).
+
+Inside the ORM the keys are Go strings (a string holds any bytes); they become
+`[]byte` only in the AttributeValue (`binaryKeyAttr` / `binaryKeyText`).
 
 ## Declaring a table
 
@@ -183,7 +184,7 @@ not a query one. `Contains` needs an equality on every Partition column.
 ```go
 // orders: always read per store, listed by date
 Partition: dynamo.Cols(t.StoreID.Size(16)),               // pk = TableID ‖ StoreID (5 digits)
-Keys:      dynamo.Cols(t.Created.Size(32), t.ID.Size(24)), // sk = enc(Created)#enc(ID)
+Keys:      dynamo.Cols(t.Created.Size(32), t.ID.Size(24)), // sk = enc(Created) 00 enc(ID)
 ```
 
 ## Fan-out indexes: query a slice by element (`array_index.go`)
@@ -195,7 +196,7 @@ the element, then the base sk:
 
 ```
 pk = base pk ‖ the slice field's cb id, 3 digits          (number: 12345678006)
-sk = composite(index Keys, slice → element) + "#" + base sk
+sk = composite(index Keys, slice → element) + 00 + base sk
 d  = the record blob, only with FullCopy: true
 ```
 
@@ -266,7 +267,7 @@ found, err := Products.Query().Eq(Products.T.NameHash, hash).Consistent().First(
 
 ```
 pk = base pk ‖ the first Keys column's cb id (3 digits)
-sk = composite(index Keys) # base sk
+sk = composite(index Keys) + 00 + base sk
 d  = the record blob, only with FullCopy
 ```
 
@@ -462,7 +463,7 @@ Customers.Query().DeltaList(1).Exec(&out)            // the listing alone, for a
   Eq or a Contains, the most specific when several fit (a tie fails).
 - **First sync, or replace** (an empty cursor; one more than 7 days of buckets
   behind; more than 144 files to read): the view is listed — the base table, or
-  keys-only hidden rows (`pk = base pk ‖ cb id`, `sk = <pinned>#<base sk>`) when a
+  keys-only hidden rows (`pk = base pk ‖ cb id`, `sk = <pinned> 00 <base sk>`) when a
   pinned column is neither a partition column nor a leading Keys prefix — plus
   the current file, and the previous one while it is unsealed.
 - **Later sync:** the held buckets and the current one are read (a ListFiles
@@ -501,7 +502,7 @@ groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].SumFloat(Orders.T.Weig
 
 ```text
 pk   = base pk ‖ 000
-sk   = g<cb ids of the Keys>#<group key>  e.g. g005.006#web#<Status b64>
+sk   = g<cb ids of the Keys> 00 <group key>  e.g. g005.006 00 web 00 <Status byte>
 c    = record count            sNNN = sum of the column with cb id NNN
 d    = a record holding only the group Keys (Group.Key)
 ```
@@ -678,9 +679,9 @@ index, not the call order.
 
 > Every range key (`sk`, `rN`, a fan-out row's sk) is a composite built the same
 > way, so the range rules are uniform. Every range is exact at any position of a
-> composite sort key: the rows whose ranged column equals `v` sort in `[v, v$)`
-> (`$` is the byte after the `#` separator), so `<= v` is `< v$`, `> v` is
-> `>= v$` and `BETWEEN a AND b` is `BETWEEN a AND b$`. After an equality prefix a
+> composite sort key: the rows whose ranged column equals `v` sort in `[v, v·01)`
+> (`01` is the byte after the `00` separator), so `<= v` is `< v·01`, `> v` is
+> `>= v·01` and `BETWEEN a AND b` is `BETWEEN a AND b·01`. After an equality prefix a
 > one-sided range becomes a `BETWEEN` bounded by that prefix (else it would run
 > into the next prefix value's rows); only a strict `<` there also needs the
 > in-memory filter.

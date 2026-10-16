@@ -57,7 +57,7 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 
 	var records []E
 	expectedRows := map[string]expectedHiddenRow{} // keyed by pk # sk
-	err = scanItems(client, []pkRange{m.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
+	err = scanItems(client, tableName(), []pkRange{m.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		for _, item := range items {
 			var record E
 			if err := m.unmarshalItem(item, &record); err != nil {
@@ -88,7 +88,7 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 	// counters (pk ‖ 000) only name the partitions to recompute, unless no GroupBy is declared.
 	var rowPuts, rowDeletes []types.WriteRequest
 	partitionsWithCounters := map[string]bool{}
-	err = scanItems(client, []pkRange{m.hiddenRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
+	err = scanItems(client, tableName(), []pkRange{m.hiddenRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		for _, storedRow := range items {
 			rowPK, rowSK := attrText(storedRow["pk"]), attrText(storedRow["sk"])
 			if strings.HasSuffix(rowPK, countersColumnID) && len(m.groupIndexes) > 0 {

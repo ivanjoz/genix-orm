@@ -84,8 +84,8 @@ func TestColumnNamesPopulated(t *testing.T) {
 }
 
 func s(av types.AttributeValue) string {
-	if m, ok := av.(*types.AttributeValueMemberS); ok {
-		return m.Value
+	if m, ok := av.(*types.AttributeValueMemberB); ok {
+		return string(m.Value)
 	}
 	if m, ok := av.(*types.AttributeValueMemberN); ok {
 		return m.Value
@@ -105,7 +105,7 @@ func TestMarshalItemDerivesKeys(t *testing.T) {
 		t.Fatalf("pk = %#v", item["pk"])
 	}
 	// sk = <created base64 width 8>#sku1
-	wantSK := EncodeOrderedUint(1700000000, 8) + "#sku1"
+	wantSK := EncodeOrderedUint(1700000000, 6) + "\x00sku1"
 	if got := s(item["sk"]); got != wantSK {
 		t.Fatalf("sk = %q want %q", got, wantSK)
 	}
@@ -113,10 +113,10 @@ func TestMarshalItemDerivesKeys(t *testing.T) {
 	if _, isNumber := item["h1"].(*types.AttributeValueMemberN); !isNumber || s(item["h1"]) != productTableID+"00007" {
 		t.Fatalf("h1 = %#v", item["h1"])
 	}
-	if got, want := s(item["r1"]), EncodeOrderedUint(1299, 7)+"#"+wantSK; got != want {
+	if got, want := s(item["r1"]), EncodeOrderedUint(1299, 5)+"\x00"+wantSK; got != want {
 		t.Fatalf("r1 = %q want %q", got, want)
 	}
-	if got, want := s(item["r2"]), "acme#"+wantSK; got != want {
+	if got, want := s(item["r2"]), "acme\x00"+wantSK; got != want {
 		t.Fatalf("r2 = %q want %q", got, want)
 	}
 	// G3 declares its own partition (Stock, Size(32) = 10 digits), and its Keys already hold Created.
@@ -164,7 +164,7 @@ func TestPlanBaseTableBetween(t *testing.T) {
 	if s(plan.values[":pk"]) != productTableID+"00007" {
 		t.Fatalf("pk value = %q", s(plan.values[":pk"]))
 	}
-	if s(plan.values[":lo"]) != EncodeOrderedUint(1700000000, 8) {
+	if s(plan.values[":lo"]) != EncodeOrderedUint(1700000000, 6) {
 		t.Fatalf("lo value = %q", s(plan.values[":lo"]))
 	}
 }
@@ -174,11 +174,11 @@ func TestPlanBaseTableBetween(t *testing.T) {
 func TestPlanRangeStaysInsideEqualityPrefix(t *testing.T) {
 	r := newProducts(t)
 	plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Created, int64(5)).Gt(r.T.ID, "b"))
-	createdPrefix := EncodeOrderedUint(5, 8)
+	createdPrefix := EncodeOrderedUint(5, 6)
 	if plan.keyCond != "#pk = :pk AND #sk BETWEEN :lo AND :hi" {
 		t.Fatalf("keyCond = %q", plan.keyCond)
 	}
-	if s(plan.values[":lo"]) != createdPrefix+"#b$" || s(plan.values[":hi"]) != createdPrefix+"$" {
+	if s(plan.values[":lo"]) != createdPrefix+"\x00b\x01" || s(plan.values[":hi"]) != createdPrefix+"\x01" {
 		t.Fatalf("range = [%q, %q]", s(plan.values[":lo"]), s(plan.values[":hi"]))
 	}
 	if len(plan.postFilter) != 0 {
@@ -191,18 +191,18 @@ func TestPlanRangeStaysInsideEqualityPrefix(t *testing.T) {
 // exclude it as asked.
 func TestPlanRangeOnANonLastSortColumn(t *testing.T) {
 	r := newProducts(t)
-	created5 := EncodeOrderedUint(5, 8)
+	created5 := EncodeOrderedUint(5, 6)
 	for _, testCase := range []struct {
 		query        *QueryBuilder[Product]
 		wantKeyCond  string
 		wantBoundary map[string]string
 	}{
-		{r.Query().Lte(r.T.Created, int64(5)), "#sk < :sk", map[string]string{":sk": created5 + "$"}},
+		{r.Query().Lte(r.T.Created, int64(5)), "#sk < :sk", map[string]string{":sk": created5 + "\x01"}},
 		{r.Query().Lt(r.T.Created, int64(5)), "#sk < :sk", map[string]string{":sk": created5}},
-		{r.Query().Gt(r.T.Created, int64(5)), "#sk >= :sk", map[string]string{":sk": created5 + "$"}},
+		{r.Query().Gt(r.T.Created, int64(5)), "#sk >= :sk", map[string]string{":sk": created5 + "\x01"}},
 		{r.Query().Gte(r.T.Created, int64(5)), "#sk >= :sk", map[string]string{":sk": created5}},
 		{r.Query().Between(r.T.Created, int64(1), int64(5)), "#sk BETWEEN :lo AND :hi",
-			map[string]string{":lo": EncodeOrderedUint(1, 8), ":hi": created5 + "$"}},
+			map[string]string{":lo": EncodeOrderedUint(1, 6), ":hi": created5 + "\x01"}},
 	} {
 		plan := onlyPlan(t, testCase.query.Eq(r.T.CategoryID, int32(7)))
 		if plan.keyCond != "#pk = :pk AND "+testCase.wantKeyCond {
@@ -220,7 +220,7 @@ func TestPlanRangeOnANonLastSortColumn(t *testing.T) {
 // prefix and a range like the base Keys, under the GSI's own hash.
 func TestPlanGSIRangesOnItsKeys(t *testing.T) {
 	r := newProducts(t)
-	price1299 := EncodeOrderedUint(1299, 7)
+	price1299 := EncodeOrderedUint(1299, 5)
 	for _, testCase := range []struct {
 		query       *QueryBuilder[Product]
 		wantIndex   string
@@ -228,15 +228,15 @@ func TestPlanGSIRangesOnItsKeys(t *testing.T) {
 		wantValues  map[string]string
 	}{
 		{r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Price, int64(1299)), "gsi-1",
-			"#pk = :pk AND begins_with(#sk, :sk)", map[string]string{":pk": productTableID + "00007", ":sk": price1299 + "#"}},
+			"#pk = :pk AND begins_with(#sk, :sk)", map[string]string{":pk": productTableID + "00007", ":sk": price1299 + "\x00"}},
 		{r.Query().Eq(r.T.CategoryID, int32(7)).Between(r.T.Price, int64(1000), int64(1299)), "gsi-1",
-			"#pk = :pk AND #sk BETWEEN :lo AND :hi", map[string]string{":lo": EncodeOrderedUint(1000, 7), ":hi": price1299 + "$"}},
+			"#pk = :pk AND #sk BETWEEN :lo AND :hi", map[string]string{":lo": EncodeOrderedUint(1000, 5), ":hi": price1299 + "\x01"}},
 		{r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Price, int64(1299)).Gte(r.T.Created, int64(5)), "gsi-1",
-			"#pk = :pk AND #sk BETWEEN :lo AND :hi", map[string]string{":lo": price1299 + "#" + EncodeOrderedUint(5, 8)}},
+			"#pk = :pk AND #sk BETWEEN :lo AND :hi", map[string]string{":lo": price1299 + "\x00" + EncodeOrderedUint(5, 6)}},
 		{r.Query().Eq(r.T.CategoryID, int32(7)).Eq(r.T.Brand, "acme"), "gsi-2",
-			"#pk = :pk AND begins_with(#sk, :sk)", map[string]string{":sk": "acme#"}},
+			"#pk = :pk AND begins_with(#sk, :sk)", map[string]string{":sk": "acme\x00"}},
 		{r.Query().Eq(r.T.Stock, int32(4)).Gt(r.T.Created, int64(5)), "gsi-3",
-			"#pk = :pk AND #sk >= :sk", map[string]string{":pk": productTableID + "0000000004", ":sk": EncodeOrderedUint(5, 8) + "$"}},
+			"#pk = :pk AND #sk >= :sk", map[string]string{":pk": productTableID + "0000000004", ":sk": EncodeOrderedUint(5, 6) + "\x01"}},
 	} {
 		plan := onlyPlan(t, testCase.query)
 		if plan.indexName != testCase.wantIndex || plan.keyCond != testCase.wantKeyCond {
@@ -380,9 +380,9 @@ func TestAccessorWidths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := EncodeOrderedUint(5, 2) + "#" + EncodeOrderedUint(300, 3) + "#" +
-		EncodeOrderedUint(70000, 6) + "#" + EncodeOrderedUint(1<<40, 11) + "#" +
-		EncodeOrderedUint(4_000_000_000, 6)
+	want := EncodeOrderedUint(5, 1) + "\x00" + EncodeOrderedUint(300, 2) + "\x00" +
+		EncodeOrderedUint(70000, 4) + "\x00" + EncodeOrderedUint(1<<40, 8) + "\x00" +
+		EncodeOrderedUint(4_000_000_000, 4)
 	if got := s(item["sk"]); got != want {
 		t.Fatalf("sk = %q\nwant %q", got, want)
 	}

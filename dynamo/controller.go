@@ -58,6 +58,9 @@ type Controller interface {
 	// ReprocessRecordsAny runs transform (record is the *E) over every record and writes
 	// back the ones it changed, silently; write false is a dry run (reprocess_records.go).
 	ReprocessRecordsAny(transform func(record any) (bool, error), write bool) (RecordsReport, error)
+	// CopyRecordsFrom writes every record stored in another table into the current one, at the key
+	// the schema builds now, skipping the keys already copied; write false is a dry run (copy_table.go).
+	CopyRecordsFrom(sourceTable string, write bool) (RecordsReport, error)
 	// ReprocessBlobs re-encodes in the current colbin every stored blob written by the previous
 	// one, which decodeLegacy reads; write false is a dry run (reprocess.go).
 	ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error)
@@ -90,7 +93,7 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 		return 0, err
 	}
 	deleted := 0
-	err = scanItems(client, []pkRange{r.meta.baseRowsRange(), r.meta.hiddenRowsRange()}, []string{"pk", "sk"}, func(items []map[string]types.AttributeValue) error {
+	err = scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange(), r.meta.hiddenRowsRange()}, []string{"pk", "sk"}, func(items []map[string]types.AttributeValue) error {
 		deletes := make([]types.WriteRequest, len(items))
 		for i, item := range items {
 			deletes[i] = types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: itemKeyOf(item)}}

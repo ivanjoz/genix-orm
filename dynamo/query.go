@@ -685,7 +685,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 	// Case A: all sort columns pinned by equality → sk = <exact>.
 	if i == len(sortColumns) {
 		plan.names["#sk"] = rangeAttr
-		plan.values[":sk"] = &types.AttributeValueMemberS{Value: buildCompositeKey(prefix)}
+		plan.values[":sk"] = binaryKeyAttr(buildCompositeKey(prefix))
 		plan.keyCond += " AND #sk = :sk"
 		return used, nil
 	}
@@ -703,8 +703,8 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 		}
 		switch p.op {
 		case opBetween:
-			plan.values[":lo"] = &types.AttributeValueMemberS{Value: boundOf(p.v1)}
-			plan.values[":hi"] = &types.AttributeValueMemberS{Value: boundOf(p.v2) + keySeparatorSuccessor}
+			plan.values[":lo"] = binaryKeyAttr(boundOf(p.v1))
+			plan.values[":hi"] = binaryKeyAttr(boundOf(p.v2) + keySeparatorSuccessor)
 			plan.keyCond += " AND #sk BETWEEN :lo AND :hi"
 		case opGt, opGte, opLt, opLte:
 			v := boundOf(p.v1)
@@ -717,7 +717,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 				if isLowerBound {
 					cmp = ">="
 				}
-				plan.values[":sk"] = &types.AttributeValueMemberS{Value: v}
+				plan.values[":sk"] = binaryKeyAttr(v)
 				plan.keyCond += " AND #sk " + cmp + " :sk"
 				break
 			}
@@ -727,8 +727,8 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 			if !isLowerBound {
 				lo, hi = buildCompositeKey(prefix)+keySeparator, v
 			}
-			plan.values[":lo"] = &types.AttributeValueMemberS{Value: lo}
-			plan.values[":hi"] = &types.AttributeValueMemberS{Value: hi}
+			plan.values[":lo"] = binaryKeyAttr(lo)
+			plan.values[":hi"] = binaryKeyAttr(hi)
 			plan.keyCond += " AND #sk BETWEEN :lo AND :hi"
 			// BETWEEN includes its upper bound, which for "< v" can be a real key: the
 			// key filter drops it, so even a strict Query takes this range.
@@ -737,7 +737,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 			}
 		case opBeginsWith:
 			v := buildCompositeKey(append(clone(prefix), stringPart(fmt.Sprintf("%v", p.v1))))
-			plan.values[":sk"] = &types.AttributeValueMemberS{Value: v}
+			plan.values[":sk"] = binaryKeyAttr(v)
 			plan.keyCond += " AND begins_with(#sk, :sk)"
 		default:
 			return nil, fmt.Errorf("db: unsupported operator on Keys column %q", next.fieldName)
@@ -749,7 +749,7 @@ func resolveKeys(byField map[string]predicate, plan *queryPlan, sortColumns []ke
 	// begins_with on the prefix boundary.
 	if len(prefix) > 0 {
 		plan.names["#sk"] = rangeAttr
-		plan.values[":sk"] = &types.AttributeValueMemberS{Value: buildCompositeKey(prefix) + keySeparator}
+		plan.values[":sk"] = binaryKeyAttr(buildCompositeKey(prefix) + keySeparator)
 		plan.keyCond += " AND begins_with(#sk, :sk)"
 	}
 	return used, nil

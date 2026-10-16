@@ -69,7 +69,7 @@ func TestReprocessPageMovesARecordWhoseKeyChanged(t *testing.T) {
 func TestReprocessPageMovesARecordStoredUnderAnOldKey(t *testing.T) {
 	r := newProducts(t)
 	storedItem := storedProductItem(t, r, Product{ID: "a", CategoryID: 7, Created: 1})
-	storedItem["sk"] = &types.AttributeValueMemberS{Value: "an-old-key-shape"}
+	storedItem["sk"] = &types.AttributeValueMemberB{Value: []byte("an-old-key-shape")}
 	report := RecordsReport{}
 	changed, err := r.reprocessPage([]map[string]types.AttributeValue{storedItem}, func(product *Product) (bool, error) {
 		return false, nil
@@ -84,7 +84,7 @@ func TestReprocessPageFailsOneRecordNotTheRun(t *testing.T) {
 	storedItems := []map[string]types.AttributeValue{
 		storedProductItem(t, r, Product{ID: "a", CategoryID: 7, Created: 1}),
 		storedProductItem(t, r, Product{ID: "b", CategoryID: 7, Created: 2}),
-		{"pk": numberAttr(1), "sk": &types.AttributeValueMemberS{Value: "broken"}},
+		{"pk": numberAttr(1), "sk": &types.AttributeValueMemberB{Value: []byte("broken")}},
 	}
 	report := RecordsReport{}
 	changed, err := r.reprocessPage(storedItems, func(product *Product) (bool, error) {

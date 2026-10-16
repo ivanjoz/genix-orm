@@ -6,49 +6,25 @@ import (
 	"testing"
 )
 
-// TestOrderedAlphabetIsMonotonic is the property the whole scheme rests on: the
-// alphabet must be 64 unique characters in strictly ascending ASCII order.
-func TestOrderedAlphabetIsMonotonic(t *testing.T) {
-	if len(orderedAlphabet) != 64 {
-		t.Fatalf("alphabet must be 64 chars, got %d", len(orderedAlphabet))
+// TestEncodeIsBigEndian pins the layout: most significant byte first, left-padded with zeros.
+func TestEncodeIsBigEndian(t *testing.T) {
+	if got := EncodeOrderedUint(0x0102, 3); got != "\x00\x01\x02" {
+		t.Fatalf("EncodeOrderedUint(0x0102, 3) = %q", got)
 	}
-	for i := 1; i < len(orderedAlphabet); i++ {
-		if orderedAlphabet[i] <= orderedAlphabet[i-1] {
-			t.Fatalf("alphabet not strictly ascending at %d: %q >= %q",
-				i, orderedAlphabet[i-1], orderedAlphabet[i])
-		}
+	if got := EncodeOrderedUint(^uint64(0), maxNumberWidth); got != "\xff\xff\xff\xff\xff\xff\xff\xff" {
+		t.Fatalf("EncodeOrderedUint(max uint64, 8) = %q", got)
 	}
 }
 
-// TestEncodeRoundTrip verifies decode(encode(v)) == v across widths.
-func TestEncodeRoundTrip(t *testing.T) {
-	values := []uint64{0, 1, 63, 64, 65, 4095, 4096, 1_000_000, 1 << 40, ^uint64(0)}
-	for _, v := range values {
-		width := maxBase64Width
-		enc := EncodeOrderedUint(v, width)
-		if len(enc) != width {
-			t.Fatalf("width mismatch: got %d want %d", len(enc), width)
-		}
-		got, err := DecodeOrderedUint(enc)
-		if err != nil {
-			t.Fatalf("decode(%q): %v", enc, err)
-		}
-		if got != v {
-			t.Fatalf("round trip: got %d want %d", got, v)
-		}
-	}
-}
-
-// TestOrderPreservedRandom is the core guarantee: for fixed width, lexicographic
-// order of encodings matches numeric order of the values.
+// TestOrderPreservedRandom is the core guarantee: for fixed width, bytewise order
+// of encodings matches numeric order of the values.
 func TestOrderPreservedRandom(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
-	const width = 8 // 48 bits of range
-	max := capacityForWidth(width)
+	const width = 6 // 48 bits of range
 
 	nums := make([]uint64, 2000)
 	for i := range nums {
-		nums[i] = uint64(rng.Int63n(int64(max)))
+		nums[i] = uint64(rng.Int63n(1 << 48))
 	}
 
 	encoded := make([]string, len(nums))
@@ -65,7 +41,7 @@ func TestOrderPreservedRandom(t *testing.T) {
 	for i := range byNum {
 		want := EncodeOrderedUint(byNum[i], width)
 		if byStr[i] != want {
-			t.Fatalf("order mismatch at %d: sorted-by-string=%q sorted-by-number=%q",
+			t.Fatalf("order mismatch at %d: sorted-by-bytes=%q sorted-by-number=%q",
 				i, byStr[i], want)
 		}
 	}
@@ -78,24 +54,39 @@ func TestOverflowPanics(t *testing.T) {
 			t.Fatal("expected panic on overflow")
 		}
 	}()
-	EncodeOrderedUint(64*64, 1) // width 1 holds 0..63
+	EncodeOrderedUint(256, 1) // width 1 holds 0..255
 }
 
-// TestSizeCapIsTheDeclaredBits: Size(32) stores 6 digits (room for 36 bits), but
-// the declared 32 bits are the limit, and Size(64) takes every uint64.
+// TestSizeCapIsTheDeclaredBits: Size(20) stores 3 bytes (room for 24 bits), but
+// the declared 20 bits are the limit, and Size(64) takes every uint64.
 func TestSizeCapIsTheDeclaredBits(t *testing.T) {
-	if got := numberPart(1<<32-1, 32).width; got != 6 {
-		t.Fatalf("Size(32) must use 6 digits, got %d", got)
+	if got := numberPart(1<<20-1, 20).width; got != 3 {
+		t.Fatalf("Size(20) must use 3 bytes, got %d", got)
 	}
-	if got := numberPart(^uint64(0), 64).width; got != maxBase64Width {
-		t.Fatalf("Size(64) must use %d digits, got %d", maxBase64Width, got)
+	if got := numberPart(^uint64(0), 64).width; got != maxNumberWidth {
+		t.Fatalf("Size(64) must use %d bytes, got %d", maxNumberWidth, got)
 	}
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic: 2^32 overflows Size(32)")
+			t.Fatal("expected panic: 2^20 overflows Size(20)")
 		}
 	}()
-	numberPart(1<<32, 32)
+	numberPart(1<<20, 20)
+}
+
+// TestStringPartRejectsSeparatorBytes: 0x00 and 0x01 bound the key ranges, so a string part
+// holding either would let a range bound land inside it.
+func TestStringPartRejectsSeparatorBytes(t *testing.T) {
+	for _, badString := range []string{"a\x00b", "a\x01"} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("expected panic for string key part %q", badString)
+				}
+			}()
+			buildCompositeKey([]keyPart{stringPart(badString)})
+		}()
+	}
 }
 
 // TestCompositeKeyRangeOrdering checks the real use case: an equality prefix
@@ -111,7 +102,7 @@ func TestCompositeKeyRangeOrdering(t *testing.T) {
 		t.Fatalf("expected a<b<c, got %q %q %q", a, b, c)
 	}
 	// Different prefixes must not interleave with the numeric suffix.
-	if !("acme#"[0] < "acmf#"[0] || mk("acme", 9) < mk("acmf", 0)) {
+	if !(mk("acme", 9) < mk("acmf", 0)) {
 		t.Fatalf("prefix ordering broken")
 	}
 }

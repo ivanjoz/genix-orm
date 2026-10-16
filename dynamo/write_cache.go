@@ -103,5 +103,5 @@ func storeWriteCacheEntry(cacheKey string, version int64, blob []byte) {
 
 // writeCacheKeyOf is the item's pk#sk, the same string recordKey builds from a record.
 func writeCacheKeyOf(item map[string]types.AttributeValue) string {
-	return item["pk"].(*types.AttributeValueMemberN).Value + keySeparator + item["sk"].(*types.AttributeValueMemberS).Value
+	return item["pk"].(*types.AttributeValueMemberN).Value + keySeparator + binaryKeyText(item["sk"])
 }

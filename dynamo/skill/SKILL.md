@@ -8,7 +8,7 @@ description: Declare tables, design keys and indexes, and read/write DynamoDB re
 A statically typed single-table DynamoDB ORM. Every entity shares one physical table:
 
 ```
-{ pk (Number), sk (String), h1/r1..h10/r10 (GSI hash Number / range String), d (colbin blob of the whole record), ver (Number) }
+{ pk (Number), sk (Binary), h1/r1..h10/r10 (GSI hash Number / range Binary), d (colbin blob of the whole record), ver (Number) }
 ```
 
 DynamoDB can only use the **key attributes**. Every field lives inside `d`, so a field that is
@@ -102,8 +102,8 @@ A violation makes `NewRepo` panic at boot:
 - **GSI slots** `G1`..`G10` take one column or a composite of several as `Keys`, and an optional
   integer `Partition`. Each slot is used once per table. An unused slot costs nothing; each used
   one costs a GSI write per record write.
-- **String key parts must not contain `#`,** the composite separator. Validate or normalize user
-  input that goes into a key.
+- **String key parts must not contain the bytes `0x00` (the composite separator) nor `0x01`.**
+  Any other character, `#` included, is fine. Validate input that goes into a key.
 - **Fan-out indexes** (an `Index` whose `Keys` hold a `ColSlice`):
   - exactly one `ColSlice` per index, anywhere in `Keys`; the other `Keys` are scalar key columns;
   - no `Slot` (the rows live in the base table); `FullCopy` is only valid here;

@@ -63,7 +63,7 @@ func (r *Repo[T, E]) ReprocessBlobs(decodeLegacy func(data []byte, dst any) erro
 		storedBlob, reencodedBlob []byte
 	}
 	ranges := []pkRange{r.meta.baseRowsRange(), r.meta.hiddenRowsRange()}
-	err = scanItems(client, ranges, []string{"pk", "sk", dataColumn}, func(items []map[string]types.AttributeValue) error {
+	err = scanItems(client, tableName(), ranges, []string{"pk", "sk", dataColumn}, func(items []map[string]types.AttributeValue) error {
 		var pageRewrites []pendingRewrite
 		for _, item := range items {
 			storedBlob, isBinary := item[dataColumn].(*types.AttributeValueMemberB)
@@ -126,7 +126,7 @@ func isConditionFailed(err error) bool {
 
 // itemName names a stored item in a failure line, by its pk and sk.
 func itemName(item map[string]types.AttributeValue) string {
-	return fmt.Sprintf("pk=%s sk=%s", attrText(item["pk"]), attrText(item["sk"]))
+	return fmt.Sprintf("pk=%s sk=%q", attrText(item["pk"]), attrText(item["sk"]))
 }
 
 var errAmbiguousBlob = errors.New("both colbin versions read it, as different records")
@@ -191,8 +191,8 @@ func attrText(attr types.AttributeValue) string {
 	switch value := attr.(type) {
 	case *types.AttributeValueMemberN:
 		return value.Value
-	case *types.AttributeValueMemberS:
-		return value.Value
+	case *types.AttributeValueMemberB:
+		return string(value.Value)
 	}
 	return "?"
 }

@@ -113,7 +113,7 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	item[versionColumn] = numberAttr(m.version.getI64(ptr))
 	for _, idx := range m.indexes {
 		item[idx.slot.hashAttr] = &types.AttributeValueMemberN{Value: m.partitionValue(ptr, idx.partition)}
-		item[idx.slot.rangeAttr] = &types.AttributeValueMemberS{Value: buildCompositeKey(m.keyPartsFor(ptr, idx.sortColumns))}
+		item[idx.slot.rangeAttr] = binaryKeyAttr(buildCompositeKey(m.keyPartsFor(ptr, idx.sortColumns)))
 	}
 	return item, nil
 }
@@ -143,10 +143,20 @@ func itemKeyOf(item map[string]types.AttributeValue) map[string]types.AttributeV
 	return map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]}
 }
 
-// itemKey is the {pk, sk} map of any row: pk is a number, sk a string.
+// itemKey is the {pk, sk} map of any row: pk is a number, sk binary.
 func itemKey(pk, sk string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		"pk": &types.AttributeValueMemberN{Value: pk},
-		"sk": &types.AttributeValueMemberS{Value: sk},
+		"sk": binaryKeyAttr(sk),
 	}
+}
+
+// binaryKeyAttr is the DynamoDB binary of a sort key (sk, rN, or a bound on them).
+func binaryKeyAttr(key string) types.AttributeValue {
+	return &types.AttributeValueMemberB{Value: []byte(key)}
+}
+
+// binaryKeyText reads a stored sort key back as the string the ORM builds keys in.
+func binaryKeyText(attr types.AttributeValue) string {
+	return string(attr.(*types.AttributeValueMemberB).Value)
 }

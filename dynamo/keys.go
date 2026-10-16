@@ -11,9 +11,9 @@ import (
 // Deriving physical key attributes from a record.
 //
 //	pk  = TableID ‖ decimal(partition columns)                 (DynamoDB number)
-//	sk  = composite(Keys columns)                              (order-preserving string)
+//	sk  = composite(Keys columns)                              (order-preserving binary)
 //	hN  = TableID ‖ decimal(index partition columns)           (DynamoDB number)
-//	rN  = composite(index Keys, then the base Keys left out)   (order-preserving string)
+//	rN  = composite(index Keys, then the base Keys left out)   (order-preserving binary)
 //
 // Array index rows (array_index.go) use pk ‖ the column's cb id as their pk.
 //

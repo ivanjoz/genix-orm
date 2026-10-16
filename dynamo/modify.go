@@ -223,8 +223,8 @@ func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Clie
 	var lostRaceErr *types.ConditionalCheckFailedException
 	if errors.As(err, &lostRaceErr) {
 		if _, hasVersion := lostRaceErr.Item[versionColumn]; len(lostRaceErr.Item) > 0 && !hasVersion {
-			return false, fmt.Errorf("db: %s pk %s sk %s has no %q attribute: it was stored before Version, migrate it",
-				r.meta.recordType.Name(), item["pk"].(*types.AttributeValueMemberN).Value, item["sk"].(*types.AttributeValueMemberS).Value, versionColumn)
+			return false, fmt.Errorf("db: %s pk %s sk %q has no %q attribute: it was stored before Version, migrate it",
+				r.meta.recordType.Name(), item["pk"].(*types.AttributeValueMemberN).Value, binaryKeyText(item["sk"]), versionColumn)
 		}
 		return false, nil
 	}

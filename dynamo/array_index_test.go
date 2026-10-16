@@ -17,7 +17,7 @@ func productBaseKeys(r *Repo[ProductTable, Product], p *Product) (string, string
 }
 
 func tagRowSK(tagID uint64, baseSK string) string {
-	return EncodeOrderedUint(tagID, 6) + "#" + baseSK // Size(32) = 6 Base64 digits
+	return EncodeOrderedUint(tagID, 4) + "\x00" + baseSK // Size(32) = 4 bytes
 }
 
 func writeKeys(writes []types.WriteRequest) []string {
@@ -47,8 +47,8 @@ func TestArrayIndexWritesDiffStoredAgainstWritten(t *testing.T) {
 	// element is put again, since the blob and Version they copy changed.
 	wantPuts := []string{
 		basePK + "008 " + tagRowSK(3, baseSK),
-		basePK + "009 a#" + baseSK,
-		basePK + "009 b#" + baseSK,
+		basePK + "009 a\x00" + baseSK,
+		basePK + "009 b\x00" + baseSK,
 	}
 	if got := writeKeys(puts); !equalStrings(got, wantPuts) {
 		t.Fatalf("puts = %v\nwant %v", got, wantPuts)
@@ -85,12 +85,12 @@ func TestArrayIndexWritesNewAndDeletedRecord(t *testing.T) {
 }
 
 func TestArrayRowSKRoundTripsTheBaseSK(t *testing.T) {
-	baseSK := EncodeOrderedUint(5, 8) + "#sku1"
-	if got := baseSKOfArrayRow(tagRowSK(3, baseSK), 1); got != baseSK {
+	baseSK := EncodeOrderedUint(5, 6) + "\x00sku1"
+	if got := baseSKOfArrayRow(tagRowSK(3, baseSK), []keyCol{{kind: kindUint, bits: 32}}); got != baseSK {
 		t.Fatalf("baseSKOfArrayRow = %q, want %q", got, baseSK)
 	}
-	twoPartRowSK := EncodeOrderedUint(3, 6) + "#" + EncodeOrderedUint(100, 6) + "#" + baseSK
-	if got := baseSKOfArrayRow(twoPartRowSK, 2); got != baseSK {
+	twoPartRowSK := EncodeOrderedUint(3, 4) + "\x00" + EncodeOrderedUint(100, 4) + "\x00" + baseSK
+	if got := baseSKOfArrayRow(twoPartRowSK, []keyCol{{kind: kindUint, bits: 32}, {kind: kindUint, bits: 32}}); got != baseSK {
 		t.Fatalf("baseSKOfArrayRow with 2 index keys = %q, want %q", got, baseSK)
 	}
 }
@@ -124,7 +124,7 @@ func TestPlanContainsOnePlanPerValue(t *testing.T) {
 	if s(plan.values[":pk"]) != productTableID+"00007008" || plan.basePK != productTableID+"00007" {
 		t.Fatalf("pk = %q, basePK = %q", s(plan.values[":pk"]), plan.basePK)
 	}
-	if s(plan.values[":sk"]) != EncodeOrderedUint(4, 6)+"#" {
+	if s(plan.values[":sk"]) != EncodeOrderedUint(4, 4)+"\x00" {
 		t.Fatalf("sk prefix = %q", s(plan.values[":sk"]))
 	}
 	if len(plan.postFilter) != 0 {
@@ -135,11 +135,11 @@ func TestPlanContainsOnePlanPerValue(t *testing.T) {
 func TestPlanContainsExtendsWithTheBaseSortRange(t *testing.T) {
 	r := newProducts(t)
 	plan := onlyPlan(t, r.Query().Eq(r.T.CategoryID, int32(7)).Contains(r.T.TagIDs, 3).Gte(r.T.Created, int64(100)))
-	elementPrefix := EncodeOrderedUint(3, 6)
+	elementPrefix := EncodeOrderedUint(3, 4)
 	if plan.keyCond != "#pk = :pk AND #sk BETWEEN :lo AND :hi" {
 		t.Fatalf("keyCond = %q", plan.keyCond)
 	}
-	if s(plan.values[":lo"]) != elementPrefix+"#"+EncodeOrderedUint(100, 8) || s(plan.values[":hi"]) != elementPrefix+"$" {
+	if s(plan.values[":lo"]) != elementPrefix+"\x00"+EncodeOrderedUint(100, 6) || s(plan.values[":hi"]) != elementPrefix+"\x01" {
 		t.Fatalf("range = [%q, %q]", s(plan.values[":lo"]), s(plan.values[":hi"]))
 	}
 }
@@ -285,7 +285,7 @@ func (t fanOutOrderTable) GetSchema() Schema {
 }
 
 func fanOutOrderRowSK(productID, updated, id uint64) string {
-	return EncodeOrderedUint(productID, 6) + "#" + EncodeOrderedUint(updated, 6) + "#" + EncodeOrderedUint(id, 6)
+	return EncodeOrderedUint(productID, 4) + "\x00" + EncodeOrderedUint(updated, 4) + "\x00" + EncodeOrderedUint(id, 4)
 }
 
 func TestCompositeFanOutRowsCarryTheScalarKeys(t *testing.T) {
@@ -297,7 +297,7 @@ func TestCompositeFanOutRowsCarryTheScalarKeys(t *testing.T) {
 	wantPuts := []string{
 		basePK + "005 " + fanOutOrderRowSK(5, 100, 1),
 		basePK + "005 " + fanOutOrderRowSK(8, 100, 1),
-		basePK + "006 web#gift#" + EncodeOrderedUint(1, 6),
+		basePK + "006 web\x00gift\x00" + EncodeOrderedUint(1, 4),
 	}
 	if got := writeKeys(puts); !equalStrings(got, wantPuts) || len(deletes) != 0 {
 		t.Fatalf("puts = %v\nwant %v (deletes %v)", got, wantPuts, writeKeys(deletes))
@@ -327,7 +327,7 @@ func TestCompositeFanOutRewritesRowsWhenAScalarKeyChanges(t *testing.T) {
 
 func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
 	orders := NewRepo[fanOutOrderTable, fanOutOrder]()
-	product5 := EncodeOrderedUint(5, 6)
+	product5 := EncodeOrderedUint(5, 4)
 	for name, query := range map[string]*QueryBuilder[fanOutOrder]{
 		"Contains": orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int32(10_000)),
 		"Eq":       orders.Query().Eq(orders.T.StoreID, int32(7)).Eq(orders.T.ProductIDs, 5).Gt(orders.T.Updated, int32(10_000)),
@@ -339,7 +339,7 @@ func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
 		if s(plan.values[":pk"]) != "23456789"+"00007"+"005" {
 			t.Fatalf("%s: pk = %q", name, s(plan.values[":pk"]))
 		}
-		if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(10_000, 6)+"$" || s(plan.values[":hi"]) != product5+"$" {
+		if s(plan.values[":lo"]) != product5+"\x00"+EncodeOrderedUint(10_000, 4)+"\x01" || s(plan.values[":hi"]) != product5+"\x01" {
 			t.Fatalf("%s: range = [%q, %q]", name, s(plan.values[":lo"]), s(plan.values[":hi"]))
 		}
 		if len(plan.postFilter) != 0 || len(plan.keyFilter) != 0 {
@@ -349,7 +349,7 @@ func TestPlanCompositeFanOutRangesOnTheScalarAfterTheSlice(t *testing.T) {
 
 	// Every index column pinned: the range goes on to the base Keys.
 	plan := onlyPlan(t, orders.Query().Eq(orders.T.StoreID, int32(7)).Contains(orders.T.ProductIDs, 5).Eq(orders.T.Updated, int32(100)).Gte(orders.T.ID, int32(3)))
-	if s(plan.values[":lo"]) != product5+"#"+EncodeOrderedUint(100, 6)+"#"+EncodeOrderedUint(3, 6) {
+	if s(plan.values[":lo"]) != product5+"\x00"+EncodeOrderedUint(100, 4)+"\x00"+EncodeOrderedUint(3, 4) {
 		t.Fatalf("lo = %q", s(plan.values[":lo"]))
 	}
 }
@@ -360,7 +360,7 @@ func TestPlanCompositeFanOutNeedsTheColumnsBeforeTheSlice(t *testing.T) {
 		t.Fatal("Contains(Tags) without Eq(Channel) must fail")
 	}
 	plan := onlyPlan(t, orders.Query().Eq(orders.T.StoreID, int32(7)).Eq(orders.T.Channel, "web").Contains(orders.T.Tags, "gift"))
-	if plan.keyCond != "#pk = :pk AND begins_with(#sk, :sk)" || s(plan.values[":sk"]) != "web#gift#" {
+	if plan.keyCond != "#pk = :pk AND begins_with(#sk, :sk)" || s(plan.values[":sk"]) != "web\x00gift\x00" {
 		t.Fatalf("keyCond = %q, sk = %q", plan.keyCond, s(plan.values[":sk"]))
 	}
 }

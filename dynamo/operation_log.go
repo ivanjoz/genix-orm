@@ -117,15 +117,15 @@ func describeTarget(input any) string {
 	return entityOfKeyValue(key["pk"])
 }
 
-// entityOfKeyValue maps a pk, a numeric slot or a string slot back to its entity: all of them
+// entityOfKeyValue maps a pk, a numeric slot or a sequence sk back to its entity: all of them
 // start with the 8-digit TableID.
 func entityOfKeyValue(value types.AttributeValue) string {
 	var raw string
 	switch typed := value.(type) {
 	case *types.AttributeValueMemberN:
 		raw = typed.Value
-	case *types.AttributeValueMemberS:
-		raw = typed.Value
+	case *types.AttributeValueMemberB:
+		raw = string(typed.Value)
 	}
 	if len(raw) < 8 {
 		return "?"

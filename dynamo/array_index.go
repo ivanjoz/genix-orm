@@ -173,13 +173,19 @@ func (m *tableMeta) arrayRowSKs(arrayIndex *arrayIndexMeta, ptr unsafe.Pointer) 
 	return rowSKs
 }
 
-// baseSKOfArrayRow recovers the base sk from a row sk. No index key part
-// contains the separator (Base64 digits, or a string key part), so the base sk
-// starts after the keyCount-th one.
-func baseSKOfArrayRow(rowSK string, keyCount int) string {
+// baseSKOfArrayRow recovers the base sk from a row sk: it skips each index key
+// part and the separator after it. A number part may contain the separator byte,
+// so it is skipped by its fixed width; a string part never does, so it ends at
+// the first separator.
+func baseSKOfArrayRow(rowSK string, indexKeys []keyCol) string {
 	start := 0
-	for range keyCount {
-		start += strings.Index(rowSK[start:], keySeparator) + 1
+	for _, kc := range indexKeys {
+		if kc.kind == kindString {
+			start += strings.Index(rowSK[start:], keySeparator)
+		} else {
+			start += numberWidth(kc.bits)
+		}
+		start += len(keySeparator)
 	}
 	return rowSK[start:]
 }
@@ -244,7 +250,7 @@ func (m *tableMeta) arrayIndexWrites(storedPtr, writtenPtr unsafe.Pointer, item 
 func recordItemsOfArrayRows(client *dynamodb.Client, basePK string, arrayIndex *arrayIndexMeta, rows []map[string]types.AttributeValue, consistentRead bool) ([]map[string]types.AttributeValue, []string, float64, error) {
 	rowSKs := make([]string, len(rows))
 	for i, row := range rows {
-		rowSKs[i] = row["sk"].(*types.AttributeValueMemberS).Value
+		rowSKs[i] = binaryKeyText(row["sk"])
 	}
 	if arrayIndex.fullCopy {
 		return rows, rowSKs, 0, nil
@@ -255,7 +261,7 @@ func recordItemsOfArrayRows(client *dynamodb.Client, basePK string, arrayIndex *
 	var keys []map[string]types.AttributeValue
 	isRequested := map[string]bool{}
 	for _, rowSK := range rowSKs {
-		baseSK := baseSKOfArrayRow(rowSK, len(arrayIndex.keys))
+		baseSK := baseSKOfArrayRow(rowSK, arrayIndex.keys)
 		if !isRequested[baseSK] {
 			isRequested[baseSK] = true
 			keys = append(keys, itemKey(basePK, baseSK))
@@ -268,12 +274,12 @@ func recordItemsOfArrayRows(client *dynamodb.Client, basePK string, arrayIndex *
 	// BatchGetItem does not keep the request order; restore the row order.
 	itemBySK := make(map[string]map[string]types.AttributeValue, len(items))
 	for _, item := range items {
-		itemBySK[item["sk"].(*types.AttributeValueMemberS).Value] = item
+		itemBySK[binaryKeyText(item["sk"])] = item
 	}
 	orderedItems := make([]map[string]types.AttributeValue, 0, len(rows))
 	orderedRowSKs := make([]string, 0, len(rows))
 	for _, rowSK := range rowSKs {
-		if item, ok := itemBySK[baseSKOfArrayRow(rowSK, len(arrayIndex.keys))]; ok {
+		if item, ok := itemBySK[baseSKOfArrayRow(rowSK, arrayIndex.keys)]; ok {
 			orderedItems = append(orderedItems, item)
 			orderedRowSKs = append(orderedRowSKs, rowSK)
 		}

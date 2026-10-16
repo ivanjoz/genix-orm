@@ -469,7 +469,7 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 	// A strict < under a prefix is a BETWEEN whose upper bound is the one sk to drop.
 	excludedSK := ""
 	if len(plan.keyFilter) > 0 {
-		excludedSK = plan.values[":hi"].(*types.AttributeValueMemberS).Value
+		excludedSK = binaryKeyText(plan.values[":hi"])
 	}
 
 	client, err := Client()
@@ -489,7 +489,7 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 			return nil, err
 		}
 		for _, item := range out.Items {
-			if item["sk"].(*types.AttributeValueMemberS).Value == excludedSK {
+			if binaryKeyText(item["sk"]) == excludedSK {
 				continue
 			}
 			group := Group[E]{
@@ -553,7 +553,7 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 		TableName:                 aws.String(tableName()),
 		KeyConditionExpression:    aws.String("#pk = :pk AND begins_with(#sk, :g)"),
 		ExpressionAttributeNames:  map[string]string{"#pk": "pk", "#sk": "sk"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberN{Value: counterPK}, ":g": &types.AttributeValueMemberS{Value: groupCountersSKPrefix}},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberN{Value: counterPK}, ":g": binaryKeyAttr(groupCountersSKPrefix)},
 		ConsistentRead:            aws.Bool(true),
 	}
 	storedCounterBySK := map[string]map[string]types.AttributeValue{}
@@ -563,7 +563,7 @@ func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK stri
 			return 0, err
 		}
 		for _, item := range out.Items {
-			storedCounterBySK[item["sk"].(*types.AttributeValueMemberS).Value] = item
+			storedCounterBySK[binaryKeyText(item["sk"])] = item
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break

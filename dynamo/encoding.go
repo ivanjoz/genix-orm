@@ -8,113 +8,44 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Order-preserving Base64
+// Order-preserving big-endian numbers
 //
-// DynamoDB sort keys (and the string GSI partition attributes) are plain
-// strings, compared lexicographically (byte by byte). To make numeric range
-// queries — BETWEEN / > / < — work on a string sort key that concatenates
-// several columns, every number must be encoded so that:
+// DynamoDB sort keys (sk and the GSI rN slots) are binary, compared byte by byte
+// as unsigned values. To make numeric range queries — BETWEEN / > / < — work on a
+// binary sort key that concatenates several columns, every number must be encoded
+// so that:
 //
-//	numeric   a < b   ⇔   lexicographic  encode(a) < encode(b)
+//	numeric   a < b   ⇔   bytewise  encode(a) < encode(b)
 //
-// Two things guarantee that:
-//
-//  1. A *fixed width*: every value of a given column encodes to the same number
-//     of characters (left-padded), so the comparison never runs off the end of
-//     the shorter string early.
-//  2. An alphabet whose 64 characters are already in ascending ASCII order, so a
-//     bigger base-64 digit is also a bigger byte.
-//
-// This mirrors genix's packed-integer indexes (`Size(bits)` per column packed
-// into one sortable int64), but instead of packing into a 64-bit integer we pack
-// into an arbitrary-length Base64 string — no 64-bit ceiling, and it lives happily
-// inside a DynamoDB string key.
+// A fixed-width big-endian unsigned integer does exactly that: the most
+// significant byte comes first, and every value of a column takes the same number
+// of bytes, so the comparison never runs off the end of the shorter one early.
+// A Size(bits) column takes ceil(bits/8) bytes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// orderedAlphabet holds 64 characters in strictly ascending ASCII order:
-//
-//	'-'(45) < '0'..'9'(48..57) < 'A'..'Z'(65..90) < '_'(95) < 'a'..'z'(97..122)
-//
-// Because the alphabet is monotonic, digit value and byte value rank the same,
-// which is what makes the encoding order-preserving. (These are exactly the
-// URL-safe Base64 characters, re-ordered.)
-const orderedAlphabet = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+// maxNumberWidth is the bytes of a full uint64.
+const maxNumberWidth = 8
 
-// orderedReverse maps a byte back to its 0..63 digit value; 0xFF means invalid.
-var orderedReverse = func() [256]byte {
-	var table [256]byte
-	for i := range table {
-		table[i] = 0xFF
-	}
-	for i := 0; i < len(orderedAlphabet); i++ {
-		table[orderedAlphabet[i]] = byte(i)
-	}
-	return table
-}()
-
-// maxBase64Width is the number of digits needed to hold a full uint64
-// (ceil(64/6) = 11). A width of 11 covers every uint64; smaller widths cap the
-// representable range at 64^width - 1.
-const maxBase64Width = 11
-
-// EncodeOrderedUint renders v as exactly `width` order-preserving Base64
-// characters, most-significant digit first, left-padded with the lowest
-// character ('-'). It panics if v does not fit in `width` digits, because a
-// silent overflow would corrupt key ordering.
+// EncodeOrderedUint renders v as exactly `width` big-endian bytes. It panics if v
+// does not fit in `width` bytes, because a silent overflow would corrupt key
+// ordering.
 func EncodeOrderedUint(v uint64, width int) string {
-	if width <= 0 || width > maxBase64Width {
-		panic(fmt.Sprintf("db: base64 width must be 1..%d, got %d", maxBase64Width, width))
+	if width <= 0 || width > maxNumberWidth {
+		panic(fmt.Sprintf("db: key number width must be 1..%d bytes, got %d", maxNumberWidth, width))
+	}
+	if width < maxNumberWidth && v>>(8*width) != 0 {
+		panic(fmt.Sprintf("db: value %d overflows %d key bytes", v, width))
 	}
 	buf := make([]byte, width)
 	for i := width - 1; i >= 0; i-- {
-		buf[i] = orderedAlphabet[v&0x3F]
-		v >>= 6
-	}
-	if v != 0 {
-		panic(fmt.Sprintf("db: value overflows base64 width %d (max %d)", width, capacityForWidth(width)-1))
+		buf[i] = byte(v)
+		v >>= 8
 	}
 	return string(buf)
 }
 
-// EncodeOrderedInt is EncodeOrderedUint for non-negative signed integers. Like
-// genix's packed indexes it rejects negatives: an index/key component that can
-// go negative would need a sign-bias that a small fixed width cannot hold, so we
-// fail loudly instead of silently misordering.
-func EncodeOrderedInt(v int64, width int) string {
-	if v < 0 {
-		panic(fmt.Sprintf("db: cannot order-encode negative value %d (index/key numbers must be >= 0)", v))
-	}
-	return EncodeOrderedUint(uint64(v), width)
-}
-
-// DecodeOrderedUint is the inverse of EncodeOrderedUint.
-func DecodeOrderedUint(s string) (uint64, error) {
-	if len(s) == 0 || len(s) > maxBase64Width {
-		return 0, fmt.Errorf("db: invalid ordered-base64 length %d", len(s))
-	}
-	var v uint64
-	for i := 0; i < len(s); i++ {
-		d := orderedReverse[s[i]]
-		if d == 0xFF {
-			return 0, fmt.Errorf("db: invalid ordered-base64 character %q", s[i])
-		}
-		v = v<<6 | uint64(d)
-	}
-	return v, nil
-}
-
-// capacityForWidth returns 64^width (the count of representable values) as a
-// uint64, saturating at the uint64 max for width >= 11.
-func capacityForWidth(width int) uint64 {
-	if width >= maxBase64Width {
-		return ^uint64(0)
-	}
-	cap := uint64(1)
-	for i := 0; i < width; i++ {
-		cap *= 64
-	}
-	return cap
-}
+// numberWidth is the bytes a Size(bits) column takes in a sort key.
+func numberWidth(bits int8) int { return (int(bits) + 7) / 8 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Decimal numeric keys
@@ -158,24 +89,28 @@ func HashTableID(entity string) int32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Composite keys
 //
-// A pk / sk / GSI-slot value is the concatenation of one or more column parts.
-// String parts go in verbatim; number parts are order-preserving Base64 of the
-// declared width. Parts are joined with keySeparator, which is lower in ASCII
-// than every alphabet character, so a shorter prefix always sorts before a
-// longer one that extends it ("a#..." < "ab#..."). String key parts therefore
-// must not contain keySeparator.
+// An sk / rN value (a DynamoDB binary) is the concatenation of one or more column
+// parts. String parts go in verbatim as UTF-8; number parts are big-endian bytes
+// of the declared width. Parts are joined with keySeparator, the lowest byte, so a
+// shorter string prefix always sorts before a longer one that extends it
+// ("a\x00..." < "ab\x00..."). A number part may hold any byte: its fixed width,
+// not the separator, delimits it. String key parts must not contain keySeparator
+// nor keySeparatorSuccessor, or a range bound could land inside them.
+//
+// The Go side keeps these keys as strings (a string holds any bytes); they become
+// []byte only in the AttributeValue (binaryKeyAttr / binaryKeyText in client.go).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// keySeparator ('#', 0x23) sorts below every orderedAlphabet character.
-const keySeparator = "#"
+// keySeparator (0x00) sorts below every other byte.
+const keySeparator = "\x00"
 
-// keySeparatorSuccessor ('$', 0x24) is the byte right after keySeparator, so every
-// key starting with prefix+"#" sorts below prefix+"$": the exclusive upper bound
-// of a prefix range.
-const keySeparatorSuccessor = "$"
+// keySeparatorSuccessor (0x01) is the byte right after keySeparator, so every
+// key starting with prefix+"\x00" sorts below prefix+"\x01": the exclusive upper
+// bound of a prefix range.
+const keySeparatorSuccessor = "\x01"
 
 // keyPart is one resolved component of a composite key: either a raw string or a
-// number to be order-encoded into `width` Base64 digits.
+// number to be order-encoded into `width` big-endian bytes.
 type keyPart struct {
 	str      string
 	num      uint64
@@ -185,17 +120,17 @@ type keyPart struct {
 
 func stringPart(s string) keyPart { return keyPart{str: s} }
 
-// numberPart encodes v for a column declared .Size(bits): ceil(bits/6) Base64
-// digits. It checks v against the declared bits, not the rounded-up width, so
-// Size(32) rejects 2^32 even though its 6 digits could hold it.
+// numberPart encodes v for a column declared .Size(bits): ceil(bits/8) bytes. It
+// checks v against the declared bits, not the rounded-up width, so Size(20)
+// rejects 2^20 even though its 3 bytes could hold it.
 func numberPart(v uint64, bits int8) keyPart {
 	if bits < 64 && v>>bits != 0 {
 		panic(fmt.Sprintf("db: value %d overflows Size(%d) (max %d)", v, bits, uint64(1)<<bits-1))
 	}
-	return keyPart{num: v, isNumber: true, width: (int(bits) + 5) / 6}
+	return keyPart{num: v, isNumber: true, width: numberWidth(bits)}
 }
 
-// buildCompositeKey renders the parts into a single order-preserving string.
+// buildCompositeKey renders the parts into a single order-preserving binary key.
 func buildCompositeKey(parts []keyPart) string {
 	var b strings.Builder
 	for i, p := range parts {
@@ -205,8 +140,8 @@ func buildCompositeKey(parts []keyPart) string {
 		if p.isNumber {
 			b.WriteString(EncodeOrderedUint(p.num, p.width))
 		} else {
-			if strings.Contains(p.str, keySeparator) {
-				panic(fmt.Sprintf("db: string key part %q must not contain the %q separator", p.str, keySeparator))
+			if strings.ContainsAny(p.str, keySeparator+keySeparatorSuccessor) {
+				panic(fmt.Sprintf("db: string key part %q must not contain the bytes 0x00 or 0x01", p.str))
 			}
 			b.WriteString(p.str)
 		}

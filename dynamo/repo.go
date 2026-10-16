@@ -548,7 +548,7 @@ func (r *Repo[T, E]) Scan(limit int32) ([]E, error) {
 		return nil, err
 	}
 	var out []E
-	err = scanItems(client, []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
+	err = scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		for _, item := range items {
 			var record E
 			if err := r.meta.unmarshalItem(item, &record); err != nil {
@@ -587,7 +587,7 @@ var errStopScan = errors.New("db: scan stopped")
 // a time, with only the projected attributes (all of them when projection is empty). A single range
 // of one pk (an entity without partition columns) is a Query; anything else is a table Scan filtered
 // on the ranges, which DynamoDB bills for the whole shared table, filtered or not.
-func scanItems(client *dynamodb.Client, ranges []pkRange, projection []string, onPage func(items []map[string]types.AttributeValue) error) error {
+func scanItems(client *dynamodb.Client, table string, ranges []pkRange, projection []string, onPage func(items []map[string]types.AttributeValue) error) error {
 	names := map[string]string{"#pk": "pk"}
 	values := map[string]types.AttributeValue{}
 	var projectionExpression *string
@@ -604,7 +604,7 @@ func scanItems(client *dynamodb.Client, ranges []pkRange, projection []string, o
 	if len(ranges) == 1 && ranges[0].lowest == ranges[0].highest {
 		values[":pk"] = &types.AttributeValueMemberN{Value: ranges[0].lowest}
 		input := &dynamodb.QueryInput{
-			TableName:                 aws.String(tableName()),
+			TableName:                 aws.String(table),
 			KeyConditionExpression:    aws.String("#pk = :pk"),
 			ProjectionExpression:      projectionExpression,
 			ExpressionAttributeNames:  names,
@@ -627,7 +627,7 @@ func scanItems(client *dynamodb.Client, ranges []pkRange, projection []string, o
 			rangeConditions[i] = "#pk BETWEEN :lo" + placeholder + " AND :hi" + placeholder
 		}
 		input := &dynamodb.ScanInput{
-			TableName:                 aws.String(tableName()),
+			TableName:                 aws.String(table),
 			FilterExpression:          aws.String(strings.Join(rangeConditions, " OR ")),
 			ProjectionExpression:      projectionExpression,
 			ExpressionAttributeNames:  names,

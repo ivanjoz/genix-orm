@@ -41,15 +41,15 @@ func TestLocalIndexWritesOneRowPerRecord(t *testing.T) {
 	rowPK := localItemTableID + "002" // NameHash's cb id names the rows
 
 	puts, deletes := items.meta.arrayIndexWrites(nil, unsafe.Pointer(&stored), nil)
-	if got, want := writeKeys(puts), []string{rowPK + " " + EncodeOrderedUint(10, 6) + "#" + baseSK}; !equalStrings(got, want) || len(deletes) != 0 {
+	if got, want := writeKeys(puts), []string{rowPK + " " + EncodeOrderedUint(10, 4) + "\x00" + baseSK}; !equalStrings(got, want) || len(deletes) != 0 {
 		t.Fatalf("new record: puts %v deletes %v", got, writeKeys(deletes))
 	}
 	// A changed key moves the row: put the new one, delete the old one.
 	puts, deletes = items.meta.arrayIndexWrites(unsafe.Pointer(&stored), unsafe.Pointer(&renamed), nil)
-	if got, want := writeKeys(puts), []string{rowPK + " " + EncodeOrderedUint(11, 6) + "#" + baseSK}; !equalStrings(got, want) {
+	if got, want := writeKeys(puts), []string{rowPK + " " + EncodeOrderedUint(11, 4) + "\x00" + baseSK}; !equalStrings(got, want) {
 		t.Fatalf("puts = %v, want %v", got, want)
 	}
-	if got, want := writeKeys(deletes), []string{rowPK + " " + EncodeOrderedUint(10, 6) + "#" + baseSK}; !equalStrings(got, want) {
+	if got, want := writeKeys(deletes), []string{rowPK + " " + EncodeOrderedUint(10, 4) + "\x00" + baseSK}; !equalStrings(got, want) {
 		t.Fatalf("deletes = %v, want %v", got, want)
 	}
 	// An unchanged key writes nothing.

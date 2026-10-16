@@ -69,7 +69,7 @@ func (r *Repo[T, E]) ReprocessRecords(transform func(record *E) (bool, error), w
 	if err != nil {
 		return report, err
 	}
-	err = scanItems(client, []pkRange{r.meta.baseRowsRange()}, nil, func(storedItems []map[string]types.AttributeValue) error {
+	err = scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange()}, nil, func(storedItems []map[string]types.AttributeValue) error {
 		pageWrites, err := r.reprocessPage(storedItems, transform, write, &report)
 		if err != nil || !write {
 			return err

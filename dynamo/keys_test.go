@@ -17,17 +17,17 @@ func TestEntityOfItemKey(t *testing.T) {
 
 	ownedKeys := [][2]string{
 		{basePK, ticketRepo.meta.skValue(unsafe.Pointer(&ticket))},
-		{groupCountersPK(basePK), groupCountersSKPrefix + "005#web"},
+		{groupCountersPK(basePK), groupCountersSKPrefix + "005\x00web"},
 		{sequencePartitionKey, tableID},
 	}
 	for _, ownedKey := range ownedKeys {
 		if entity, found := EntityOfItemKey(ownedKey[0], ownedKey[1]); !found || entity != "tick" {
-			t.Fatalf("pk %s sk %s: got %q %v, want tick", ownedKey[0], ownedKey[1], entity, found)
+			t.Fatalf("pk %s sk %q: got %q %v, want tick", ownedKey[0], ownedKey[1], entity, found)
 		}
 	}
 	for _, foreignKey := range [][2]string{{sequencePartitionKey, "images"}, {"99999998", ""}, {"12", ""}} {
 		if entity, found := EntityOfItemKey(foreignKey[0], foreignKey[1]); found {
-			t.Fatalf("pk %s sk %s: got %q, want no entity", foreignKey[0], foreignKey[1], entity)
+			t.Fatalf("pk %s sk %q: got %q, want no entity", foreignKey[0], foreignKey[1], entity)
 		}
 	}
 }
