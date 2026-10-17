@@ -595,6 +595,39 @@ state item: pk = base pk ‖ 000, sk = "f" + name: gen, sh (shape), w (snapshot,
   code without the frame write no changelog: each drifts a frame until
   `RebuildDataFrames`. `Modify`/`PutManyIfVersion` are exact.
 
+## Text search (`textsearch.go`)
+
+An entity can keep a text index in the backend the app installs with
+`db.SetTextSearchBackend` (genix-s3 through `search/genixs3`, or the GenixSearch daemon through
+`search/daemon`), the same one the Scylla driver uses:
+
+```go
+func (t ItemTable) GetSchema() dynamo.Schema {
+    return dynamo.Schema{
+        Entity:     "item",
+        Partition:  dynamo.Cols(t.CompanyID.Size(16)),
+        Keys:       dynamo.Cols(t.ID.Size(31)),                // the document ID
+        TextSearch: &dynamo.TextSearch{Columns: dynamo.Cols(t.Name, t.Brand)},
+    }
+}
+
+hits, err := Items.SearchTextIDs("polo rojo", 20, 0, companyID)   // []db.TextHit, best first
+hits, err = Items.SearchText(&out, "polo rojo", 20, 0, companyID) // also reads the records (GetMany)
+```
+
+- One index per (entity, partition), named after the Partition values like Scylla does: `p12`
+  for one column, `p3_p12` for two, `all` for an entity without Partition.
+- `Keys` must be a single integer column that fits int32: it is the document ID.
+- The text is the `Columns` joined by a space; only active records are indexed (`Status` != 0).
+- An entity with TextSearch reads the stored version of what it writes, like one with GroupBy, so
+  every write (`Put`, `PutMany`, `InsertMany`, `PutIfAbsent`, `Modify`, `PutManyIfVersion`,
+  `Delete`) sends the index only what changed: the text, or the active state. `DeleteRecordsAll`
+  drops the index of every partition it emptied. A write fails before it lands when no backend is
+  installed. `Manual: true` turns the sync off.
+- `ReprocessRecords` and `CopyRecordsFrom` write silently: reindex after them.
+- Maintenance: `ReindexTextSearch(partitionValues...)`, `ReindexTextSearchAll()`,
+  `CompactTextSearch(...)` and `DropTextSearch(...)`, also on the `Controller` interface.
+
 ## Optimistic concurrency: `PutManyIfVersion`, `Modify` (`modify.go`)
 
 A write replaces the whole record (it is one blob), so two read-modify-writes of
@@ -952,7 +985,9 @@ by-IDs slots and entity controllers are kept/ported — see above.)
   whose transport tunnels each request elsewhere (through a proxy that signs it)
   plus placeholder `Credentials` leave every operation of the ORM unchanged.
 - `go test ./dynamo/` runs fully offline (encoding, marshaling and query
-  planning); it does not require AWS.
+  planning); it does not require AWS. Set `GENIX_ORM_DYNAMO_TEST` to a DynamoDB Local endpoint
+  (`podman run -d -p 127.0.0.1:18077:8000 amazon/dynamodb-local -jar DynamoDBLocal.jar -inMemory`)
+  to also run the text search writes against a real table.
 
 ## Quick listing from the CLI
 

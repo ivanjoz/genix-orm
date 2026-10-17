@@ -239,6 +239,9 @@ type Schema struct {
 	// (data_frame.go), read with Repo.QueryFrame. The entity takes no Partition, and needs Updated
 	// and a GSI whose Keys start with it.
 	DataFrames []DataFrame
+	// TextSearch keeps a text index of the entity in the backend installed with
+	// db.SetTextSearchBackend (textsearch.go). Its Keys are one integer column, the document ID.
+	TextSearch *TextSearch
 
 	// UseAutoincrement makes the ORM assign the record's integer "ID" field
 	// automatically on Put/PutMany when it is still zero. IDs come from a

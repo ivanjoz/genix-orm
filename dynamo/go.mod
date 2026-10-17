@@ -11,6 +11,7 @@ require (
 	github.com/aws/smithy-go v1.27.3
 	github.com/ivanjoz/colbin v0.6.2
 	github.com/ivanjoz/genix-orm/dataframe v0.0.0
+	github.com/ivanjoz/genix-orm/db v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0
 	github.com/viant/xunsafe v0.11.0
 )
@@ -31,5 +32,7 @@ require (
 )
 
 replace github.com/ivanjoz/genix-orm/dataframe => ../dataframe
+
+replace github.com/ivanjoz/genix-orm/db => ../db
 
 replace github.com/ivanjoz/genix-orm/utils => ../utils

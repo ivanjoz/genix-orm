@@ -80,6 +80,7 @@ type tableMeta struct {
 	accessors        map[string]*colAccessor // record field name -> precompiled accessor
 	autoinc          *autoincConfig          // nil unless the schema sets UseAutoincrement
 	cacheByIDs       *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
+	textSearch       *textSearchMeta         // nil unless the schema declares TextSearch
 	// The managed fields (delta.go): Version, on every table, and Updated, nil without one.
 	version *colAccessor
 	updated *keyCol
@@ -89,9 +90,9 @@ type tableMeta struct {
 }
 
 // readsStoredVersion reports whether a write needs the record as stored first: to
-// diff its hidden rows, its GroupBy counters or its DataFrame values.
+// diff its hidden rows, its GroupBy counters, its DataFrame values or its indexed text.
 func (m *tableMeta) readsStoredVersion() bool {
-	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0 || m.frames != nil
+	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0 || m.frames != nil || m.syncsTextSearch()
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -273,6 +274,9 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 	}
 	if schema.CacheByIDs {
 		meta.cacheByIDs = resolveCacheByIDs(recordType, meta.partition, meta.keys)
+	}
+	if schema.TextSearch != nil {
+		meta.textSearch = resolveTextSearch(schema, recordType, meta)
 	}
 	// A delta read returns the log's Metadata records as records of the table.
 	if metadataField, hasField := recordType.FieldByName(metadataFieldName); len(meta.deltaIndexes) > 0 &&

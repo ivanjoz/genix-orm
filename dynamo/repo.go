@@ -60,6 +60,9 @@ func (r *Repo[T, E]) Put(record *E) error {
 // of the same key exactly one wins — the primitive for "enqueue once" and "claim
 // once". Autoincrement IDs are assigned as in Put.
 func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
+	if err := r.meta.checkTextSearchBackend(); err != nil {
+		return false, err
+	}
 	ptr := unsafe.Pointer(record)
 	if _, err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
@@ -100,7 +103,11 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 	if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 		return true, err
 	}
-	if err := r.meta.appendDeltaLogs([]deltaLogWrite{{writtenPtr: ptr, version: 1}}); err != nil {
+	landedWrites := []deltaLogWrite{{writtenPtr: ptr, version: 1}}
+	if err := r.meta.appendDeltaLogs(landedWrites); err != nil {
+		return true, err
+	}
+	if err := r.meta.syncTextSearch(landedWrites); err != nil {
 		return true, err
 	}
 	return true, r.meta.setSlotsUpdated([]unsafe.Pointer{ptr})
@@ -144,6 +151,9 @@ func (r *Repo[T, E]) AssignIDs(records []E) error {
 func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	if len(records) == 0 {
 		return nil
+	}
+	if err := r.meta.checkTextSearchBackend(); err != nil {
+		return err
 	}
 	client, err := Client()
 	if err != nil {
@@ -202,6 +212,9 @@ func (r *Repo[T, E]) insertNew(client *dynamodb.Client, ptrs []unsafe.Pointer) e
 	if err := r.meta.appendDeltaLogs(logWrites); err != nil {
 		return err
 	}
+	if err := r.meta.syncTextSearch(logWrites); err != nil {
+		return err
+	}
 	return r.meta.setSlotsUpdated(ptrs)
 }
 
@@ -226,6 +239,9 @@ func (r *Repo[T, E]) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.P
 		return err
 	}
 	if err := r.meta.appendDeltaLogs(logWrites); err != nil {
+		return err
+	}
+	if err := r.meta.syncTextSearch(logWrites); err != nil {
 		return err
 	}
 	return r.meta.setSlotsUpdated(ptrs)
@@ -414,6 +430,9 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if r.meta.frames != nil {
 		return fmt.Errorf("db: %s has DataFrames and is never deleted: set its Status to 0", r.meta.recordType.Name())
 	}
+	if err := r.meta.checkTextSearchBackend(); err != nil {
+		return err
+	}
 	client, err := Client()
 	if err != nil {
 		return err
@@ -446,8 +465,11 @@ func (r *Repo[T, E]) Delete(record *E) error {
 		if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 			return err
 		}
-		deleteVersion := nextVersion(r.meta.version.getI64(storedPtr))
-		if err := r.meta.appendDeltaLogs([]deltaLogWrite{{storedPtr: storedPtr, version: deleteVersion}}); err != nil {
+		landedWrites := []deltaLogWrite{{storedPtr: storedPtr, version: nextVersion(r.meta.version.getI64(storedPtr))}}
+		if err := r.meta.appendDeltaLogs(landedWrites); err != nil {
+			return err
+		}
+		if err := r.meta.syncTextSearch(landedWrites); err != nil {
 			return err
 		}
 	}

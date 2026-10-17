@@ -59,6 +59,18 @@ type Controller interface {
 	MaterializeDataFrames() error
 	// RebuildDataFrames computes a DataFrame ("" every one) again from the records.
 	RebuildDataFrames(frameName string) error
+	// The four below maintain the text index of an entity that declares TextSearch
+	// (textsearch.go); on any other entity they do nothing. A partition is given by
+	// one value per Partition column, as in TopN.
+
+	// ReindexTextSearch rebuilds one partition's index from its active records.
+	ReindexTextSearch(partitionValues ...any) error
+	// ReindexTextSearchAll runs ReindexTextSearch on every partition that has records.
+	ReindexTextSearchAll() error
+	// CompactTextSearch folds the partition's pending index writes, for backends with a write log.
+	CompactTextSearch(partitionValues ...any) error
+	// DropTextSearch empties the partition's index.
+	DropTextSearch(partitionValues ...any) error
 	// BackfillCreated gives crt to every stored record without one; one-off (backfill_created.go).
 	BackfillCreated(write bool) (int, []string, error)
 	// ReprocessRecordsAny runs transform (record is the *E) over every record and writes
@@ -91,9 +103,38 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 // rows), so sibling entities (and the internal sequence counters) in the shared
 // table are untouched. The by-IDs slots go too: a recreated record is stamped a
 // later Updated, so it can't match a value a client holds. The returned count
-// includes array index rows and GroupBy counters.
+// includes array index rows and GroupBy counters. With TextSearch synced on write, the
+// index of every partition it emptied is dropped too.
 // This is a destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
+	if err := r.meta.checkTextSearchBackend(); err != nil {
+		return 0, err
+	}
+	var emptiedPartitionsValues [][]uint64
+	if r.meta.syncsTextSearch() {
+		var err error
+		if emptiedPartitionsValues, err = r.storedPartitionsValues(); err != nil {
+			return 0, err
+		}
+	}
+	deleted, err := r.deleteItemsAll()
+	if err != nil {
+		return deleted, err
+	}
+	for _, values := range emptiedPartitionsValues {
+		partitionValues := make([]any, len(values))
+		for i, value := range values {
+			partitionValues[i] = value
+		}
+		if err := r.DropTextSearch(partitionValues...); err != nil {
+			return deleted, err
+		}
+	}
+	return deleted, nil
+}
+
+// deleteItemsAll deletes every base and hidden row of the entity.
+func (r *Repo[T, E]) deleteItemsAll() (int, error) {
 	client, err := Client()
 	if err != nil {
 		return 0, err

@@ -97,6 +97,9 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 // the Version they held. The new hidden rows go first, as in PutMany; a record that then loses leaves
 // them as extra rows, which every read re-checks and drops.
 func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedByKey map[string]storedRecord) ([]int, error) {
+	if err := r.meta.checkTextSearchBackend(); err != nil {
+		return nil, err
+	}
 	ptrs := make([]unsafe.Pointer, len(records))
 	expectedVersions := make([]int64, len(records))
 	items := make([]map[string]types.AttributeValue, len(records))
@@ -163,6 +166,9 @@ func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedBy
 		return nil, err
 	}
 	if err := r.meta.appendDeltaLogs(logWrites); err != nil {
+		return nil, err
+	}
+	if err := r.meta.syncTextSearch(logWrites); err != nil {
 		return nil, err
 	}
 	return lostIndexes, r.meta.setSlotsUpdated(writtenPtrs)
