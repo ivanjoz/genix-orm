@@ -1,12 +1,10 @@
 package dynamo
 
 import (
-	"encoding/json"
-	"fmt"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"os"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -42,97 +40,11 @@ func (t cachedItemTable) GetSchema() Schema {
 	}
 }
 
-// yearTickVectors is testdata/year_tick_vectors.json, which genix-ui's wire test reads too. Updated
-// values are SUnixTime.
-type yearTickVectors struct {
-	Cycles []struct {
-		Updated    int64  `json:"updated"`
-		CycleYear  int    `json:"cycleYear"`
-		CycleStart *int64 `json:"cycleStart"`
-	} `json:"cycles"`
-	WrittenTicks []struct {
-		Updated     int64  `json:"updated"`
-		Tick        uint32 `json:"tick"`
-		HeldUpdated int64  `json:"heldUpdated"`
-	} `json:"writtenTicks"`
-	Requests []struct {
-		Encoded string     `json:"encoded"`
-		Decoded [][3]int64 `json:"decoded"`
-	} `json:"requests"`
-}
-
-// readYearTickVectors loads the shared vectors.
-func readYearTickVectors(t *testing.T) yearTickVectors {
-	t.Helper()
-	content, err := os.ReadFile("testdata/year_tick_vectors.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var vectors yearTickVectors
-	if err := json.Unmarshal(content, &vectors); err != nil {
-		t.Fatal(err)
-	}
-	return vectors
-}
-
-func TestYearTickVectors(t *testing.T) {
-	vectors := readYearTickVectors(t)
-	for _, cycle := range vectors.Cycles {
-		if got := yearCycleOf(sUnixTimeToTime(cycle.Updated)); got != cycle.CycleYear {
-			t.Fatalf("Updated %d: cycle %d, want %d", cycle.Updated, got, cycle.CycleYear)
-		}
-		if cycle.CycleStart != nil && utils.SUnixTimeOf(cycleStartTime(cycle.CycleYear)) != *cycle.CycleStart {
-			t.Fatalf("cycle %d starts at %d, want %d", cycle.CycleYear, utils.SUnixTimeOf(cycleStartTime(cycle.CycleYear)), *cycle.CycleStart)
-		}
-	}
-	for _, written := range vectors.WrittenTicks {
-		cycleStart := utils.SUnixTimeOf(cycleStartTime(yearCycleOf(sUnixTimeToTime(written.Updated))))
-		tick := writtenYearTick(written.Updated, cycleStart)
-		if tick != written.Tick || yearTickToUpdated(tick, cycleStart) != written.HeldUpdated {
-			t.Fatalf("Updated %d: tick %d held as %d, want %d held as %d",
-				written.Updated, tick, yearTickToUpdated(tick, cycleStart), written.Tick, written.HeldUpdated)
-		}
-		if tick >= 1<<24 {
-			t.Fatalf("tick %d does not fit a uint24", tick)
-		}
-	}
-}
-
-func TestDecodeCachedIDsRequest(t *testing.T) {
-	for _, vector := range readYearTickVectors(t).Requests {
-		request, err := DecodeCachedIDsRequest(vector.Encoded)
-		if err != nil {
-			t.Fatalf("%s: %v", vector.Encoded, err)
-		}
-		var decoded [][3]int64
-		for _, cachedID := range request.IDs {
-			decoded = append(decoded, [3]int64{cachedID.Partition, cachedID.ID, int64(cachedID.YearTick)})
-		}
-		if request.CycleYear != 2024 || fmt.Sprint(decoded) != fmt.Sprint(vector.Decoded) {
-			t.Fatalf("%s: cycle %d, IDs %v; want 2024, %v", vector.Encoded, request.CycleYear, decoded, vector.Decoded)
-		}
-	}
-
-	for name, encoded := range map[string]string{
-		"empty":                "",
-		"not base64":           "GA==",
-		"truncated slot":       "5-3--FlZ",     // year, 1 partition, delta 0, 1 slot, then 2 of its 4 bytes
-		"IDs not ascending":    "5-3---76--",   // IDs 7 then delta 0
-		"count beyond payload": "5-3--6w6",     // 127 IDs announced, 1 sent
-		"trailing bytes":       "5-3---36--",   // one ID, then a stray byte
-		"slot tick 0":          "5-3--Fk-----", // slot 12 listed with tick 0
-	} {
-		if _, err := DecodeCachedIDsRequest(encoded); err == nil {
-			t.Fatalf("%s: %q decoded without an error", name, encoded)
-		}
-	}
-}
-
 func TestSlotFileWrites(t *testing.T) {
 	SetFileStore(utils.NewMemoryFileStore())
 	defer SetFileStore(nil)
 	items := NewRepo[cachedItemTable, cachedItem]()
-	cycleStart := int32(utils.SUnixTimeOf(cycleStartTime(2026)))
+	cycleStart := int32(utils.SUnixTimeOf(cache.CycleStartTime(2026)))
 
 	written := []cachedItem{
 		{StoreID: 7, ID: 300, Updated: cycleStart + 10_000}, // slot 44, tick 10002
@@ -150,13 +62,13 @@ func TestSlotFileWrites(t *testing.T) {
 	basePKOf := func(storeID int32) string {
 		return items.meta.pkValue(unsafe.Pointer(&cachedItem{StoreID: storeID}))
 	}
-	slotFile, _, err := readSlotFile(slotFileKey(2026, basePKOf(7)))
-	if err != nil || slotTickOf(slotFile, 44) != 10_002 || slotTickOf(slotFile, 1) != 2_002 || slotTickOf(slotFile, 2) != 0 {
+	slotFile, _, err := cache.ReadSlotFile(cache.SlotFileKey(2026, basePKOf(7)))
+	if err != nil || cache.SlotTickOf(slotFile, 44) != 10_002 || cache.SlotTickOf(slotFile, 1) != 2_002 || cache.SlotTickOf(slotFile, 2) != 0 {
 		t.Fatalf("store 7: slot 44 = %d, slot 1 = %d, slot 2 = %d, err %v; want 10002, 2002, 0",
-			slotTickOf(slotFile, 44), slotTickOf(slotFile, 1), slotTickOf(slotFile, 2), err)
+			cache.SlotTickOf(slotFile, 44), cache.SlotTickOf(slotFile, 1), cache.SlotTickOf(slotFile, 2), err)
 	}
-	lastCycleFile, _, _ := readSlotFile(slotFileKey(2025, basePKOf(8)))
-	if slotTickOf(lastCycleFile, 44) == 0 {
+	lastCycleFile, _, _ := cache.ReadSlotFile(cache.SlotFileKey(2025, basePKOf(8)))
+	if cache.SlotTickOf(lastCycleFile, 44) == 0 {
 		t.Fatal("a write stamped before the cycle start must land in the previous cycle's file")
 	}
 
@@ -165,28 +77,10 @@ func TestSlotFileWrites(t *testing.T) {
 	if err := items.meta.setSlotsUpdated([]unsafe.Pointer{unsafe.Pointer(&late)}); err != nil {
 		t.Fatal(err)
 	}
-	if slotFile, _, _ = readSlotFile(slotFileKey(2026, basePKOf(7))); slotTickOf(slotFile, 44) != 10_002 {
-		t.Fatalf("slot 44 = %d after a late write, want it kept at 10002", slotTickOf(slotFile, 44))
+	if slotFile, _, _ = cache.ReadSlotFile(cache.SlotFileKey(2026, basePKOf(7))); cache.SlotTickOf(slotFile, 44) != 10_002 {
+		t.Fatalf("slot 44 = %d after a late write, want it kept at 10002", cache.SlotTickOf(slotFile, 44))
 	}
 
-	// Concurrent writers of one file, each to its own slot: the conditional PUT keeps every one.
-	var waitGroup sync.WaitGroup
-	for slot := range 20 {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
-			if err := raiseSlotTicks("ids-cache/2026/concurrent", map[uint8]uint32{uint8(slot): uint32(slot) + 2}); err != nil {
-				t.Error(err)
-			}
-		}()
-	}
-	waitGroup.Wait()
-	slotFile, _, _ = readSlotFile("ids-cache/2026/concurrent")
-	for slot := range 20 {
-		if slotTickOf(slotFile, uint8(slot)) != uint32(slot)+2 {
-			t.Fatalf("slot %d = %d after concurrent writes, want %d", slot, slotTickOf(slotFile, uint8(slot)), slot+2)
-		}
-	}
 }
 
 type badCachedRecord struct {
@@ -299,20 +193,20 @@ func TestQueryCachedIDs(t *testing.T) {
 	allIDs := request(CachedID{Partition: 7, ID: firstID}, CachedID{Partition: 7, ID: firstID + 1},
 		CachedID{Partition: 7, ID: firstID + 256}, CachedID{Partition: 9, ID: firstID})
 
-	// A slot younger than slotTrustTicks is not trusted yet: the records come back with Updated 0.
+	// A slot younger than cache.SlotTrustTicks is not trusted yet: the records come back with Updated 0.
 	fetched, err := items.QueryCachedIDs(allIDs)
 	if err != nil || countRecords(fetched) != 4 || fetched[0].Records[0].Updated != 0 {
 		t.Fatalf("fresh read: got %d records, err %v; want 4 with Updated 0", countRecords(fetched), err)
 	}
 
 	// The reads below run as if the trust window had passed since every write: a tick is held as the
-	// end of its 2-second window, trusted slotTrustTicks after it.
+	// end of its 2-second window, trusted cache.SlotTrustTicks after it.
 	readAfterOverlap := func(request CachedIDsRequest) ([]CachedPartition[cachedItem], error) {
-		Now = func() time.Time { return time.Now().Add((slotTrustTicks + 2) * 2 * time.Second) }
+		Now = func() time.Time { return time.Now().Add((cache.SlotTrustTicks + 2) * 2 * time.Second) }
 		defer func() { Now = time.Now }()
 		return items.QueryCachedIDs(request)
 	}
-	cycleStart := utils.SUnixTimeOf(cycleStartTime(cycleYear))
+	cycleStart := utils.SUnixTimeOf(cache.CycleStartTime(cycleYear))
 
 	// Nothing held: every record comes back, grouped by partition, stamped with its slot's tick.
 	fetched, err = readAfterOverlap(allIDs)

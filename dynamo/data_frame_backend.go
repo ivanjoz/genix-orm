@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"time"
 	"unsafe"
 
@@ -39,7 +40,7 @@ type frameBackend[E any] struct {
 }
 
 func frameBackendOf[E any](meta *tableMeta) (*frameBackend[E], error) {
-	if fileStore == nil {
+	if cache.FileStore() == nil {
 		return nil, fmt.Errorf("db: %s has DataFrames and no file store holds their files: call SetFileStore at boot", meta.recordType.Name())
 	}
 	client, err := Client()
@@ -59,7 +60,7 @@ func (r *Repo[T, E]) MaterializeDataFrames() error {
 	if err != nil {
 		return err
 	}
-	return dataframe.Materialize(r.meta.frames, backend, fileStore, Now())
+	return dataframe.Materialize(r.meta.frames, backend, cache.FileStore(), Now())
 }
 
 // RebuildDataFrames computes the files of the frame frameName ("" every frame) again from the
@@ -72,7 +73,7 @@ func (r *Repo[T, E]) RebuildDataFrames(frameName string) error {
 	if err != nil {
 		return err
 	}
-	return dataframe.Rebuild(r.meta.frames, backend, fileStore, frameName, Now())
+	return dataframe.Rebuild(r.meta.frames, backend, cache.FileStore(), frameName, Now())
 }
 
 func (backend *frameBackend[E]) stateKey(frame *dataframe.Frame) map[string]types.AttributeValue {

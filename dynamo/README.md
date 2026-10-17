@@ -343,11 +343,13 @@ value, returning the previous one (genix's `SetCounterValue`). The next ID uses
 Requirements: the record/table must declare an integer field named `ID`; padding
 is `0..9`. Both are checked at compile time (`NewRepo` panics otherwise).
 
-## By-IDs cache (`cache_by_ids.go`)
+## By-IDs cache (`cache_by_ids.go`, protocol in `db/cache`)
 
 It answers "give me records [12, 87, 412] of partition 5" with only the ones
 that changed since the value the client holds, which is what genix-ui's
-cache-by-ids sends (the `cc` parameter, `DecodeCachedIDsRequest`).
+cache-by-ids sends (the `cc` parameter, `DecodeCachedIDsRequest`). The protocol
+(slot files, ticks, request) is `db/cache`'s, shared with the scylla driver;
+dynamo brings the base pk, the write hook and the BatchGetItem.
 
 ```go
 type Story struct {
@@ -404,7 +406,7 @@ changed, err := Stories.QueryCachedIDs(request) // []CachedPartition[Story]{{Par
 - **Wire format** (`DecodeCachedIDsRequest`), base64 (`utils.Base64`): `[cycle year − 2000: u8]`
   `[partition count: uvarint]`, then per partition, ascending: `[partition
   delta: uvarint] [slot count: uvarint] ([slot: u8][tick: u24 LE])* [ID count:
-  uvarint] [ID delta: uvarint]*`. `testdata/year_tick_vectors.json` pins it for
+  uvarint] [ID delta: uvarint]*`. `db/cache/testdata/year_tick_vectors.json` pins it for
   both sides (genix-ui's `cache-by-ids.wire.ts`).
 
 ## Managed fields (`delta.go`)
@@ -425,7 +427,7 @@ changed, err := Stories.QueryCachedIDs(request) // []CachedPartition[Story]{{Par
   `BackfillCreated(write)` (one-off, a Controller method).
 - **`cgl`**, only on a table with DataFrames: the changelog (see DataFrames).
 
-## Delta sync (`delta.go`, `delta_log.go`)
+## Delta sync (`delta.go`, `delta_log.go`; the log files and rules in `db/cache`)
 
 `Delta()` answers "the records written since the part of the change log I hold",
 which is what genix-ui's delta cache (`GetHandler`, `?up=<bucket>.<bytes>...`) asks.

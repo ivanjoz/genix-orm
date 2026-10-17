@@ -1,4 +1,4 @@
-package dynamo
+package cache
 
 import (
 	"encoding/binary"
@@ -23,7 +23,7 @@ import (
 //	             version, typically a bulk insert at version 1
 //
 // The scale is the table's: 32-bit when its log ID takes at most 32 bits. The
-// version is the record's Version folded into 13 bits (wireVersion). Every entry is
+// version is the record's Version folded into 13 bits (WireVersion). Every entry is
 // a whole number of bytes and an append writes whole entries, so a file is a plain
 // sequence of them.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,8 +47,8 @@ type DeltaLogEntry struct {
 	IsDeleted bool
 }
 
-// wireVersion folds a record's Version (1..32767) into an entry's 13 bits: 1..8191.
-func wireVersion(version int16) uint16 {
+// WireVersion folds a record's Version (1..32767) into an entry's 13 bits: 1..8191.
+func WireVersion(version int16) uint16 {
 	return uint16((int(version)-1)%deltaLogVersionModulo + 1)
 }
 
@@ -59,9 +59,9 @@ func scaleIndex(is64BitScale bool) int {
 	return 0
 }
 
-// encodeDeltaLogEntries packs the entries of one append. Entries sharing a version and a deleted flag
+// EncodeDeltaLogEntries packs the entries of one append. Entries sharing a version and a deleted flag
 // go as a group when that takes fewer bytes than one entry each.
-func encodeDeltaLogEntries(entries []DeltaLogEntry, is64BitScale bool) []byte {
+func EncodeDeltaLogEntries(entries []DeltaLogEntry, is64BitScale bool) []byte {
 	type groupKey struct {
 		version   uint16
 		isDeleted bool
@@ -135,8 +135,8 @@ func (writer *bitWriter) writeSingleEntry(entry DeltaLogEntry, is64BitScale bool
 	writer.write(uint64(entry.Version), deltaLogVersionBits)
 }
 
-// decodeDeltaLogEntries reads a file, or the part of it past a byte offset, entry by entry.
-func decodeDeltaLogEntries(content []byte, is64BitScale bool) ([]DeltaLogEntry, error) {
+// DecodeDeltaLogEntries reads a file, or the part of it past a byte offset, entry by entry.
+func DecodeDeltaLogEntries(content []byte, is64BitScale bool) ([]DeltaLogEntry, error) {
 	var entries []DeltaLogEntry
 	reader := bitReader{bytes: content}
 	for reader.position < len(content)*8 {
@@ -173,9 +173,9 @@ func decodeDeltaLogEntries(content []byte, is64BitScale bool) ([]DeltaLogEntry, 
 	return entries, nil
 }
 
-// packDeltaLogID packs the log ID columns of a record into one integer, the first column in the high
+// PackDeltaLogID packs the log ID columns of a record into one integer, the first column in the high
 // bits, each taking its Size.
-func packDeltaLogID(values []uint64, columnBits []int8) uint64 {
+func PackDeltaLogID(values []uint64, columnBits []int8) uint64 {
 	logID := uint64(0)
 	for i, value := range values {
 		logID = logID<<columnBits[i] | value
@@ -183,35 +183,35 @@ func packDeltaLogID(values []uint64, columnBits []int8) uint64 {
 	return logID
 }
 
-// unpackDeltaLogID is the inverse of packDeltaLogID.
-func unpackDeltaLogID(logID uint64, columnBits []int8) []uint64 {
+// UnpackDeltaLogID is the inverse of PackDeltaLogID.
+func UnpackDeltaLogID(logID uint64, columnBits []int8) []uint64 {
 	values := make([]uint64, len(columnBits))
 	for i := len(columnBits) - 1; i >= 0; i-- {
-		values[i] = logID & maxValueForBits(columnBits[i])
+		values[i] = logID & (^uint64(0) >> (64 - int(columnBits[i])))
 		logID >>= columnBits[i]
 	}
 	return values
 }
 
-// The flags of a Metadata record (deltaMetadataBytes).
+// The flags of a Metadata record (DeltaMetadataBytes).
 const (
-	deltaMetadataFlag64BitScale = 1 << 0
-	// deltaMetadataFlagReplace: the response holds every record of the view (a first sync, or a cursor
+	DeltaMetadataFlag64BitScale = 1 << 0
+	// DeltaMetadataFlagReplace: the response holds every record of the view (a first sync, or a cursor
 	// too far behind), so the browser drops the records it holds that the response doesn't.
-	deltaMetadataFlagReplace = 1 << 1
-	// deltaMetadataFlagSealed: no append reaches this file anymore. The browser applies it and forgets
+	DeltaMetadataFlagReplace = 1 << 1
+	// DeltaMetadataFlagSealed: no append reaches this file anymore. The browser applies it and forgets
 	// it, so it stops sending it in its cursor.
-	deltaMetadataFlagSealed = 1 << 2
+	DeltaMetadataFlagSealed = 1 << 2
 )
 
-// deltaMetadataBytes is the content of a Metadata record before Safe85:
+// DeltaMetadataBytes is the content of a Metadata record before Safe85:
 //
 //	[flags: u8][bucket: uvarint][log ID column count: u8][Size of each column: u8 …][the file's bytes]
 //
 // The bucket is the file's, also the record's negative ID; it travels here too so the browser reads it
 // whatever the table's key columns are. The column count is 0 when the log ID is a single column;
 // with several, the browser packs a cached record's columns with these Sizes to match it.
-func deltaMetadataBytes(flags byte, bucket int64, logIDColumnBits []int8, fileContent []byte) []byte {
+func DeltaMetadataBytes(flags byte, bucket int64, logIDColumnBits []int8, fileContent []byte) []byte {
 	metadata := binary.AppendUvarint([]byte{flags}, uint64(bucket))
 	if len(logIDColumnBits) > 1 {
 		metadata = append(metadata, byte(len(logIDColumnBits)))

@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/dataframe"
@@ -98,7 +99,7 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := dataframe.Read(q.meta.frames, q.frame, backend, fileStore, selection, q.isFresh)
+	rows, err := dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), selection, q.isFresh)
 	if err != nil {
 		return nil, err
 	}

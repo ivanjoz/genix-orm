@@ -3,6 +3,7 @@ package dynamo
 import (
 	"bytes"
 	"context"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"strings"
 	"unsafe"
 
@@ -152,7 +153,7 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 		var currentCyclePtrs []unsafe.Pointer
 		for i := range records {
 			ptr := unsafe.Pointer(&records[i])
-			if yearCycleOf(sUnixTimeToTime(m.updated.acc.getI64(ptr))) == currentCycle {
+			if cache.YearCycleOf(cache.SUnixTimeToTime(m.updated.acc.getI64(ptr))) == currentCycle {
 				currentCyclePtrs = append(currentCyclePtrs, ptr)
 			}
 		}

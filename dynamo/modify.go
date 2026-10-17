@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"maps"
 	"strings"
 	"time"
@@ -110,7 +111,7 @@ func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedBy
 	for i := range records {
 		ptrs[i] = unsafe.Pointer(&records[i])
 		expectedVersions[i] = r.meta.version.getI64(ptrs[i])
-		r.meta.version.setI64(ptrs[i], nextVersion(expectedVersions[i]))
+		r.meta.version.setI64(ptrs[i], cache.NextVersion(expectedVersions[i]))
 		var err error
 		if items[i], err = r.meta.marshalItem(ptrs[i], &records[i]); err != nil {
 			return nil, err

@@ -2,7 +2,7 @@ package dynamo
 
 import (
 	"bytes"
-	"context"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"slices"
 	"strings"
 	"testing"
@@ -78,9 +78,9 @@ func (t deltaVisitTable) GetSchema() Schema {
 // memory file store, both restored after the test.
 func withDeltaClock(t *testing.T) *utils.MemoryFileStore {
 	t.Helper()
-	originalNow, originalStore := Now, fileStore
-	t.Cleanup(func() { Now, fileStore = originalNow, originalStore })
-	Now = func() time.Time { return sUnixTimeToTime(1_500_010) }
+	originalNow, originalStore := Now, cache.FileStore()
+	t.Cleanup(func() { Now = originalNow; cache.SetFileStore(originalStore) })
+	Now = func() time.Time { return cache.SUnixTimeToTime(1_500_010) }
 	store := utils.NewMemoryFileStore()
 	SetFileStore(store)
 	return store
@@ -92,7 +92,7 @@ func readDeltaLogFile(t *testing.T, store *utils.MemoryFileStore, fileKey string
 	if err != nil {
 		t.Fatalf("%s: %v", fileKey, err)
 	}
-	entries, err := decodeDeltaLogEntries(content, is64BitScale)
+	entries, err := cache.DecodeDeltaLogEntries(content, is64BitScale)
 	if err != nil {
 		t.Fatalf("%s: %v", fileKey, err)
 	}
@@ -255,7 +255,7 @@ func TestAppendDeltaLogsFollowsTheRecordAcrossFolders(t *testing.T) {
 		}
 	}
 
-	folder := deltaLogFolder + meta.pkValue(unsafe.Pointer(&created)) + "/"
+	folder := cache.DeltaLogFolder + meta.pkValue(unsafe.Pointer(&created)) + "/"
 	expectedEntriesByFile := map[string][]DeltaLogEntry{
 		"003/5000":       {{LogID: 7, Version: 1}, {LogID: 7, Version: 2}, {LogID: 7, Version: 3, IsDeleted: true}},
 		"002-003/1/5000": {{LogID: 7, Version: 1}, {LogID: 7, Version: 2, IsDeleted: true}},
@@ -267,7 +267,7 @@ func TestAppendDeltaLogsFollowsTheRecordAcrossFolders(t *testing.T) {
 			t.Errorf("%s = %+v, want %+v", file, entries, expectedEntries)
 		}
 	}
-	if fileKeys, _ := store.ListFiles(deltaLogFolder); len(fileKeys) != len(expectedEntriesByFile) {
+	if fileKeys, _ := store.ListFiles(cache.DeltaLogFolder); len(fileKeys) != len(expectedEntriesByFile) {
 		t.Errorf("files = %v, want only %d", fileKeys, len(expectedEntriesByFile))
 	}
 }
@@ -284,7 +284,7 @@ func TestAppendDeltaLogsKeepsTheLastWriteOfARecordInOneCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries := readDeltaLogFile(t, store, deltaLogFolder+meta.pkValue(unsafe.Pointer(&first))+"/003/5000", false)
+	entries := readDeltaLogFile(t, store, cache.DeltaLogFolder+meta.pkValue(unsafe.Pointer(&first))+"/003/5000", false)
 	if want := []DeltaLogEntry{{LogID: 7, Version: 5, IsDeleted: true}, {LogID: 8, Version: 1}}; !slices.Equal(entries, want) {
 		t.Fatalf("entries = %+v, want %+v", entries, want)
 	}
@@ -297,22 +297,22 @@ func TestAppendDeltaLogsPacksACompositeLogID(t *testing.T) {
 	if err := meta.appendDeltaLogs([]deltaLogWrite{{writtenPtr: unsafe.Pointer(&visit), version: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	folder := deltaLogFolder + meta.pkValue(unsafe.Pointer(&visit)) + "/"
-	packedLogID := packDeltaLogID([]uint64{20_000, 41}, []int8{16, 32})
+	folder := cache.DeltaLogFolder + meta.pkValue(unsafe.Pointer(&visit)) + "/"
+	packedLogID := cache.PackDeltaLogID([]uint64{20_000, 41}, []int8{16, 32})
 	if entries := readDeltaLogFile(t, store, folder+"003-004/9/5000", true); len(entries) != 1 || entries[0].LogID != packedLogID {
 		t.Fatalf("creator log = %+v, want log ID %d", entries, packedLogID)
 	}
 	if entries := readDeltaLogFile(t, store, folder+"001-004/20000/5000", false); len(entries) != 1 || entries[0].LogID != 41 {
 		t.Fatalf("date log = %+v, want log ID 41", entries)
 	}
-	if unpacked := unpackDeltaLogID(packedLogID, []int8{16, 32}); !slices.Equal(unpacked, []uint64{20_000, 41}) {
+	if unpacked := cache.UnpackDeltaLogID(packedLogID, []int8{16, 32}); !slices.Equal(unpacked, []uint64{20_000, 41}) {
 		t.Fatalf("unpacked = %v", unpacked)
 	}
 }
 
 func TestAppendDeltaLogsNeedsAFileStore(t *testing.T) {
 	withDeltaClock(t)
-	fileStore = nil
+	cache.SetFileStore(nil)
 	meta := NewRepo[deltaMemberTable, deltaMember]().meta
 	member := deltaMember{ID: 7, Status: 1}
 	if err := meta.appendDeltaLogs([]deltaLogWrite{{writtenPtr: unsafe.Pointer(&member), version: 1}}); err == nil ||
@@ -322,35 +322,6 @@ func TestAppendDeltaLogsNeedsAFileStore(t *testing.T) {
 }
 
 // ── Read side ────────────────────────────────────────────────────────────────
-
-func TestDeltaBucketsAndSealing(t *testing.T) {
-	if bucket := deltaBucketOf(sUnixTimeToTime(1_500_299)); bucket != 5000 {
-		t.Fatalf("bucket = %d, want 5000", bucket)
-	}
-	bucketEnd := sUnixTimeToTime(1_500_300)
-	if isDeltaBucketSealed(5000, bucketEnd.Add(deltaBucketSealDelay-time.Second)) {
-		t.Error("a bucket still takes appends until deltaBucketSealDelay after its end")
-	}
-	if !isDeltaBucketSealed(5000, bucketEnd.Add(deltaBucketSealDelay)) {
-		t.Error("a bucket is sealed deltaBucketSealDelay after its end")
-	}
-}
-
-func TestDeltaLogFilesAreListedAndReadByBucket(t *testing.T) {
-	store := withDeltaClock(t)
-	folder := deltaLogFolder + "1/003/"
-	for _, fileKey := range []string{folder + "4998", folder + "5000", folder + "4990", deltaLogFolder + "1/002-003/1/4999"} {
-		store.PutFileIfMatch(context.Background(), fileKey, []byte{byte(len(fileKey))}, "")
-	}
-	buckets, err := listDeltaLogBuckets(folder, 4995)
-	if slices.Sort(buckets); err != nil || !slices.Equal(buckets, []int64{4998, 5000}) {
-		t.Fatalf("buckets = %v, err %v; want [4998 5000]", buckets, err)
-	}
-	contents, err := readDeltaLogFiles(folder, []int64{4998, 4999})
-	if err != nil || len(contents[0]) != 1 || contents[1] != nil {
-		t.Fatalf("contents = %v, err %v; want the 4998 file and an empty 4999", contents, err)
-	}
-}
 
 func TestDeltaIndexSelection(t *testing.T) {
 	members := NewRepo[deltaMemberTable, deltaMember]()
@@ -378,20 +349,16 @@ func TestDeltaMetadataRecords(t *testing.T) {
 	visits := NewRepo[deltaVisitTable, deltaVisit]()
 	query := visits.Query().Eq(visits.T.CreatedBy, 9).Delta(DeltaCursor{5000: 3}, 1)
 	content := []byte{1, 2, 3}
-	record := query.deltaMetadataRecord(5000, deltaMetadataFlag64BitScale|deltaMetadataFlagSealed, content)
+	metadataText := utils.EncodeSafe85(cache.DeltaMetadataBytes(cache.DeltaMetadataFlag64BitScale|cache.DeltaMetadataFlagSealed, 5000, []int8{16, 32}, content))
+	record := query.deltaMetadataRecord(cache.DeltaMetadataFile{Bucket: 5000, Text: metadataText})
 	// −bucket goes in the log ID's last column; the rest of the key stays zero.
 	if record.ID != -5000 || record.Date != 0 || record.Metadata == nil {
 		t.Fatalf("record = %+v", record)
 	}
 	decoded, err := utils.DecodeSafe85(*record.Metadata)
-	want := deltaMetadataBytes(deltaMetadataFlag64BitScale|deltaMetadataFlagSealed, 5000, []int8{16, 32}, content)
+	want := cache.DeltaMetadataBytes(cache.DeltaMetadataFlag64BitScale|cache.DeltaMetadataFlagSealed, 5000, []int8{16, 32}, content)
 	if err != nil || !bytes.Equal(decoded, want) {
 		t.Fatalf("metadata = %v, err %v; want %v", decoded, err, want)
-	}
-
-	replace, err := utils.DecodeSafe85(DeltaReplaceMetadata())
-	if err != nil || !bytes.Equal(replace, deltaMetadataBytes(deltaMetadataFlagReplace|deltaMetadataFlagSealed, 0, nil, nil)) {
-		t.Fatalf("replace metadata = %v, err %v", replace, err)
 	}
 }
 

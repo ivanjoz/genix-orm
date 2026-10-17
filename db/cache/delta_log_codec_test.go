@@ -1,4 +1,4 @@
-package dynamo
+package cache
 
 import (
 	"encoding/hex"
@@ -57,13 +57,13 @@ func TestDeltaLogEntriesMatchTheSharedVectors(t *testing.T) {
 		for i, entry := range vector.Entries {
 			entries[i] = DeltaLogEntry{LogID: entry.LogID, Version: entry.Version, IsDeleted: entry.IsDeleted}
 		}
-		encoded := hex.EncodeToString(encodeDeltaLogEntries(entries, vector.Is64BitScale))
+		encoded := hex.EncodeToString(EncodeDeltaLogEntries(entries, vector.Is64BitScale))
 		if encoded != vector.Hex {
 			t.Errorf("%s: encodes to %s, want %s", vector.Name, encoded, vector.Hex)
 			continue
 		}
 		content, _ := hex.DecodeString(vector.Hex)
-		decoded, err := decodeDeltaLogEntries(content, vector.Is64BitScale)
+		decoded, err := DecodeDeltaLogEntries(content, vector.Is64BitScale)
 		if err != nil {
 			t.Errorf("%s: %v", vector.Name, err)
 			continue
@@ -83,21 +83,21 @@ func TestDeltaLogEntriesMatchTheSharedVectors(t *testing.T) {
 func TestDeltaLogWireVersionsLogIDsAndMetadataMatchTheSharedVectors(t *testing.T) {
 	vectors := readDeltaLogVectors(t)
 	for _, versionPair := range vectors.WireVersions {
-		if got := wireVersion(int16(versionPair[0])); int(got) != versionPair[1] {
-			t.Errorf("wireVersion(%d) = %d, want %d", versionPair[0], got, versionPair[1])
+		if got := WireVersion(int16(versionPair[0])); int(got) != versionPair[1] {
+			t.Errorf("WireVersion(%d) = %d, want %d", versionPair[0], got, versionPair[1])
 		}
 	}
 	for _, vector := range vectors.LogIDs {
-		if got := packDeltaLogID(vector.Values, vector.ColumnBits); got != vector.LogID {
-			t.Errorf("packDeltaLogID(%v, %v) = %d, want %d", vector.Values, vector.ColumnBits, got, vector.LogID)
+		if got := PackDeltaLogID(vector.Values, vector.ColumnBits); got != vector.LogID {
+			t.Errorf("PackDeltaLogID(%v, %v) = %d, want %d", vector.Values, vector.ColumnBits, got, vector.LogID)
 		}
-		if got := unpackDeltaLogID(vector.LogID, vector.ColumnBits); !slices.Equal(got, vector.Values) {
-			t.Errorf("unpackDeltaLogID(%d, %v) = %v, want %v", vector.LogID, vector.ColumnBits, got, vector.Values)
+		if got := UnpackDeltaLogID(vector.LogID, vector.ColumnBits); !slices.Equal(got, vector.Values) {
+			t.Errorf("UnpackDeltaLogID(%d, %v) = %v, want %v", vector.LogID, vector.ColumnBits, got, vector.Values)
 		}
 	}
 	for _, vector := range vectors.Metadata {
 		fileContent, _ := hex.DecodeString(vector.FileHex)
-		if got := utils.EncodeSafe85(deltaMetadataBytes(vector.Flags, vector.Bucket, vector.ColumnBits, fileContent)); got != vector.Safe85 {
+		if got := utils.EncodeSafe85(DeltaMetadataBytes(vector.Flags, vector.Bucket, vector.ColumnBits, fileContent)); got != vector.Safe85 {
 			t.Errorf("metadata %+v encodes to %q, want %q", vector, got, vector.Safe85)
 		}
 	}
@@ -111,7 +111,7 @@ func TestDecodeDeltaLogEntriesRejectsDamage(t *testing.T) {
 		"c0010305", // a group of 3 holding 1 ID
 	} {
 		content, _ := hex.DecodeString(damagedHex)
-		if entries, err := decodeDeltaLogEntries(content, false); err == nil {
+		if entries, err := DecodeDeltaLogEntries(content, false); err == nil {
 			t.Errorf("%s decoded to %+v", damagedHex, entries)
 		}
 	}

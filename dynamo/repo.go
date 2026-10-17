@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"maps"
 	"slices"
 	"strconv"
@@ -248,11 +249,11 @@ func (r *Repo[T, E]) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.P
 }
 
 // putItemRaisingVersion writes item with one UpdateItem that SETs every attribute and raises "ver"
-// inside DynamoDB: 1 for a new item, one above the stored one, and 1 again after maxVersion, where the
+// inside DynamoDB: 1 for a new item, one above the stored one, and 1 again after cache.MaxVersion, where the
 // conditional raise fails and the write is issued again starting over. It returns the Version written.
 func putItemRaisingVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue) (int64, error) {
 	names := map[string]string{"#ver": versionColumn}
-	values := map[string]types.AttributeValue{":one": numberAttr(1), ":zero": numberAttr(0), ":max": numberAttr(maxVersion)}
+	values := map[string]types.AttributeValue{":one": numberAttr(1), ":zero": numberAttr(0), ":max": numberAttr(cache.MaxVersion)}
 	setClauses := setClausesOf(item, names, values)
 	input := &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
@@ -465,7 +466,7 @@ func (r *Repo[T, E]) Delete(record *E) error {
 		if err := r.meta.applyGroupCounterDeltas(client, groupDeltas); err != nil {
 			return err
 		}
-		landedWrites := []deltaLogWrite{{storedPtr: storedPtr, version: nextVersion(r.meta.version.getI64(storedPtr))}}
+		landedWrites := []deltaLogWrite{{storedPtr: storedPtr, version: cache.NextVersion(r.meta.version.getI64(storedPtr))}}
 		if err := r.meta.appendDeltaLogs(landedWrites); err != nil {
 			return err
 		}

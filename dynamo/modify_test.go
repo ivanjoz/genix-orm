@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"testing"
 	"unsafe"
 
@@ -57,9 +58,9 @@ func TestItemsCarryTheirVersionOutsideTheBlob(t *testing.T) {
 
 // A write raises Version by one and starts over at 1 after the highest.
 func TestNextVersionWrapsAfterTheHighest(t *testing.T) {
-	for stored, want := range map[int64]int64{0: 1, 1: 2, maxVersion - 1: maxVersion, maxVersion: 1} {
-		if got := nextVersion(stored); got != want {
-			t.Fatalf("nextVersion(%d) = %d, want %d", stored, got, want)
+	for stored, want := range map[int64]int64{0: 1, 1: 2, cache.MaxVersion - 1: cache.MaxVersion, cache.MaxVersion: 1} {
+		if got := cache.NextVersion(stored); got != want {
+			t.Fatalf("cache.NextVersion(%d) = %d, want %d", stored, got, want)
 		}
 	}
 }

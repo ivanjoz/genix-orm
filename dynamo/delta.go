@@ -2,10 +2,9 @@ package dynamo
 
 import (
 	"fmt"
-	"net/url"
+	"github.com/ivanjoz/genix-orm/db/cache"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -49,25 +48,12 @@ const (
 	metadataFieldName = "Metadata"
 	// versionColumn is the item attribute holding Version.
 	versionColumn = "ver"
-	// maxVersion is the highest Version: the write after it stores 1 again.
-	maxVersion = 32767
 	// maxPackedLogIDBits keeps a packed log ID an exact JS number.
 	maxPackedLogIDBits = 53
 )
 
 // Now is the ORM's clock. An app with its own clock assigns it once at boot.
 var Now = time.Now
-
-// sUnixTimeToTime turns an SUnixTime back into the start of its 2-second tick.
-func sUnixTimeToTime(sUnixTime int64) time.Time { return time.Unix(sUnixTime*2+1e9, 0) }
-
-// nextVersion is the Version of the write after the one stored at version (0: nothing stored).
-func nextVersion(version int64) int64 {
-	if version >= maxVersion {
-		return 1
-	}
-	return version + 1
-}
 
 // resolveVersion validates the record's managed Version field: every table needs an int16 one.
 func resolveVersion(recordType reflect.Type, accessors map[string]*colAccessor) *colAccessor {
@@ -231,20 +217,7 @@ func (deltaIndex *deltaIndexMeta) logIDOf(ptr unsafe.Pointer) uint64 {
 	if len(values) == 1 {
 		return values[0]
 	}
-	return packDeltaLogID(values, deltaIndex.logIDColumnBits)
-}
-
-// pinnedValueText is one pinned value as a log folder name.
-func pinnedValueText(value any) string {
-	reflected := reflect.ValueOf(value)
-	switch {
-	case reflected.CanInt():
-		return strconv.FormatInt(reflected.Int(), 10)
-	case reflected.CanUint():
-		return strconv.FormatUint(reflected.Uint(), 10)
-	default:
-		return url.PathEscape(fmt.Sprint(value))
-	}
+	return cache.PackDeltaLogID(values, deltaIndex.logIDColumnBits)
 }
 
 // pinnedFolders lists the log folders, under the index's, the record at ptr is in: one per value
@@ -267,7 +240,7 @@ func (m *tableMeta) pinnedFolders(deltaIndex *deltaIndexMeta, ptr unsafe.Pointer
 		var nextFolders []string
 		for _, folder := range folders {
 			for _, value := range values {
-				nextFolders = append(nextFolders, folder+pinnedValueText(value.Interface())+"/")
+				nextFolders = append(nextFolders, folder+cache.PinnedValueText(value.Interface())+"/")
 			}
 		}
 		folders = nextFolders
@@ -276,9 +249,8 @@ func (m *tableMeta) pinnedFolders(deltaIndex *deltaIndexMeta, ptr unsafe.Pointer
 	return slices.Compact(folders)
 }
 
-// DeltaCursor is what a client holds of a delta index's log: per log file still open (its 10-minute
-// bucket), how many of its bytes it applied. Empty on a first sync.
-type DeltaCursor map[int64]int
+// DeltaCursor is what a client holds of a delta index's log (db/cache).
+type DeltaCursor = cache.DeltaCursor
 
 // Delta turns the query into a delta-cache read (delta_log.go). A first sync (an empty cursor) lists
 // the view, with syncFilterValues filtering its sync filter column; a later one reads the log past
