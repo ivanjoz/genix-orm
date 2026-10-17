@@ -120,9 +120,11 @@ A violation makes `NewRepo` panic at boot:
 - **The managed `Version`:** every record declares `Version int16 json:"ver,omitempty" cb:"-"`. It
   lives outside the blob, as the item attribute `ver`: every write raises it by one (wrapping at
   32767), inside DynamoDB when the write reads nothing. `Modify`/`PutManyIfVersion` compare it.
-- **The managed `Updated`** (optional; required by `CacheByIDs`): an `int32` field named `Updated`
-  (`json:"upd"`), in the record and the table struct. Every write stamps it with the write's
-  **SUnixTime** (`(unix − 1e9) / 2`, 2-second ticks). Never set it yourself.
+- **The managed `Updated`** (optional; required by `CacheByIDs` and DataFrames): an `int32` field
+  named `Updated` (`json:"upd"`), in the record and the table struct. Every write stamps it with the
+  write's **SUnixTime** (`(unix − 1e9) / 2`, 2-second ticks). Never set it yourself.
+- **The managed `crt`:** every item carries its creation (a SUnixTime) as the attribute `crt`, with
+  no struct field: the ORM writes it on insert and keeps it on every later write.
 - **`CacheByIDs`** needs exactly one integer `Keys` column and the `Updated`. See section 3b.
 - **Delta indexes** (`{Type: TypeDelta, Keys: ...}`) need `Metadata *string json:"mdt,omitempty"
   cb:"-"` in the record, a `cb` tag on their first Key, and integer unpinned Keys within 53 bits
@@ -372,6 +374,43 @@ groups[0].Key.Status; groups[0].Count; groups[0].Sum(Orders.T.Total); groups[0].
   longer declared.
 - Every write pays one `UpdateItem` per touched group (merged over the call), and a hot group is a
   hot item.
+
+## 3e. DataFrames (`Schema.DataFrames`, `QueryFrame`)
+
+Use it for "a table of totals per row" (per employee, per product) of one group (a year and a
+program, a day): one columnar file in the FileStore per value of the Keys, read in one GET, instead
+of one counter per row.
+
+```go
+// schema: 1–3 integer Keys, an integer Rows, integer or float Sums and/or Count; cb tags 1..255;
+// no Partition; Updated and a GSI on it, which the runs read the recent writes through:
+{Slot: dynamo.G2, Keys: dynamo.Cols(t.Updated.Size(32))},
+DataFrames: []dynamo.DataFrame{
+    {Name: "enrollment-report", Keys: dynamo.Cols(t.Year, t.ProgramID), Rows: t.EmployeeID,
+        Sums: dynamo.Cols(t.RecordedMinutes, t.Points)},
+},
+
+rows, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).Exec()
+rows[0].Key.ProgramID; rows[0].Key.EmployeeID; rows[0].Sum(Enrollments.T.Points) // SumFloat, Count()
+Enrollments.QueryFrame("enrollment-report").Between(Enrollments.T.Year, 2025, 2026).Eq(Enrollments.T.ProgramID, 3).Fresh().Exec()
+```
+
+- **Freshness:** every item keeps, in its own attribute `cgl`, the values its frame fields held
+  before each change of the last ~36 h. A run every 10 minutes (berryapps: the `frames-materialize`
+  cron job, `core/frames`) reads the records written since its snapshot through the Updated GSI and
+  moves them in the files up to now − 2 min. `Exec` is 2 to 12 minutes behind; `Fresh()` also moves
+  the records written since, exact for landed writes.
+- **No hard deletes:** `Delete` fails on a table with frames; set `Status` to 0.
+- **Selection:** Keys[0] takes an Eq or a Between (≤ 400 values); later Keys an Eq on a leading run,
+  or nothing (the folder is listed). Rows come sorted by Keys, then Rows; a row whose sums are all 0
+  is left out.
+- **Not built yet:** right after a deploy that adds a frame or changes its columns, reads fail with
+  `ErrFrameNotBuilt` until the next run builds it. Handle it.
+- **Rebuild** (the fix for drift, and after a `ReprocessRecords`, whose writes keep `Updated`):
+  `Repo.RebuildDataFrames("")` or `Reprocess(true)`; berryapps: `fn-db rebuild-frames`.
+- Negative Keys or Rows values fail the write. Like GroupBy, frames are exact for
+  `Modify`/`PutManyIfVersion`/`PutMany` and drift on racing plain Puts and `InsertMany` of a stored
+  record.
 
 ## 4. Pitfalls
 

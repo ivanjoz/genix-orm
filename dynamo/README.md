@@ -401,7 +401,7 @@ changed, err := Stories.QueryCachedIDs(request) // []CachedPartition[Story]{{Par
 - A write refetches the whole slot (IDs 256 apart, in that partition). The
   client sends one tick per slot, the lowest it holds, so a slot whose records
   disagree is read whole once and then agrees.
-- **Wire format** (`DecodeCachedIDsRequest`), base64url: `[cycle year − 2000: u8]`
+- **Wire format** (`DecodeCachedIDsRequest`), base64 (`utils.Base64`): `[cycle year − 2000: u8]`
   `[partition count: uvarint]`, then per partition, ascending: `[partition
   delta: uvarint] [slot count: uvarint] ([slot: u8][tick: u24 LE])* [ID count:
   uvarint] [ID delta: uvarint]*`. `testdata/year_tick_vectors.json` pins it for
@@ -415,9 +415,15 @@ changed, err := Stories.QueryCachedIDs(request) // []CachedPartition[Story]{{Par
   it inside DynamoDB (`SET ver = if_not_exists(ver, 0) + 1`), reading nothing; the
   others read the stored version and write conditioned on it. `InsertMany` and
   `PutIfAbsent` write version 1. The client compares versions by equality.
-- **`Updated int32 json:"upd"`**, optional (required with `CacheByIDs`): the
-  write time as a **SUnixTime** (`(unix − 1e9) / 2`, 2-second ticks), stamped on
-  every write from `dynamo.Now`. Never set it yourself.
+- **`Updated int32 json:"upd"`**, optional (required with `CacheByIDs` and
+  DataFrames): the write time as a **SUnixTime** (`(unix − 1e9) / 2`, 2-second
+  ticks), stamped on every write from `dynamo.Now`. Never set it yourself.
+- **`crt`**, on every item, no struct field: the record's creation, a SUnixTime
+  (its first `Updated`; the clock on a table without one). An insert writes it; a
+  write over a stored item keeps the stored one (`if_not_exists`); reprocessing
+  copies it. Records stored before the ORM managed it get it from
+  `BackfillCreated(write)` (one-off, a Controller method).
+- **`cgl`**, only on a table with DataFrames: the changelog (see DataFrames).
 
 ## Delta sync (`delta.go`, `delta_log.go`)
 
@@ -528,6 +534,66 @@ d    = a record holding only the group Keys (Group.Key)
   recomputes the counters, rewrites only those that differ and deletes the non-zero
   ones no record produces. It is the backfill after adding a GroupBy, a column or
   changing its Keys, and the cleanup after removing one.
+
+## DataFrames (`data_frame.go`, `data_frame_backend.go`, `data_frame_query.go`)
+
+A DataFrame is a group-by aggregate of a table kept as columnar files in the
+FileStore (S3 Express, or a general purpose bucket in compatibility mode): one
+file per value of its Keys, one row per value of its Rows column, with the Sums
+of the records that hold it. Where a GroupBy keeps one counter per group, a frame
+keeps a whole table of rows per file, read in one GET.
+
+```go
+DataFrames: []dynamo.DataFrame{
+    {Name: "enrollment-report", Keys: dynamo.Cols(t.Year, t.ProgramID), Rows: t.EmployeeID,
+        Sums: dynamo.Cols(t.RecordedMinutes, t.Points)},             // Count: true adds a record count
+},
+
+rows, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).Exec()
+rows[0].Key.ProgramID; rows[0].Key.EmployeeID; rows[0].Sum(Enrollments.T.Points)
+rows, err = Enrollments.QueryFrame("enrollment-report").Between(Enrollments.T.Year, 2025, 2026).
+    Eq(Enrollments.T.ProgramID, 3).Fresh().Exec()                     // as the records are now
+```
+
+```text
+dtf/<TableID>/<frame>/<generation>/<k1>            a 1-key frame's file
+dtf/<TableID>/<frame>/<generation>/<k1>/<k2>_<k3>  a 2–3-key frame's file
+state item: pk = base pk ‖ 000, sk = "f" + name: gen, sh (shape), w (snapshot, a SUnixTime), lk/lid (lock)
+```
+
+- **Declaring:** 1–3 Keys and Rows (integer `Col`s), and Sums (integer or float
+  `Col`s, floats kept as `round(v × 10⁶)`) or `Count`, every column with a `cb`
+  tag in 1..255. The table needs `Updated` and a GSI whose Keys start with it
+  (`{Slot: G2, Keys: Cols(t.Updated.Size(32))}`), and no Partition. A negative
+  Keys or Rows value fails the write before it lands. `Delete` fails: a record
+  leaves the frames with `Status` 0.
+- **The logic lives in the dataframe module** (`../dataframe`, explained in
+  [`DATAFRAMES.md`](../dataframe/DATAFRAMES.md)): the changelog, the file codec,
+  the runs, the rebuilds and the reads. dynamo is its backend: it compiles the
+  frames from the schema, writes every item's `crt` and `cgl` (the changelog, a
+  Binary attribute beside `d` and `ver`: what the frame fields held before each
+  change of the last ~36 h), keeps the state item and the lock, and reads the
+  records written since a snapshot through the GSI on `Updated`. A table with
+  frames reads the stored version of every write, as for GroupBy, to compute the
+  next `cgl`; the write is the one item.
+- **Run** (`MaterializeDataFrames`, every 10 minutes): moves the files to now − 2
+  minutes, from the records the GSI returns past the snapshot `w`; rebuilds a
+  frame not built in its shape or too far behind. A crashed run is finished by
+  the next one.
+- **Reads:** `Exec` returns the files as the last run left them, 2 to 12 minutes
+  behind; `Fresh()` also moves the records written since `w` to their current
+  values. Keys[0] takes an Eq or a Between (at most 400 values); the later Keys an
+  Eq on a leading run, or nothing: then the folder of each Keys[0] value is
+  listed. Before the first run builds the frame, a read fails with
+  `ErrFrameNotBuilt`.
+- **Rebuild** (`RebuildDataFrames(name)`, `""` every frame; also `Reprocess(true)`):
+  sums what every record held at now − 2 minutes into a new generation, exact
+  whatever writes land meanwhile.
+- **Best-effort, like GroupBy:** two plain Puts racing on one record compute their
+  changelog from the same read, an `InsertMany` of a stored record drops its
+  changelog, a `ReprocessRecords` writes without moving `Updated`, and Lambdas on
+  code without the frame write no changelog: each drifts a frame until
+  `RebuildDataFrames`. `Modify`/`PutManyIfVersion` are exact.
 
 ## Optimistic concurrency: `PutManyIfVersion`, `Modify` (`modify.go`)
 
@@ -878,8 +944,9 @@ by-IDs slots and entity controllers are kept/ported — see above.)
 
 - Table name from `dynamo.TableName` (set at startup); falls back to the
   `DYNAMO_TABLE` environment variable, then `demo-app`.
-- `dynamo.SetFileStore(store)` once at startup, before the first write: where the
-  by-IDs slot files and the delta logs live (`NewMemoryFileStore()` for tests).
+- `dynamo.SetFileStore(store)` once at startup, before the first write: the `utils.FileStore`
+  where the by-IDs slot files, the delta logs and the DataFrames live
+  (`utils.NewMemoryFileStore()` for tests).
 - Client uses the standard AWS chain; set `DYNAMO_ENDPOINT` for a local DynamoDB.
   `ClientOptions` customize the client before its first call: an `HTTPClient`
   whose transport tunnels each request elsewhere (through a proxy that signs it)

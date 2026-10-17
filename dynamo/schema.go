@@ -235,6 +235,10 @@ type Schema struct {
 	// Indexes are the secondary access paths: GSI slots (G1..G10), fan-out
 	// indexes over a slice field, delta indexes and GroupBy counters (see Index).
 	Indexes []Index
+	// DataFrames are group-by aggregates of the entity kept as files in the utils.FileStore
+	// (data_frame.go), read with Repo.QueryFrame. The entity takes no Partition, and needs Updated
+	// and a GSI whose Keys start with it.
+	DataFrames []DataFrame
 
 	// UseAutoincrement makes the ORM assign the record's integer "ID" field
 	// automatically on Put/PutMany when it is still zero. IDs come from a
@@ -252,7 +256,7 @@ type Schema struct {
 
 	// CacheByIDs enables the by-IDs cache (cache_by_ids.go): every write raises the
 	// record's slot to the year tick of its Updated, in a slot file per partition
-	// (in the FileStore, file_store.go), and Repo.QueryCachedIDs returns only the requested records
+	// (in the utils.FileStore, file_store.go), and Repo.QueryCachedIDs returns only the requested records
 	// whose slot moved since the tick the client holds. It needs exactly one integer
 	// Keys column (the ID), at most one Partition column, and the managed int32
 	// "Updated" field (see delta.go), which a by-IDs read overwrites with the slot's.
@@ -320,7 +324,7 @@ var (
 //     Put/PutMany/PutIfAbsent/Delete (see array_index.go); a scalar column in
 //     Keys that changes on a write rewrites every element row.
 //   - A delta index: Type is TypeDelta (see delta.go): a change log in the
-//     FileStore, plus hidden rows when a pinned Key is not a base key column.
+//     utils.FileStore, plus hidden rows when a pinned Key is not a base key column.
 //   - A local index: Type is TypeLocal (see local_index.go). Scalar Keys, no
 //     Slot: one hidden row per record, read like a GSI but consistently.
 type Index struct {
@@ -340,6 +344,23 @@ type Index struct {
 	// each column, read with Repo.QueryGroups (group_by.go). Not on a TypeDelta
 	// index. An Index with a GroupBy may go without a Slot: counters only.
 	GroupBy []Coln
+}
+
+// DataFrame is one group-by aggregate of the entity (data_frame.go): one file per value of its
+// Keys, listing each value of Rows with the Sums of the records that hold it.
+type DataFrame struct {
+	// Name is the frame's folder: lowercase letters, digits and '-', unique in the entity.
+	// Renaming it orphans the files.
+	Name string
+	// Keys name the file, 1 to 3 integer Cols with a cb tag. With 1, Keys[0] is the file; with
+	// 2–3, Keys[0] is a folder and the rest name the file inside it. Negative values fail the write.
+	Keys []Coln
+	// Rows is the integer Col each file lists, ascending. A negative value fails the write.
+	Rows Coln
+	// Sums are the integer or float Cols summed per row (floats with 6 decimals: FrameRow.SumFloat).
+	Sums []Coln
+	// Count adds the number of records per row (FrameRow.Count).
+	Count bool
 }
 
 // holdsSliceColumn reports whether the index is a fan-out index: one of its Keys is a ColSlice.

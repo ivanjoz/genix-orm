@@ -11,7 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/ivanjoz/colbin"
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +95,7 @@ func (r *Repo[T, E]) ReprocessBlobs(decodeLegacy func(data []byte, dst any) erro
 		// Each UpdateItem touches its own item, so a page's writes run in parallel: one at a
 		// time is a network round trip per record.
 		wasWrittenConcurrently := make([]bool, len(pageRewrites))
-		err := parallel.Run(len(pageRewrites), func(rewriteIndex int) error {
+		err := utils.RunParallel(len(pageRewrites), func(rewriteIndex int) error {
 			rewrite := pageRewrites[rewriteIndex]
 			err := writeReencodedBlob(client, rewrite.item, rewrite.storedBlob, rewrite.reencodedBlob)
 			if isConditionFailed(err) {

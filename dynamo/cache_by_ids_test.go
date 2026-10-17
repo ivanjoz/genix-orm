@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ── By-IDs test entity: partitioned by store, one integer ID ─────────────────
@@ -79,12 +81,12 @@ func TestYearTickVectors(t *testing.T) {
 		if got := yearCycleOf(sUnixTimeToTime(cycle.Updated)); got != cycle.CycleYear {
 			t.Fatalf("Updated %d: cycle %d, want %d", cycle.Updated, got, cycle.CycleYear)
 		}
-		if cycle.CycleStart != nil && sUnixTimeOf(cycleStartTime(cycle.CycleYear)) != *cycle.CycleStart {
-			t.Fatalf("cycle %d starts at %d, want %d", cycle.CycleYear, sUnixTimeOf(cycleStartTime(cycle.CycleYear)), *cycle.CycleStart)
+		if cycle.CycleStart != nil && utils.SUnixTimeOf(cycleStartTime(cycle.CycleYear)) != *cycle.CycleStart {
+			t.Fatalf("cycle %d starts at %d, want %d", cycle.CycleYear, utils.SUnixTimeOf(cycleStartTime(cycle.CycleYear)), *cycle.CycleStart)
 		}
 	}
 	for _, written := range vectors.WrittenTicks {
-		cycleStart := sUnixTimeOf(cycleStartTime(yearCycleOf(sUnixTimeToTime(written.Updated))))
+		cycleStart := utils.SUnixTimeOf(cycleStartTime(yearCycleOf(sUnixTimeToTime(written.Updated))))
 		tick := writtenYearTick(written.Updated, cycleStart)
 		if tick != written.Tick || yearTickToUpdated(tick, cycleStart) != written.HeldUpdated {
 			t.Fatalf("Updated %d: tick %d held as %d, want %d held as %d",
@@ -113,12 +115,12 @@ func TestDecodeCachedIDsRequest(t *testing.T) {
 
 	for name, encoded := range map[string]string{
 		"empty":                "",
-		"not base64url":        "GA==",
-		"truncated slot":       "GAEAAQxk",     // year, 1 partition, delta 0, 1 slot, then 2 of its 4 bytes
-		"IDs not ascending":    "GAEAAAIHAA",   // IDs 7 then delta 0
-		"count beyond payload": "GAEAAH8H",     // 127 IDs announced, 1 sent
-		"trailing bytes":       "GAEAAAEHAA",   // one ID, then a stray byte
-		"slot tick 0":          "GAEAAQwAAAAA", // slot 12 listed with tick 0
+		"not base64":           "GA==",
+		"truncated slot":       "5-3--FlZ",     // year, 1 partition, delta 0, 1 slot, then 2 of its 4 bytes
+		"IDs not ascending":    "5-3---76--",   // IDs 7 then delta 0
+		"count beyond payload": "5-3--6w6",     // 127 IDs announced, 1 sent
+		"trailing bytes":       "5-3---36--",   // one ID, then a stray byte
+		"slot tick 0":          "5-3--Fk-----", // slot 12 listed with tick 0
 	} {
 		if _, err := DecodeCachedIDsRequest(encoded); err == nil {
 			t.Fatalf("%s: %q decoded without an error", name, encoded)
@@ -127,10 +129,10 @@ func TestDecodeCachedIDsRequest(t *testing.T) {
 }
 
 func TestSlotFileWrites(t *testing.T) {
-	SetFileStore(NewMemoryFileStore())
+	SetFileStore(utils.NewMemoryFileStore())
 	defer SetFileStore(nil)
 	items := NewRepo[cachedItemTable, cachedItem]()
-	cycleStart := int32(sUnixTimeOf(cycleStartTime(2026)))
+	cycleStart := int32(utils.SUnixTimeOf(cycleStartTime(2026)))
 
 	written := []cachedItem{
 		{StoreID: 7, ID: 300, Updated: cycleStart + 10_000}, // slot 44, tick 10002
@@ -264,7 +266,7 @@ func TestQueryCachedIDs(t *testing.T) {
 	if os.Getenv("DYNAMO_ENDPOINT") == "" {
 		t.Skip("DYNAMO_ENDPOINT not set: QueryCachedIDs needs a live DynamoDB")
 	}
-	SetFileStore(NewMemoryFileStore())
+	SetFileStore(utils.NewMemoryFileStore())
 	defer SetFileStore(nil)
 	items := NewRepo[cachedItemTable, cachedItem]()
 	// A fresh ID per run; ID+256 shares its slot, ID+1 does not. Store 9 holds the same ID as store 7.
@@ -310,7 +312,7 @@ func TestQueryCachedIDs(t *testing.T) {
 		defer func() { Now = time.Now }()
 		return items.QueryCachedIDs(request)
 	}
-	cycleStart := sUnixTimeOf(cycleStartTime(cycleYear))
+	cycleStart := utils.SUnixTimeOf(cycleStartTime(cycleYear))
 
 	// Nothing held: every record comes back, grouped by partition, stamped with its slot's tick.
 	fetched, err = readAfterOverlap(allIDs)

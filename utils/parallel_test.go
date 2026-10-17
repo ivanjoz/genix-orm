@@ -1,4 +1,4 @@
-package parallel
+package utils
 
 import (
 	"errors"
@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-func TestRun(t *testing.T) {
-	if err := Run(0, func(int) error { t.Fatal("no task must run"); return nil }); err != nil {
+func TestRunParallel(t *testing.T) {
+	if err := RunParallel(0, func(int) error { t.Fatal("no task must run"); return nil }); err != nil {
 		t.Fatalf("zero tasks: %v", err)
 	}
 
@@ -16,7 +16,7 @@ func TestRun(t *testing.T) {
 	const taskCount = 35
 	var ranTasks [taskCount]atomic.Int32
 	var runningTasks, peakRunningTasks atomic.Int32
-	err := Run(taskCount, func(taskIndex int) error {
+	err := RunParallel(taskCount, func(taskIndex int) error {
 		running := runningTasks.Add(1)
 		for peak := peakRunningTasks.Load(); running > peak && !peakRunningTasks.CompareAndSwap(peak, running); peak = peakRunningTasks.Load() {
 		}
@@ -39,7 +39,7 @@ func TestRun(t *testing.T) {
 
 	// The errors of every failed task come back joined.
 	firstErr, secondErr := errors.New("first"), errors.New("second")
-	err = Run(3, func(taskIndex int) error {
+	err = RunParallel(3, func(taskIndex int) error {
 		return []error{firstErr, nil, secondErr}[taskIndex]
 	})
 	if !errors.Is(err, firstErr) || !errors.Is(err, secondErr) {

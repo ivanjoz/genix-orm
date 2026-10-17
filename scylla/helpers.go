@@ -12,6 +12,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/utils"
 	"github.com/kr/pretty"
 	"github.com/viant/xunsafe"
 )
@@ -52,67 +53,26 @@ func BasicHashInt(s string) int32 {
 	return hashValue
 }
 
-const base64Chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+// negativeSign marks a negative Int64ToBase64Bytes value: "-" is a digit of utils.Base64Alphabet.
+const negativeSign = '~'
 
+// Int64ToBase64Bytes writes n's magnitude in utils.EncodeUintBase64, after negativeSign when n < 0.
 func Int64ToBase64Bytes(n int64) []byte {
-	if n == 0 {
-		return []byte{base64Chars[0]}
-	}
-
-	// 1. Determine if negative and use absolute value
-	isNegative := false
-	un := uint64(n)
 	if n < 0 {
-		isNegative = true
-		// Handle math.MinInt64 edge case by converting to uint64 first
-		un = uint64(-n)
+		// uint64(-n) is also right for math.MinInt64: its negation wraps to 2^63.
+		return utils.AppendUintBase64([]byte{negativeSign}, uint64(-n))
 	}
-
-	// 2. Max length: 11 chars for magnitude + 1 for sign = 12
-	var buf [12]byte
-	i := 12
-
-	// 3. Mathematical Base64 conversion
-	for un > 0 {
-		i--
-		buf[i] = base64Chars[un%64]
-		un /= 64
-	}
-
-	// 4. Add the minus sign if necessary
-	if isNegative {
-		i--
-		buf[i] = '-'
-	}
-
-	// Return only the occupied part of the buffer
-	// We create a copy to avoid the buffer escaping to heap if needed
-	result := make([]byte, 12-i)
-	copy(result, buf[i:])
-	return result
+	return utils.AppendUintBase64(nil, uint64(n))
 }
 
+// Base64BytesToInt64 reverses Int64ToBase64Bytes; 0 for an empty or malformed value.
 func Base64BytesToInt64(b []byte) int64 {
-	if len(b) == 0 {
-		return 0
-	}
-	isNegative := false
-	if b[0] == '-' {
-		isNegative = true
-		b = b[1:]
-	}
-	var res uint64
-	for _, char := range b {
-		idx := strings.IndexByte(base64Chars, char)
-		if idx == -1 {
-			continue
-		}
-		res = res*64 + uint64(idx)
-	}
+	magnitudeText, isNegative := strings.CutPrefix(string(b), string(negativeSign))
+	magnitude, _ := utils.DecodeUintBase64(magnitudeText)
 	if isNegative {
-		return -int64(res)
+		return -int64(magnitude)
 	}
-	return int64(res)
+	return int64(magnitude)
 }
 
 func HashInt(values ...any) int32 {

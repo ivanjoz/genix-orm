@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ func (r *Repo[T, E]) ReprocessRecords(transform func(record *E) (bool, error), w
 
 		// Each write touches its own items, so a page's writes run in parallel.
 		writeFailures := make([]string, len(pageWrites))
-		err = parallel.Run(len(pageWrites), func(writeIndex int) error {
+		err = utils.RunParallel(len(pageWrites), func(writeIndex int) error {
 			failure, err := writeReprocessedItem(client, pageWrites[writeIndex].item, pageWrites[writeIndex].storedItem, pageWrites[writeIndex].isMove)
 			writeFailures[writeIndex] = failure
 			return err
@@ -145,6 +145,12 @@ func (r *Repo[T, E]) reprocessPage(storedItems []map[string]types.AttributeValue
 			changed.item, err = m.marshalItem(unsafe.Pointer(changed.record), changed.record)
 			return err
 		})
+		// A reprocessed record keeps when it was created and its changelog.
+		for _, managedColumn := range []string{createdColumn, changelogColumn} {
+			if storedAttr, isStored := changed.storedItem[managedColumn]; isStored && changed.item != nil {
+				changed.item[managedColumn] = storedAttr
+			}
+		}
 		if err != nil {
 			report.Failures = append(report.Failures, itemName(changed.storedItem)+": "+err.Error())
 			continue

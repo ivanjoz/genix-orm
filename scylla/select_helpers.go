@@ -499,8 +499,8 @@ func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable Sc
 			rewrittenStatement = ColumnStatement{
 				Col:      keyCol.GetName(),
 				Operator: "BETWEEN",
-				From:     []ColumnStatement{{Col: keyCol.GetName(), Value: prefixValueText + "_"}},
-				To:       []ColumnStatement{{Col: keyCol.GetName(), Value: prefixValueText + "_\uffff"}},
+				From:     []ColumnStatement{{Col: keyCol.GetName(), Value: prefixValueText + KeyConcatSeparator}},
+				To:       []ColumnStatement{{Col: keyCol.GetName(), Value: prefixValueText + KeyConcatSeparator + "\uffff"}},
 			}
 		}
 	} else {
@@ -517,8 +517,8 @@ func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable Sc
 			rangeValue := MakeKeyConcat(append(prefixValues, rangeStatement.Value)...)
 			prefixMin, prefixMax := "", "\uffff"
 			if prefixValueText != "" {
-				prefixMin = prefixValueText + "_"
-				prefixMax = prefixValueText + "_\uffff"
+				prefixMin = prefixValueText + KeyConcatSeparator
+				prefixMax = prefixValueText + KeyConcatSeparator + "\uffff"
 			}
 			fromValue := rangeTransform.from(rangeValue, prefixMin, prefixMax)
 			toValue := rangeTransform.to(rangeValue, prefixMin, prefixMax)

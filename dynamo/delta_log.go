@@ -14,12 +14,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Delta logs: the change-log files of the TypeDelta indexes (delta.go), in the
-// FileStore, and the Delta() read over them.
+// utils.FileStore, and the Delta() read over them.
 //
 //	key = delta-log/<base pk>/<index tag>/<pinned value>/…/<bucket>
 //	bucket = floor(SUnixTime / 300): the 10 minutes the append landed in
@@ -70,7 +70,7 @@ const (
 )
 
 // deltaBucketOf is the bucket a moment falls in.
-func deltaBucketOf(moment time.Time) int64 { return sUnixTimeOf(moment) / deltaBucketTicks }
+func deltaBucketOf(moment time.Time) int64 { return utils.SUnixTimeOf(moment) / deltaBucketTicks }
 
 // isDeltaBucketSealed reports whether bucket can no longer take an append at now.
 func isDeltaBucketSealed(bucket int64, now time.Time) bool {
@@ -149,7 +149,7 @@ func (m *tableMeta) appendDeltaLogs(writes []deltaLogWrite) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), appendDeltaLogTimeout)
 	defer cancel()
-	return parallel.Run(len(fileKeys), func(fileIndex int) error {
+	return utils.RunParallel(len(fileKeys), func(fileIndex int) error {
 		pending := appendsByFile[fileKeys[fileIndex]]
 		entries := make([]DeltaLogEntry, len(pending.logIDs))
 		for i, logID := range pending.logIDs {
@@ -320,7 +320,7 @@ func (q *QueryBuilder[E]) deltaMetadataRecord(bucket int64, flags byte, content 
 	var record E
 	recordValue := reflect.ValueOf(&record).Elem()
 	setKeyField(recordValue, q.deltaIndex.logIDColumns[len(q.deltaIndex.logIDColumns)-1].fieldName, -bucket)
-	metadataText := EncodeSafe85(deltaMetadataBytes(flags, bucket, q.deltaIndex.logIDColumnBits, content))
+	metadataText := utils.EncodeSafe85(deltaMetadataBytes(flags, bucket, q.deltaIndex.logIDColumnBits, content))
 	recordValue.FieldByName(metadataFieldName).Set(reflect.ValueOf(&metadataText))
 	return record
 }
@@ -355,10 +355,10 @@ func listDeltaLogBuckets(folder string, fromBucket int64) ([]int64, error) {
 // readDeltaLogFiles reads the files of buckets, in order; a missing one is empty.
 func readDeltaLogFiles(folder string, buckets []int64) ([][]byte, error) {
 	contents := make([][]byte, len(buckets))
-	err := parallel.Run(len(buckets), func(bucketIndex int) error {
+	err := utils.RunParallel(len(buckets), func(bucketIndex int) error {
 		fileKey := folder + strconv.FormatInt(buckets[bucketIndex], 10)
 		content, _, err := fileStore.GetFile(fileKey)
-		if errors.Is(err, ErrFileNotFound) {
+		if errors.Is(err, utils.ErrFileNotFound) {
 			return nil
 		}
 		if err != nil {
@@ -374,5 +374,5 @@ func readDeltaLogFiles(folder string, buckets []int64) ([][]byte, error) {
 // view every time: one record carrying it (any negative ID) tells the client to drop every held
 // record the response doesn't bring. It is sealed, so the client keeps no cursor and sends none.
 func DeltaReplaceMetadata() string {
-	return EncodeSafe85(deltaMetadataBytes(deltaMetadataFlagReplace|deltaMetadataFlagSealed, 0, nil, nil))
+	return utils.EncodeSafe85(deltaMetadataBytes(deltaMetadataFlagReplace|deltaMetadataFlagSealed, 0, nil, nil))
 }

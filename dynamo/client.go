@@ -103,6 +103,9 @@ const dataColumn = "d"
 // record in one blob affordable, and it is why a *T pointing at T's zero value
 // comes back nil rather than pointing at a zero.
 func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]types.AttributeValue, error) {
+	if err := m.checkFrameValues(ptr); err != nil {
+		return nil, err
+	}
 	blob, err := colbin.Marshal(record)
 	if err != nil {
 		return nil, fmt.Errorf("db: colbin marshaling %s: %w", m.recordType.Name(), err)
@@ -111,6 +114,9 @@ func (m *tableMeta) marshalItem(ptr unsafe.Pointer, record any) (map[string]type
 	item[dataColumn] = &types.AttributeValueMemberB{Value: blob}
 	// Version lives outside the blob: a write can raise it in DynamoDB, and a conditional write compares it.
 	item[versionColumn] = numberAttr(m.version.getI64(ptr))
+	// crt, the record's creation: right for an insert. A write over a stored item keeps the stored one
+	// (if_not_exists in putItemRaisingVersion and putItemIfVersion); reprocessing copies it.
+	item[createdColumn] = numberAttr(m.writeTimeOf(ptr))
 	for _, idx := range m.indexes {
 		item[idx.slot.hashAttr] = &types.AttributeValueMemberN{Value: m.partitionValue(ptr, idx.partition)}
 		item[idx.slot.rangeAttr] = binaryKeyAttr(buildCompositeKey(m.keyPartsFor(ptr, idx.sortColumns)))

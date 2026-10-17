@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -13,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/ivanjoz/colbin"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +96,7 @@ func (r *Repo[T, E]) PutManyIfVersion(records []E) ([]E, error) {
 // holds as stored, and returns the indexes of the records that lost to a concurrent write: those keep
 // the Version they held. The new hidden rows go first, as in PutMany; a record that then loses leaves
 // them as extra rows, which every read re-checks and drops.
-func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedByKey map[string]unsafe.Pointer) ([]int, error) {
+func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedByKey map[string]storedRecord) ([]int, error) {
 	ptrs := make([]unsafe.Pointer, len(records))
 	expectedVersions := make([]int64, len(records))
 	items := make([]map[string]types.AttributeValue, len(records))
@@ -110,7 +112,11 @@ func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedBy
 		if items[i], err = r.meta.marshalItem(ptrs[i], &records[i]); err != nil {
 			return nil, err
 		}
-		storedPtr := storedByKey[r.meta.recordKey(ptrs[i])]
+		stored := storedByKey[r.meta.recordKey(ptrs[i])]
+		storedPtr := stored.ptr
+		if err := r.meta.putChangelog(items[i], stored, ptrs[i]); err != nil {
+			return nil, err
+		}
 		groupDeltasByRecord[i] = map[string]*groupCounterDelta{}
 		if err := r.meta.addGroupCounterDeltas(groupDeltasByRecord[i], storedPtr, ptrs[i]); err != nil {
 			return nil, err
@@ -124,7 +130,7 @@ func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedBy
 		return nil, err
 	}
 	isWritten := make([]bool, len(records))
-	err := parallel.Run(len(records), func(recordIndex int) (putErr error) {
+	err := utils.RunParallel(len(records), func(recordIndex int) (putErr error) {
 		isWritten[recordIndex], putErr = r.putItemIfVersion(ctx, client, items[recordIndex], expectedVersions[recordIndex])
 		return putErr
 	})
@@ -148,7 +154,7 @@ func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedBy
 		staleRowDeletes = append(staleRowDeletes, rowDeletesByRecord[i]...)
 		mergeGroupCounterDeltas(groupDeltas, groupDeltasByRecord[i])
 		refreshStoredItem(items[i], writtenVersion)
-		logWrites = append(logWrites, deltaLogWrite{storedPtr: storedByKey[r.meta.recordKey(ptrs[i])], writtenPtr: ptrs[i], version: writtenVersion})
+		logWrites = append(logWrites, deltaLogWrite{storedPtr: storedByKey[r.meta.recordKey(ptrs[i])].ptr, writtenPtr: ptrs[i], version: writtenVersion})
 	}
 	if err := r.batchWriteAll(ctx, client, staleRowDeletes); err != nil {
 		return nil, err
@@ -168,28 +174,28 @@ func (r *Repo[T, E]) putIfVersion(client *dynamodb.Client, records []E, storedBy
 // there: in both cases the write's condition proves the shortcut, since it only
 // lands if the stored item is exactly that. Only the rest is read. Nil without
 // hidden rows or GroupBy.
-func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsafe.Pointer, expectedVersions []int64) (map[string]unsafe.Pointer, error) {
+func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsafe.Pointer, expectedVersions []int64) (map[string]storedRecord, error) {
 	if !r.meta.readsStoredVersion() {
 		return nil, nil
 	}
-	storedByKey := map[string]unsafe.Pointer{}
+	storedByKey := map[string]storedRecord{}
 	var uncachedPtrs []unsafe.Pointer
 	for i, ptr := range ptrs {
 		if expectedVersions[i] == 0 {
 			continue
 		}
 		recordKey := r.meta.recordKey(ptr)
-		storedBlob, isCached := cachedStoredBlob(recordKey, expectedVersions[i])
+		storedBlob, storedChangelog, isCached := cachedStoredBlob(recordKey, expectedVersions[i])
 		if !isCached {
 			uncachedPtrs = append(uncachedPtrs, ptr)
 			continue
 		}
-		storedRecord := new(E)
-		if err := colbin.Unmarshal(storedBlob, storedRecord); err != nil {
+		record := new(E)
+		if err := colbin.Unmarshal(storedBlob, record); err != nil {
 			return nil, fmt.Errorf("db: colbin unmarshaling %s: %w", r.meta.recordType.Name(), err)
 		}
-		r.meta.version.setI64(unsafe.Pointer(storedRecord), expectedVersions[i])
-		storedByKey[recordKey] = unsafe.Pointer(storedRecord)
+		r.meta.version.setI64(unsafe.Pointer(record), expectedVersions[i])
+		storedByKey[recordKey] = storedRecord{ptr: unsafe.Pointer(record), changelog: storedChangelog}
 	}
 	if len(uncachedPtrs) == 0 {
 		return storedByKey, nil
@@ -198,28 +204,37 @@ func (r *Repo[T, E]) storedVersionsForWrite(client *dynamodb.Client, ptrs []unsa
 	if err != nil {
 		return nil, err
 	}
-	for recordKey, storedPtr := range readByKey {
-		storedByKey[recordKey] = storedPtr
-	}
+	maps.Copy(storedByKey, readByKey)
 	return storedByKey, nil
 }
 
-// putItemIfVersion is one conditional PutItem, false when the stored item moved
-// on. A stored item with no "ver" can never match: that is an error, not a race.
+// putItemIfVersion is one conditional UpdateItem that SETs every attribute of item (crt only when
+// missing), false when the stored item moved on. A stored item with no "ver" can never match: that is
+// an error, not a race. Every attribute a record writes is in item, but cgl, which is REMOVEd when
+// the record has none left.
 func (r *Repo[T, E]) putItemIfVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue, expectedVersion int64) (bool, error) {
-	input := &dynamodb.PutItemInput{
+	names := map[string]string{"#ver": versionColumn}
+	values := map[string]types.AttributeValue{":ver": item[versionColumn]}
+	updateExpression := "SET " + strings.Join(append(setClausesOf(item, names, values), "#ver = :ver"), ", ")
+	if _, hasChangelog := item[changelogColumn]; r.meta.frames != nil && !hasChangelog {
+		names["#cgl"] = changelogColumn
+		updateExpression += " REMOVE #cgl"
+	}
+	input := &dynamodb.UpdateItemInput{
 		TableName:                           aws.String(tableName()),
-		Item:                                item,
+		Key:                                 itemKeyOf(item),
+		UpdateExpression:                    aws.String(updateExpression),
+		ExpressionAttributeNames:            names,
+		ExpressionAttributeValues:           values,
 		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	}
 	if expectedVersion == 0 {
 		input.ConditionExpression = aws.String("attribute_not_exists(pk)")
 	} else {
-		input.ConditionExpression = aws.String("#ver = :ver")
-		input.ExpressionAttributeNames = map[string]string{"#ver": versionColumn}
-		input.ExpressionAttributeValues = map[string]types.AttributeValue{":ver": numberAttr(expectedVersion)}
+		input.ConditionExpression = aws.String("#ver = :expected")
+		values[":expected"] = numberAttr(expectedVersion)
 	}
-	_, err := client.PutItem(ctx, input)
+	_, err := client.UpdateItem(ctx, input)
 	var lostRaceErr *types.ConditionalCheckFailedException
 	if errors.As(err, &lostRaceErr) {
 		if _, hasVersion := lostRaceErr.Item[versionColumn]; len(lostRaceErr.Item) > 0 && !hasVersion {

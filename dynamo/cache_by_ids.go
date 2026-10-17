@@ -3,7 +3,6 @@ package dynamo
 import (
 	"cmp"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +14,8 @@ import (
 	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,7 +159,7 @@ func setSlotTick(slotFile []byte, slot uint8, tick uint32) {
 // readSlotFile returns a partition's slot file and its ETag; a missing one is all zeros with no ETag.
 func readSlotFile(key string) ([]byte, string, error) {
 	content, etag, err := fileStore.GetFile(key)
-	if errors.Is(err, ErrFileNotFound) {
+	if errors.Is(err, utils.ErrFileNotFound) {
 		return make([]byte, slotFileSize), "", nil
 	}
 	if err != nil {
@@ -188,7 +189,7 @@ func (m *tableMeta) setSlotsUpdated(ptrs []unsafe.Pointer) error {
 			ticksByFile[key] = map[uint8]uint32{}
 		}
 		slot := slotOfRecordID(m.cacheByIDs.idColumn.acc.getI64(ptr))
-		tick := writtenYearTick(updated, sUnixTimeOf(cycleStartTime(cycleYear)))
+		tick := writtenYearTick(updated, utils.SUnixTimeOf(cycleStartTime(cycleYear)))
 		ticksByFile[key][slot] = max(ticksByFile[key][slot], tick)
 	}
 	for key, ticksBySlot := range ticksByFile {
@@ -218,7 +219,7 @@ func raiseSlotTicks(key string, ticksBySlot map[uint8]uint32) error {
 			return nil
 		}
 		_, err = fileStore.PutFileIfMatch(context.Background(), key, slotFile, etag)
-		if !errors.Is(err, ErrFilePreconditionFailed) || attempt == slotPutAttempts {
+		if !errors.Is(err, utils.ErrFilePreconditionFailed) || attempt == slotPutAttempts {
 			return err
 		}
 		time.Sleep(time.Duration(rand.Int64N(int64(attempt) * int64(slotPutPauseStep))))
@@ -269,14 +270,14 @@ func (r *Repo[T, E]) QueryCachedIDs(request CachedIDsRequest) ([]CachedPartition
 	}
 
 	cycleYear := CurrentYearCycle()
-	cycleStart := sUnixTimeOf(cycleStartTime(cycleYear))
+	cycleStart := utils.SUnixTimeOf(cycleStartTime(cycleYear))
 	slotFileByPartition, err := readSlotFiles(cycleYear, basePKByPartition)
 	if err != nil {
 		return nil, err
 	}
 
 	// Ticks at or above it may still be raised by a write stamped inside their window.
-	trustedBelow := sUnixTimeOf(Now()) - slotTrustTicks
+	trustedBelow := utils.SUnixTimeOf(Now()) - slotTrustTicks
 	trustedSlotTick := func(partition int64, slot uint8) uint32 {
 		tick := max(slotTickOf(slotFileByPartition[partition], slot), 1) // stored 0: no write this cycle
 		if yearTickToUpdated(tick, cycleStart) <= trustedBelow {
@@ -366,7 +367,7 @@ func readSlotFiles(cycleYear int, basePKByPartition map[int64]string) (map[int64
 	return slotFileByPartition, firstErr
 }
 
-// DecodeCachedIDsRequest decodes genix-ui's by-IDs request (the "cc" query parameter), base64url of:
+// DecodeCachedIDsRequest decodes genix-ui's by-IDs request (the "cc" query parameter), utils.Base64 of:
 //
 //	[cycle year − 2000: u8]
 //	[partition count: uvarint]
@@ -380,9 +381,9 @@ func readSlotFiles(cycleYear int, basePKByPartition map[int64]string) (map[int64
 // An ID takes its slot's tick, 0 when the slot isn't listed. The client sends the lowest tick it holds
 // among a slot's requested IDs (a record it doesn't hold counts as 0, which leaves the slot out).
 func DecodeCachedIDsRequest(encodedRequest string) (CachedIDsRequest, error) {
-	payload, err := base64.RawURLEncoding.DecodeString(encodedRequest)
+	payload, err := utils.Base64.DecodeString(encodedRequest)
 	if err != nil || len(payload) == 0 {
-		return CachedIDsRequest{}, fmt.Errorf("the by-IDs request is not valid base64url")
+		return CachedIDsRequest{}, fmt.Errorf("the by-IDs request is not valid base64")
 	}
 	reader := cachedIDsReader{payload: payload, position: 1}
 	request := CachedIDsRequest{CycleYear: 2000 + int(payload[0])}

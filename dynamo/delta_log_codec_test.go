@@ -6,6 +6,8 @@ import (
 	"os"
 	"slices"
 	"testing"
+
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // deltaLogVectors is testdata/delta_log_vectors.json, which genix-ui's delta-log wire test reads too:
@@ -95,7 +97,7 @@ func TestDeltaLogWireVersionsLogIDsAndMetadataMatchTheSharedVectors(t *testing.T
 	}
 	for _, vector := range vectors.Metadata {
 		fileContent, _ := hex.DecodeString(vector.FileHex)
-		if got := EncodeSafe85(deltaMetadataBytes(vector.Flags, vector.Bucket, vector.ColumnBits, fileContent)); got != vector.Safe85 {
+		if got := utils.EncodeSafe85(deltaMetadataBytes(vector.Flags, vector.Bucket, vector.ColumnBits, fileContent)); got != vector.Safe85 {
 			t.Errorf("metadata %+v encodes to %q, want %q", vector, got, vector.Safe85)
 		}
 	}

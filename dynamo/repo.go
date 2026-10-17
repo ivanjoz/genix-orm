@@ -15,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,7 +216,7 @@ func (r *Repo[T, E]) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.P
 		}
 	}
 	logWrites := make([]deltaLogWrite, len(ptrs))
-	err := parallel.Run(len(ptrs), func(recordIndex int) error {
+	err := utils.RunParallel(len(ptrs), func(recordIndex int) error {
 		writtenVersion, err := putItemRaisingVersion(context.Background(), client, items[recordIndex])
 		r.meta.version.setI64(ptrs[recordIndex], writtenVersion)
 		logWrites[recordIndex] = deltaLogWrite{writtenPtr: ptrs[recordIndex], version: writtenVersion}
@@ -237,16 +237,7 @@ func (r *Repo[T, E]) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.P
 func putItemRaisingVersion(ctx context.Context, client *dynamodb.Client, item map[string]types.AttributeValue) (int64, error) {
 	names := map[string]string{"#ver": versionColumn}
 	values := map[string]types.AttributeValue{":one": numberAttr(1), ":zero": numberAttr(0), ":max": numberAttr(maxVersion)}
-	var setClauses []string
-	attrNames := slices.Sorted(maps.Keys(item))
-	for i, attrName := range attrNames {
-		if attrName == "pk" || attrName == "sk" || attrName == versionColumn {
-			continue
-		}
-		placeholder := strconv.Itoa(i)
-		names["#a"+placeholder], values[":a"+placeholder] = attrName, item[attrName]
-		setClauses = append(setClauses, "#a"+placeholder+" = :a"+placeholder)
-	}
+	setClauses := setClausesOf(item, names, values)
 	input := &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       map[string]types.AttributeValue{"pk": item["pk"], "sk": item["sk"]},
@@ -269,6 +260,26 @@ func putItemRaisingVersion(ctx context.Context, client *dynamodb.Client, item ma
 		return 0, err
 	}
 	return numberAttrValue(out.Attributes, versionColumn), nil
+}
+
+// setClausesOf is the UpdateExpression SET of every attribute of item but its key and "ver", their
+// names and values added to names and values. crt only fills a missing one: a stored record keeps
+// when it was created.
+func setClausesOf(item map[string]types.AttributeValue, names map[string]string, values map[string]types.AttributeValue) []string {
+	var setClauses []string
+	for i, attrName := range slices.Sorted(maps.Keys(item)) {
+		if attrName == "pk" || attrName == "sk" || attrName == versionColumn {
+			continue
+		}
+		placeholder := strconv.Itoa(i)
+		names["#a"+placeholder], values[":a"+placeholder] = attrName, item[attrName]
+		if attrName == createdColumn {
+			setClauses = append(setClauses, "#a"+placeholder+" = if_not_exists(#a"+placeholder+", :a"+placeholder+")")
+			continue
+		}
+		setClauses = append(setClauses, "#a"+placeholder+" = :a"+placeholder)
+	}
+	return setClauses
 }
 
 // putOverStoredVersions writes records of a table that diffs its hidden rows or counters: each one is
@@ -300,8 +311,8 @@ func (r *Repo[T, E]) putOverStoredVersions(client *dynamodb.Client, records []E,
 		}
 		for _, ptr := range roundPtrs {
 			storedVersion := int64(0)
-			if storedPtr := storedByKey[r.meta.recordKey(ptr)]; storedPtr != nil {
-				storedVersion = r.meta.version.getI64(storedPtr)
+			if stored := storedByKey[r.meta.recordKey(ptr)]; stored.ptr != nil {
+				storedVersion = r.meta.version.getI64(stored.ptr)
 			}
 			r.meta.version.setI64(ptr, storedVersion)
 		}
@@ -328,9 +339,15 @@ func (r *Repo[T, E]) putOverStoredVersions(client *dynamodb.Client, records []E,
 	}
 }
 
-// storedVersions reads (consistently) the stored version of each record, keyed
-// by recordKey, so its hidden rows and GroupBy counters can be diffed. Nil without them.
-func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]unsafe.Pointer, error) {
+// storedRecord is a record as stored, decoded, with its item's changelog (cgl).
+type storedRecord struct {
+	ptr       unsafe.Pointer
+	changelog []byte
+}
+
+// storedVersions reads (consistently) the stored version of each record, keyed by recordKey, so its
+// hidden rows, GroupBy counters and DataFrame changelog can be diffed. Nil without them.
+func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]storedRecord, error) {
 	if !r.meta.readsStoredVersion() {
 		return nil, nil
 	}
@@ -342,13 +359,13 @@ func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Point
 	if err != nil {
 		return nil, err
 	}
-	storedByKey := make(map[string]unsafe.Pointer, len(items))
+	storedByKey := make(map[string]storedRecord, len(items))
 	for _, item := range items {
-		storedRecord := new(E)
-		if err := r.meta.unmarshalItem(item, storedRecord); err != nil {
+		record := new(E)
+		if err := r.meta.unmarshalItem(item, record); err != nil {
 			return nil, err
 		}
-		storedByKey[r.meta.recordKey(unsafe.Pointer(storedRecord))] = unsafe.Pointer(storedRecord)
+		storedByKey[r.meta.recordKey(unsafe.Pointer(record))] = storedRecord{ptr: unsafe.Pointer(record), changelog: changelogOf(item)}
 	}
 	return storedByKey, nil
 }
@@ -393,6 +410,10 @@ func (r *Repo[T, E]) batchWrite(ctx context.Context, client *dynamodb.Client, wr
 // after it, its GroupBy counters move, and its logs get a deleted entry one
 // Version above it. The record's Updated is set to the delete's.
 func (r *Repo[T, E]) Delete(record *E) error {
+	// A record that vanishes takes its changelog with it, so the frames could never move it out.
+	if r.meta.frames != nil {
+		return fmt.Errorf("db: %s has DataFrames and is never deleted: set its Status to 0", r.meta.recordType.Name())
+	}
 	client, err := Client()
 	if err != nil {
 		return err

@@ -9,6 +9,8 @@ import (
 	"unsafe"
 
 	"github.com/viant/xunsafe"
+
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,11 +71,15 @@ type tableMeta struct {
 	keys            []keyCol
 	indexes         []indexMeta
 	arrayIndexes    []arrayIndexMeta
-	deltaIndexes    []deltaIndexMeta        // the TypeDelta indexes (delta.go)
-	groupIndexes    []groupIndexMeta        // the Indexes declaring GroupBy (group_by.go)
-	accessors       map[string]*colAccessor // record field name -> precompiled accessor
-	autoinc         *autoincConfig          // nil unless the schema sets UseAutoincrement
-	cacheByIDs      *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
+	deltaIndexes    []deltaIndexMeta // the TypeDelta indexes (delta.go)
+	groupIndexes    []groupIndexMeta // the Indexes declaring GroupBy (group_by.go)
+	// frames are the schema's DataFrames, compiled by the dataframe module (data_frame.go); nil
+	// without any. trackedAccessors read its Tracked columns, in their order.
+	frames           *dataframe.Table
+	trackedAccessors []*colAccessor
+	accessors        map[string]*colAccessor // record field name -> precompiled accessor
+	autoinc          *autoincConfig          // nil unless the schema sets UseAutoincrement
+	cacheByIDs       *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
 	// The managed fields (delta.go): Version, on every table, and Updated, nil without one.
 	version *colAccessor
 	updated *keyCol
@@ -83,9 +89,9 @@ type tableMeta struct {
 }
 
 // readsStoredVersion reports whether a write needs the record as stored first: to
-// diff its hidden rows or its GroupBy counters.
+// diff its hidden rows, its GroupBy counters or its DataFrame values.
 func (m *tableMeta) readsStoredVersion() bool {
-	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0
+	return len(m.arrayIndexes) > 0 || len(m.groupIndexes) > 0 || m.frames != nil
 }
 
 var metaCache sync.Map // reflect.Type (record) -> *tableMeta
@@ -249,9 +255,12 @@ func buildTableMeta(schema Schema, recordType reflect.Type) *tableMeta {
 		meta.indexes = append(meta.indexes, compileGSI(recordType, accessors, idx, meta))
 	}
 
+	compileDataFrames(schema, recordType, accessors, meta)
+
 	pkDigits := len(meta.tableID) + meta.partitionDigits
-	// Fan-out rows, the by-IDs slots item and the GroupBy counters append 3 digits to the base pk.
-	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || schema.CacheByIDs {
+	// Fan-out rows, the by-IDs slots item, the GroupBy counters and the DataFrame states append 3
+	// digits to the base pk.
+	if len(meta.arrayIndexes) > 0 || len(meta.groupIndexes) > 0 || meta.frames != nil || schema.CacheByIDs {
 		pkDigits += arrayIndexColumnIDDigits
 	}
 	if pkDigits > maxNumericKeyDigits {

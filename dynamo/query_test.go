@@ -134,10 +134,10 @@ func TestMarshalItemDerivesKeys(t *testing.T) {
 	if _, isNumber := item["ver"].(*types.AttributeValueMemberN); !isNumber {
 		t.Fatalf("ver = %#v, want a number", item["ver"])
 	}
-	allowed := map[string]bool{"pk": true, "sk": true, "h1": true, "r1": true, "h2": true, "r2": true, "h3": true, "r3": true, "d": true, "ver": true}
+	allowed := map[string]bool{"pk": true, "sk": true, "h1": true, "r1": true, "h2": true, "r2": true, "h3": true, "r3": true, "d": true, "ver": true, "crt": true}
 	for k := range item {
 		if !allowed[k] {
-			t.Fatalf("unexpected attribute %q in item (only keys/index/d/ver allowed)", k)
+			t.Fatalf("unexpected attribute %q in item (only keys/index/d/ver/crt allowed)", k)
 		}
 	}
 	// Round-trip the blob back into a record.

@@ -1,4 +1,4 @@
-package dynamo
+package utils
 
 import (
 	"bytes"
@@ -44,7 +44,7 @@ func TestSafe85RoundTripsEveryFinalGroup(t *testing.T) {
 	}
 }
 
-func TestDecodeSafe85SkipsWhitespaceAndRejectsDamage(t *testing.T) {
+func TestDecodeSkipsWhitespaceAndRejectsDamage(t *testing.T) {
 	if decoded, err := DecodeSafe85(" 9F3{+\tRVCLI\r\n9LDzZ!4e "); err != nil || len(decoded) != 14 {
 		t.Errorf("whitespace was not skipped: % x, %v", decoded, err)
 	}

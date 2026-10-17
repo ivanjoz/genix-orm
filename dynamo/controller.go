@@ -55,6 +55,12 @@ type Controller interface {
 	// Reprocess rebuilds the hidden rows, GroupBy counters and by-IDs slots from the
 	// records, writing only what differs; write false is a dry run (reprocess_derived.go).
 	Reprocess(write bool) (DerivedReport, error)
+	// MaterializeDataFrames builds or brings up to date every DataFrame (data_frame_backend.go).
+	MaterializeDataFrames() error
+	// RebuildDataFrames computes a DataFrame ("" every one) again from the records.
+	RebuildDataFrames(frameName string) error
+	// BackfillCreated gives crt to every stored record without one; one-off (backfill_created.go).
+	BackfillCreated(write bool) (int, []string, error)
 	// ReprocessRecordsAny runs transform (record is the *E) over every record and writes
 	// back the ones it changed, silently; write false is a dry run (reprocess_records.go).
 	ReprocessRecordsAny(transform func(record any) (bool, error), write bool) (RecordsReport, error)

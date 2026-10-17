@@ -23,6 +23,7 @@ import (
 //     and the counters of an entity that declares no GroupBy anymore are deleted.
 //   - The slots of the records written in the current year cycle are raised to their
 //     Updated.
+//   - The DataFrames are rebuilt (RebuildDataFrames).
 //
 // It writes only what differs, so a table with nothing to fix costs reads only. It is
 // the fix for drift, the backfill after a schema change, and the second half of a
@@ -37,6 +38,7 @@ type DerivedReport struct {
 	HiddenRowsPut     int // missing hidden rows, and FullCopy rows behind their record
 	HiddenRowsDeleted int // hidden rows no record produces
 	CountersRewritten int // GroupBy counters put or deleted
+	FramesRebuilt     int // DataFrames rebuilt
 }
 
 // expectedHiddenRow is a hidden row the records produce.
@@ -156,6 +158,15 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 		}
 		if err := m.setSlotsUpdated(currentCyclePtrs); err != nil {
 			return report, err
+		}
+	}
+
+	if m.frames != nil {
+		report.FramesRebuilt = len(m.frames.Frames)
+		if write {
+			if err := r.RebuildDataFrames(""); err != nil {
+				return report, err
+			}
 		}
 	}
 	return report, nil

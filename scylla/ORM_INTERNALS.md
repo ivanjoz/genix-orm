@@ -294,7 +294,7 @@ For hash indexes with range constraints:
 
 ### 9.1 KeyConcatenated
 
-Multiple fields are flattened into one string key using Base62-compatible concatenation.
+Multiple fields are flattened into one string key with `db.MakeKeyConcat`: integers in `utils.EncodeUintBase64`, components joined by `.` (`KeyConcatSeparator`).
 
 ### 9.2 KeyIntPacking
 

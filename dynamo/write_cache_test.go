@@ -39,14 +39,14 @@ func TestWriteCacheServesTheExactVersionWithinTheTTL(t *testing.T) {
 	rememberStoredItems([]map[string]types.AttributeValue{storedItemOf(t, members, member)})
 	recordKey := members.meta.recordKey(unsafe.Pointer(&member))
 
-	if _, isCached := cachedStoredBlob(recordKey, 4); !isCached {
+	if _, _, isCached := cachedStoredBlob(recordKey, 4); !isCached {
 		t.Fatal("Version 4 was read for update but is not cached")
 	}
-	if _, isCached := cachedStoredBlob(recordKey, 5); isCached {
+	if _, _, isCached := cachedStoredBlob(recordKey, 5); isCached {
 		t.Fatal("an entry served a version it does not hold")
 	}
 	*clock = clock.Add(writeCacheTTL + time.Second)
-	if _, isCached := cachedStoredBlob(recordKey, 4); isCached {
+	if _, _, isCached := cachedStoredBlob(recordKey, 4); isCached {
 		t.Fatal("an expired entry was served")
 	}
 }
@@ -66,11 +66,11 @@ func TestStoredVersionsForWriteDecodesCachedBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	storedPtr := storedByKey[members.meta.recordKey(unsafe.Pointer(&edited))]
-	if storedPtr == nil || len(storedByKey) != 1 {
+	storedMember := storedByKey[members.meta.recordKey(unsafe.Pointer(&edited))]
+	if storedMember.ptr == nil || len(storedByKey) != 1 {
 		t.Fatalf("stored versions = %v, want only the cached member", storedByKey)
 	}
-	if decoded := (*deltaMember)(storedPtr); len(decoded.TeamIDs) != 2 || decoded.Version != 4 {
+	if decoded := (*deltaMember)(storedMember.ptr); len(decoded.TeamIDs) != 2 || decoded.Version != 4 {
 		t.Fatalf("decoded stored member = %+v", *decoded)
 	}
 }
@@ -84,12 +84,12 @@ func TestRefreshKeepsOnlyKeysReadForUpdate(t *testing.T) {
 
 	readMember.Version = 7
 	refreshStoredItem(storedItemOf(t, members, readMember), 7)
-	if _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&readMember)), 7); !isCached {
+	if _, _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&readMember)), 7); !isCached {
 		t.Fatal("the written version did not replace the cached one")
 	}
 	otherMember := deltaMember{ID: 11, Status: 1, Version: 7}
 	refreshStoredItem(storedItemOf(t, members, otherMember), 7)
-	if _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&otherMember)), 7); isCached {
+	if _, _, isCached := cachedStoredBlob(members.meta.recordKey(unsafe.Pointer(&otherMember)), 7); isCached {
 		t.Fatal("a record never read for update entered the cache")
 	}
 }
@@ -99,12 +99,12 @@ func TestFullWriteCacheEvictsExpiredEntriesFirst(t *testing.T) {
 	clock := withFreshWriteCache(t, time.Unix(2_000_000_000, 0))
 	writeCache.Lock()
 	for i := 0; i < writeCacheMaxEntries; i++ {
-		storeWriteCacheEntry("old#"+strconv.Itoa(i), 1, []byte{1})
+		storeWriteCacheEntry("old#"+strconv.Itoa(i), 1, []byte{1}, nil)
 	}
-	storeWriteCacheEntry("refused", 1, []byte{1})
+	storeWriteCacheEntry("refused", 1, []byte{1}, nil)
 	_, refusedIsCached := writeCache.entriesByKey["refused"]
 	*clock = clock.Add(writeCacheTTL + time.Second)
-	storeWriteCacheEntry("accepted", 1, []byte{1})
+	storeWriteCacheEntry("accepted", 1, []byte{1}, nil)
 	_, acceptedIsCached := writeCache.entriesByKey["accepted"]
 	remainingEntries := len(writeCache.entriesByKey)
 	writeCache.Unlock()

@@ -1,7 +1,6 @@
 package scylla
 
 import (
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/ivanjoz/colbin"
 	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/utils"
 	"github.com/viant/xunsafe"
 )
 
@@ -374,19 +374,9 @@ func valueToCSVBase64(val any) []byte {
 		}
 		return dst
 	case []byte:
-		dst := make([]byte, base64.StdEncoding.EncodedLen(len(v)))
-		base64.StdEncoding.Encode(dst, v)
-		for len(dst) > 0 && dst[len(dst)-1] == '=' {
-			dst = dst[:len(dst)-1]
-		}
-		return dst
+		return utils.Base64.AppendEncode(nil, v)
 	case *[]byte:
-		dst := make([]byte, base64.StdEncoding.EncodedLen(len(*v)))
-		base64.StdEncoding.Encode(dst, *v)
-		for len(dst) > 0 && dst[len(dst)-1] == '=' {
-			dst = dst[:len(dst)-1]
-		}
-		return dst
+		return utils.Base64.AppendEncode(nil, *v)
 	case bool:
 		if v {
 			return []byte{'1'}
@@ -427,10 +417,7 @@ func base64CSVStringToValue(val string, valType int8) any {
 	case 8: // bool
 		return val == "1"
 	case 9: // []byte
-		for len(val)%4 != 0 {
-			val += "="
-		}
-		recordBytes, _ := base64.StdEncoding.DecodeString(val)
+		recordBytes, _ := utils.Base64.DecodeString(val)
 		return recordBytes
 	case 11: // []string
 		parts := strings.Split(val, "``")

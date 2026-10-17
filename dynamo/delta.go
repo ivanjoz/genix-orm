@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -25,7 +27,7 @@ import (
 //
 // A delta index, {Type: TypeDelta, Keys: Cols(...)}, is a change log (delta_log.go):
 // every write appends (log ID, Version, deleted) to the index's file of the
-// record's partition, pinned values and 10-minute bucket, in the FileStore.
+// record's partition, pinned values and 10-minute bucket, in the utils.FileStore.
 //
 //   - The last Key, unless it is a ColSlice, is the sync filter column: Delta()'s
 //     values filter it on a first sync only. Cols(Status) is the usual shape:
@@ -55,9 +57,6 @@ const (
 
 // Now is the ORM's clock. An app with its own clock assigns it once at boot.
 var Now = time.Now
-
-// sUnixTimeOf is a moment as SUnixTime: (unix seconds − 1e9) / 2.
-func sUnixTimeOf(moment time.Time) int64 { return (moment.Unix() - 1e9) / 2 }
 
 // sUnixTimeToTime turns an SUnixTime back into the start of its 2-second tick.
 func sUnixTimeToTime(sUnixTime int64) time.Time { return time.Unix(sUnixTime*2+1e9, 0) }
@@ -105,10 +104,18 @@ func (m *tableMeta) stampUpdated(ptrs []unsafe.Pointer) {
 	if m.updated == nil {
 		return
 	}
-	writeTime := sUnixTimeOf(Now())
+	writeTime := utils.SUnixTimeOf(Now())
 	for _, ptr := range ptrs {
 		m.updated.acc.setI64(ptr, writeTime)
 	}
+}
+
+// writeTimeOf is the SUnixTime of a record's write: its stamped Updated, the clock without one.
+func (m *tableMeta) writeTimeOf(ptr unsafe.Pointer) int64 {
+	if m.updated == nil {
+		return utils.SUnixTimeOf(Now())
+	}
+	return m.updated.acc.getI64(ptr)
 }
 
 // deltaIndexMeta is one resolved TypeDelta index (see the top of this file).

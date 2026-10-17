@@ -34,9 +34,10 @@ const (
 )
 
 type writeCacheEntry struct {
-	version  int64
-	blob     []byte
-	cachedAt time.Time
+	version   int64
+	blob      []byte
+	changelog []byte // the item's cgl (data_frame.go), nil without one
+	cachedAt  time.Time
 }
 
 var writeCache = struct {
@@ -58,7 +59,7 @@ func rememberStoredItems(items []map[string]types.AttributeValue) {
 		if err != nil {
 			continue
 		}
-		storeWriteCacheEntry(writeCacheKeyOf(item), version, blobAttr.Value)
+		storeWriteCacheEntry(writeCacheKeyOf(item), version, blobAttr.Value, changelogOf(item))
 	}
 }
 
@@ -69,24 +70,24 @@ func refreshStoredItem(item map[string]types.AttributeValue, version int64) {
 	defer writeCache.Unlock()
 	cacheKey := writeCacheKeyOf(item)
 	if _, isCached := writeCache.entriesByKey[cacheKey]; isCached {
-		storeWriteCacheEntry(cacheKey, version, item[dataColumn].(*types.AttributeValueMemberB).Value)
+		storeWriteCacheEntry(cacheKey, version, item[dataColumn].(*types.AttributeValueMemberB).Value, changelogOf(item))
 	}
 }
 
-// cachedStoredBlob returns the stored blob of a record at exactly expectedVersion.
-func cachedStoredBlob(cacheKey string, expectedVersion int64) ([]byte, bool) {
+// cachedStoredBlob returns the stored blob and changelog of a record at exactly expectedVersion.
+func cachedStoredBlob(cacheKey string, expectedVersion int64) ([]byte, []byte, bool) {
 	writeCache.Lock()
 	defer writeCache.Unlock()
 	entry, isCached := writeCache.entriesByKey[cacheKey]
 	if !isCached || entry.version != expectedVersion || Now().Sub(entry.cachedAt) > writeCacheTTL {
-		return nil, false
+		return nil, nil, false
 	}
-	return entry.blob, true
+	return entry.blob, entry.changelog, true
 }
 
 // storeWriteCacheEntry must run under the lock. The blob is copied: an SDK
 // response buffer must not be kept alive, nor edited under the cache.
-func storeWriteCacheEntry(cacheKey string, version int64, blob []byte) {
+func storeWriteCacheEntry(cacheKey string, version int64, blob, changelog []byte) {
 	if _, isCached := writeCache.entriesByKey[cacheKey]; !isCached && len(writeCache.entriesByKey) >= writeCacheMaxEntries {
 		now := Now()
 		for expiredKey, entry := range writeCache.entriesByKey {
@@ -98,7 +99,7 @@ func storeWriteCacheEntry(cacheKey string, version int64, blob []byte) {
 			return
 		}
 	}
-	writeCache.entriesByKey[cacheKey] = writeCacheEntry{version: version, blob: bytes.Clone(blob), cachedAt: Now()}
+	writeCache.entriesByKey[cacheKey] = writeCacheEntry{version: version, blob: bytes.Clone(blob), changelog: bytes.Clone(changelog), cachedAt: Now()}
 }
 
 // writeCacheKeyOf is the item's pk#sk, the same string recordKey builds from a record.

@@ -10,6 +10,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.0
 	github.com/aws/smithy-go v1.27.3
 	github.com/ivanjoz/colbin v0.6.2
+	github.com/ivanjoz/genix-orm/dataframe v0.0.0
+	github.com/ivanjoz/genix-orm/utils v0.0.0
 	github.com/viant/xunsafe v0.11.0
 )
 
@@ -27,3 +29,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.0 // indirect
 )
+
+replace github.com/ivanjoz/genix-orm/dataframe => ../dataframe
+
+replace github.com/ivanjoz/genix-orm/utils => ../utils

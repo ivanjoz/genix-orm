@@ -8,7 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
-	"github.com/ivanjoz/genix-orm/dynamo/internal/parallel"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ func (r *Repo[T, E]) CopyRecordsFrom(sourceTable string, write bool) (RecordsRep
 			return err
 		}
 		isAlreadyCopied := make([]bool, len(pageWrites))
-		err = parallel.Run(len(pageWrites), func(writeIndex int) error {
+		err = utils.RunParallel(len(pageWrites), func(writeIndex int) error {
 			item := pageWrites[writeIndex].item
 			// A record written in the source after an earlier run (a higher Version) is copied again.
 			_, err := client.PutItem(context.Background(), &dynamodb.PutItemInput{

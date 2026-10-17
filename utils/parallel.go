@@ -1,5 +1,7 @@
-// Package parallel runs the independent calls of one ORM step at once, bounded.
-package parallel
+// Package utils holds what genix-orm's modules share and no database owns: the file store
+// (filestore.go), Safe85 (safe85.go), SUnixTime (sunixtime.go) and bounded parallel calls
+// (parallel.go). The dynamo backend and the dataframe module import it; scylla can too.
+package utils
 
 import (
 	"errors"
@@ -12,9 +14,9 @@ import (
 // instead of opening new TLS ones.
 const maxConcurrentTasks = 10
 
-// Run runs task(0)..task(count-1), at most maxConcurrentTasks at a time, and returns their errors
+// RunParallel runs task(0)..task(count-1), at most maxConcurrentTasks at a time, and returns their errors
 // joined. The calls of one step are independent, so their order does not matter.
-func Run(count int, task func(index int) error) error {
+func RunParallel(count int, task func(index int) error) error {
 	if count == 1 {
 		return task(0)
 	}

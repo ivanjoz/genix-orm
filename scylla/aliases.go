@@ -75,6 +75,8 @@ var (
 	MakeKeyConcat = db.MakeKeyConcat
 )
 
+const KeyConcatSeparator = db.KeyConcatSeparator
+
 // Generic functions cannot be aliased, so the shared query constructors are
 // re-exported as thin wrappers until callers move to db directly.
 

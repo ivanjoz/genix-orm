@@ -2,11 +2,14 @@ package dynamo
 
 import (
 	"bytes"
+	"context"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ── Delta test entity: no partition, a keyless delta and a fan-out delta ─────
@@ -73,17 +76,17 @@ func (t deltaVisitTable) GetSchema() Schema {
 
 // withDeltaClock pins Now to a moment in bucket 5000 (SUnixTime 1_500_010) and installs an empty
 // memory file store, both restored after the test.
-func withDeltaClock(t *testing.T) *MemoryFileStore {
+func withDeltaClock(t *testing.T) *utils.MemoryFileStore {
 	t.Helper()
 	originalNow, originalStore := Now, fileStore
 	t.Cleanup(func() { Now, fileStore = originalNow, originalStore })
 	Now = func() time.Time { return sUnixTimeToTime(1_500_010) }
-	store := NewMemoryFileStore()
+	store := utils.NewMemoryFileStore()
 	SetFileStore(store)
 	return store
 }
 
-func readDeltaLogFile(t *testing.T, store *MemoryFileStore, fileKey string, is64BitScale bool) []DeltaLogEntry {
+func readDeltaLogFile(t *testing.T, store *utils.MemoryFileStore, fileKey string, is64BitScale bool) []DeltaLogEntry {
 	t.Helper()
 	content, _, err := store.GetFile(fileKey)
 	if err != nil {
@@ -337,7 +340,7 @@ func TestDeltaLogFilesAreListedAndReadByBucket(t *testing.T) {
 	store := withDeltaClock(t)
 	folder := deltaLogFolder + "1/003/"
 	for _, fileKey := range []string{folder + "4998", folder + "5000", folder + "4990", deltaLogFolder + "1/002-003/1/4999"} {
-		store.write(fileKey, []byte{byte(len(fileKey))})
+		store.PutFileIfMatch(context.Background(), fileKey, []byte{byte(len(fileKey))}, "")
 	}
 	buckets, err := listDeltaLogBuckets(folder, 4995)
 	if slices.Sort(buckets); err != nil || !slices.Equal(buckets, []int64{4998, 5000}) {
@@ -380,13 +383,13 @@ func TestDeltaMetadataRecords(t *testing.T) {
 	if record.ID != -5000 || record.Date != 0 || record.Metadata == nil {
 		t.Fatalf("record = %+v", record)
 	}
-	decoded, err := DecodeSafe85(*record.Metadata)
+	decoded, err := utils.DecodeSafe85(*record.Metadata)
 	want := deltaMetadataBytes(deltaMetadataFlag64BitScale|deltaMetadataFlagSealed, 5000, []int8{16, 32}, content)
 	if err != nil || !bytes.Equal(decoded, want) {
 		t.Fatalf("metadata = %v, err %v; want %v", decoded, err, want)
 	}
 
-	replace, err := DecodeSafe85(DeltaReplaceMetadata())
+	replace, err := utils.DecodeSafe85(DeltaReplaceMetadata())
 	if err != nil || !bytes.Equal(replace, deltaMetadataBytes(deltaMetadataFlagReplace|deltaMetadataFlagSealed, 0, nil, nil)) {
 		t.Fatalf("replace metadata = %v, err %v", replace, err)
 	}

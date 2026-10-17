@@ -28,13 +28,13 @@
         { "partition": 5, "idTicks": [[12, 100], [268, 100], [300, 0], [524, 150]] },
         { "partition": 200, "idTicks": [[100, 0]] }
       ],
-      "encoded": "GAIFAQxkAAAEDIACIOABwwEAAWQ",
+      "encoded": "5-74-FlZ---327-17D-0kk3--LF",
       "decoded": [[5, 12, 100], [5, 268, 100], [5, 300, 0], [5, 524, 100], [200, 100, 0]]
     },
     {
       "cycleYear": 2024,
       "partitions": [{ "partition": 0, "idTicks": [[7, 0]] }],
-      "encoded": "GAEAAAEH",
+      "encoded": "5-3---36",
       "decoded": [[0, 7, 0]]
     }
   ]

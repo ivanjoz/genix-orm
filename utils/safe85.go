@@ -1,11 +1,3 @@
-package dynamo
-
-import (
-	"errors"
-	"fmt"
-	"strings"
-)
-
 // Safe85 is the one base85 variant of the ORM and of berryapps (https://github.com/kstenerud/safe-encoding,
 // safe85-specification.md): the delta Metadata records carry their log bytes in it, and genix-ui's
 // safe85.ts decodes them. Its alphabet leaves out `"` `#` `%` `&` `'` `/` `<` `?` `\`, so the text
@@ -13,6 +5,15 @@ import (
 // text sorts like the bytes it holds. Every 4 bytes, read big-endian, become 5 characters; a final
 // group of 1 to 3 bytes becomes 2 to 4 characters. `$` and the backtick are in the alphabet: never
 // interpolate a value unquoted in a shell.
+
+package utils
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
 const safe85Alphabet = "!$()*+,-.0123456789:;=>@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 // safe85ValueOf maps a character to its chunk value, -1 for a character outside the alphabet.
