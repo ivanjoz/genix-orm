@@ -117,12 +117,13 @@ func (b *Backend) Apply(ctx context.Context, table, partition string, puts []db.
 		docs[i] = genix.Doc{ID: uint32(doc.ID), Text: doc.Text}
 	}
 
-	ids := make([]uint32, len(dels))
+	// One collection per table: every document is in group 0.
+	refs := make([]genix.Ref, len(dels))
 	for i, id := range dels {
-		ids[i] = uint32(id)
+		refs[i] = genix.Ref{ID: uint32(id)}
 	}
 
-	res, err := b.client.Apply(ctx, table, partition, docs, ids)
+	res, err := b.client.Apply(ctx, table, partition, docs, refs)
 	if err != nil {
 		return fmt.Errorf("genixs3: apply %s/%s: %w", table, partition, err)
 	}
