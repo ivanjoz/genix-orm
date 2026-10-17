@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
 )
 
@@ -29,10 +30,12 @@ type ScyllaTable struct {
 	// fixedValueRanges holds the schema's FixedValues per column name, which is what lets a
 	// TypeDelta view size each key's bit slot without a .Size() decorator.
 	fixedValueRanges map[string]columnValueRange
-	// maxDeltaVersionValue is the widest "updated_version" the delta view's trailing slot can hold.
-	// Zero means the table declares no delta view and nothing needs checking.
-	maxDeltaVersionValue int64
-	capabilities         []QueryCapability
+	// deltaIndexes are the compiled TypeDelta indexes, each with its own change log (delta_log.go).
+	deltaIndexes []deltaIndexInfo
+	// readConsistency overrides the cluster's LocalOne on the copy of the table one read runs with:
+	// the cache reads use LocalQuorum. Zero keeps the session default.
+	readConsistency gocql.Consistency
+	capabilities    []QueryCapability
 	// Composite bucket metadata is used to materialize virtual hash sets and plan range+contains reads.
 	compositeBucketIndexes []compositeBucketIndex
 	indexGroups            []indexGroupInfo
@@ -103,7 +106,7 @@ type viewInfo struct {
 	packedSlotBitsPerColumn []int64
 	// packedIsInt32 tells which storage encoding (storeVirtualPacked) the packed column uses.
 	packedIsInt32 bool
-	Operators                 []string
+	Operators     []string
 	// RequiresPostFilter indicates the index/view can overfetch and should be exact-filtered in memory.
 	// Keep this for hash-style plans that intentionally trade exact routing for bounded overfetch.
 	RequiresPostFilter    bool
@@ -210,7 +213,7 @@ func GetCounter(keyspace string, name string, increment int) (int64, error) {
 }
 
 // ReserveCounterRange, when set, replaces GetCounter as the allocator behind every managed
-// sequence: autoincrement keys, the updated_version write sequence, and GetAutoincrementID.
+// sequence: autoincrement keys and GetAutoincrementID.
 //
 // It exists because GetCounter cannot be made safe on its own. It reads the counter and then
 // increments it, and Cassandra counters offer no way to read the result of your own increment, so

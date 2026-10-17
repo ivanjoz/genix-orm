@@ -544,7 +544,11 @@ func scanSelectQueryRows(
 			)
 		}
 
-		iter := getScyllaConnection().Query(queryStr, queryValues...).Iter()
+		query := getScyllaConnection().Query(queryStr, queryValues...)
+		if scyllaTable.readConsistency != 0 {
+			query = query.Consistency(scyllaTable.readConsistency)
+		}
+		iter := query.Iter()
 		rd, err := iter.RowData()
 		if err != nil {
 			fmt.Println("Error on RowData::", err)
@@ -875,6 +879,9 @@ func selectExec[E any](
 	}
 	if len(scyllaTable.Namespace) == 0 {
 		return errors.New("no se ha especificado un keyspace")
+	}
+	if tableInfo.Delta != nil {
+		return execDelta(recordsGetted, tableInfo, scyllaTable, selectStartTime)
 	}
 
 	compiledSelect, err := tryGetOrCompileSelectStatement(tableInfo, scyllaTable)

@@ -3,6 +3,8 @@ package db
 import (
 	"fmt"
 	"strings"
+
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // ColumnStatement is one predicate against a column. It is a plain description
@@ -38,6 +40,13 @@ func (q ColumnStatement) GetValue() any {
 	}
 }
 
+// DeltaRead is what a Delta() call asked for: the client's cursor of the log, and the values a first
+// sync (or a replace) filters the index's sync filter column with.
+type DeltaRead struct {
+	Cursor           cache.DeltaCursor
+	SyncFilterValues []any
+}
+
 // TableInfo is the mutable per-query state collected by the fluent builder
 // before Exec hands it to a driver. It is bound once per query, never shared,
 // and holds no storage-engine detail — only what the caller asked for.
@@ -54,6 +63,8 @@ type TableInfo struct {
 	CachedIndexGroups map[int32]int32
 	// UseIndexGroupSelect routes Exec into grouped hash fetches.
 	UseIndexGroupSelect bool
+	// Delta makes Exec a delta-cache read (db/cache), set by TableStruct.Delta.
+	Delta *DeltaRead
 	// RefSlice points at the caller's destination slice (*[]E). It is untyped here
 	// so the driver boundary stays free of type parameters.
 	RefSlice any

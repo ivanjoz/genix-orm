@@ -32,7 +32,6 @@ Cached items include:
 - field name/index/type
 - `xunsafe.Field` pointer for direct memory access
 - inferred ORM type (`colType`)
-- managed `updated_version` column
 
 This avoids rebuilding reflection metadata for each call to `initStructTable`.
 
@@ -192,7 +191,7 @@ This is the primary mechanism used to avoid accidental `ALLOW FILTERING` queries
 
 A signature only matches when the query constrains every column it names, so a query that skips a
 *leading* key of an index cannot reach it — `company_id = ? AND type = ?` misses a view keyed
-`[company_id, status, type, updated_version]` and falls back to a table scan.
+`[company_id, status, type]` and falls back to a table scan.
 
 When the skipped column declares `FixedValues`, the gap can be closed by enumeration:
 `status IN (0,1) AND type = 1` is logically identical to the original predicate and *is* a valid key
@@ -227,7 +226,7 @@ Inference rules:
 - `Type: TypeGlobalIndex`: global secondary index
 - `Cols != nil`: materialized view payload declaration
 - `Type: TypeViewTable`: derived table with write-side maintenance
-- `Type: TypeDelta`: packed range view with an implicit trailing `updated_version` key
+- `Type: TypeDelta`: a change log in the file store (§11), listed through a view on its keys
 - `UseIndexGroup: true`: write-maintained hash group metadata
 
 An index group compiles to exactly one virtual hash column per declaration (`zz_ig_` for scalars,
@@ -273,12 +272,11 @@ tier, while a partial prefix sits above the bare-partition plan (100) and below 
 equality (120) — a narrow index beats a broad prefix scan, and picking the view instead would leave
 the narrow predicate as an unservable leftover filter.
 
-`TypeDelta` is a range view whose bit layout is resolved from `TableSchema.FixedValues` instead of
-per-column `Size()` hints, with the managed `updated_version` column appended as the trailing key.
-Each declared key takes `bits.Len64(max)` bits; `compileSchemaDeltaView` picks `int` when the keys
-plus the 27-bit version slot fit 32 bits, and `bigint` (34-bit version) otherwise. Only the sum of
-the slots decides the fit, so key order does not matter. Range upper bounds are inclusive (every
-trailing slot at its max), so no bound can overflow the packed column.
+A `TypeDelta` with several keys lists its first sync through a range view whose bit layout is
+resolved from `TableSchema.FixedValues` instead of per-column `Size()` hints. Each declared key takes
+`bits.Len64(max)` bits (one key without a range takes the remainder); `compileSchemaDeltaView` picks
+`int` when the keys fit 32 bits, and `bigint` otherwise. One key compiles to a plain view on it, and
+no key to no view: the first sync reads the partition.
 
 ### 8.4 Composite Bucketing
 
@@ -328,36 +326,32 @@ Update path enforces dependency integrity:
 
 ---
 
-## 11. By-IDs Slot Versions (`cache_updated_version`)
+## 11. The cache protocols (`db/cache`)
 
-`SaveUpdatedVersion` opts a table into the by-IDs cache. Records are bucketed into 256 slots by
-`uint8(record_id)`, and one row per (table+partition, slot) holds the version of the last write that
-touched it. Metadata is precomputed during table build (`configureSlotVersionFields`).
+Both client caches keep their state in the ORM's file store (`db.SetFileStore`), not in Scylla. The
+files, their formats and the rules over them live in `genix-orm/db/cache`, shared with the dynamo
+driver; this driver brings the keys, the record reads and the write hooks. A partition is named
+`<keyspace>/<table ID>/<partition>` in every file key.
 
-Stored runtime metadata:
-- managed `updated_version` column
-- partition column and key column used to derive the slot key
+**By-IDs** (`CacheByIDs`, `cache_by_ids.go`). Records are bucketed into 256 slots by `uint8(ID)`;
+each partition has a year-cycle slot file of 256 ticks. After the rows are written, a write raises
+its records' slots to the tick of their `updated`. `QueryCachedIDs` reads the slot files, selects
+only the IDs whose slot moved (`part = ? AND key IN (…)`, at LocalQuorum), and overwrites each
+returned record's `Updated` with the tick the client now holds. The table needs one integer key, an
+integer partition, and an `Updated int32` field.
 
-Storage:
+**Delta** (`TypeDelta`, `delta_log.go`). The last Key is the sync filter, the others are pinned (each
+pinned value has its own log), and the table's single integer key is the log ID. Before the CQL, a
+write reads the stored `version`, status and pinned values of its keys and stamps `version + 1`
+(`cache.NextVersion`); after it, every record appends `(ID, version)` to its folder of each index —
+a deleted entry when its status is 0, and one in the folder it left when a pinned value changed.
+`Delta(cursor, filter…)` reads the log past the client's cursor and selects the logged IDs, or lists
+the view on a first sync or a replace; the result ends with one Metadata record (key = −bucket) per
+log file read. Two concurrent writers of one record can store the same version: one write is then
+not re-applied until the record's next change.
 
-```
-cache_updated_version(partition_table_id int, id_slot tinyint, updated_version smallint,
-                      PRIMARY KEY (partition_table_id, id_slot))
-```
-
-- `partition_table_id` packs the tenant (18 bits) and `TableSchema.ID` (14 bits) into one int.
-- `updated_version` is the write sequence truncated to int16. Slot versions are only compared for
-  equality, so wrap-around aliasing (1 in 65536) is accepted for a much smaller row. `0` is reserved
-  to mean "unknown" and is never stored.
-
-Read/write flow:
-- **Write**: one blind `UPDATE` per touched slot, batched. Nothing is read first — the version is
-  already on the record, assigned by the same counter call that hands out autoincrement IDs.
-- **Read**: one query returns a tenant's whole slot partition (≤256 tiny rows, kept hot by
-  `rows_per_partition: ALL`). Requested IDs whose client version equals their slot version are never
-  read from the base table.
-- Returned records have their `updated_version` overwritten with the **slot** version. Ordinary
-  selects do not touch it, so a delta read still carries each record's own write version.
+Both run in the marker phase, after the derived data, so a client never holds a marker newer than the
+row it read.
 
 ---
 
@@ -371,13 +365,13 @@ Capabilities:
 - generate required `IS NOT NULL` clauses for view key parts
 
 `DeployScylla` also calls `EnsureInternalTables()` before homologating anything. The ORM's own
-tables — `sequences` and `cache_updated_version` — are raw CQL, not declared `TableSchema`s, so the
+tables — `sequences` — are raw CQL, not declared `TableSchema`s, so the
 homologation pass cannot discover them: it only inspects the controllers it was handed. Without that
 call a standalone deploy would produce a keyspace with every application table and no counters,
 and the first write would fail. All the statements are `IF NOT EXISTS`, so it is free to re-run.
 
 Homologation never drops anything. A table that stops being declared — like the old `cache_version`
-— stays in the keyspace until it is dropped by hand.
+or `cache_updated_version` — stays in the keyspace until it is dropped by hand.
 
 ---
 

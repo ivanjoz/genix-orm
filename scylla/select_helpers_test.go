@@ -433,9 +433,6 @@ func TestCompiledSelectStatementSkipsWriteOnlyManagedColumns(t *testing.T) {
 	if strings.Contains(compiledStatement.queryTemplate, managedUpdatedColumnName) {
 		t.Fatalf("did not expect %q in query template: %s", managedUpdatedColumnName, compiledStatement.queryTemplate)
 	}
-	if strings.Contains(compiledStatement.queryTemplate, managedUpdatedVersionColumnName) {
-		t.Fatalf("did not expect %q in query template: %s", managedUpdatedVersionColumnName, compiledStatement.queryTemplate)
-	}
 	if !strings.Contains(compiledStatement.queryTemplate, "FROM genix_test.sequences") {
 		t.Fatalf("unexpected query template: %s", compiledStatement.queryTemplate)
 	}

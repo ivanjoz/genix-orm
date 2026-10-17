@@ -19,22 +19,20 @@ func containsAny(values []any, needle any) bool {
 	return false
 }
 
-// Declaring UpdatedVersion is what opts a table into the managed write sequence when it has
-// neither a TypeDelta index nor SaveUpdatedVersion.
 type updateCounterRecord struct {
 	TableStruct[updateCounterSchema, updateCounterRecord]
-	CompanyID      int32  `db:"empresa_id"`
-	ID             int64  `db:"id"`
-	Nombre         string `db:"nombre"`
-	UpdatedVersion int32  `json:"upv,omitempty"`
+	CompanyID int32  `db:"empresa_id"`
+	ID        int64  `db:"id"`
+	Nombre    string `db:"nombre"`
+	Updated   int32  `json:"upd,omitempty"`
 }
 
 type updateCounterSchema struct {
 	TableStruct[updateCounterSchema, updateCounterRecord]
-	CompanyID      Col[*updateCounterSchema, int32]
-	ID             Col[*updateCounterSchema, int64]
-	Nombre         Col[*updateCounterSchema, string]
-	UpdatedVersion Col[*updateCounterSchema, int32]
+	CompanyID Col[*updateCounterSchema, int32]
+	ID        Col[*updateCounterSchema, int64]
+	Nombre    Col[*updateCounterSchema, string]
+	Updated   Col[*updateCounterSchema, int32]
 }
 
 type updateCounterDisabledRecord struct {
@@ -113,15 +111,19 @@ func (e indexGroupSchema) GetSchema() TableSchema {
 func TestMakeScyllaTableAddsManagedAuditColumns(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterRecord, updateCounterSchema]()
 
-	for _, columnName := range []string{"created", "updated", "updated_version"} {
+	for _, columnName := range []string{"created", "updated"} {
 		if scyllaTable.ColumnsMap[columnName] == nil {
 			t.Fatalf("expected managed column %q to exist in table metadata", columnName)
 		}
 	}
+	// Only a table with a delta log pays for the version.
+	if scyllaTable.VersionCol != nil || scyllaTable.ColumnsMap["version"] != nil {
+		t.Fatal("expected no version column without a TypeDelta index")
+	}
 }
 
-// A table can omit default audit columns and still avoids the update counter when no feature consumes it.
-func TestMakeScyllaTableDisablesDefaultColumnsAndUnusedUpdateCounter(t *testing.T) {
+// A table can omit default audit columns.
+func TestMakeScyllaTableDisablesDefaultColumns(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterDisabledRecord, updateCounterDisabledSchema]()
 
 	for _, columnName := range []string{"created", "updated"} {
@@ -131,12 +133,6 @@ func TestMakeScyllaTableDisablesDefaultColumnsAndUnusedUpdateCounter(t *testing.
 	}
 	if scyllaTable.CreatedCol != nil || scyllaTable.UpdatedCol != nil {
 		t.Fatalf("expected default audit metadata to be disabled")
-	}
-	if scyllaTable.ColumnsMap["updated_version"] != nil {
-		t.Fatalf("expected updated_version managed column to be disabled")
-	}
-	if scyllaTable.UpdatedVersionCol != nil {
-		t.Fatalf("expected updateCounterCol runtime metadata to be nil when disabled")
 	}
 }
 
@@ -154,67 +150,28 @@ func TestMakeInsertStatementSkipsDisabledDefaultColumns(t *testing.T) {
 	}
 }
 
-func TestApplyWriteManagedColumnsUsesPartitionScopedUpdatedCounter(t *testing.T) {
+// updated is the time of the write, even over a value the caller set: both cache protocols read it
+// so. created keeps a value the caller set.
+func TestApplyWriteManagedColumnsAlwaysStampsUpdated(t *testing.T) {
 	scyllaTable := MakeScyllaTable[updateCounterRecord, updateCounterSchema]()
 	records := []updateCounterRecord{
-		{CompanyID: 7, ID: 1, Nombre: "uno"},
-		{CompanyID: 7, ID: 2, Nombre: "dos"},
+		{CompanyID: 7, ID: 1, Nombre: "uno", Updated: 5},
 		{CompanyID: 8, ID: 3, Nombre: "tres"},
 	}
 
-	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
-	t.Cleanup(func() {
-		getWriteCounterValue = originalCounterFetcher
-		getManagedUnixTime = originalManagedUnixTime
-	})
-
+	t.Cleanup(func() { getManagedUnixTime = originalManagedUnixTime })
 	getManagedUnixTime = func() int32 { return 77 }
 
-	counterCalls := []string{}
-	getWriteCounterValue = func(keyspace string, name string, increment int) (int64, error) {
-		counterCalls = append(counterCalls, name)
-		if keyspace != "test_keyspace" {
-			t.Fatalf("unexpected keyspace: %s", keyspace)
-		}
-		if increment != 1 {
-			t.Fatalf("unexpected counter increment: %d", increment)
-		}
-
-		switch name {
-		case "x7_update_counter_records_updated":
-			return 41, nil
-		case "x8_update_counter_records_updated":
-			return 52, nil
-		default:
-			t.Fatalf("unexpected counter name: %s", name)
-			return 0, nil
-		}
-	}
-
-	managedValues, err := applyWriteManagedColumns(makeRecordSlice(&records), scyllaTable, true)
-	if err != nil {
-		t.Fatalf("applyWriteManagedColumns returned error: %v", err)
-	}
-
-	if len(counterCalls) != 2 {
-		t.Fatalf("expected one counter fetch per partition, got %v", counterCalls)
-	}
-	slices.Sort(counterCalls)
-	if counterCalls[0] != "x7_update_counter_records_updated" || counterCalls[1] != "x8_update_counter_records_updated" {
-		t.Fatalf("unexpected counter names: %v", counterCalls)
-	}
-
+	managedValues := applyWriteManagedColumns(makeRecordSlice(&records), scyllaTable, true)
 	for recordIndex := range records {
 		if managedValues.createdValues[recordIndex] != int32(77) {
 			t.Fatalf("expected managed created 77, got %v at index %d", managedValues.createdValues[recordIndex], recordIndex)
 		}
-		if managedValues.updatedValues[recordIndex] != int32(77) {
-			t.Fatalf("expected managed updated 77, got %v at index %d", managedValues.updatedValues[recordIndex], recordIndex)
+		if managedValues.updatedValues[recordIndex] != int32(77) || records[recordIndex].Updated != 77 {
+			t.Fatalf("expected updated 77 on the record and the statement, got %v / %v at index %d",
+				managedValues.updatedValues[recordIndex], records[recordIndex].Updated, recordIndex)
 		}
-	}
-	if managedValues.updatedVersionValues[0] != int32(41) || managedValues.updatedVersionValues[1] != int32(41) || managedValues.updatedVersionValues[2] != int32(52) {
-		t.Fatalf("unexpected managed update counters: %v", managedValues.updatedVersionValues)
 	}
 }
 
@@ -224,17 +181,9 @@ func TestMakeUpdateStatementsAlwaysPersistsManagedUpdatedColumns(t *testing.T) {
 	}
 	table := TableOf[updateCounterRecord, updateCounterSchema]()
 
-	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
-	t.Cleanup(func() {
-		getWriteCounterValue = originalCounterFetcher
-		getManagedUnixTime = originalManagedUnixTime
-	})
-
+	t.Cleanup(func() { getManagedUnixTime = originalManagedUnixTime })
 	getManagedUnixTime = func() int32 { return 77 }
-	getWriteCounterValue = func(keyspace string, name string, increment int) (int64, error) {
-		return 41, nil
-	}
 
 	preparedStatements := MakeUpdateStatements(&records, table.Nombre)
 	if len(preparedStatements) != 1 {
@@ -242,17 +191,28 @@ func TestMakeUpdateStatementsAlwaysPersistsManagedUpdatedColumns(t *testing.T) {
 	}
 	preparedStatement := preparedStatements[0]
 
-	for _, expectedSetClause := range []string{"nombre = ?", "updated = ?", "updated_version = ?"} {
+	for _, expectedSetClause := range []string{"nombre = ?", "updated = ?"} {
 		if !strings.Contains(preparedStatement.Stmt, expectedSetClause) {
 			t.Fatalf("expected SET clause %q in statement: %s", expectedSetClause, preparedStatement.Stmt)
 		}
 	}
-
-	expectedBoundValues := []any{"nuevo", int32(77), int32(41)}
-	for _, expectedValue := range expectedBoundValues {
+	for _, expectedValue := range []any{"nuevo", int32(77)} {
 		if !containsAny(preparedStatement.Args, expectedValue) {
 			t.Fatalf("expected bound value %v in args %v", expectedValue, preparedStatement.Args)
 		}
+	}
+}
+
+// A delta table writes its version on every update, whatever columns the caller included.
+func TestMakeUpdateStatementsPersistsTheVersionOfADeltaTable(t *testing.T) {
+	resetORMTableCachesForTesting()
+
+	records := []deltaViewRecord{{CompanyID: 7, ID: 1, Status: 1, Type: 2, RegistryNumber: "x", Version: 4}}
+	table := TableOf[deltaViewRecord, deltaViewSchema]()
+	// The packed listing view needs its keys written together.
+	preparedStatements := MakeUpdateStatements(&records, table.Status, table.Type)
+	if !strings.Contains(preparedStatements[0].Stmt, "version = ?") || !containsAny(preparedStatements[0].Args, int16(4)) {
+		t.Fatalf("expected the version SET clause and value, got %s %v", preparedStatements[0].Stmt, preparedStatements[0].Args)
 	}
 }
 
@@ -261,17 +221,9 @@ func TestMakeInsertStatementIncludesManagedAuditColumnsWithoutStructFields(t *te
 		{CompanyID: 7, ID: 1, Nombre: "nuevo"},
 	}
 
-	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
-	t.Cleanup(func() {
-		getWriteCounterValue = originalCounterFetcher
-		getManagedUnixTime = originalManagedUnixTime
-	})
-
+	t.Cleanup(func() { getManagedUnixTime = originalManagedUnixTime })
 	getManagedUnixTime = func() int32 { return 77 }
-	getWriteCounterValue = func(keyspace string, name string, increment int) (int64, error) {
-		return 41, nil
-	}
 
 	insertStatements := MakeInsertStatement(&records)
 	if len(insertStatements) != 1 {
@@ -279,16 +231,13 @@ func TestMakeInsertStatementIncludesManagedAuditColumnsWithoutStructFields(t *te
 	}
 	preparedStatement := insertStatements[0]
 
-	for _, expectedColumn := range []string{"created", "updated", "updated_version"} {
+	for _, expectedColumn := range []string{"created", "updated"} {
 		if !strings.Contains(preparedStatement.Stmt, expectedColumn) {
 			t.Fatalf("expected managed column %q in insert statement: %s", expectedColumn, preparedStatement.Stmt)
 		}
 	}
-
-	for _, expectedValue := range []any{int32(77), int32(41)} {
-		if !containsAny(preparedStatement.Args, expectedValue) {
-			t.Fatalf("expected managed value %v in args %v", expectedValue, preparedStatement.Args)
-		}
+	if !containsAny(preparedStatement.Args, int32(77)) {
+		t.Fatalf("expected managed value 77 in args %v", preparedStatement.Args)
 	}
 }
 
@@ -315,17 +264,9 @@ func TestMakeUpdateStatementsAllowsIndexGroupUpdateWhenOmittedValuesExistInStruc
 	}
 	table := TableOf[indexGroupRecord, indexGroupSchema]()
 
-	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
-	t.Cleanup(func() {
-		getWriteCounterValue = originalCounterFetcher
-		getManagedUnixTime = originalManagedUnixTime
-	})
-
+	t.Cleanup(func() { getManagedUnixTime = originalManagedUnixTime })
 	getManagedUnixTime = func() int32 { return 77 }
-	getWriteCounterValue = func(keyspace string, name string, increment int) (int64, error) {
-		return 41, nil
-	}
 
 	preparedStatements := MakeUpdateStatements(&records, table.ClientID)
 	if len(preparedStatements) != 1 {
@@ -350,17 +291,9 @@ func TestMakeUpdateStatementsRejectsIndexGroupUpdateWhenOmittedValuesMissingInSt
 	}
 	table := TableOf[indexGroupRecord, indexGroupSchema]()
 
-	originalCounterFetcher := getWriteCounterValue
 	originalManagedUnixTime := getManagedUnixTime
-	t.Cleanup(func() {
-		getWriteCounterValue = originalCounterFetcher
-		getManagedUnixTime = originalManagedUnixTime
-	})
-
+	t.Cleanup(func() { getManagedUnixTime = originalManagedUnixTime })
 	getManagedUnixTime = func() int32 { return 77 }
-	getWriteCounterValue = func(keyspace string, name string, increment int) (int64, error) {
-		return 41, nil
-	}
 
 	defer func() {
 		recoveredValue := recover()
@@ -398,7 +331,7 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 	}
 
 	managedValues := managedWriteValues{
-		updatedVersionValues: []any{int32(41)},
+		updatedValues: []any{int32(41)},
 	}
 
 	if err := syncIndexGroupsAfterWrite(recordSliceGroup{makeRecordSlice(&records)}, &scyllaTable, managedValues); err != nil {
@@ -512,9 +445,6 @@ func TestBuildSelectProjectionSkipsWriteOnlyManagedColumns(t *testing.T) {
 	}
 	if slices.Contains(columnNames, managedUpdatedColumnName) {
 		t.Fatalf("did not expect %q in default projection: %v", managedUpdatedColumnName, columnNames)
-	}
-	if slices.Contains(columnNames, managedUpdatedVersionColumnName) {
-		t.Fatalf("did not expect %q in default projection: %v", managedUpdatedVersionColumnName, columnNames)
 	}
 	if !slices.Contains(columnNames, "name") || !slices.Contains(columnNames, "current_value") {
 		t.Fatalf("expected real sequence columns in projection, got %v", columnNames)

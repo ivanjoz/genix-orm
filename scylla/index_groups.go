@@ -427,7 +427,8 @@ func syncIndexGroupsAfterWrite(
 	if records.len() == 0 || len(scyllaTable.indexGroups) == 0 || scyllaTable.indexUpdatedTable == nil {
 		return nil
 	}
-	if len(managedValues.updatedVersionValues) == 0 {
+	// A group's update_counter is the updated (SUnixTime) of its latest write.
+	if len(managedValues.updatedValues) == 0 {
 		return nil
 	}
 
@@ -436,7 +437,7 @@ func syncIndexGroupsAfterWrite(
 	for recordIndex := range records.len() {
 		recordPointer := records.at(recordIndex)
 		partitionValue := int32(scyllaTable.GetPartValue(recordPointer))
-		updateCounterValue := convertToInt64(managedValues.updatedVersionValues[recordIndex])
+		updateCounterValue := convertToInt64(managedValues.updatedValues[recordIndex])
 		appendIndexUpdatedRowsForRecord(recordPointer, scyllaTable, partitionValue, updateCounterValue, rowsByPartitionAndHash, &rowsToPersist)
 	}
 

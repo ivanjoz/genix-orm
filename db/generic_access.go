@@ -14,7 +14,7 @@ import (
 // read and write a table it can only identify by a string. The typed API stays the default for
 // application code — this one exists because Go generics cannot resolve a table from a runtime
 // name, and without it tooling would fall back to hand-written CQL and lose every managed column
-// the ORM maintains (autoincrement keys, updated_version, virtual columns, views, text index).
+// the ORM maintains (autoincrement keys, version, virtual columns, views, text index).
 
 // FilterSpec is one predicate expressed with strings and JSON-native values. Column accepts either
 // the storage column name ("company_id") or the Go field name ("CompanyID"), because a caller that
@@ -48,7 +48,7 @@ type ColumnDescription struct {
 	IsKey       bool   `json:"is_key,omitempty"`
 	IsVirtual   bool   `json:"is_virtual,omitempty"`
 	// IsManaged marks a column the ORM writes on the caller's behalf, so a write payload must
-	// leave it out: created, updated and updated_version.
+	// leave it out: created, updated and version.
 	IsManaged bool `json:"is_managed,omitempty"`
 }
 
@@ -56,14 +56,14 @@ type ColumnDescription struct {
 // filter. QueryShapes is the decisive field: it lists the predicate combinations the compiled
 // table can serve through a key, an index or a view, so anything else needs ALLOW FILTERING.
 type TableDescription struct {
-	Name               string              `json:"name"`
-	Namespace          string              `json:"namespace,omitempty"`
-	ID                 int16               `json:"id"`
-	Partition          string              `json:"partition,omitempty"`
-	Keys               []string            `json:"keys"`
-	Columns            []ColumnDescription `json:"columns"`
-	QueryShapes        []string            `json:"query_shapes"`
-	SaveUpdatedVersion bool                `json:"save_updated_version,omitempty"`
+	Name        string              `json:"name"`
+	Namespace   string              `json:"namespace,omitempty"`
+	ID          int16               `json:"id"`
+	Partition   string              `json:"partition,omitempty"`
+	Keys        []string            `json:"keys"`
+	Columns     []ColumnDescription `json:"columns"`
+	QueryShapes []string            `json:"query_shapes"`
+	CacheByIDs  bool                `json:"cache_by_ids,omitempty"`
 }
 
 // namedCol re-wraps a compiled column as the Coln handle the write API takes. Insert and Update

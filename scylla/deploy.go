@@ -299,8 +299,8 @@ func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.
 	}
 
 	appendSelectedColumn(partitionColumn)
-	if scyllaTable.UpdatedVersionCol != nil {
-		appendSelectedColumn(scyllaTable.UpdatedVersionCol)
+	if scyllaTable.UpdatedCol != nil {
+		appendSelectedColumn(scyllaTable.UpdatedCol)
 	}
 	for _, indexGroup := range scyllaTable.indexGroups {
 		for _, sourceColumn := range indexGroup.sourceColumns {
@@ -359,7 +359,7 @@ func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.
 
 		for valueIndex, selectedColumn := range selectedColumns {
 			rawValue := dereferenceScyllaValue(rowData.Values[valueIndex])
-			if selectedColumn.GetName() == managedUpdatedVersionColumnName {
+			if selectedColumn.GetName() == managedUpdatedColumnName {
 				updateCounterValue = convertToInt64(rawValue)
 				continue
 			}

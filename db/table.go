@@ -31,7 +31,7 @@ type Table interface {
 // cross-package unexported access, embedding included.
 type TableCore struct {
 	Name string
-	// ID is the table's hand-assigned identity, packed into the by-IDs cache key.
+	// ID is the table's hand-assigned identity; it names the table's cache files.
 	ID int16
 	// Namespace is the logical grouping the table lives in — a keyspace on Scylla.
 	Namespace     string
@@ -41,15 +41,13 @@ type TableCore struct {
 	Columns       []IColInfo
 	ColumnsMap    map[string]IColInfo
 	ColumnsIdxMap map[int16]IColInfo
-	// SaveUpdatedVersion enables the by-IDs slot-version hooks on writes for this table.
-	SaveUpdatedVersion bool
-	// By-IDs cache metadata is precomputed during table creation.
-	SlotVersionPartitionCol IColInfo
-	SlotVersionKeyCol       IColInfo
-	// Columns the ORM writes on the caller's behalf.
-	CreatedCol        IColInfo
-	UpdatedCol        IColInfo
-	UpdatedVersionCol IColInfo
+	// CacheByIDs enables the by-IDs slot hooks on writes for this table.
+	CacheByIDs bool
+	// Columns the ORM writes on the caller's behalf. VersionCol is nil on a table without a
+	// TypeDelta index.
+	CreatedCol IColInfo
+	UpdatedCol IColInfo
+	VersionCol IColInfo
 	// Sequence and autoincrement metadata for generated keys.
 	UseSequences      bool
 	SequencePartCol   IColInfo

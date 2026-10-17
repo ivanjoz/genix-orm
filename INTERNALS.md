@@ -86,7 +86,7 @@ type Executor[TableT any, RecordT any] interface {
     InsertUpdateExclude(records *[]RecordT, isInsert func(*RecordT) bool, columnsToExcludeUpdate []Coln, columnsToExcludeInsert ...Coln) error
     Merge(records *[]RecordT, columnsToExcludeUpdate []Coln, onUpdate func(previous, current *RecordT) bool, onInsert func(*RecordT)) error
 
-    QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error
+    QueryCachedIDs(request cache.CachedIDsRequest) ([]cache.CachedPartition[RecordT], error)
     SearchTextIDs(partition int32, query string, limit, offset int) ([]TextHit, error)
     SearchText(refSlice *[]RecordT, partition int32, query string, limit, offset int) ([]TextHit, error)
 
@@ -126,7 +126,7 @@ them in its `init()`:
 ```go
 var (
     GetAutoincrementID      func(key string, recordsSize int) (int64, error)
-    QueryCachedGenericByIDs func(tableName string, cachedIDs []IDUpdatedVersion) ([]GenericRecord, error)
+    QueryCachedGenericByIDs func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[GenericRecord], error)
     SetDebugLogging         func(level int)
 )
 ```
@@ -259,7 +259,7 @@ type Table interface {
 `db.TableCore` implements it and holds the metadata that means the same thing
 everywhere: `Name`, `Namespace`, `Keys`, `PartKey`, `Columns`, `ColumnsMap`,
 `ColumnsIdxMap`, `KeysIdx`, the managed columns (`CreatedCol`, `UpdatedCol`,
-`UpdatedVersionCol`), sequence/autoincrement metadata, by-IDs slot metadata, and
+`VersionCol`), sequence/autoincrement metadata, the `CacheByIDs` flag, and
 `MaxColIdx`.
 
 A driver embeds it and adds its own. `scylla.ScyllaTable` adds views, indexes,

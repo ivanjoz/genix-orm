@@ -3,8 +3,9 @@ package db
 import (
 	"fmt"
 	"reflect"
-	"sort"
 	"strings"
+
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // TableStruct is embedded in both the record struct and the table struct of every
@@ -132,172 +133,18 @@ func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
 	})
 }
 
-// Delta constrains a read to the delta-cache shape backed by one of the table's TypeDelta indexes.
+// Delta turns the query into a delta-cache read (db/cache). An empty cursor is a first sync: it lists
+// the TypeDelta index's view, syncFilterValues filtering its sync filter column (its last Key). A
+// cursor reads the log past it and returns the records written since, in every status, so records
+// that left the filter (soft-deleted) reach the clients still caching them; a cursor older than the
+// log answers like a first sync. Either way the result ends with one Metadata record per log file
+// read, which the client keeps as its next cursor.
 //
-// updatedSince is the client's watermark: the highest "updated_version" it has already received.
-// Greater than zero asks for everything written after it, fanned out over every declared value of
-// the sync-filter column so the client also sees rows flipped to an inactive value and can evict
-// them. Zero is a first sync and keeps only syncFilterValues.
-//
-// The filtered column is not named here, it is inferred from the shape of the query: among the
-// declared TypeDelta indexes, the one whose keys are all pinned by predicates already on the query
-// except for exactly one, and that remaining key is what syncFilterValues applies to. A table can
-// therefore declare several delta indexes for different read shapes — given
-// {WarehouseID, Status} and {Status}, a query that pinned WarehouseID routes to the first and
-// filters Status, while one that did not routes to the second. Pass no value to constrain nothing
-// but the watermark, which selects an index whose every key is already pinned (commonly a keyless
-// one).
-//
-// Call Delta() last: it reads the predicates already set to make that choice.
-func (e *TableStruct[D, T, E]) Delta(updatedSince int32, syncFilterValues ...int64) *T {
-	schema := (*e.schemaStruct).GetSchema()
-
-	deltaIndexes := []Index{}
-	for _, index := range schema.Indexes {
-		if index.Type == TypeDelta {
-			deltaIndexes = append(deltaIndexes, index)
-		}
-	}
-	if len(deltaIndexes) == 0 {
-		panic(fmt.Sprintf(`Table "%v": Delta() requires a delta index. Declare {Type: db.TypeDelta, Keys: db.Cols(…)}.`,
-			schema.Name))
-	}
-
-	syncFilterColumn := ""
-	filterValues := []any{}
-
-	if len(syncFilterValues) > 0 {
-		syncFilterColumn = resolveDeltaSyncFilterColumn(schema, deltaIndexes, e.equalityPinnedColumns())
-
-		filterValues = make([]any, 0, len(syncFilterValues))
-		if updatedSince > 0 {
-			// A delta sync must carry every value of the filter column, or rows that moved to an
-			// inactive one would never reach the client that still caches them.
-			for _, declaredValue := range declaredValuesOfColumn(schema, syncFilterColumn) {
-				filterValues = append(filterValues, declaredValue)
-			}
-		} else {
-			for _, requestedValue := range syncFilterValues {
-				filterValues = append(filterValues, requestedValue)
-			}
-		}
-
-		if len(filterValues) == 1 {
-			e.SetWhere(syncFilterColumn, "=", filterValues[0])
-		} else {
-			e.SetWhereIn(syncFilterColumn, filterValues)
-		}
-	}
-
-	// The watermark predicate is always emitted, even at zero: a packed delta view is only reachable
-	// through a range on its trailing key, so without it the planner falls into exact-equality
-	// matching. The bound is expressed as ">= W+1" rather than "> W" because the packed view builds
-	// its lower bound from the statement value and ignores the operator; versions start at 1, so a
-	// first sync still reads the whole slot.
-	e.SetWhere(ColumnNameUpdatedVersion, ">=", updatedSince+1)
-
-	// A delta read that returns the whole table is indistinguishable from a first sync in the
-	// scan counters, so the watermark it was actually given is printed with the shape it produced.
-	if ShouldLog() {
-		fmt.Printf("Delta:: table=%v isFirstSync=%v %v>=%v filter=%v in %v\n",
-			schema.Name, updatedSince == 0, ColumnNameUpdatedVersion, updatedSince+1,
-			syncFilterColumn, filterValues)
-	}
+// The driver picks the TypeDelta index from the predicates already set: the one whose pinned Keys
+// (every Key but the last) all have an equality, the most specific when several fit. Call it last.
+func (e *TableStruct[D, T, E]) Delta(cursor cache.DeltaCursor, syncFilterValues ...any) *T {
+	e.tableInfo.Delta = &DeltaRead{Cursor: cursor, SyncFilterValues: syncFilterValues}
 	return e.schemaStruct
-}
-
-// equalityPinnedColumns names the columns the caller already constrained to a value or a value set.
-// A packed delta view is only reachable through a range on its trailing key once every leading key
-// is pinned, so these are what decide which delta index a read can use.
-func (e *TableStruct[D, T, E]) equalityPinnedColumns() map[string]bool {
-	pinnedColumns := map[string]bool{}
-	for _, statement := range e.tableInfo.Statements {
-		if statement.Operator == "=" || statement.Operator == "IN" {
-			pinnedColumns[statement.Col] = true
-		}
-	}
-	return pinnedColumns
-}
-
-// resolveDeltaSyncFilterColumn picks the delta index that fits the query's shape and returns the one
-// key it leaves for Delta() to filter. A usable index has every key pinned but that one; when
-// several qualify the most specific wins, since a read that pinned more columns should use the
-// narrower view.
-func resolveDeltaSyncFilterColumn(schema TableSchema, deltaIndexes []Index, pinnedColumns map[string]bool) string {
-	declaredShapes := make([]string, 0, len(deltaIndexes))
-	bestSyncFilterColumn := ""
-	bestPinnedCount := -1
-	isAmbiguous := false
-
-	for _, deltaIndex := range deltaIndexes {
-		keyNames := make([]string, 0, len(deltaIndex.Keys))
-		unpinnedKeyNames := make([]string, 0, len(deltaIndex.Keys))
-		for _, key := range deltaIndex.Keys {
-			keyName := key.GetInfo().Name
-			keyNames = append(keyNames, keyName)
-			if !pinnedColumns[keyName] {
-				unpinnedKeyNames = append(unpinnedKeyNames, keyName)
-			}
-		}
-		declaredShapes = append(declaredShapes, "["+strings.Join(keyNames, ",")+"]")
-
-		// Delta() supplies exactly one column's values, so exactly one key may still be open.
-		if len(unpinnedKeyNames) != 1 {
-			continue
-		}
-		pinnedCount := len(keyNames) - 1
-		if pinnedCount == bestPinnedCount {
-			isAmbiguous = true
-			continue
-		}
-		if pinnedCount > bestPinnedCount {
-			bestSyncFilterColumn, bestPinnedCount, isAmbiguous = unpinnedKeyNames[0], pinnedCount, false
-		}
-	}
-
-	if isAmbiguous {
-		panic(fmt.Sprintf(`Table "%v": Delta() cannot choose between the delta indexes %v — several fit this query equally well. Pin one more key column, or drop a delta index.`,
-			schema.Name, strings.Join(declaredShapes, " ")))
-	}
-	if bestPinnedCount < 0 {
-		panic(fmt.Sprintf(`Table "%v": Delta() was given filter values, but no delta index %v leaves exactly one key unpinned by this query (pinned: %v). Declare a matching delta index, set the other key columns before calling Delta(), or drop the filter values.`,
-			schema.Name, strings.Join(declaredShapes, " "), sortedColumnNames(pinnedColumns)))
-	}
-	return bestSyncFilterColumn
-}
-
-func sortedColumnNames(columns map[string]bool) []string {
-	names := make([]string, 0, len(columns))
-	for name := range columns {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// declaredValuesOfColumn enumerates a column's FixedValues, expanding a Min/Max range when no
-// explicit list was given.
-func declaredValuesOfColumn(schema TableSchema, columnName string) []int64 {
-	for _, fixedValues := range schema.FixedValues {
-		if fixedValues.Col == nil || fixedValues.Col.GetInfo().Name != columnName {
-			continue
-		}
-		if len(fixedValues.Values) > 0 {
-			return fixedValues.Values
-		}
-		minValue, maxValue, isDeclared := fixedValues.Bounds()
-		if !isDeclared {
-			break
-		}
-		values := make([]int64, 0, maxValue-minValue+1)
-		for value := minValue; value <= maxValue; value++ {
-			values = append(values, value)
-		}
-		return values
-	}
-
-	panic(fmt.Sprintf(`Table "%v": Delta() needs a FixedValues entry for "%v" to fan a delta sync out over its every value.`,
-		schema.Name, columnName))
 }
 
 func (e *TableStruct[D, T, E]) SetTableInfo(t *TableInfo) {

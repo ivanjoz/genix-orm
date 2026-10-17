@@ -2,8 +2,11 @@ package scylla
 
 import (
 	"fmt"
-	"github.com/ivanjoz/genix-orm/db"
 	"strings"
+
+	"github.com/gocql/gocql"
+	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // Generic by-IDs reads let one endpoint resolve "give me the label for these IDs" for any table,
@@ -15,8 +18,8 @@ import (
 // buffer and copies it into the result. The read loop therefore performs no reflection, no map
 // lookups and no type switching per row — it just walks a slice of closures.
 //
-// Requirements are inherited from the by-IDs cache: SaveUpdatedVersion enabled, exactly one integer
-// key column, integer partition. That is what makes "ID is an integer" always true here.
+// Requirements are inherited from the by-IDs cache: CacheByIDs enabled, exactly one integer key
+// column, integer partition. That is what makes "ID is an integer" always true here.
 
 // genericScanSlot binds a typed buffer gocql scans into to the assignment that moves it into the
 // record. Allocated once per query and reused for every row of that query.
@@ -128,9 +131,9 @@ func configureGenericRecordFields(scyllaTable *ScyllaTable, schema TableSchema) 
 		return
 	}
 
-	// The slot version is what makes the generic read incremental, so the two features are inseparable.
-	if !shouldUseSlotVersionFeature(*scyllaTable) {
-		panic(fmt.Sprintf(`Table "%v": GenericRecord requires SaveUpdatedVersion enabled.`, scyllaTable.Name))
+	// The slot ticks are what make the generic read incremental, so the two features are inseparable.
+	if !scyllaTable.CacheByIDs {
+		panic(fmt.Sprintf(`Table "%v": GenericRecord requires CacheByIDs.`, scyllaTable.Name))
 	}
 	if schema.GenericRecord.Name == nil {
 		panic(fmt.Sprintf(`Table "%v": GenericRecord requires a Name column.`, scyllaTable.Name))
@@ -138,9 +141,9 @@ func configureGenericRecordFields(scyllaTable *ScyllaTable, schema TableSchema) 
 
 	plan := genericRecordPlan{}
 
-	// The ID accessor comes first and is always the slot-version key column, which the by-IDs
-	// validation already guarantees to be a single integer key.
-	plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.Name, scyllaTable.SlotVersionKeyCol,
+	// The ID accessor comes first and is always the table's key, which the by-IDs validation already
+	// guarantees to be a single integer one.
+	plan.accessors = append(plan.accessors, makeGenericIntAccessor(scyllaTable.Name, scyllaTable.Keys[0],
 		func(record *GenericRecord, value int64) { record.ID = value }))
 
 	nameColumn := resolveGenericColumn(scyllaTable, schema.GenericRecord.Name, "Name")
@@ -196,11 +199,10 @@ func (e ScyllaTable) GenericRecordProjection() string {
 /* Query */
 
 // QueryCachedGenericByIDs resolves IDs to the flat GenericRecord shape for any table that opts in
-// through TableSchema.GenericRecord, using the same slot-version filtering as QueryCachedIDs:
-// records whose client upv still matches their slot are not read from the table at all.
-func QueryCachedGenericByIDs(tableName string, cachedIDs []IDUpdatedVersion) ([]GenericRecord, error) {
-	if len(cachedIDs) == 0 {
-		fmt.Println("QueryCachedGenericByIDs: empty request, nothing to process")
+// through TableSchema.GenericRecord, with the same slot filtering as QueryCachedIDs: records whose
+// slot did not move since the tick the client holds are not read from the table at all.
+func QueryCachedGenericByIDs(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[GenericRecord], error) {
+	if len(request.IDs) == 0 {
 		return nil, nil
 	}
 
@@ -221,28 +223,18 @@ func QueryCachedGenericByIDs(tableName string, cachedIDs []IDUpdatedVersion) ([]
 	if plan == nil {
 		return nil, fmt.Errorf("la tabla %q no expone registros genéricos", tableName)
 	}
-	if err := prepareCachedIDsTable(&scyllaTable, "QueryCachedGenericByIDs"); err != nil {
+	readPlan, err := planCachedIDsRead(scyllaTable, request, "QueryCachedGenericByIDs")
+	if err != nil || len(readPlan.IDsToRead) == 0 {
 		return nil, err
 	}
 
-	fetchPlan, err := planCachedIDsFetch(scyllaTable, cachedIDs)
-	if err != nil {
-		return nil, err
-	}
-	if !fetchPlan.hasRecordsToFetch() {
-		fmt.Println("QueryCachedGenericByIDs: all IDs resolved from slot versions, skipping table select")
-		return nil, nil
-	}
-
-	records := []GenericRecord{}
-
-	err = forEachCachedIDsBatch(fetchPlan, scyllaTable, plan.projection,
-		func(queryString string, queryValues []any, partitionID int32) error {
+	recordsByPartition := map[int64][]GenericRecord{}
+	err = forEachIDsBatch(scyllaTable, idsByPartition(readPlan.IDsToRead), plan.projection,
+		func(queryString string, queryValues []any, partition int64) error {
 			// Buffers are allocated once per batch and overwritten per row by gocql.
 			scanTargets, scanSlots := plan.newScanSlots()
-			versionBySlot := fetchPlan.versionsBySlotAndPart[partitionID]
-
-			iterator := getScyllaConnection().Query(queryString, queryValues...).Iter()
+			// LocalQuorum, as every cache read: see readRecordsByIDs.
+			iterator := getScyllaConnection().Query(queryString, queryValues...).Consistency(gocql.LocalQuorum).Iter()
 			scanner := iterator.Scanner()
 			for scanner.Next() {
 				if err := scanner.Scan(scanTargets...); err != nil {
@@ -253,15 +245,13 @@ func QueryCachedGenericByIDs(tableName string, cachedIDs []IDUpdatedVersion) ([]
 				for _, scanSlot := range scanSlots {
 					scanSlot.assign(&record)
 				}
-				// upv carries the slot version here, from the state already loaded in phase 1.
-				record.UpdatedVersion = versionBySlot[slotOfRecordID(record.ID)]
-				records = append(records, record)
+				record.Updated = int32(readPlan.HeldUpdated(partition, record.ID))
+				recordsByPartition[partition] = append(recordsByPartition[partition], record)
 			}
 			return iterator.Close()
 		})
 	if err != nil {
 		return nil, err
 	}
-
-	return records, nil
+	return groupCachedPartitions(recordsByPartition), nil
 }

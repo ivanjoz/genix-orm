@@ -116,7 +116,7 @@ type Controller interface {
 	// The four below are the name-addressed data surface (see generic_access.go): the read and
 	// write a caller can drive knowing only the table's name. Records cross the boundary as the
 	// record struct's own JSON, so a row that was read can be edited and written straight back,
-	// and the write still runs through the ORM — keeping autoincrement keys, updated_version,
+	// and the write still runs through the ORM — keeping autoincrement keys, version,
 	// virtual columns, views and the text index.
 
 	// DescribeTable publishes the schema in serializable form.

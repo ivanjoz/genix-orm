@@ -11,7 +11,7 @@ import (
 // The name-addressed data surface of db.Controller. Everything here resolves columns from strings
 // and then goes through the ordinary typed paths — Query, Insert, Update — so a caller that only
 // knows a table's name still gets every managed behaviour: autoincrement keys, created/updated,
-// updated_version, virtual columns, view fan-out and the text-search index.
+// version, virtual columns, view fan-out and the text-search index.
 
 // DescribeTable publishes this table's schema in serializable form.
 func (e *ScyllaController[T, E]) DescribeTable() db.TableDescription {
@@ -46,7 +46,7 @@ func (e *ScyllaController[T, E]) DescribeTable() db.TableDescription {
 	}
 
 	managedColumns := []IColInfo{
-		scyllaTable.CreatedCol, scyllaTable.UpdatedCol, scyllaTable.UpdatedVersionCol,
+		scyllaTable.CreatedCol, scyllaTable.UpdatedCol, scyllaTable.VersionCol,
 	}
 
 	return db.TableDescription{
@@ -57,8 +57,8 @@ func (e *ScyllaController[T, E]) DescribeTable() db.TableDescription {
 		Keys:      keyNames,
 		Columns: db.DescribeColumns(scyllaTable.Columns, scyllaTable.Keys, partitionColumn,
 			managedColumns, reflect.TypeOf(*new(T))),
-		QueryShapes:        queryShapes,
-		SaveUpdatedVersion: scyllaTable.SaveUpdatedVersion,
+		QueryShapes: queryShapes,
+		CacheByIDs:  scyllaTable.CacheByIDs,
 	}
 }
 

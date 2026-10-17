@@ -143,17 +143,17 @@ func TestResetCounterPropagatesAnAllocatorRefusal(t *testing.T) {
 	}
 }
 
-// The write path reaches the allocator through getWriteCounterValue, so the hook has to be visible
-// from there too — that variable is what the updated_version sequence and autoincrement keys share.
+// Autoincrement keys reach the allocator through reserveCounter, so the hook has to be visible from
+// there too.
 func TestTheWritePathUsesTheHook(t *testing.T) {
 	installReserveCounterRange(t, func(_ string, name string, _ int) (int64, error) {
-		if name != "x3_ventas_updated" {
-			t.Fatalf("counter name = %q; want the write sequence's own name", name)
+		if name != "x3_ventas_id" {
+			t.Fatalf("counter name = %q; want the autoincrement counter's own name", name)
 		}
 		return 77, nil
 	})
 
-	start, err := getWriteCounterValue("genix", "x3_ventas_updated", 1)
+	start, err := reserveCounter("genix", "x3_ventas_id", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

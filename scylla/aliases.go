@@ -16,7 +16,6 @@ type (
 
 	GenericRecordSchema = db.GenericRecordSchema
 	GenericRecord       = db.GenericRecord
-	IDUpdatedVersion    = db.IDUpdatedVersion
 
 	Table = db.Table
 )
@@ -49,10 +48,7 @@ type RecordOf[TableT TableSchemaInterface[TableT], RecordT TableBaseInterface[Ta
 }
 
 const (
-	// Bounds of the packed by-IDs cache key, re-exported so the driver's own packing code reads
-	// against the same declaration the schema layer validates with.
-	MaxTableID          = db.MaxTableID
-	MaxCachePartitionID = db.MaxCachePartitionID
+	MaxTableID = db.MaxTableID
 
 	TypeGlobalIndex    = db.TypeGlobalIndex
 	TypeLocalIndex     = db.TypeLocalIndex

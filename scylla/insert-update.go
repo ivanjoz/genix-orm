@@ -16,22 +16,11 @@ import (
 
 const maxInsertBatchRows = 500
 
-// The updated_version sequence reads through this var so tests can stub it; the autoincrement path
-// calls reserveCounter directly. Both end at the same allocator, which is what matters: installing
-// ReserveCounterRange redirects them together, and splitting them would leave one racing while the
-// other was safe.
-var getWriteCounterValue = reserveCounter
 var getManagedUnixTime = currentManagedUnixTime
 
 type managedWriteValues struct {
-	createdValues        []any
-	updatedValues        []any
-	updatedVersionValues []any
-}
-
-type prefetchedManagedCounterValues struct {
-	counterValueByPartition map[int64]any
-	counterNameByPartition  map[int64]string
+	createdValues []any
+	updatedValues []any
 }
 
 func currentManagedUnixTime() int32 {
@@ -49,9 +38,6 @@ func (e managedWriteValues) slice(start int, end int) managedWriteValues {
 	if len(e.updatedValues) > 0 {
 		slicedValues.updatedValues = e.updatedValues[start:end]
 	}
-	if len(e.updatedVersionValues) > 0 {
-		slicedValues.updatedVersionValues = e.updatedVersionValues[start:end]
-	}
 	return slicedValues
 }
 
@@ -64,10 +50,6 @@ func (e managedWriteValues) getValueForColumn(recordIndex int, column IColInfo, 
 	case managedUpdatedColumnName:
 		if recordIndex < len(e.updatedValues) && e.updatedValues[recordIndex] != nil {
 			return e.updatedValues[recordIndex], true
-		}
-	case managedUpdatedVersionColumnName:
-		if recordIndex < len(e.updatedVersionValues) && e.updatedVersionValues[recordIndex] != nil {
-			return e.updatedVersionValues[recordIndex], true
 		}
 	}
 	return nil, false
@@ -90,20 +72,14 @@ func coerceManagedIntegerValue(column IColInfo, value int64) any {
 	}
 }
 
-func resolveManagedTimestampValue(column IColInfo, ptr unsafe.Pointer, fallbackValue int64) any {
-	if column == nil {
-		return nil
-	}
-
-	currentValue := column.GetRawValue(ptr)
-	if currentValue != nil {
-		currentValueInt := convertToInt64(currentValue)
-		if currentValueInt > 0 {
+// resolveCreatedValue keeps a created value the caller already set, the write time otherwise.
+func resolveCreatedValue(column IColInfo, ptr unsafe.Pointer, writeTime int64) any {
+	if currentValue := column.GetRawValue(ptr); currentValue != nil {
+		if currentValueInt := convertToInt64(currentValue); currentValueInt > 0 {
 			return coerceManagedIntegerValue(column, currentValueInt)
 		}
 	}
-
-	return coerceManagedIntegerValue(column, fallbackValue)
+	return coerceManagedIntegerValue(column, writeTime)
 }
 
 type selfParser interface {
@@ -122,126 +98,35 @@ func runSelfParseIfDefined(records recordSlice) {
 	}
 }
 
-func fetchManagedCounterValues(
-	records recordSliceGroup, scyllaTable ScyllaTable,
-) (prefetchedManagedCounterValues, error) {
-	prefetchedValues := prefetchedManagedCounterValues{
-		counterValueByPartition: map[int64]any{},
-		counterNameByPartition:  map[int64]string{},
-	}
-	if records.len() == 0 || scyllaTable.UpdatedVersionCol == nil {
-		return prefetchedValues, nil
-	}
-
-	partitionColumn := scyllaTable.GetPartKey()
-	partitionValuesToFetch := map[int64]struct{}{}
-	for recordIndex := range records.len() {
-		recordPointer := records.at(recordIndex)
-		partitionValue := int64(0)
-		if partitionColumn != nil && !partitionColumn.IsNil() {
-			partitionValue = convertToInt64(partitionColumn.GetRawValue(recordPointer))
-		}
-		partitionValuesToFetch[partitionValue] = struct{}{}
-	}
-
-	for partitionValue := range partitionValuesToFetch {
-		counterName := fmt.Sprintf("x%v_%v_updated", partitionValue, scyllaTable.Name)
-		nextCounterValue, err := getWriteCounterValue(scyllaTable.Namespace, counterName, 1)
-		if err != nil {
-			return prefetchedManagedCounterValues{}, fmt.Errorf("write updated_version %s: %w", counterName, err)
-		}
-		// A delta view packs the version into a fixed bit slot, and the packer panics on a version that
-		// overruns it. Refuse the write here first, with the counter's name.
-		if scyllaTable.maxDeltaVersionValue > 0 && nextCounterValue > scyllaTable.maxDeltaVersionValue {
-			return prefetchedManagedCounterValues{}, fmt.Errorf(
-				`table %q: updated_version %d exhausted the delta view slot (max %d) for counter %s`,
-				scyllaTable.Name, nextCounterValue, scyllaTable.maxDeltaVersionValue, counterName)
-		}
-		prefetchedValues.counterNameByPartition[partitionValue] = counterName
-		prefetchedValues.counterValueByPartition[partitionValue] = coerceManagedIntegerValue(scyllaTable.UpdatedVersionCol, nextCounterValue)
-	}
-
-	return prefetchedValues, nil
-}
-
-func applyPrefetchedManagedCounterValues(
-	records recordSlice, scyllaTable ScyllaTable, managedValues *managedWriteValues, prefetchedValues prefetchedManagedCounterValues,
-) {
-	if scyllaTable.UpdatedVersionCol == nil {
-		return
-	}
-
-	partitionColumn := scyllaTable.GetPartKey()
-	for recordIndex := range records.len() {
-		recordPointer := records.at(recordIndex)
-		partitionValue := int64(0)
-		if partitionColumn != nil && !partitionColumn.IsNil() {
-			partitionValue = convertToInt64(partitionColumn.GetRawValue(recordPointer))
-		}
-
-		counterValue := prefetchedValues.counterValueByPartition[partitionValue]
-		managedValues.updatedVersionValues[recordIndex] = counterValue
-		scyllaTable.UpdatedVersionCol.SetValue(recordPointer, counterValue)
-	}
-
-	if DebugFull {
-		for partitionValue, counterName := range prefetchedValues.counterNameByPartition {
-			fmt.Printf("Write updated_version assigned: table=%s partition=%d column=%s counter=%s records=%d\n",
-				scyllaTable.Name, partitionValue, scyllaTable.UpdatedVersionCol.GetName(), counterName, records.len())
-		}
-	}
-}
-
-func applyWriteManagedColumnsWithPrefetchedCounters(
-	records recordSlice, scyllaTable ScyllaTable, isInsert bool, prefetchedValues *prefetchedManagedCounterValues,
-) (managedWriteValues, error) {
+// applyWriteManagedColumns stamps the audit columns: created on insert when the caller left it
+// zero, and updated on every write. Both cache protocols read updated as the time of the write, so it
+// is never kept from the caller.
+func applyWriteManagedColumns(records recordSlice, scyllaTable ScyllaTable, isInsert bool) managedWriteValues {
 	managedValues := managedWriteValues{}
 	if records.len() == 0 {
-		return managedValues, nil
+		return managedValues
 	}
 
 	managedValues.createdValues = make([]any, records.len())
 	managedValues.updatedValues = make([]any, records.len())
-	managedValues.updatedVersionValues = make([]any, records.len())
 	currentWriteTime := int64(getManagedUnixTime())
 
 	for recordIndex := range records.len() {
 		recordPointer := records.at(recordIndex)
 
 		if isInsert && scyllaTable.CreatedCol != nil {
-			createdValue := resolveManagedTimestampValue(scyllaTable.CreatedCol, recordPointer, currentWriteTime)
+			createdValue := resolveCreatedValue(scyllaTable.CreatedCol, recordPointer, currentWriteTime)
 			managedValues.createdValues[recordIndex] = createdValue
 			scyllaTable.CreatedCol.SetValue(recordPointer, createdValue)
 		}
 
 		if scyllaTable.UpdatedCol != nil {
-			updatedValue := resolveManagedTimestampValue(scyllaTable.UpdatedCol, recordPointer, currentWriteTime)
+			updatedValue := coerceManagedIntegerValue(scyllaTable.UpdatedCol, currentWriteTime)
 			managedValues.updatedValues[recordIndex] = updatedValue
 			scyllaTable.UpdatedCol.SetValue(recordPointer, updatedValue)
 		}
 	}
-
-	if scyllaTable.UpdatedVersionCol != nil {
-		valuesToApply := prefetchedManagedCounterValues{}
-		if prefetchedValues == nil {
-			fetchedValues, err := fetchManagedCounterValues(recordSliceGroup{records}, scyllaTable)
-			if err != nil {
-				return managedWriteValues{}, err
-			}
-			valuesToApply = fetchedValues
-		} else {
-			valuesToApply = *prefetchedValues
-		}
-		applyPrefetchedManagedCounterValues(records, scyllaTable, &managedValues, valuesToApply)
-	}
-
-	return managedValues, nil
-}
-
-func applyWriteManagedColumns(
-	records recordSlice, scyllaTable ScyllaTable, isInsert bool,
-) (managedWriteValues, error) {
-	return applyWriteManagedColumnsWithPrefetchedCounters(records, scyllaTable, isInsert, nil)
+	return managedValues
 }
 
 func fetchAutoincrementCounterStarts(
@@ -403,10 +288,7 @@ type PreparedStatement struct {
 func MakeInsertStatement[T TableBaseInterface[E, T], E TableSchemaInterface[E]](records *[]T, columnsToExclude ...Coln) []PreparedStatement {
 	refTable := db.InitStructTable[E, T](new(E))
 	scyllaTable := getOrCompileScyllaTable(refTable)
-	managedValues, err := applyWriteManagedColumns(makeRecordSlice(records), scyllaTable, true)
-	if err != nil {
-		panic(err)
-	}
+	managedValues := applyWriteManagedColumns(makeRecordSlice(records), scyllaTable, true)
 
 	columns := collectInsertColumns(&scyllaTable, columnsToExclude)
 
@@ -481,7 +363,7 @@ func collectInsertColumns(scyllaTable *ScyllaTable, columnsToExclude []Coln) []I
 	for _, column := range scyllaTable.Columns {
 		mustIncludeManagedColumn := column.GetName() == managedCreatedColumnName ||
 			column.GetName() == managedUpdatedColumnName ||
-			column.GetName() == managedUpdatedVersionColumnName
+			column.GetName() == managedVersionColumnName
 		if mustIncludeManagedColumn || !slices.Contains(columnNamesToExclude, column.GetName()) {
 			columnsToInsert = append(columnsToInsert, column)
 		}
@@ -694,10 +576,7 @@ func MakeUpdateStatements[T TableBaseInterface[E, T], E TableSchemaInterface[E]]
 ) []PreparedStatement {
 	scyllaTable := MakeScyllaTable[T, E]()
 	recordsView := makeRecordSlice(records)
-	managedValues, err := applyWriteManagedColumns(recordsView, scyllaTable, false)
-	if err != nil {
-		panic(err)
-	}
+	managedValues := applyWriteManagedColumns(recordsView, scyllaTable, false)
 
 	resolvedTable, columnsToUpdate := resolveUpdateColumnsForWrite(scyllaTable, recordsView.len(),
 		recordsView.at, columnsToInclude, nil, false)
@@ -776,9 +655,8 @@ func UpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 
 func mergeManagedWriteValues(first managedWriteValues, second managedWriteValues) managedWriteValues {
 	return managedWriteValues{
-		createdValues:        append(append([]any{}, first.createdValues...), second.createdValues...),
-		updatedValues:        append(append([]any{}, first.updatedValues...), second.updatedValues...),
-		updatedVersionValues: append(append([]any{}, first.updatedVersionValues...), second.updatedVersionValues...),
+		createdValues: append(append([]any{}, first.createdValues...), second.createdValues...),
+		updatedValues: append(append([]any{}, first.updatedValues...), second.updatedValues...),
 	}
 }
 
@@ -906,48 +784,42 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	// so copying every one of them to do it was pure waste -- and the copy had to be rebuilt
 	// after the write phase, because the first one held stale pre-mutation records.
 	allWrittenRecords := recordSliceGroup{insertRecords, updateRecords}
-	prefetchedManagedCounters := prefetchedManagedCounterValues{}
 	autoincrementCounterStarts := map[string]int64{}
-	var fetchGroup errgroup.Group
-
-	if scyllaTable.UpdatedVersionCol != nil {
-		fetchGroup.Go(func() error {
-			values, err := fetchManagedCounterValues(allWrittenRecords, scyllaTable)
-			if err != nil {
-				return err
-			}
-			prefetchedManagedCounters = values
-			return nil
-		})
-	}
 	if scyllaTable.AutoincrementCol != nil && insertRecords.len() > 0 {
-		fetchGroup.Go(func() error {
-			values, err := fetchAutoincrementCounterStarts(insertRecords, scyllaTable)
-			if err != nil {
-				return err
-			}
-			autoincrementCounterStarts = values
-			return nil
-		})
+		values, err := fetchAutoincrementCounterStarts(insertRecords, scyllaTable)
+		if err != nil {
+			return err
+		}
+		autoincrementCounterStarts = values
 	}
 
-	if err := fetchGroup.Wait(); err != nil {
-		return err
-	}
-
-	managedInsertValues, err := applyWriteManagedColumnsWithPrefetchedCounters(insertRecords, scyllaTable, true, &prefetchedManagedCounters)
-	if err != nil {
-		return err
-	}
-	managedUpdateValues, err := applyWriteManagedColumnsWithPrefetchedCounters(updateRecords, scyllaTable, false, &prefetchedManagedCounters)
-	if err != nil {
-		return err
-	}
+	managedInsertValues := applyWriteManagedColumns(insertRecords, scyllaTable, true)
+	managedUpdateValues := applyWriteManagedColumns(updateRecords, scyllaTable, false)
 
 	if insertRecords.len() > 0 {
 		if err := handlePreInsert(insertRecords, scyllaTable, autoincrementCounterStarts); err != nil {
 			return err
 		}
+	}
+
+	// The update-phase column set drives the version stamp, the view sync and the text-search sync,
+	// so it is resolved once here instead of being recomputed inside each block.
+	updateAffectedColumns := []IColInfo{}
+	if updateRecords.len() > 0 {
+		if useIncludeUpdateColumns {
+			updateAffectedColumns = collectAffectedColumnsForInclude(&scyllaTable, columnsToUpdate)
+		} else {
+			updateAffectedColumns = collectAffectedColumnsForExclude(&scyllaTable, columnsToUpdate)
+		}
+	}
+
+	// The keys are final now, so the stored versions can be read and the next ones stamped.
+	deltaWrittenRecords, err := stampDeltaVersions(scyllaTable, []deltaWritePhase{
+		{records: insertRecords, writtenColumns: collectAffectedColumnsForInsert(&scyllaTable, columnsToExcludeInsert)},
+		{records: updateRecords, writtenColumns: updateAffectedColumns},
+	})
+	if err != nil {
+		return err
 	}
 
 	session := getScyllaConnection()
@@ -1011,22 +883,11 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 
 	combinedManagedValues := mergeManagedWriteValues(managedInsertValues, managedUpdateValues)
 
-	// The update-phase column set drives both the view sync and the text-search sync, so it is
-	// resolved once here instead of being recomputed inside each block.
-	updateAffectedColumns := []IColInfo{}
-	if updateRecords.len() > 0 {
-		if useIncludeUpdateColumns {
-			updateAffectedColumns = collectAffectedColumnsForInclude(&scyllaTable, columnsToUpdate)
-		} else {
-			updateAffectedColumns = collectAffectedColumnsForExclude(&scyllaTable, columnsToUpdate)
-		}
-	}
-
 	// The post-write syncs run in two parallel phases, separated by a barrier.
 	//
 	// Phase 1 writes the derived DATA (view tables, search index). Phase 2 writes the FRESHNESS
-	// MARKERS the delta cache reads to decide whether to refetch (__index_updated counters and
-	// cache_updated_version slots). The barrier is what makes the protocol safe: publishing a
+	// MARKERS the caches read to decide whether to refetch (__index_updated counters, the by-IDs
+	// slot files and the delta logs). The barrier is what makes the protocol safe: publishing a
 	// marker before the data it gates lets a client refetch a stale row and then record the new
 	// version, permanently missing the update.
 	//
@@ -1085,10 +946,17 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 		return nil
 	})
 
-	// Combined insert/update writes bump each touched slot once for the merged mutation set.
+	// Combined insert/update writes raise each touched slot once for the merged mutation set.
 	markerSyncGroup.Go(func() error {
-		if err := updateSlotVersionsAfterWrite(allWrittenRecords, scyllaTable); err != nil {
-			return fmt.Errorf("updating slot versions: %w", err)
+		if err := raiseWrittenSlots(allWrittenRecords, scyllaTable); err != nil {
+			return fmt.Errorf("raising by-IDs slots: %w", err)
+		}
+		return nil
+	})
+
+	markerSyncGroup.Go(func() error {
+		if err := appendDeltaLogs(scyllaTable, deltaWrittenRecords); err != nil {
+			return fmt.Errorf("appending delta logs: %w", err)
 		}
 		return nil
 	})
@@ -1157,7 +1025,7 @@ func resolveUpdateColumnsForWrite(
 
 	if len(columnsToInclude) > 0 {
 		updatedAlreadyIncluded := scyllaTable.UpdatedCol == nil
-		updatedVersionAlreadyIncluded := scyllaTable.UpdatedVersionCol == nil
+		versionAlreadyIncluded := scyllaTable.VersionCol == nil
 		for _, col_ := range columnsToInclude {
 			col := scyllaTable.ColumnsMap[col_.GetName()]
 			if col == nil {
@@ -1172,16 +1040,16 @@ func resolveUpdateColumnsForWrite(
 			if scyllaTable.UpdatedCol != nil && col.GetName() == scyllaTable.UpdatedCol.GetName() {
 				updatedAlreadyIncluded = true
 			}
-			if scyllaTable.UpdatedVersionCol != nil && col.GetName() == scyllaTable.UpdatedVersionCol.GetName() {
-				updatedVersionAlreadyIncluded = true
+			if scyllaTable.VersionCol != nil && col.GetName() == scyllaTable.VersionCol.GetName() {
+				versionAlreadyIncluded = true
 			}
 		}
 		if !updatedAlreadyIncluded {
 			columnsToUpdate = append(columnsToUpdate, scyllaTable.UpdatedCol)
 		}
-		if !updatedVersionAlreadyIncluded {
-			// The managed update counter must always persist, even when callers provide an explicit include list.
-			columnsToUpdate = append(columnsToUpdate, scyllaTable.UpdatedVersionCol)
+		if !versionAlreadyIncluded {
+			// The managed version must always persist, even when callers provide an explicit include list.
+			columnsToUpdate = append(columnsToUpdate, scyllaTable.VersionCol)
 		}
 	} else {
 		columnsToExcludeNames := []string{}
@@ -1191,7 +1059,7 @@ func resolveUpdateColumnsForWrite(
 		for _, col := range scyllaTable.Columns {
 			isExcluded := slices.Contains(columnsToExcludeNames, col.GetName())
 			mustIncludeManagedColumn := (scyllaTable.UpdatedCol != nil && col.GetName() == scyllaTable.UpdatedCol.GetName()) ||
-				(scyllaTable.UpdatedVersionCol != nil && col.GetName() == scyllaTable.UpdatedVersionCol.GetName())
+				(scyllaTable.VersionCol != nil && col.GetName() == scyllaTable.VersionCol.GetName())
 			if !col.GetInfo().IsVirtual && (mustIncludeManagedColumn || !isExcluded) && !slices.Contains(scyllaTable.KeysIdx, col.GetInfo().Idx) {
 				columnsToUpdate = append(columnsToUpdate, col)
 			}

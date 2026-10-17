@@ -13,9 +13,9 @@ import (
 var rangeOperators = []string{">", "<", ">=", "<="}
 
 const (
-	managedCreatedColumnName        = "created"
-	managedUpdatedColumnName        = "updated"
-	managedUpdatedVersionColumnName = db.ColumnNameUpdatedVersion
+	managedCreatedColumnName = "created"
+	managedUpdatedColumnName = "updated"
+	managedVersionColumnName = db.ColumnNameVersion
 )
 
 var makeStatementWith string = `	WITH caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
@@ -96,43 +96,32 @@ func ensureManagedIntColumn(dbTable *ScyllaTable, columnName string) IColInfo {
 	return managedColumn
 }
 
-// consumesUpdatedVersion reports whether the table has a reader for the write sequence number: a
-// delta index watermarks on it, and the by-IDs cache compares slot versions with it. A table struct
-// that declares the column counts too, so declaring the field is never silently ignored.
-func consumesUpdatedVersion(dbTable *ScyllaTable, schema TableSchema) bool {
-	if schema.SaveUpdatedVersion {
-		return true
-	}
-	for _, index := range schema.Indexes {
-		if index.Type == TypeDelta {
-			return true
-		}
-	}
-	_, isDeclaredByTableStruct := dbTable.ColumnsMap[managedUpdatedVersionColumnName]
-	return isDeclaredByTableStruct
+func hasDeltaIndex(schema TableSchema) bool {
+	return slices.ContainsFunc(schema.Indexes, func(index Index) bool { return index.Type == TypeDelta })
 }
 
 func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
-	if !schema.DisableDefaultColumns {
+	// A column already in ColumnsMap was declared by the table struct, so it is backed by a record
+	// field and reaches the client: the cache protocols need both of these there.
+	if _, isDeclared := dbTable.ColumnsMap[managedUpdatedColumnName]; schema.CacheByIDs && !isDeclared {
+		panic(fmt.Sprintf(`Table "%v": CacheByIDs returns each record's slot tick in its Updated. `+
+			`Declare the field "Updated int32" with the json tag "upd,omitempty" in the record struct, `+
+			`and "Updated db.Col[...]" in the table struct.`, dbTable.Name))
+	}
+	if _, isDeclared := dbTable.ColumnsMap[managedVersionColumnName]; hasDeltaIndex(schema) && !isDeclared {
+		panic(fmt.Sprintf(`Table "%v": TypeDelta logs each write's Version and the client compares it. `+
+			`Declare the field "Version int16" with the json tag "ver,omitempty" in the record struct, `+
+			`and "Version db.Col[...]" in the table struct.`, dbTable.Name))
+	}
+
+	if !schema.DisableDefaultColumns || schema.CacheByIDs {
 		dbTable.CreatedCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
 		dbTable.UpdatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
 	}
-
-	// The version costs a counter read per write, so a table that has no reader for it keeps neither
-	// the column nor that cost.
-	if !consumesUpdatedVersion(dbTable, schema) {
-		return
+	// The version costs a read per write (delta_log.go), so only a table with a delta log keeps it.
+	if hasDeltaIndex(schema) {
+		dbTable.VersionCol = ensureManagedIntColumn(dbTable, managedVersionColumnName)
 	}
-
-	// A column already in ColumnsMap was declared by the table struct, so it is backed by a record
-	// field and reaches the client — which is required, since the client sends it back as a watermark.
-	if _, isDeclaredByTableStruct := dbTable.ColumnsMap[managedUpdatedVersionColumnName]; !isDeclaredByTableStruct {
-		panic(fmt.Sprintf(`Table "%v": SaveUpdatedVersion and TypeDelta need the version to reach the client. `+
-			`Declare the field "UpdatedVersion int32" with the json tag "upv,omitempty" in the record struct, `+
-			`and "UpdatedVersion db.Col[...]" in the table struct.`, dbTable.Name))
-	}
-
-	dbTable.UpdatedVersionCol = ensureManagedIntColumn(dbTable, managedUpdatedVersionColumnName)
 }
 
 func flattenCompositeInt64Values(rawValue any) []int64 {
@@ -226,14 +215,14 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 
 	dbTable := ScyllaTable{
 		TableCore: db.TableCore{
-			Namespace:          schema.Namespace,
-			Name:               schema.Name,
-			ID:                 schema.ID,
-			SaveUpdatedVersion: schema.SaveUpdatedVersion,
-			ColumnsMap:         map[string]IColInfo{},
-			ColumnsIdxMap:      map[int16]IColInfo{},
-			UseSequences:       schema.UseSequences,
-			MaxColIdx:          int16(structRefValue.NumField()) + 1,
+			Namespace:     schema.Namespace,
+			Name:          schema.Name,
+			ID:            schema.ID,
+			CacheByIDs:    schema.CacheByIDs,
+			ColumnsMap:    map[string]IColInfo{},
+			ColumnsIdxMap: map[int16]IColInfo{},
+			UseSequences:  schema.UseSequences,
+			MaxColIdx:     int16(structRefValue.NumField()) + 1,
 		},
 		indexes:              map[string]*viewInfo{},
 		views:                map[string]*viewInfo{},
@@ -447,8 +436,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 
 	// Compile schema indexes in one pass to keep the public API and compiler flow simple.
 	for _, indexCfg := range schema.Indexes {
-		// TypeDelta is the one kind that means something with no keys: it appends "updated_version"
-		// itself, so a keyless entry declares a watermark-only sync.
+		// TypeDelta is the one kind that means something with no keys: a log of the whole partition.
 		if len(indexCfg.Keys) == 0 && resolveSchemaIndexType(indexCfg) != TypeDelta {
 			panic(fmt.Sprintf(`Table "%v": Indexes entry must not be empty`, dbTable.Name))
 		}
@@ -457,8 +445,8 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		}
 		// Only views materialize their own partition, so an override is meaningless elsewhere.
 		schemaIndexType := resolveSchemaIndexType(indexCfg)
-		if indexPartitionColumnName(indexCfg) != "" && schemaIndexType != TypeView && schemaIndexType != TypeDelta {
-			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView and TypeDelta indexes`, dbTable.Name))
+		if indexPartitionColumnName(indexCfg) != "" && schemaIndexType != TypeView {
+			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView indexes`, dbTable.Name))
 		}
 		if indexCfg.UseIndexGroup {
 			registerIndexGroup(&dbTable, &idxCount, indexCfg)
@@ -625,9 +613,9 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 
 	dbTable.capabilities = dbTable.ComputeCapabilities()
 
-	// Initializes and validates by-IDs slot metadata once per table build, not per query/write call.
-	configureSlotVersionFields(&dbTable)
-	// Precompiles the generic by-IDs access plan; depends on the slot metadata above.
+	// Validates the by-IDs table shape once per table build, not per query/write call.
+	configureCacheByIDs(&dbTable)
+	// Precompiles the generic by-IDs access plan; depends on the validation above.
 	configureGenericRecordFields(&dbTable, schema)
 
 	return dbTable

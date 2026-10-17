@@ -1,44 +1,46 @@
 package scylla
 
 import (
-	"github.com/ivanjoz/genix-orm/db"
 	"testing"
+
+	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // Table declaring a full GenericRecord mapping across mixed integer widths, so the precompiled
 // accessors are exercised for int16/int32/int64 and for the auto-resolved status column.
 type genericLabelRecord struct {
 	TableStruct[genericLabelSchema, genericLabelRecord]
-	CompanyID      int32  `db:"company_id"`
-	ID             int32  `db:"id"`
-	Name           string `db:"name"`
-	SKU            string `db:"sku"`
-	City           string `db:"city"`
-	Price          int64  `db:"price"`
-	BrandID        int16  `db:"brand_id"`
-	Status         int8   `db:"status"`
-	UpdatedVersion int32  `json:"upv,omitempty"`
+	CompanyID int32  `db:"company_id"`
+	ID        int32  `db:"id"`
+	Name      string `db:"name"`
+	SKU       string `db:"sku"`
+	City      string `db:"city"`
+	Price     int64  `db:"price"`
+	BrandID   int16  `db:"brand_id"`
+	Status    int8   `db:"status"`
+	Updated   int32  `json:"upd,omitempty"`
 }
 
 type genericLabelSchema struct {
 	TableStruct[genericLabelSchema, genericLabelRecord]
-	CompanyID      Col[*genericLabelSchema, int32]
-	ID             Col[*genericLabelSchema, int32]
-	Name           Col[*genericLabelSchema, string]
-	SKU            Col[*genericLabelSchema, string]
-	City           Col[*genericLabelSchema, string]
-	Price          Col[*genericLabelSchema, int64]
-	BrandID        Col[*genericLabelSchema, int16]
-	Status         Col[*genericLabelSchema, int8]
-	UpdatedVersion Col[*genericLabelSchema, int32]
+	CompanyID Col[*genericLabelSchema, int32]
+	ID        Col[*genericLabelSchema, int32]
+	Name      Col[*genericLabelSchema, string]
+	SKU       Col[*genericLabelSchema, string]
+	City      Col[*genericLabelSchema, string]
+	Price     Col[*genericLabelSchema, int64]
+	BrandID   Col[*genericLabelSchema, int16]
+	Status    Col[*genericLabelSchema, int8]
+	Updated   Col[*genericLabelSchema, int32]
 }
 
 func (e genericLabelSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:                 10000,
-		Name:               "generic_label",
-		Partition:          e.CompanyID,
-		SaveUpdatedVersion: true,
+		ID:         10000,
+		Name:       "generic_label",
+		Partition:  e.CompanyID,
+		CacheByIDs: true,
 		GenericRecord: GenericRecordSchema{
 			Name: e.Name, S1: e.SKU, S2: e.City, N1: e.Price, N2: e.BrandID,
 		},
@@ -46,34 +48,34 @@ func (e genericLabelSchema) GetSchema() TableSchema {
 	}
 }
 
-// Table with SaveUpdatedVersion but no GenericRecord: must stay unexposed.
+// Table with CacheByIDs but no GenericRecord: must stay unexposed.
 type genericOptedOutRecord struct {
 	TableStruct[genericOptedOutSchema, genericOptedOutRecord]
-	CompanyID      int32  `db:"company_id"`
-	ID             int32  `db:"id"`
-	Name           string `db:"name"`
-	UpdatedVersion int32  `json:"upv,omitempty"`
+	CompanyID int32  `db:"company_id"`
+	ID        int32  `db:"id"`
+	Name      string `db:"name"`
+	Updated   int32  `json:"upd,omitempty"`
 }
 
 type genericOptedOutSchema struct {
 	TableStruct[genericOptedOutSchema, genericOptedOutRecord]
-	CompanyID      Col[*genericOptedOutSchema, int32]
-	ID             Col[*genericOptedOutSchema, int32]
-	Name           Col[*genericOptedOutSchema, string]
-	UpdatedVersion Col[*genericOptedOutSchema, int32]
+	CompanyID Col[*genericOptedOutSchema, int32]
+	ID        Col[*genericOptedOutSchema, int32]
+	Name      Col[*genericOptedOutSchema, string]
+	Updated   Col[*genericOptedOutSchema, int32]
 }
 
 func (e genericOptedOutSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:                 10001,
-		Name:               "generic_opted_out",
-		Partition:          e.CompanyID,
-		SaveUpdatedVersion: true,
-		Keys:               Cols(e.ID.Autoincrement(0)),
+		ID:         10001,
+		Name:       "generic_opted_out",
+		Partition:  e.CompanyID,
+		CacheByIDs: true,
+		Keys:       Cols(e.ID.Autoincrement(0)),
 	}
 }
 
-// GenericRecord without SaveUpdatedVersion must panic: the slot version is what makes the read incremental.
+// GenericRecord without CacheByIDs must panic: the slot ticks are what make the read incremental.
 type genericNoSlotVersionRecord struct {
 	TableStruct[genericNoSlotVersionSchema, genericNoSlotVersionRecord]
 	CompanyID int32  `db:"company_id"`
@@ -101,28 +103,28 @@ func (e genericNoSlotVersionSchema) GetSchema() TableSchema {
 // A non-string column in a string slot must panic rather than mis-scan at runtime.
 type genericBadNameRecord struct {
 	TableStruct[genericBadNameSchema, genericBadNameRecord]
-	CompanyID      int32 `db:"company_id"`
-	ID             int32 `db:"id"`
-	Amount         int32 `db:"amount"`
-	UpdatedVersion int32 `json:"upv,omitempty"`
+	CompanyID int32 `db:"company_id"`
+	ID        int32 `db:"id"`
+	Amount    int32 `db:"amount"`
+	Updated   int32 `json:"upd,omitempty"`
 }
 
 type genericBadNameSchema struct {
 	TableStruct[genericBadNameSchema, genericBadNameRecord]
-	CompanyID      Col[*genericBadNameSchema, int32]
-	ID             Col[*genericBadNameSchema, int32]
-	Amount         Col[*genericBadNameSchema, int32]
-	UpdatedVersion Col[*genericBadNameSchema, int32]
+	CompanyID Col[*genericBadNameSchema, int32]
+	ID        Col[*genericBadNameSchema, int32]
+	Amount    Col[*genericBadNameSchema, int32]
+	Updated   Col[*genericBadNameSchema, int32]
 }
 
 func (e genericBadNameSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:                 10003,
-		Name:               "generic_bad_name",
-		Partition:          e.CompanyID,
-		SaveUpdatedVersion: true,
-		GenericRecord:      GenericRecordSchema{Name: e.Amount},
-		Keys:               Cols(e.ID.Autoincrement(0)),
+		ID:            10003,
+		Name:          "generic_bad_name",
+		Partition:     e.CompanyID,
+		CacheByIDs:    true,
+		GenericRecord: GenericRecordSchema{Name: e.Amount},
+		Keys:          Cols(e.ID.Autoincrement(0)),
 	}
 }
 
@@ -206,21 +208,21 @@ func TestGenericRecordPlanAbsentWhenNotDeclared(t *testing.T) {
 }
 
 func TestQueryCachedGenericByIDsRejectsUnregisteredAndOptedOutTables(t *testing.T) {
-	if _, err := QueryCachedGenericByIDs("table_that_does_not_exist", []IDUpdatedVersion{{ID: 1}}); err == nil {
+	if _, err := QueryCachedGenericByIDs("table_that_does_not_exist", cache.CachedIDsRequest{IDs: []cache.CachedID{{ID: 1}}}); err == nil {
 		t.Fatal("expected an error for a table name that was never registered")
 	}
 
 	RegisterTableFactory("generic_opted_out", func() db.Table {
 		return MakeScyllaTable[genericOptedOutRecord, genericOptedOutSchema]()
 	})
-	if _, err := QueryCachedGenericByIDs("generic_opted_out", []IDUpdatedVersion{{ID: 1}}); err == nil {
+	if _, err := QueryCachedGenericByIDs("generic_opted_out", cache.CachedIDsRequest{IDs: []cache.CachedID{{ID: 1}}}); err == nil {
 		t.Fatal("expected an error for a registered table that did not declare GenericRecord")
 	}
 }
 
 // An empty request must short-circuit before any table or registry lookup.
 func TestQueryCachedGenericByIDsIgnoresEmptyRequest(t *testing.T) {
-	records, err := QueryCachedGenericByIDs("generic_label", nil)
+	records, err := QueryCachedGenericByIDs("generic_label", cache.CachedIDsRequest{})
 	if err != nil || records != nil {
 		t.Fatalf("expected a no-op for an empty request, got records=%v err=%v", records, err)
 	}
@@ -233,9 +235,9 @@ func TestGenericRecordSchemaValidationPanics(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "GenericRecord without SaveUpdatedVersion",
+			name:       "GenericRecord without CacheByIDs",
 			makeTable:  func() { MakeScyllaTable[genericNoSlotVersionRecord, genericNoSlotVersionSchema]() },
-			wantReason: "requires SaveUpdatedVersion enabled",
+			wantReason: "requires CacheByIDs",
 		},
 		{
 			name:       "non-string column in the Name slot",

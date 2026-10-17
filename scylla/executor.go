@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // Exec is the ScyllaDB implementation of db.Executor. It is a zero-size type: all
@@ -71,8 +72,8 @@ func (Exec[TableT, RecordT]) Merge(
 	return Merge[RecordT, TableT](records, columnsToExcludeUpdate, onUpdate, onInsert)
 }
 
-func (Exec[TableT, RecordT]) QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error {
-	return QueryCachedIDs[RecordT, TableT](refSlice, cachedIDs)
+func (Exec[TableT, RecordT]) QueryCachedIDs(request cache.CachedIDsRequest) ([]cache.CachedPartition[RecordT], error) {
+	return QueryCachedIDs[RecordT, TableT](request)
 }
 
 func (Exec[TableT, RecordT]) SearchTextIDs(partition int32, query string, limit, offset int) ([]db.TextHit, error) {

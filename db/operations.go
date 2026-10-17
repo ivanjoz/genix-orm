@@ -1,5 +1,7 @@
 package db
 
+import "github.com/ivanjoz/genix-orm/db/cache"
+
 // The operations below are the package-level API application code calls. Each one
 // resolves the driver from the record type's declared default (D is inferred, so
 // callers pass no type arguments) and dispatches through the generic Executor —
@@ -72,9 +74,9 @@ func Merge[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInt
 }
 
 func QueryCachedIDs[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
-	refSlice *[]RecordT, cachedIDs []IDUpdatedVersion,
-) error {
-	return executorFor[RecordT, TableT, D]().QueryCachedIDs(refSlice, cachedIDs)
+	request cache.CachedIDsRequest,
+) ([]cache.CachedPartition[RecordT], error) {
+	return executorFor[RecordT, TableT, D]().QueryCachedIDs(request)
 }
 
 func SearchTextIDs[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
@@ -102,7 +104,7 @@ var (
 	GetAutoincrementID func(key string, recordsSize int) (int64, error)
 	// QueryCachedGenericByIDs resolves IDs to the flat GenericRecord shape for any table
 	// that opted in through TableSchema.GenericRecord.
-	QueryCachedGenericByIDs func(tableName string, cachedIDs []IDUpdatedVersion) ([]GenericRecord, error)
+	QueryCachedGenericByIDs func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[GenericRecord], error)
 	// SetDebugLogging raises the ORM's log verbosity: 0 off, 1 statements, 2 full.
 	SetDebugLogging func(level int)
 )

@@ -35,11 +35,11 @@ const (
 	TypeInheritFromKey int8 = 4
 	TypeView           int8 = 6
 	TypeViewTable      int8 = 9
-	// TypeDelta is a TypeView packed range view with the table's "updated_version" column appended
-	// as its last key, so one index serves both halves of a delta-cache sync. The bit width of
-	// every declared key comes from its FixedValues instead of a .Size() decorator, and the
-	// packed column is int32 whenever the slots fit its 32 bits. Keys[0] is also the column Delta()
-	// filters on; see TableStruct.Delta for the query side.
+	// TypeDelta is a change log (db/cache): every write appends (log ID, Version, deleted) to the
+	// file of the record's partition, pinned values and 10-minute bucket, and Delta() reads it past
+	// the client's cursor. The last Key is the sync filter column, which a first sync filters on;
+	// the other Keys are pinned, each value with its own log. The Keys that are not pinned make the
+	// log ID. A keyless TypeDelta logs the whole partition with no sync filter.
 	TypeDelta int8 = 10
 )
 
@@ -51,30 +51,21 @@ var IndexTypeNames = map[int8]string{
 	TypeInheritFromKey: "Inherit From Key",
 	TypeView:           "View",
 	TypeViewTable:      "View Table",
-	TypeDelta:          "Delta View",
+	TypeDelta:          "Delta",
 }
 
 // ColumnNameUpdated is the column the ORM maintains as every record's last-write timestamp. It is
 // resolved by name rather than declared, so the query side and the drivers share one spelling.
 const ColumnNameUpdated = "updated"
 
-// ColumnNameUpdatedVersion is the column the ORM maintains as every record's write sequence number:
-// one value per write call per partition, taken from the same counter that hands out autoincrement
-// IDs. Unlike a timestamp it is strictly increasing and never collides, which is what lets a delta
-// sync ask for "> my watermark" and lets the by-IDs cache compare slot versions for equality.
-//
-// It costs one counter read per write, so it is maintained only for tables that consume it: those
-// declaring a TypeDelta index or SaveUpdatedVersion. Both require the record and table structs to
-// declare the field, since the value has to reach the client to be sent back as a watermark.
-const ColumnNameUpdatedVersion = "updated_version"
+// ColumnNameVersion is the column the ORM maintains as every record's write count on a table with a
+// TypeDelta index: 1 on insert, one more on every write, 1 again after cache.MaxVersion. The delta
+// log carries it, and the client skips a logged write whose version it already holds. The record
+// declares it as `Version int16 json:"ver,omitempty"`.
+const ColumnNameVersion = "version"
 
-// MaxTableID is the largest value TableSchema.ID can hold: it occupies the low 14 bits of the
-// packed partition_table_id key of cache_updated_version.
+// MaxTableID is the largest value TableSchema.ID can hold.
 const MaxTableID = int16(1<<14 - 1)
-
-// MaxCachePartitionID is the largest partition value the same packed key can carry, in its high
-// 18 bits.
-const MaxCachePartitionID = int32(1<<18 - 1)
 
 type Index struct {
 	Type int8
@@ -132,8 +123,8 @@ func (f FixedValues) Bounds() (int64, int64, bool) {
 // cannot express it.
 type TableSchema struct {
 	// ID is the table's stable, hand-assigned identity, unique across the whole project and never
-	// derived from the name. It is packed into cache_updated_version's partition key, so changing
-	// it silently repoints a table's cached slot versions. Range: 1..MaxTableID.
+	// derived from the name. It names the table's cache files (db/cache), so changing it silently
+	// repoints them. Range: 1..MaxTableID.
 	ID int16
 	// Namespace is the logical grouping a table lives in — a keyspace on Scylla.
 	Namespace string
@@ -154,9 +145,10 @@ type TableSchema struct {
 	// DisableDefaultColumns prevents the ORM from adding its DB-only "created" and "updated"
 	// timestamp columns. Explicitly declared columns with those names remain regular user columns.
 	DisableDefaultColumns bool
-	// SaveUpdatedVersion opts the table into the by-IDs cache: writes bump the record's slot in
-	// cache_updated_version, and QueryCachedIDs skips reading rows whose slot did not move.
-	SaveUpdatedVersion bool
+	// CacheByIDs opts the table into the by-IDs cache (db/cache): writes raise the record's slot in
+	// its partition's slot file, and QueryCachedIDs skips reading rows whose slot did not move. The
+	// table needs one integer key and the record an `Updated int32 json:"upd"` field.
+	CacheByIDs bool
 	// GenericRecord maps this table's columns onto the flat shape returned by
 	// QueryCachedGenericByIDs, so a single endpoint can resolve labels for any table by name.
 	GenericRecord GenericRecordSchema
@@ -183,7 +175,7 @@ func (schema GenericRecordSchema) IsEmpty() bool {
 }
 
 // GenericRecord is the flat, table-agnostic row returned to the client. Short json tags keep the
-// payload small, which is the whole point of this endpoint. ID keeps its capitalised name and upv/ss
+// payload small, which is the whole point of this endpoint. ID keeps its capitalised name and upd/ss
 // are required by the frontend by-ID cache contract (IMinimalRecord).
 type GenericRecord struct {
 	ID     int64  `json:"ID"`
@@ -193,20 +185,9 @@ type GenericRecord struct {
 	N1     int64  `json:"n1,omitempty"`
 	N2     int64  `json:"n2,omitempty"`
 	Status int8   `json:"ss,omitempty"`
-	// UpdatedVersion carries the record's *slot* version here, not its own write version: by-IDs
-	// reads are the one path where "upv" means "the version this record was validated against".
-	UpdatedVersion uint16 `json:"upv,omitempty"`
-}
-
-// IDUpdatedVersion is one entry of a client's by-ID cache: which record it holds
-// and which slot version it was last validated against, so the server can reply
-// with only what changed.
-type IDUpdatedVersion struct {
-	ID          int64
-	PartitionID int32
-	// UpdatedVersion is 0 when the client holds no version yet, which never matches a stored slot
-	// version and therefore always forces a read.
-	UpdatedVersion uint16
+	// Updated carries the record's slot tick as the client holds it (db/cache), not its own write
+	// time: by-IDs reads are the one path where "upd" means "the tick this record was validated at".
+	Updated int32 `json:"upd,omitempty"`
 }
 
 // RecordGroup is a set of records sharing one index-group hash, plus the counter

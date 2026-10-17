@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/ivanjoz/genix-orm/db"
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // fakeExec stands in for a second driver. It records which calls it received so the
@@ -53,8 +54,8 @@ func (f *fakeExec[TableT, RecordT]) Merge(
 ) error {
 	return nil
 }
-func (f *fakeExec[TableT, RecordT]) QueryCachedIDs(_ *[]RecordT, _ []IDUpdatedVersion) error {
-	return nil
+func (f *fakeExec[TableT, RecordT]) QueryCachedIDs(_ cache.CachedIDsRequest) ([]cache.CachedPartition[RecordT], error) {
+	return nil, nil
 }
 func (f *fakeExec[TableT, RecordT]) SearchTextIDs(_ int32, _ string, _, _ int) ([]db.TextHit, error) {
 	return nil, nil

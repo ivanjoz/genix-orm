@@ -1,5 +1,7 @@
 package db
 
+import "github.com/ivanjoz/genix-orm/db/cache"
+
 // Executor is one storage engine's implementation of the operations that need a
 // live connection. It is deliberately *generic*: an Executor[ProductTable, Product]
 // can only ever be handed a *[]Product, so the record type survives all the way
@@ -35,9 +37,8 @@ type Executor[TableT any, RecordT any] interface {
 	// update is needed, and mutate new records before insert.
 	Merge(records *[]RecordT, columnsToExcludeUpdate []Coln,
 		onUpdate func(previous, current *RecordT) bool, onInsert func(record *RecordT)) error
-	// QueryCachedIDs resolves records by ID, skipping any whose client cache version
-	// still matches the server.
-	QueryCachedIDs(refSlice *[]RecordT, cachedIDs []IDUpdatedVersion) error
+	// QueryCachedIDs resolves records by ID, skipping any whose slot tick the client still holds.
+	QueryCachedIDs(request cache.CachedIDsRequest) ([]cache.CachedPartition[RecordT], error)
 	// SearchTextIDs returns the active records of one partition that match query, best first.
 	SearchTextIDs(partition int32, query string, limit, offset int) ([]TextHit, error)
 	// SearchText fills refSlice with the matching records, in the order of the returned hits.

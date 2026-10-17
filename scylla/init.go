@@ -33,17 +33,14 @@ func Init() error {
 }
 
 // EnsureInternalTables creates the tables the ORM maintains for itself: the shared sequence
-// counters and the by-IDs slot versions.
+// counters.
 //
 // These are raw CQL rather than declared TableSchemas, so DeployScylla's homologation pass cannot
 // discover them — it only knows about the controllers it is handed. Every entry point that prepares
 // a keyspace has to call this, which is why DeployScylla does so itself rather than relying on the
 // caller having run Init first. All statements are IF NOT EXISTS, so re-running costs nothing.
 func EnsureInternalTables() error {
-	if err := InitSequencesTable(); err != nil {
-		return err
-	}
-	return InitCacheUpdatedVersionTable()
+	return InitSequencesTable()
 }
 
 // CreateKeyspaceIfNotExists ensures the configured keyspace exists in ScyllaDB,
