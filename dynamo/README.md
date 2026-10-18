@@ -541,14 +541,18 @@ d    = a record holding only the group Keys (Group.Key)
 
 A DataFrame is a group-by aggregate of a table kept as columnar files in the
 FileStore (S3 Express, or a general purpose bucket in compatibility mode): one
-file per value of its Keys, one row per value of its Rows column, with the Sums
+file per value of its Keys, one row per value of its Rows columns, with the Sums
 of the records that hold it. Where a GroupBy keeps one counter per group, a frame
 keeps a whole table of rows per file, read in one GET.
 
 ```go
 DataFrames: []dynamo.DataFrame{
-    {Name: "enrollment-report", Keys: dynamo.Cols(t.Year, t.ProgramID), Rows: t.EmployeeID,
+    {Name: "enrollment-report", Keys: dynamo.Cols(t.Year, t.ProgramID), Rows: dynamo.Cols(t.EmployeeID),
         Sums: dynamo.Cols(t.RecordedMinutes, t.Points)},             // Count: true adds a record count
+    // Several Rows Cols, the widest group first: one row per department × employee, nested in
+    // the file like folders (each department once, its employees under it)
+    {Name: "year", Keys: dynamo.Cols(t.Year), Rows: dynamo.Cols(t.DepartmentID, t.EmployeeID),
+        Sums: dynamo.Cols(t.Points)},
 },
 
 rows, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).Exec()
@@ -563,7 +567,8 @@ dtf/<TableID>/<frame>/<generation>/<k1>/<k2>_<k3>  a 2–3-key frame's file
 state item: pk = base pk ‖ 000, sk = "f" + name: gen, sh (shape), w (snapshot, a SUnixTime), lk/lid (lock)
 ```
 
-- **Declaring:** 1–3 Keys and Rows (integer `Col`s), and Sums (integer or float
+- **Declaring:** 1–3 Keys and 1–3 Rows (integer `Col`s; `Key` of each row has
+  every Keys and Rows `Col` set), and Sums (integer or float
   `Col`s, floats kept as `round(v × 10⁶)`) or `Count`, every column with a `cb`
   tag in 1..255. The table needs `Updated` and a GSI whose Keys start with it
   (`{Slot: G2, Keys: Cols(t.Updated.Size(32))}`), and no Partition. A negative

@@ -18,14 +18,31 @@ var everyFrameCodecOptions = []codecOptions{
 	{}, {skipsDivisor: true}, {skipsPatches: true}, {skipsDivisor: true, skipsPatches: true},
 }
 
-// randomFrameFile builds a file of rowCount rows whose sums have at most sumBits significant bits
-// (64: the whole int64 range, negatives included) and whose row IDs step by up to maxStep.
-func randomFrameFile(rng *rand.Rand, rowCount, sumsCount, sumBits int, maxStep int64) File {
-	file := File{Snapshot: rng.Int64N(1 << 31), RowIDs: make([]int64, rowCount), Sums: make([][]int64, sumsCount)}
-	nextID := rng.Int64N(1 << 20)
-	for row := range file.RowIDs {
-		file.RowIDs[row] = nextID
-		nextID += 1 + rng.Int64N(maxStep)
+// randomFrameFile builds a file of rowCount rows of rowColumnCount Rows columns, whose sums have at
+// most sumBits significant bits (64: the whole int64 range, negatives included). Each row moves one
+// Rows column, by up to maxStep, and restarts the later ones at a random value: with several columns
+// the rows nest in groups of random sizes, many of a single row.
+func randomFrameFile(rng *rand.Rand, rowCount, rowColumnCount, sumsCount, sumBits int, maxStep int64) File {
+	file := File{Snapshot: rng.Int64N(1 << 31), Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
+	current := make([]int64, rowColumnCount)
+	for c := range current {
+		current[c] = rng.Int64N(1 << 20)
+	}
+	for row := range rowCount {
+		if row > 0 {
+			// The innermost column moves most often, as employees under a program.
+			movedColumn := rowColumnCount - 1
+			for movedColumn > 0 && rng.IntN(4) == 0 {
+				movedColumn--
+			}
+			current[movedColumn] += 1 + rng.Int64N(maxStep)
+			for c := movedColumn + 1; c < rowColumnCount; c++ {
+				current[c] = rng.Int64N(1 << 20)
+			}
+		}
+		for c := range current {
+			file.Rows[c] = append(file.Rows[c], current[c])
+		}
 	}
 	for column := range file.Sums {
 		file.Sums[column] = make([]int64, rowCount)
@@ -39,7 +56,10 @@ func randomFrameFile(rng *rand.Rand, rowCount, sumsCount, sumBits int, maxStep i
 // cloneFrameFile copies the columns: the encoder transforms its own copies, but a test compares
 // against the original after encoding.
 func cloneFrameFile(file File) File {
-	clone := File{Snapshot: file.Snapshot, RowIDs: slices.Clone(file.RowIDs), Sums: make([][]int64, len(file.Sums))}
+	clone := File{Snapshot: file.Snapshot, Rows: make([][]int64, len(file.Rows)), Sums: make([][]int64, len(file.Sums))}
+	for i := range file.Rows {
+		clone.Rows[i] = slices.Clone(file.Rows[i])
+	}
 	for i := range file.Sums {
 		clone.Sums[i] = slices.Clone(file.Sums[i])
 	}
@@ -50,7 +70,7 @@ func assertFrameFileRoundTrip(t *testing.T, name string, file File) {
 	t.Helper()
 	for _, options := range everyFrameCodecOptions {
 		content := appendFile(nil, cloneFrameFile(file), options)
-		decoded, err := DecodeFile(content, len(file.Sums))
+		decoded, err := DecodeFile(content, len(file.Rows), len(file.Sums))
 		if err != nil {
 			t.Fatalf("%s %+v: decode: %v", name, options, err)
 		}
@@ -62,25 +82,35 @@ func assertFrameFileRoundTrip(t *testing.T, name string, file File) {
 
 // TestFrameFileRoundTrip covers the shapes the transforms and the blocks special-case: no rows, one
 // row, block boundaries (127, 128, 129), constant and consecutive columns, negatives, the int64
-// extremes and every sum width from 0 to 64 bits.
+// extremes, every sum width from 0 to 64 bits, and 1 to 3 nested Rows columns.
 func TestFrameFileRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
-	assertFrameFileRoundTrip(t, "empty", File{Snapshot: 9, Sums: make([][]int64, 2)})
-	assertFrameFileRoundTrip(t, "one row", File{Snapshot: 1, RowIDs: []int64{77}, Sums: [][]int64{{-5}, {0}}})
+	assertFrameFileRoundTrip(t, "empty", File{Snapshot: 9, Rows: make([][]int64, 1), Sums: make([][]int64, 2)})
+	assertFrameFileRoundTrip(t, "empty, 3 Rows columns", File{Snapshot: 9, Rows: make([][]int64, 3), Sums: make([][]int64, 1)})
+	assertFrameFileRoundTrip(t, "one row", File{Snapshot: 1, Rows: [][]int64{{77}}, Sums: [][]int64{{-5}, {0}}})
+	assertFrameFileRoundTrip(t, "one row, 3 Rows columns", File{Snapshot: 1, Rows: [][]int64{{7}, {0}, {9}}, Sums: [][]int64{{-5}}})
 	assertFrameFileRoundTrip(t, "int64 extremes", File{
-		RowIDs: []int64{0, 1, math.MaxInt64},
-		Sums:   [][]int64{{math.MinInt64, 0, math.MaxInt64}, {-1, -1, -1}},
+		Rows: [][]int64{{0, 1, math.MaxInt64}},
+		Sums: [][]int64{{math.MinInt64, 0, math.MaxInt64}, {-1, -1, -1}},
 	})
-	for _, rowCount := range []int{2, 127, 128, 129, 300, 1000} {
-		consecutive := randomFrameFile(rng, rowCount, 1, 0, 1)
-		assertFrameFileRoundTrip(t, fmt.Sprintf("consecutive ids, zero sums, %d rows", rowCount), consecutive)
-		for sumBits := 0; sumBits <= 64; sumBits++ {
-			file := randomFrameFile(rng, rowCount, 2, sumBits, 1+rng.Int64N(1000))
-			assertFrameFileRoundTrip(t, fmt.Sprintf("%d rows, %d-bit sums", rowCount, sumBits), file)
+	assertFrameFileRoundTrip(t, "int64 extremes, 2 Rows columns", File{
+		Rows: [][]int64{{0, 0, math.MaxInt64}, {math.MaxInt64 - 1, math.MaxInt64, 0}},
+		Sums: [][]int64{{1, 2, 3}},
+	})
+	assertFrameFileRoundTrip(t, "one outer value", File{Rows: [][]int64{{5, 5, 5}, {1, 2, 9}}, Sums: [][]int64{{1, 1, 1}}})
+	assertFrameFileRoundTrip(t, "every outer value once", File{Rows: [][]int64{{1, 2, 3}, {4, 4, 4}, {9, 0, 3}}, Sums: [][]int64{{1, 1, 1}}})
+	for rowColumnCount := 1; rowColumnCount <= MaxRowColumns; rowColumnCount++ {
+		for _, rowCount := range []int{2, 127, 128, 129, 300, 1000} {
+			consecutive := randomFrameFile(rng, rowCount, rowColumnCount, 1, 0, 1)
+			assertFrameFileRoundTrip(t, fmt.Sprintf("%d Rows columns, consecutive, zero sums, %d rows", rowColumnCount, rowCount), consecutive)
+			for sumBits := 0; sumBits <= 64; sumBits++ {
+				file := randomFrameFile(rng, rowCount, rowColumnCount, 2, sumBits, 1+rng.Int64N(1000))
+				assertFrameFileRoundTrip(t, fmt.Sprintf("%d Rows columns, %d rows, %d-bit sums", rowColumnCount, rowCount, sumBits), file)
+			}
 		}
 	}
 	// Multiples of a common divisor, with a heavy tail that the patches carry.
-	tail := randomFrameFile(rng, 1000, 1, 0, 3)
+	tail := randomFrameFile(rng, 1000, 1, 1, 0, 3)
 	for row := range tail.Sums[0] {
 		tail.Sums[0][row] = 1000 * int64(1+rng.IntN(8))
 		if rng.IntN(50) == 0 {
@@ -144,23 +174,30 @@ func TestFrameBlockCostIsExactAndSmallest(t *testing.T) {
 
 // TestFrameFileTruncated: every proper prefix of a file is refused, never a panic.
 func TestFrameFileTruncated(t *testing.T) {
-	file := randomFrameFile(rand.New(rand.NewPCG(5, 6)), 300, 2, 40, 9)
-	content := appendFile(nil, cloneFrameFile(file), codecOptions{})
-	for length := range len(content) {
-		if _, err := DecodeFile(content[:length], 2); err == nil {
-			t.Fatalf("a %d-byte prefix of a %d-byte file decoded without an error", length, len(content))
+	for rowColumnCount := 1; rowColumnCount <= MaxRowColumns; rowColumnCount++ {
+		file := randomFrameFile(rand.New(rand.NewPCG(5, 6)), 300, rowColumnCount, 2, 40, 9)
+		content := appendFile(nil, cloneFrameFile(file), codecOptions{})
+		for length := range len(content) {
+			if _, err := DecodeFile(content[:length], rowColumnCount, 2); err == nil {
+				t.Fatalf("%d Rows columns: a %d-byte prefix of a %d-byte file decoded without an error", rowColumnCount, length, len(content))
+			}
 		}
 	}
 }
 
-// FuzzFrameDecode: arbitrary input returns an error or a file, never a panic.
+// FuzzFrameDecode: arbitrary input returns an error or a file, never a panic, read with 1 to 3 Rows
+// columns whatever it was written with.
 func FuzzFrameDecode(f *testing.F) {
 	rng := rand.New(rand.NewPCG(7, 8))
-	for _, sumBits := range []int{0, 7, 33, 64} {
-		f.Add(appendFile(nil, randomFrameFile(rng, 200, 2, sumBits, 5), codecOptions{}))
+	for rowColumnCount := 1; rowColumnCount <= MaxRowColumns; rowColumnCount++ {
+		for _, sumBits := range []int{0, 7, 33, 64} {
+			f.Add(appendFile(nil, randomFrameFile(rng, 200, rowColumnCount, 2, sumBits, 5), codecOptions{}))
+		}
 	}
 	f.Fuzz(func(t *testing.T, content []byte) {
-		_, _ = DecodeFile(content, 2)
+		for rowColumnCount := 1; rowColumnCount <= MaxRowColumns; rowColumnCount++ {
+			_, _ = DecodeFile(content, rowColumnCount, 2)
+		}
 	})
 }
 
@@ -170,7 +207,7 @@ func FuzzFrameDecode(f *testing.F) {
 func varint16RowsLength(file File) int {
 	length := 1 + len(binary.AppendUvarint(nil, uint64(file.Snapshot)))
 	previousID := int64(0)
-	for row, rowID := range file.RowIDs {
+	for row, rowID := range file.Rows[0] {
 		length += len(binary.AppendUvarint(nil, uint64(rowID-previousID)))
 		previousID = rowID
 		for _, sumColumn := range file.Sums {
@@ -232,7 +269,7 @@ func TestFrameFileSizeExample(t *testing.T) {
 		fmt.Fprintf(&report, "%-46s %9d %9.2f %9d\n", column.name, length, float64(length*8)/productCount, bare)
 	}
 
-	file := File{Snapshot: 1_250_000, RowIDs: productIDs, Sums: [][]int64{quantities, unitPrices}}
+	file := File{Snapshot: 1_250_000, Rows: [][]int64{productIDs}, Sums: [][]int64{quantities, unitPrices}}
 	fullLength := 0
 	fmt.Fprintf(&report, "\nfile: ProductID + Quantity + UnitPrice, one day\n")
 	for _, variant := range []struct {
@@ -245,7 +282,7 @@ func TestFrameFileSizeExample(t *testing.T) {
 		{"without either", codecOptions{skipsDivisor: true, skipsPatches: true}},
 	} {
 		content := appendFile(nil, cloneFrameFile(file), variant.options)
-		decoded, err := DecodeFile(content, 2)
+		decoded, err := DecodeFile(content, 1, 2)
 		if err != nil || !reflect.DeepEqual(decoded, file) {
 			t.Fatalf("%s: the file does not read back: %v", variant.name, err)
 		}
@@ -260,4 +297,50 @@ func TestFrameFileSizeExample(t *testing.T) {
 	if fullLength >= rowsLength {
 		t.Fatalf("the columnar file (%d B) is not smaller than varint16 rows (%d B)", fullLength, rowsLength)
 	}
+}
+
+// TestFrameFileNestedRowsSize measures a volunteer-month file: one row per department × program ×
+// employee of a month, as three nested Rows columns and as the one integer they could be packed into
+// (department << 46 | program << 31 | employee). Employees are IDs 1..60,000 spread over the
+// departments; six 0–3 sums. Run with -v for the report.
+func TestFrameFileNestedRowsSize(t *testing.T) {
+	var report strings.Builder
+	fmt.Fprintf(&report, "\n%-34s %7s %7s %9s %9s\n", "file", "rows", "packed", "nested", "saved")
+	for _, scenario := range []struct {
+		departmentCount, programCount, rowCount int
+	}{{20, 6, 1000}, {20, 6, 3000}, {200, 10, 20000}} {
+		rng := rand.New(rand.NewPCG(uint64(scenario.rowCount), 1))
+		departmentIDs := rng.Perm(1000)[:scenario.departmentCount]
+		isTaken := map[[3]int64]bool{}
+		var rows [][3]int64
+		for len(rows) < scenario.rowCount {
+			row := [3]int64{int64(departmentIDs[rng.IntN(len(departmentIDs))]), 1 + rng.Int64N(int64(scenario.programCount)), 1 + rng.Int64N(60000)}
+			if !isTaken[row] {
+				isTaken[row] = true
+				rows = append(rows, row)
+			}
+		}
+		slices.SortFunc(rows, func(a, b [3]int64) int { return slices.Compare(a[:], b[:]) })
+		nested := File{Rows: make([][]int64, 3), Sums: make([][]int64, 6)}
+		packed := File{Rows: make([][]int64, 1), Sums: nested.Sums}
+		for _, row := range rows {
+			for c := range row {
+				nested.Rows[c] = append(nested.Rows[c], row[c])
+			}
+			packed.Rows[0] = append(packed.Rows[0], row[0]<<46|row[1]<<31|row[2])
+		}
+		for s := range nested.Sums {
+			for range rows {
+				nested.Sums[s] = append(nested.Sums[s], rng.Int64N(4))
+			}
+		}
+		assertFrameFileRoundTrip(t, "nested volunteer-month", nested)
+		nestedLength, packedLength := len(EncodeFile(cloneFrameFile(nested))), len(EncodeFile(cloneFrameFile(packed)))
+		name := fmt.Sprintf("%d depts × %d programs", scenario.departmentCount, scenario.programCount)
+		fmt.Fprintf(&report, "%-34s %7d %7d B %7d B %8.1f%%\n", name, len(rows), packedLength, nestedLength, 100*float64(packedLength-nestedLength)/float64(packedLength))
+		if nestedLength >= packedLength {
+			t.Fatalf("%s: nested Rows (%d B) is not smaller than the packed key (%d B)", name, nestedLength, packedLength)
+		}
+	}
+	t.Log(report.String())
 }

@@ -47,7 +47,7 @@ func (t frameEnrollmentTable) GetSchema() Schema {
 		Keys:    Cols(t.ActivityID.Size(32), t.EmployeeID.Size(32)),
 		Indexes: []Index{{Slot: G1, Keys: Cols(t.Updated.Size(32))}},
 		DataFrames: []DataFrame{
-			{Name: "year-program", Keys: Cols(t.Year, t.ProgramID), Rows: t.EmployeeID, Sums: Cols(t.Minutes, t.Points, t.Hours), Count: true},
+			{Name: "year-program", Keys: Cols(t.Year, t.ProgramID), Rows: Cols(t.EmployeeID), Sums: Cols(t.Minutes, t.Points, t.Hours), Count: true},
 		},
 	}
 }
@@ -62,18 +62,18 @@ func TestDataFrameDeclarationRules(t *testing.T) {
 		partition func(t *frameEnrollmentTable) []Coln
 	}{
 		"a string column": {frames: func(t *frameEnrollmentTable) []DataFrame {
-			return []DataFrame{{Name: "a", Keys: Cols(t.Note), Rows: t.EmployeeID, Count: true}}
+			return []DataFrame{{Name: "a", Keys: Cols(t.Note), Rows: Cols(t.EmployeeID), Count: true}}
 		}},
 		"a rule of the dataframe module": {frames: func(t *frameEnrollmentTable) []DataFrame {
-			return []DataFrame{{Name: "Year", Keys: Cols(t.Year), Rows: t.EmployeeID, Count: true}}
+			return []DataFrame{{Name: "Year", Keys: Cols(t.Year), Rows: Cols(t.EmployeeID), Count: true}}
 		}},
 		"no GSI on Updated": {frames: func(t *frameEnrollmentTable) []DataFrame {
-			return []DataFrame{{Name: "a", Keys: Cols(t.Year), Rows: t.EmployeeID, Count: true}}
+			return []DataFrame{{Name: "a", Keys: Cols(t.Year), Rows: Cols(t.EmployeeID), Count: true}}
 		}, indexes: func(t *frameEnrollmentTable) []Index {
 			return []Index{{Slot: G1, Keys: Cols(t.Year.Size(16), t.Updated.Size(32))}}
 		}},
 		"a Partition": {frames: func(t *frameEnrollmentTable) []DataFrame {
-			return []DataFrame{{Name: "a", Keys: Cols(t.ProgramID), Rows: t.EmployeeID, Count: true}}
+			return []DataFrame{{Name: "a", Keys: Cols(t.ProgramID), Rows: Cols(t.EmployeeID), Count: true}}
 		}, partition: func(t *frameEnrollmentTable) []Coln { return Cols(t.Year.Size(16)) }},
 	} {
 		func() {

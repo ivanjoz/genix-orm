@@ -38,10 +38,16 @@ const (
 	hoursIndex
 )
 
+// compileTestTable compiles two frames of the same sums: year-program, one file per year and program
+// with a row per employee, and year, one file per year with a row per program × employee (nested
+// Rows).
 func compileTestTable(t *testing.T) *Table {
 	t.Helper()
 	table, err := Compile("enrollment", 78901377, []Spec{{
-		Name: "year-program", Keys: []Column{yearColumn, programColumn}, Rows: employeeColumn,
+		Name: "year-program", Keys: []Column{yearColumn, programColumn}, Rows: []Column{employeeColumn},
+		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true,
+	}, {
+		Name: "year", Keys: []Column{yearColumn}, Rows: []Column{programColumn, employeeColumn},
 		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true,
 	}}, &statusColumn)
 	if err != nil {
@@ -56,20 +62,27 @@ func TestCompileRules(t *testing.T) {
 	if frame.Folder != "dtf/3gz10/year-program/" || frame.SumsCount != 4 || len(frame.Shape) != 8 || len(table.Tracked) != 7 || table.StatusIndex != statusIndex {
 		t.Fatalf("compiled: %+v", table)
 	}
+	if nested := &table.Frames[1]; len(nested.Rows) != 2 || nested.Rows[0].TrackedIndex != programIndex || nested.Rows[1].TrackedIndex != employeeIndex || nested.Shape == frame.Shape {
+		t.Fatalf("compiled nested Rows: %+v", nested)
+	}
+	employeeRows := []Column{employeeColumn}
 	for name, spec := range map[string]Spec{
-		"a name with capitals":   {Name: "Year", Keys: []Column{yearColumn}, Rows: employeeColumn, Count: true},
-		"four Keys":              {Name: "a", Keys: []Column{yearColumn, programColumn, minutesColumn, pointsColumn}, Rows: employeeColumn, Count: true},
+		"a name with capitals":   {Name: "Year", Keys: []Column{yearColumn}, Rows: employeeRows, Count: true},
+		"four Keys":              {Name: "a", Keys: []Column{yearColumn, programColumn, minutesColumn, pointsColumn}, Rows: employeeRows, Count: true},
 		"no Rows":                {Name: "a", Keys: []Column{yearColumn}, Count: true},
-		"neither Sums nor Count": {Name: "a", Keys: []Column{yearColumn}, Rows: employeeColumn},
-		"a float Key":            {Name: "a", Keys: []Column{hoursColumn}, Rows: employeeColumn, Count: true},
-		"a column twice":         {Name: "a", Keys: []Column{yearColumn}, Rows: employeeColumn, Sums: []Column{yearColumn}},
-		"a column id over 255":   {Name: "a", Keys: []Column{{FieldName: "Wide", ColumnID: 300}}, Rows: employeeColumn, Count: true},
+		"four Rows":              {Name: "a", Keys: []Column{yearColumn}, Rows: []Column{programColumn, minutesColumn, pointsColumn, employeeColumn}, Count: true},
+		"neither Sums nor Count": {Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows},
+		"a float Key":            {Name: "a", Keys: []Column{hoursColumn}, Rows: employeeRows, Count: true},
+		"a float Rows column":    {Name: "a", Keys: []Column{yearColumn}, Rows: []Column{programColumn, hoursColumn}, Count: true},
+		"a column twice":         {Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Sums: []Column{yearColumn}},
+		"a Key in the Rows":      {Name: "a", Keys: []Column{yearColumn}, Rows: []Column{yearColumn, employeeColumn}, Count: true},
+		"a column id over 255":   {Name: "a", Keys: []Column{{FieldName: "Wide", ColumnID: 300}}, Rows: employeeRows, Count: true},
 	} {
 		if _, err := Compile("bad", 1, []Spec{spec}, nil); err == nil {
 			t.Fatalf("%s: compiled", name)
 		}
 	}
-	twice := Spec{Name: "a", Keys: []Column{yearColumn}, Rows: employeeColumn, Count: true}
+	twice := Spec{Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Count: true}
 	if _, err := Compile("bad", 1, []Spec{twice, twice}, nil); err == nil {
 		t.Fatal("two frames with one name compiled")
 	}
@@ -80,8 +93,11 @@ func TestValuesAndTheWriteCheck(t *testing.T) {
 	frame := &table.Frames[0]
 	tracked := []int64{4, 2026, 3, 240, 100, 1, 1_500_000}
 	values := table.valuesOf(frame, tracked)
-	if !slices.Equal(values.keys, []int64{2026, 3}) || values.row != 4 || !slices.Equal(values.sums, []int64{240, 100, 1_500_000, 1}) {
+	if !slices.Equal(values.keys, []int64{2026, 3}) || values.row != (rowKey{4}) || !slices.Equal(values.sums, []int64{240, 100, 1_500_000, 1}) {
 		t.Fatalf("frame values: %+v", values)
+	}
+	if nestedValues := table.valuesOf(&table.Frames[1], tracked); !slices.Equal(nestedValues.keys, []int64{2026}) || nestedValues.row != (rowKey{3, 4}) {
+		t.Fatalf("nested frame values: %+v", nestedValues)
 	}
 	tracked[statusIndex] = 0
 	if table.valuesOf(frame, tracked) != nil {
@@ -90,6 +106,10 @@ func TestValuesAndTheWriteCheck(t *testing.T) {
 	tracked[statusIndex], tracked[yearIndex] = 1, -1
 	if err := table.CheckValues(tracked); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("a negative Keys value must fail the write, got %v", err)
+	}
+	tracked[yearIndex], tracked[programIndex] = 2026, -1
+	if err := table.CheckValues(tracked); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("a negative Rows value must fail the write, got %v", err)
 	}
 	if _, isKept := ScaledFloat(1e13); isKept {
 		t.Fatal("a float past ±1.1e12 must not be kept")
@@ -288,30 +308,39 @@ func TestValuesAtMatchesTheHistory(t *testing.T) {
 	}
 }
 
-// memoryBackend keeps the frame's state in memory and answers the records as the simulation stored
+// memoryBackend keeps each frame's state in memory and answers the records as the simulation stored
 // them at readAt.
 type memoryBackend struct {
-	sim    simHistory
-	readAt int64
-	state  State
-	holder string
+	sim           simHistory
+	readAt        int64
+	stateByFrame  map[string]State
+	holderByFrame map[string]string
 }
 
-func (backend *memoryBackend) ReadState(frame *Frame) (State, error) { return backend.state, nil }
-func (backend *memoryBackend) TakeLock(frame *Frame, holderID string, now, lockedUntil time.Time) (State, bool, error) {
-	backend.holder = holderID
-	return backend.state, true, nil
+func newMemoryBackend(sim simHistory) *memoryBackend {
+	return &memoryBackend{sim: sim, stateByFrame: map[string]State{}, holderByFrame: map[string]string{}}
 }
-func (backend *memoryBackend) ReleaseLock(frame *Frame, holderID string) { backend.holder = "" }
+
+func (backend *memoryBackend) ReadState(frame *Frame) (State, error) {
+	return backend.stateByFrame[frame.Name], nil
+}
+func (backend *memoryBackend) TakeLock(frame *Frame, holderID string, now, lockedUntil time.Time) (State, bool, error) {
+	backend.holderByFrame[frame.Name] = holderID
+	return backend.stateByFrame[frame.Name], true, nil
+}
+func (backend *memoryBackend) ReleaseLock(frame *Frame, holderID string) {
+	delete(backend.holderByFrame, frame.Name)
+}
 func (backend *memoryBackend) CommitSnapshot(ctx context.Context, frame *Frame, holderID string, state State, snapshot int64) error {
-	if holderID != backend.holder || state != backend.state {
+	if holderID != backend.holderByFrame[frame.Name] || state != backend.stateByFrame[frame.Name] {
 		return errors.New("lock or state moved")
 	}
-	backend.state.Snapshot = snapshot
+	state.Snapshot = snapshot
+	backend.stateByFrame[frame.Name] = state
 	return nil
 }
 func (backend *memoryBackend) CommitGeneration(ctx context.Context, frame *Frame, holderID string, generation string, snapshot int64) error {
-	backend.state = State{Generation: generation, Shape: frame.Shape, Snapshot: snapshot}
+	backend.stateByFrame[frame.Name] = State{Generation: generation, Shape: frame.Shape, Snapshot: snapshot}
 	return nil
 }
 func (backend *memoryBackend) HistoriesWrittenAfter(moment int64) ([]History, error) {
@@ -342,10 +371,10 @@ func (store *crashingFileStore) PutFileIfMatch(ctx context.Context, key string, 
 
 func timeOfSUnix(moment int64) time.Time { return time.Unix(moment*2+1e9, 0) }
 
-// readAll is every row of the test frame (its Years are 2025..2027).
-func readAll(t *testing.T, table *Table, backend Backend, store utils.FileStore, isFresh bool) []Row {
+// readAll is every row of a test frame (its Years are 2025..2027).
+func readAll(t *testing.T, table *Table, frame *Frame, backend Backend, store utils.FileStore, isFresh bool) []Row {
 	t.Helper()
-	rows, err := Read(table, &table.Frames[0], backend, store, Selection{FromKey: 2025, ToKey: 2027}, isFresh)
+	rows, err := Read(table, frame, backend, store, Selection{FromKey: 2025, ToKey: 2027}, isFresh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,15 +383,14 @@ func readAll(t *testing.T, table *Table, backend Backend, store utils.FileStore,
 
 // TestRunsSurviveCrashes: a rebuild, then runs at random moments, some crashing after a random part of
 // their files, leave the files equal to the brute force at their target, and a fresh read equal to it
-// at the read's moment.
+// at the read's moment, for both test frames.
 func TestRunsSurviveCrashes(t *testing.T) {
 	table := compileTestTable(t)
-	frame := &table.Frames[0]
 	for seed := range uint64(30) {
 		rng := rand.New(rand.NewPCG(seed, 99))
 		sim := simulateWrites(t, table, rng, 40000)
 		store := &crashingFileStore{MemoryFileStore: utils.NewMemoryFileStore(), rng: rng}
-		backend := &memoryBackend{sim: sim}
+		backend := newMemoryBackend(sim)
 
 		// The first Materialize builds the frame; each record is read a little after the target.
 		now := simStart + 2000 + rng.Int64N(3000)
@@ -370,21 +398,28 @@ func TestRunsSurviveCrashes(t *testing.T) {
 		if err := Materialize(table, backend, store, timeOfSUnix(now)); err != nil {
 			t.Fatal(err)
 		}
-		if got, want := readAll(t, table, backend, store, false), sim.bruteForceRows(frame, now-TargetLag); !reflect.DeepEqual(got, want) {
-			t.Fatalf("seed %d: the rebuild at %d differs from the brute force", seed, now-TargetLag)
+		for i := range table.Frames {
+			frame := &table.Frames[i]
+			if got, want := readAll(t, table, frame, backend, store, false), sim.bruteForceRows(frame, now-TargetLag); !reflect.DeepEqual(got, want) {
+				t.Fatalf("seed %d frame %s: the rebuild at %d differs from the brute force", seed, frame.Name, now-TargetLag)
+			}
 		}
 
 		for now += 300; now < simStart+40000; now += 300 + rng.Int64N(1500) {
 			backend.readAt = now + rng.Int64N(30)
 			store.isCrashing = rng.IntN(3) == 0
 			err := Materialize(table, backend, store, timeOfSUnix(now))
-			if store.isCrashing = false; err == nil {
-				if got, want := readAll(t, table, backend, store, false), sim.bruteForceRows(frame, now-TargetLag); !reflect.DeepEqual(got, want) {
-					t.Fatalf("seed %d: the files after the run at %d differ from the brute force", seed, now)
+			store.isCrashing = false
+			for i := range table.Frames {
+				frame := &table.Frames[i]
+				if err == nil {
+					if got, want := readAll(t, table, frame, backend, store, false), sim.bruteForceRows(frame, now-TargetLag); !reflect.DeepEqual(got, want) {
+						t.Fatalf("seed %d frame %s: the files after the run at %d differ from the brute force", seed, frame.Name, now)
+					}
 				}
-			}
-			if got, want := readAll(t, table, backend, store, true), sim.bruteForceRows(frame, backend.readAt); !reflect.DeepEqual(got, want) {
-				t.Fatalf("seed %d: the fresh read at %d differs from the brute force", seed, backend.readAt)
+				if got, want := readAll(t, table, frame, backend, store, true), sim.bruteForceRows(frame, backend.readAt); !reflect.DeepEqual(got, want) {
+					t.Fatalf("seed %d frame %s: the fresh read at %d differs from the brute force", seed, frame.Name, backend.readAt)
+				}
 			}
 		}
 	}

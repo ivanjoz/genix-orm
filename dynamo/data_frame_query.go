@@ -10,7 +10,7 @@ import (
 
 // FrameRow is one row of a DataFrame file, as Group is one GroupBy counter.
 type FrameRow[E any] struct {
-	// Key is a record with only the frame's Keys and Rows set.
+	// Key is a record with only the frame's Keys and Rows Cols set.
 	Key   E
 	frame *dataframe.Frame
 	sums  []int64
@@ -110,7 +110,9 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 		for k, key := range q.frame.Keys {
 			q.meta.trackedAccessors[key.TrackedIndex].setI64(keyPtr, row.Keys[k])
 		}
-		q.meta.trackedAccessors[q.frame.Rows.TrackedIndex].setI64(keyPtr, row.RowID)
+		for c, rowColumn := range q.frame.Rows {
+			q.meta.trackedAccessors[rowColumn.TrackedIndex].setI64(keyPtr, row.RowValues[c])
+		}
 	}
 	return frameRows, nil
 }

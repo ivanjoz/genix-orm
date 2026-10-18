@@ -145,8 +145,8 @@ func (table *Table) moveFiles(ctx context.Context, store utils.FileStore, frame 
 		if loaded.snapshotByFileKey[fileKey] >= target {
 			return nil // a run that crashed after writing it already brought it here
 		}
-		file := loaded.rowsByFileKey[fileKey].fileAt(target, frame.SumsCount)
-		if len(file.RowIDs) == 0 && loaded.etagByFileKey[fileKey] == "" {
+		file := loaded.rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
+		if file.rowCount() == 0 && loaded.etagByFileKey[fileKey] == "" {
 			return nil // a file no record is left in is not created
 		}
 		_, err := store.PutFileIfMatch(ctx, fileKey, EncodeFile(file), loaded.etagByFileKey[fileKey])
@@ -227,7 +227,7 @@ func loadFiles(store utils.FileStore, frame *Frame, fileKeys []string, snapshot 
 		if err != nil {
 			return fmt.Errorf("dataframe: reading the frame file %s: %w", fileKeys[fileIndex], err)
 		}
-		if files[fileIndex], err = DecodeFile(content, frame.SumsCount); err != nil {
+		if files[fileIndex], err = DecodeFile(content, len(frame.Rows), frame.SumsCount); err != nil {
 			return fmt.Errorf("%s: %w", fileKeys[fileIndex], err)
 		}
 		etags[fileIndex] = etag
@@ -260,7 +260,7 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 
 	fileKeys := slices.Collect(maps.Keys(rowsByFileKey))
 	err = utils.RunParallel(len(fileKeys), func(fileIndex int) error {
-		content := EncodeFile(rowsByFileKey[fileKeys[fileIndex]].fileAt(target, frame.SumsCount))
+		content := EncodeFile(rowsByFileKey[fileKeys[fileIndex]].fileAt(target, len(frame.Rows), frame.SumsCount))
 		_, err := store.PutFileIfMatch(lock.ctx, fileKeys[fileIndex], content, "")
 		return err
 	})

@@ -29,15 +29,15 @@ func (selection Selection) matches(keys []int64) bool {
 	return keys[0] >= selection.FromKey && keys[0] <= selection.ToKey && slices.Equal(keys[1:1+len(selection.PinnedKeys)], selection.PinnedKeys)
 }
 
-// Row is one row of a frame file: the file's Keys, the Rows value and the sums (Frame.Sums in order,
-// then the record count when the frame counts records).
+// Row is one row of a frame file: the file's Keys, its Rows values (Frame.Rows in order) and the sums
+// (Frame.Sums in order, then the record count when the frame counts records).
 type Row struct {
-	Keys  []int64
-	RowID int64
-	Sums  []int64
+	Keys      []int64
+	RowValues []int64
+	Sums      []int64
 }
 
-// Read returns the selected rows, sorted by Keys then by RowID, as the last run left them; isFresh
+// Read returns the selected rows, sorted by Keys then by RowValues, as the last run left them; isFresh
 // also moves the records written since the frame's snapshot to their current values.
 func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, selection Selection, isFresh bool) ([]Row, error) {
 	readName := fmt.Sprintf("dataframe: %s frame %q", table.Name, frame.Name)
@@ -116,7 +116,7 @@ func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, s
 	return slices.Concat(listedByFirstKey...), err
 }
 
-// rowsOf turns the files into rows, by Keys then by RowID.
+// rowsOf turns the files into rows, by Keys then by RowValues.
 func (frame *Frame) rowsOf(generation string, fileKeys []string, rowsByFileKey map[string]frameRows) []Row {
 	keysByFileKey := map[string][]int64{}
 	for _, fileKey := range fileKeys {
@@ -124,30 +124,41 @@ func (frame *Frame) rowsOf(generation string, fileKeys []string, rowsByFileKey m
 	}
 	slices.SortFunc(fileKeys, func(a, b string) int { return slices.Compare(keysByFileKey[a], keysByFileKey[b]) })
 	var rows []Row
+	rowColumnCount := len(frame.Rows)
 	for _, fileKey := range fileKeys {
-		file := rowsByFileKey[fileKey].fileAt(0, frame.SumsCount)
-		for i, rowID := range file.RowIDs {
-			row := Row{Keys: keysByFileKey[fileKey], RowID: rowID, Sums: make([]int64, frame.SumsCount)}
-			for s := range row.Sums {
-				row.Sums[s] = file.Sums[s][i]
+		file := rowsByFileKey[fileKey].fileAt(0, rowColumnCount, frame.SumsCount)
+		// One backing array per file for every row's values and sums: two allocations, not two per row.
+		rowWidth := rowColumnCount + frame.SumsCount
+		backing := make([]int64, file.rowCount()*rowWidth)
+		for i := range file.rowCount() {
+			rowBacking := backing[i*rowWidth : (i+1)*rowWidth : (i+1)*rowWidth]
+			for c := range rowColumnCount {
+				rowBacking[c] = file.Rows[c][i]
 			}
-			rows = append(rows, row)
+			for s := range frame.SumsCount {
+				rowBacking[rowColumnCount+s] = file.Sums[s][i]
+			}
+			rows = append(rows, Row{Keys: keysByFileKey[fileKey], RowValues: rowBacking[:rowColumnCount:rowColumnCount], Sums: rowBacking[rowColumnCount:]})
 		}
 	}
 	return rows
 }
 
 // frameRows is the content of one file while it is being changed: the sums per row.
-type frameRows map[int64][]int64
+type frameRows map[rowKey][]int64
 
 func rowsOfFile(file File) frameRows {
-	rows := frameRows{}
-	for i, rowID := range file.RowIDs {
+	rows := make(frameRows, file.rowCount())
+	for i := range file.rowCount() {
+		var row rowKey
+		for c := range file.Rows {
+			row[c] = file.Rows[c][i]
+		}
 		sums := make([]int64, len(file.Sums))
 		for j := range file.Sums {
 			sums[j] = file.Sums[j][i]
 		}
-		rows[rowID] = sums
+		rows[row] = sums
 	}
 	return rows
 }
@@ -165,14 +176,16 @@ func (rows frameRows) add(values *frameValues, sign int64) {
 }
 
 // fileAt encodes the rows as a file at snapshot, rows ascending; a row whose sums are all 0 is dropped.
-func (rows frameRows) fileAt(snapshot int64, sumsCount int) File {
-	file := File{Snapshot: snapshot, Sums: make([][]int64, sumsCount)}
-	for _, rowID := range slices.Sorted(maps.Keys(rows)) {
-		sums := rows[rowID]
+func (rows frameRows) fileAt(snapshot int64, rowColumnCount, sumsCount int) File {
+	file := File{Snapshot: snapshot, Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
+	for _, row := range slices.SortedFunc(maps.Keys(rows), compareRowKeys) {
+		sums := rows[row]
 		if !slices.ContainsFunc(sums, func(sum int64) bool { return sum != 0 }) {
 			continue
 		}
-		file.RowIDs = append(file.RowIDs, rowID)
+		for c := range file.Rows {
+			file.Rows[c] = append(file.Rows[c], row[c])
+		}
 		for j, sum := range sums {
 			file.Sums[j] = append(file.Sums[j], sum)
 		}

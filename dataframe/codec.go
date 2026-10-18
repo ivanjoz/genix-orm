@@ -3,7 +3,6 @@ package dataframe
 import (
 	"encoding/binary"
 	"errors"
-	"math"
 	"math/bits"
 	"slices"
 )
@@ -14,15 +13,32 @@ import (
 //	u8        format version
 //	uvarint   snapshot: the SUnixTime the file holds its frame at
 //	uvarint   row count n (no columns follow when n = 0)
-//	column    Rows: uvarint first, uvarint minStep, residuals of the n − 1 steps
+//	rows      the Rows columns, nested (below)
 //	column    each Sums column: varint min, residuals of the n values
 //
+// The rows are sorted by their Rows values, so with several Rows columns (department,
+// program, employee) they nest like folders: a department once, the programs under
+// it, the employees under each program. The file stores that tree level by level
+// instead of repeating the outer values on every row:
+//
+//	[uvarint  g1, the distinct values of Rows[0]: only with 2 or 3 Rows columns]
+//	level 1   the g1 values of Rows[0], an ascending column: uvarint first, steps
+//	level k   per node of level k − 1 (each value of the columns before):
+//	            sums column  how many values of Rows[k−1] it holds (≥ 1)
+//	            sums column  the first of them
+//	            steps        the steps between its next ones, every node's in a row
+//	steps     := uvarint minStep, residuals of the steps less minStep (none when empty)
+//
+// The last level holds the n rows. With one Rows column the file is level 1 alone.
+// Packing the IDs into one integer instead costs a patch of 4–6 bytes on every
+// department and program boundary, where the packed step jumps by 2^31 or more.
+//
 // Each column is turned into small non-negative residuals by a transform its role
-// fixes, so no transform byte is stored: the ascending Rows column is delta-coded
-// and its smallest step subtracted, and each Sums column has its minimum
-// subtracted (frame of reference), which leaves every residual >= 0 even when a
-// value is negative. The residuals are then divided by the largest of 1000, 100,
-// 10, 8, 5 and 2 that divides them all (quantities stored as multiples of 1000 lose
+// fixes, so no transform byte is stored: ascending values are delta-coded and their
+// smallest step subtracted, and each Sums column (and the counts and first values
+// of the nested Rows) has its minimum subtracted (frame of reference), which leaves
+// every residual >= 0 even when a value is negative. The residuals are then divided
+// by the largest of 1000, 100, 10, 8, 5 and 2 that divides them all (quantities stored as multiples of 1000 lose
 // 10 bits each) and written in blocks of 128:
 //
 //	residuals := uvarint divisor, block*
@@ -40,7 +56,7 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	formatVersion    = 1
+	formatVersion    = 2
 	blockSize        = 128
 	blockPatchedFlag = 0x80
 	blockWidthMask   = 0x7F
@@ -51,12 +67,21 @@ const (
 
 var errCorrupt = errors.New("dataframe: frame file is truncated or corrupt")
 
-// File is a decoded frame file: the frame at Snapshot. RowIDs is strictly ascending and >= 0, and
-// each column of Sums is parallel to it.
+// File is a decoded frame file: the frame at Snapshot. Rows holds one column per Rows column of the
+// frame, all of one length: row i is (Rows[0][i], Rows[1][i]...), strictly ascending in that order and
+// >= 0. Each column of Sums is parallel to them.
 type File struct {
 	Snapshot int64
-	RowIDs   []int64
+	Rows     [][]int64
 	Sums     [][]int64
+}
+
+// rowCount is the number of rows of the file; 0 for the zero File, which a missing file reads as.
+func (file File) rowCount() int {
+	if len(file.Rows) == 0 {
+		return 0
+	}
+	return len(file.Rows[0])
 }
 
 // codecOptions turns off a compression step. Files are always written with the zero value
@@ -73,30 +98,86 @@ func EncodeFile(file File) []byte { return appendFile(nil, file, codecOptions{})
 func appendFile(out []byte, file File, options codecOptions) []byte {
 	out = append(out, formatVersion)
 	out = binary.AppendUvarint(out, uint64(file.Snapshot))
-	out = binary.AppendUvarint(out, uint64(len(file.RowIDs)))
-	if len(file.RowIDs) == 0 {
+	out = binary.AppendUvarint(out, uint64(file.rowCount()))
+	if file.rowCount() == 0 {
 		return out
 	}
-	out = appendAscendingColumn(out, file.RowIDs, options)
+	out = appendRowColumns(out, file.Rows, options)
 	for _, sumColumn := range file.Sums {
 		out = appendSumsColumn(out, sumColumn, options)
 	}
 	return out
 }
 
+// appendRowColumns writes the Rows columns as the tree of their values (the file layout above): the
+// distinct values of each column, under the node of the columns before it.
+func appendRowColumns(out []byte, rowColumns [][]int64, options codecOptions) []byte {
+	levelCount := len(rowColumns)
+	// valuesByLevel[k]: the nodes of level k, one per distinct prefix (Rows[0..k]), in row order.
+	// childCountsByLevel[k] (k ≥ 1): how many nodes of level k each node of level k − 1 holds.
+	valuesByLevel := make([][]int64, levelCount)
+	childCountsByLevel := make([][]int64, levelCount)
+	for row := range rowColumns[0] {
+		// The first level whose prefix changes on this row: every level from it starts a node.
+		changedLevel := 0
+		if row > 0 {
+			for changedLevel < levelCount-1 && rowColumns[changedLevel][row] == rowColumns[changedLevel][row-1] {
+				changedLevel++
+			}
+		}
+		for level := changedLevel; level < levelCount; level++ {
+			valuesByLevel[level] = append(valuesByLevel[level], rowColumns[level][row])
+			if level == 0 {
+				continue
+			}
+			if level > changedLevel {
+				childCountsByLevel[level] = append(childCountsByLevel[level], 1) // the first child of a new node
+			} else {
+				childCountsByLevel[level][len(childCountsByLevel[level])-1]++
+			}
+		}
+	}
+
+	if levelCount > 1 {
+		out = binary.AppendUvarint(out, uint64(len(valuesByLevel[0])))
+	}
+	out = appendAscendingColumn(out, valuesByLevel[0], options)
+	for level := 1; level < levelCount; level++ {
+		childCounts, values := childCountsByLevel[level], valuesByLevel[level]
+		firstValues := make([]int64, len(childCounts))
+		steps := make([]uint64, 0, len(values)-len(childCounts))
+		start := 0
+		for node, childCount := range childCounts {
+			firstValues[node] = values[start]
+			for i := start + 1; i < start+int(childCount); i++ {
+				steps = append(steps, uint64(values[i]-values[i-1]))
+			}
+			start += int(childCount)
+		}
+		out = appendSumsColumn(out, childCounts, options)
+		out = appendSumsColumn(out, firstValues, options)
+		out = appendSteps(out, steps, options)
+	}
+	return out
+}
+
 // appendAscendingColumn writes a non-decreasing column of values >= 0: its first value, then the
-// steps between neighbours less the smallest step. Consecutive IDs become a run of zeros.
+// steps between neighbours. Consecutive IDs become a run of zeros.
 func appendAscendingColumn(out []byte, values []int64, options codecOptions) []byte {
 	out = binary.AppendUvarint(out, uint64(values[0]))
-	if len(values) == 1 {
-		return out
-	}
 	steps := make([]uint64, len(values)-1)
-	minStep := uint64(math.MaxUint64)
 	for i := 1; i < len(values); i++ {
 		steps[i-1] = uint64(values[i] - values[i-1])
-		minStep = min(minStep, steps[i-1])
 	}
+	return appendSteps(out, steps, options)
+}
+
+// appendSteps writes the smallest step, then each step less it; nothing when there are no steps.
+func appendSteps(out []byte, steps []uint64, options codecOptions) []byte {
+	if len(steps) == 0 {
+		return out
+	}
+	minStep := slices.Min(steps)
 	for i := range steps {
 		steps[i] -= minStep
 	}
@@ -306,8 +387,9 @@ type byteDecoder struct {
 	position int
 }
 
-// DecodeFile reads a file written by appendFile; sumsCount comes from the frame's schema.
-func DecodeFile(content []byte, sumsCount int) (File, error) {
+// DecodeFile reads a file written by appendFile; rowColumnCount and sumsCount come from the frame's
+// schema.
+func DecodeFile(content []byte, rowColumnCount, sumsCount int) (File, error) {
 	decoder := &byteDecoder{data: append(slices.Clip(content), make([]byte, decodePadding)...), end: len(content)}
 	version, err := decoder.readByte()
 	if err != nil || version != formatVersion {
@@ -323,11 +405,11 @@ func DecodeFile(content []byte, sumsCount int) (File, error) {
 	if err != nil || rowCount > uint64(decoder.end)*blockSize+1 {
 		return File{}, errCorrupt
 	}
-	file := File{Snapshot: int64(snapshot), Sums: make([][]int64, sumsCount)}
+	file := File{Snapshot: int64(snapshot), Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
 	if rowCount == 0 {
 		return file, nil
 	}
-	if file.RowIDs, err = decoder.readAscendingColumn(int(rowCount)); err != nil {
+	if file.Rows, err = decoder.readRowColumns(int(rowCount), rowColumnCount); err != nil {
 		return File{}, err
 	}
 	for i := range file.Sums {
@@ -341,28 +423,121 @@ func DecodeFile(content []byte, sumsCount int) (File, error) {
 	return file, nil
 }
 
+// readRowColumns reads the tree of the Rows values written by appendRowColumns back into rowCount
+// rows of rowColumnCount columns.
+func (decoder *byteDecoder) readRowColumns(rowCount, rowColumnCount int) ([][]int64, error) {
+	nodeCount := rowCount
+	if rowColumnCount > 1 {
+		count, err := decoder.readUvarint()
+		if err != nil || count == 0 || count > uint64(rowCount) {
+			return nil, errCorrupt
+		}
+		nodeCount = int(count)
+	}
+	values, err := decoder.readAscendingColumn(nodeCount)
+	if err != nil {
+		return nil, err
+	}
+	rowColumns := make([][]int64, rowColumnCount)
+	rowColumns[0] = values
+	// childCountsByLevel[k]: how many nodes of level k each node of level k − 1 holds.
+	childCountsByLevel := make([][]int64, rowColumnCount)
+	for level := 1; level < rowColumnCount; level++ {
+		childCounts, err := decoder.readSumsColumn(nodeCount)
+		if err != nil {
+			return nil, err
+		}
+		firstValues, err := decoder.readSumsColumn(nodeCount)
+		if err != nil {
+			return nil, err
+		}
+		// Every node holds 1 or more children and the last level holds the rows: checked before the
+		// counts size anything.
+		childTotal := 0
+		for _, childCount := range childCounts {
+			if childCount < 1 || childCount > int64(rowCount-childTotal) {
+				return nil, errCorrupt
+			}
+			childTotal += int(childCount)
+		}
+		if level == rowColumnCount-1 && childTotal != rowCount {
+			return nil, errCorrupt
+		}
+		steps, err := decoder.readSteps(childTotal - nodeCount)
+		if err != nil {
+			return nil, err
+		}
+		levelValues := make([]int64, 0, childTotal)
+		for node, childCount := range childCounts {
+			levelValues = append(levelValues, firstValues[node])
+			for _, step := range steps[:childCount-1] {
+				levelValues = append(levelValues, levelValues[len(levelValues)-1]+int64(step))
+			}
+			steps = steps[childCount-1:]
+		}
+		rowColumns[level], childCountsByLevel[level], nodeCount = levelValues, childCounts, childTotal
+	}
+	// Expand the outer levels to one value per row: each node's value repeated over the rows under
+	// it, its span, the sum of its children's spans (a row of the last level spans itself).
+	var childSpans []int64
+	for level := rowColumnCount - 2; level >= 0; level-- {
+		spans := make([]int64, len(rowColumns[level]))
+		child := 0
+		for node, childCount := range childCountsByLevel[level+1] {
+			if childSpans == nil {
+				spans[node] = childCount
+				continue
+			}
+			for _, childSpan := range childSpans[child : child+int(childCount)] {
+				spans[node] += childSpan
+			}
+			child += int(childCount)
+		}
+		expanded := make([]int64, 0, rowCount)
+		for node, value := range rowColumns[level] {
+			for range spans[node] {
+				expanded = append(expanded, value)
+			}
+		}
+		rowColumns[level], childSpans = expanded, spans
+	}
+	return rowColumns, nil
+}
+
 func (decoder *byteDecoder) readAscendingColumn(count int) ([]int64, error) {
 	first, err := decoder.readUvarint()
 	if err != nil {
 		return nil, err
 	}
+	steps, err := decoder.readSteps(count - 1)
+	if err != nil {
+		return nil, err
+	}
 	values := make([]int64, count)
 	values[0] = int64(first)
-	if count == 1 {
-		return values, nil
+	for i, step := range steps {
+		values[i+1] = values[i] + int64(step)
+	}
+	return values, nil
+}
+
+// readSteps reads count steps written by appendSteps.
+func (decoder *byteDecoder) readSteps(count int) ([]uint64, error) {
+	if count == 0 {
+		return nil, nil
 	}
 	minStep, err := decoder.readUvarint()
 	if err != nil {
 		return nil, err
 	}
-	steps, err := decoder.readResiduals(count - 1)
+	steps, err := decoder.readResiduals(count)
 	if err != nil {
 		return nil, err
 	}
-	for i, step := range steps {
-		values[i+1] = values[i] + int64(step+minStep)
+	for i := range steps {
+		steps[i] += minStep
 	}
-	return values, nil
+	return steps, nil
 }
 
 func (decoder *byteDecoder) readSumsColumn(count int) ([]int64, error) {

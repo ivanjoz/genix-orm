@@ -25,7 +25,7 @@ A frame is declared by three things:
 | Part | What it is | Example (voluntariado enrollments) |
 |---|---|---|
 | **Keys** (1–3 integer columns) | which **file** a record goes to | `Year`, `ProgramID` |
-| **Rows** (1 integer column) | which **row** of that file | `EmployeeID` |
+| **Rows** (1–3 integer columns) | which **row** of that file | `EmployeeID` |
 | **Sums** (integer or float columns), and/or **Count** | what each row adds up | `RecordedMinutes`, `Points` |
 
 So every distinct `(Year, ProgramID)` gets one file, and inside it one row per employee holding the
@@ -40,8 +40,13 @@ file dtf/3gz10/enrollment-report/P49QA9-/2026/3      (Year 2026, ProgramID 3)
   1005         300               20
 ```
 
+With several Rows columns a row is one combination of their values: `Rows: DepartmentID, ProgramID,
+EmployeeID` gives one row per department × program × employee. Declare them **from the widest group
+to the narrowest**: the file stores them nested like folders, each department once with its programs
+under it and each program once with its employees under it (section 3.3).
+
 A soft-deleted record (`Status = 0`) is in no file. A record that changes a Key moves to another
-file; one that changes its Rows value moves to another row; one that changes a Sum changes its row.
+file; one that changes a Rows value moves to another row; one that changes a Sum changes its row.
 
 A GroupBy counter (dynamo) keeps one item per group. A frame keeps a whole table of rows per file,
 so a report over thousands of employees is one read.
@@ -106,26 +111,47 @@ One record per frame, kept by the backend (dynamo: an item `pk = <table base pk>
 
 ### 3.3 The file: columnar, compressed
 
-A file holds its rows sorted by Rows value, stored **by column**: first the Rows column, then one
+A file holds its rows sorted by their Rows values, stored **by column**: first the Rows, then one
 column per Sum (in declaration order), then the record count when the frame has `Count`. Floats are
 stored as integers, `round(v × 10⁶)`, so adding and subtracting the same value is exact.
 
 ```text
-u8       format version
+u8       format version (2)
 uvarint  snapshot: the SUnixTime this file is exact at
 uvarint  row count n                       (nothing follows when n = 0)
-column   Rows    first value, smallest step, then the n − 1 steps less that smallest step
+rows     the Rows columns, nested (below)
 column   Sum 1   minimum, then each value less the minimum
 column   …       one per Sum, then Count
 ```
+
+**The Rows, nested.** With one Rows column it is a single ascending column: first value, smallest
+step, then the n − 1 steps less that smallest step. With 2 or 3, the sorted rows form a tree (a
+department, its programs, each program's employees) and the file stores it level by level, so an
+outer value is written once instead of on every row:
+
+```text
+uvarint  g1: the distinct values of Rows[0]
+level 1  those g1 values, an ascending column
+level k  for each node of level k − 1 (a distinct prefix of the Rows before):
+           column  how many values of Rows[k−1] it holds      (minimum, then each less it)
+           column  the first of them                          (minimum, then each less it)
+           steps   the steps between its next ones, all nodes in a row (smallest step, then each less it)
+```
+
+The last level holds the n rows. The reader rebuilds each outer column by repeating a node's value
+over the rows under it. Packing the IDs into one integer instead (`department << 46 | program << 31
+| employee`) makes the step jump by 2³¹ or more at every department and program boundary, a 4–6 byte
+patch each, and needs a bit budget and pack/unpack code in the module. `TestFrameFileNestedRowsSize`
+measures a volunteer-month file of 6 small sums: 4–11% smaller nested (the Rows alone, 8–18%).
 
 Each column becomes a list of small **non-negative residuals**, and those are what get packed:
 
 1. **Transform, fixed by the column's role** (so no transform byte is stored):
    - Rows ascend, so they are **delta-coded**: consecutive IDs become steps of 1, and subtracting
-     the smallest step turns them into zeros.
-   - Sums get their **minimum subtracted** (frame of reference), which also makes negative sums
-     non-negative.
+     the smallest step turns them into zeros. The steps inside the nodes of a nested level are
+     coded the same way.
+   - Sums, and a nested level's counts and first values, get their **minimum subtracted** (frame
+     of reference), which also makes negative sums non-negative.
 2. **Common divisor:** the residuals are divided by the largest of 1000, 100, 10, 8, 5, 2 that
    divides them all (amounts in multiples of 1000 save 10 bits each).
 3. **Bit packing in blocks of 128:** each block stores a head byte with its bit width, then every
@@ -231,8 +257,8 @@ twice or lost. A run whose lock expired fails its conditional writes and its com
 4. **Fresh read:** also read `HistoriesWrittenAfter(w)` and bring the selected files up to the
    records' current values, the same subtract/add as a run, including files a change created that
    are not listed yet. If a run moved w while it read, it starts over (3 attempts).
-5. Rows come back sorted by Keys, then Rows value, as `Row{Keys, RowID, Sums}`. Sums are in
-   declaration order, followed by the count.
+5. Rows come back sorted by Keys, then Rows values, as `Row{Keys, RowValues, Sums}`. RowValues
+   follow `Frame.Rows`; Sums are in declaration order, followed by the count.
 
 ```go
 // berryapps, through the dynamo adapter
@@ -253,7 +279,7 @@ In the dynamo schema (berryapps `voluntariado/types/activities.go`):
 DataFrames: []db.DataFrame{{
     Name: "enrollment-report",
     Keys: db.Cols(table.Year, table.ProgramID),
-    Rows: table.EmployeeID,
+    Rows: db.Cols(table.EmployeeID),
     Sums: db.Cols(table.RecordedMinutes, table.Points),
 }},
 ```
@@ -265,15 +291,15 @@ The table also needs a GSI on `Updated` for `HistoriesWrittenAfter`. The adapter
 table, err := dataframe.Compile("Enrollment", 78901377, []dataframe.Spec{{
     Name: "enrollment-report",
     Keys: []dataframe.Column{{FieldName: "Year", ColumnID: 24}, {FieldName: "ProgramID", ColumnID: 25}},
-    Rows: dataframe.Column{FieldName: "EmployeeID", ColumnID: 2},
+    Rows: []dataframe.Column{{FieldName: "EmployeeID", ColumnID: 2}},
     Sums: []dataframe.Column{{FieldName: "RecordedMinutes", ColumnID: 10}, {FieldName: "Points", ColumnID: 18}},
 }}, &dataframe.Column{FieldName: "Status", ColumnID: 14})
 ```
 
 - `ColumnID` is the field's stable id (genix-orm's `cb` tag). Files and changelogs name columns by
   it, so renaming a Go field keeps them.
-- Names: `a-z`, `0-9`, `-`. 1–3 Keys and the Rows are integers (non-negative values); Sums are
-  integers or floats; a frame needs Sums or `Count`.
+- Names: `a-z`, `0-9`, `-`. 1–3 Keys and 1–3 Rows are integers (non-negative values), no column
+  twice; Sums are integers or floats; a frame needs Sums or `Count`.
 - `Table.Tracked` lists the tracked columns in column id order. **Every tracked-values slice the
   backend passes in follows that order**, with floats already scaled (`ScaledFloat`).
 - Limits: at most 63 tracked columns, column ids 1..255, values within ±2⁶⁰.
@@ -331,7 +357,8 @@ A `History` is built with `NewHistory(recordKey, trackedValues, created, updated
   halfway.
 - It also covers the changelog's sizes, its shift/drop rules, and `valuesAt` against the recorded
   history.
-- `codec_test.go` covers the file format and its compression steps.
+- `codec_test.go` covers the file format and its compression steps, 1 to 3 nested Rows columns,
+  truncated files and a decode fuzzer. The simulation runs a frame of one Rows column and one of two.
 
 ## 12. Adding a backend (scylla)
 

@@ -350,7 +350,8 @@ type Index struct {
 }
 
 // DataFrame is one group-by aggregate of the entity (data_frame.go): one file per value of its
-// Keys, listing each value of Rows with the Sums of the records that hold it.
+// Keys, listing each value of Rows (each combination, with several Rows Cols) with the Sums of the
+// records that hold it.
 type DataFrame struct {
 	// Name is the frame's folder: lowercase letters, digits and '-', unique in the entity.
 	// Renaming it orphans the files.
@@ -358,8 +359,11 @@ type DataFrame struct {
 	// Keys name the file, 1 to 3 integer Cols with a cb tag. With 1, Keys[0] is the file; with
 	// 2–3, Keys[0] is a folder and the rest name the file inside it. Negative values fail the write.
 	Keys []Coln
-	// Rows is the integer Col each file lists, ascending. A negative value fails the write.
-	Rows Coln
+	// Rows are the 1 to 3 integer Cols (cb tag) each file lists one row per combination of, the
+	// widest group first: Cols(table.DepartmentID, table.ProgramID, table.EmployeeID). The file nests
+	// them like folders, each department once with its programs under it, so put the Col with the
+	// fewest values first. A negative value fails the write.
+	Rows []Coln
 	// Sums are the integer or float Cols summed per row (floats with 6 decimals: FrameRow.SumFloat).
 	Sums []Coln
 	// Count adds the number of records per row (FrameRow.Count).

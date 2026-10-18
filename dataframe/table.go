@@ -30,6 +30,8 @@ const (
 	maxTrackedColumns = 63
 	// maxColumnID: the changelog names a column by one byte.
 	maxColumnID = 255
+	// MaxRowColumns bounds a frame's Rows: a row is named by up to 3 values (rowKey).
+	MaxRowColumns = 3
 )
 
 var frameNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
@@ -44,11 +46,13 @@ type Column struct {
 }
 
 // Spec declares one frame: one file per value of Keys (1 to 3 integer columns), one row per value of
-// Rows (an integer column) with the Sums of the records that hold it, and their count with Count.
+// Rows (1 to 3 integer columns, the widest group first: department, program, employee) with the Sums
+// of the records that hold it, and their count with Count. The file nests the rows like folders: each
+// value of Rows[0] once, with the values of Rows[1] under it, and so on (codec.go).
 type Spec struct {
 	Name  string
 	Keys  []Column
-	Rows  Column
+	Rows  []Column
 	Sums  []Column
 	Count bool
 }
@@ -64,7 +68,7 @@ type FrameColumn struct {
 type Frame struct {
 	Name          string
 	Keys          []FrameColumn
-	Rows          FrameColumn
+	Rows          []FrameColumn
 	Sums          []FrameColumn
 	CountsRecords bool
 	// SumsCount is the number of summed columns in its files: the Sums, then the record count.
@@ -95,12 +99,12 @@ func Compile(tableName string, tableID uint64, specs []Spec, status *Column) (*T
 		if !frameNamePattern.MatchString(spec.Name) || slices.ContainsFunc(table.Frames, func(frame Frame) bool { return frame.Name == spec.Name }) {
 			return nil, fmt.Errorf("dataframe: %s frame name %q must be unique and hold only a-z, 0-9 and '-'", tableName, spec.Name)
 		}
-		if len(spec.Keys) == 0 || len(spec.Keys) > 3 || spec.Rows.FieldName == "" || (len(spec.Sums) == 0 && !spec.Count) {
-			return nil, fmt.Errorf("dataframe: %s frame %q needs 1 to 3 Keys, Rows, and Sums or Count", tableName, spec.Name)
+		if len(spec.Keys) == 0 || len(spec.Keys) > 3 || len(spec.Rows) == 0 || len(spec.Rows) > MaxRowColumns || (len(spec.Sums) == 0 && !spec.Count) {
+			return nil, fmt.Errorf("dataframe: %s frame %q needs 1 to 3 Keys, 1 to %d Rows, and Sums or Count", tableName, spec.Name, MaxRowColumns)
 		}
-		frameColumns := slices.Concat(spec.Keys, []Column{spec.Rows}, spec.Sums)
+		frameColumns := slices.Concat(spec.Keys, spec.Rows, spec.Sums)
 		for i, column := range frameColumns {
-			if column.IsFloat && i <= len(spec.Keys) {
+			if column.IsFloat && i < len(spec.Keys)+len(spec.Rows) {
 				return nil, fmt.Errorf("dataframe: %s frame %q Keys and Rows must be integers, %q is a float", tableName, spec.Name, column.FieldName)
 			}
 			if slices.ContainsFunc(frameColumns[:i], func(earlier Column) bool { return earlier.FieldName == column.FieldName }) {
@@ -115,7 +119,9 @@ func Compile(tableName string, tableID uint64, specs []Spec, status *Column) (*T
 		for _, column := range spec.Keys {
 			frame.Keys = append(frame.Keys, FrameColumn{Column: column})
 		}
-		frame.Rows = FrameColumn{Column: spec.Rows}
+		for _, column := range spec.Rows {
+			frame.Rows = append(frame.Rows, FrameColumn{Column: column})
+		}
 		for _, column := range spec.Sums {
 			frame.Sums = append(frame.Sums, FrameColumn{Column: column})
 		}
@@ -148,7 +154,9 @@ func Compile(tableName string, tableID uint64, specs []Spec, status *Column) (*T
 		for j := range frame.Keys {
 			frame.Keys[j].TrackedIndex = table.trackedIndexOf(frame.Keys[j].FieldName)
 		}
-		frame.Rows.TrackedIndex = table.trackedIndexOf(frame.Rows.FieldName)
+		for j := range frame.Rows {
+			frame.Rows[j].TrackedIndex = table.trackedIndexOf(frame.Rows[j].FieldName)
+		}
 		for j := range frame.Sums {
 			frame.Sums[j].TrackedIndex = table.trackedIndexOf(frame.Sums[j].FieldName)
 		}
@@ -171,7 +179,7 @@ func (table *Table) FrameNamed(name string) *Frame {
 }
 
 // shapeOf hashes what the files are laid out by: the column ids of the Keys, the Rows and the Sums,
-// the record count, and the layout version (v3: the dtf/ folder, base64 table id and generation), so a frame built otherwise is rebuilt.
+// the record count, and the layout version (v4: nested Rows columns), so a frame built otherwise is rebuilt.
 func shapeOf(frame Frame) string {
 	columnIDs := func(columns []FrameColumn) string {
 		ids := make([]string, len(columns))
@@ -180,7 +188,7 @@ func shapeOf(frame Frame) string {
 		}
 		return strings.Join(ids, ".")
 	}
-	layout := fmt.Sprintf("v3|%s|%d|%s|%t", columnIDs(frame.Keys), frame.Rows.ColumnID, columnIDs(frame.Sums), frame.CountsRecords)
+	layout := fmt.Sprintf("v4|%s|%s|%s|%t", columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords)
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(layout)))
 }
 
@@ -205,17 +213,23 @@ func (table *Table) CheckValues(tracked []int64) error {
 	for i := range table.Frames {
 		frame := &table.Frames[i]
 		values := table.valuesOf(frame, tracked)
-		if values != nil && (values.row < 0 || slices.ContainsFunc(values.keys, func(key int64) bool { return key < 0 })) {
+		if values != nil && (slices.ContainsFunc(values.row[:], func(rowValue int64) bool { return rowValue < 0 }) || slices.ContainsFunc(values.keys, func(key int64) bool { return key < 0 })) {
 			return fmt.Errorf("dataframe: %s frame %q takes no negative Keys or Rows value", table.Name, frame.Name)
 		}
 	}
 	return nil
 }
 
+// rowKey names a row of a file: its Rows values in order, the positions past len(Frame.Rows) 0. A
+// fixed array, so it keys a map without an allocation.
+type rowKey [MaxRowColumns]int64
+
+func compareRowKeys(a, b rowKey) int { return slices.Compare(a[:], b[:]) }
+
 // frameValues is what one record puts in a frame: the file (keys), the row and the sums.
 type frameValues struct {
 	keys []int64
-	row  int64
+	row  rowKey
 	sums []int64 // SumsCount values: the Sums, then 1 when the frame counts records
 }
 
@@ -225,9 +239,12 @@ func (table *Table) valuesOf(frame *Frame, tracked []int64) *frameValues {
 	if tracked == nil || (table.StatusIndex >= 0 && tracked[table.StatusIndex] == 0) {
 		return nil
 	}
-	values := &frameValues{keys: make([]int64, len(frame.Keys)), row: tracked[frame.Rows.TrackedIndex], sums: make([]int64, frame.SumsCount)}
+	values := &frameValues{keys: make([]int64, len(frame.Keys)), sums: make([]int64, frame.SumsCount)}
 	for i, key := range frame.Keys {
 		values.keys[i] = tracked[key.TrackedIndex]
+	}
+	for i, rowColumn := range frame.Rows {
+		values.row[i] = tracked[rowColumn.TrackedIndex]
 	}
 	for i, sum := range frame.Sums {
 		values.sums[i] = tracked[sum.TrackedIndex]

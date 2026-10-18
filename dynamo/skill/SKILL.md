@@ -385,12 +385,15 @@ program, a day): one columnar file in the FileStore per value of the Keys, read 
 of one counter per row.
 
 ```go
-// schema: 1–3 integer Keys, an integer Rows, integer or float Sums and/or Count; cb tags 1..255;
-// no Partition; Updated and a GSI on it, which the runs read the recent writes through:
+// schema: 1–3 integer Keys, 1–3 integer Rows (widest group first), integer or float Sums and/or
+// Count; cb tags 1..255; no Partition; Updated and a GSI on it, which the runs read the recent
+// writes through:
 {Slot: dynamo.G2, Keys: dynamo.Cols(t.Updated.Size(32))},
 DataFrames: []dynamo.DataFrame{
-    {Name: "enrollment-report", Keys: dynamo.Cols(t.Year, t.ProgramID), Rows: t.EmployeeID,
+    {Name: "enrollment-report", Keys: dynamo.Cols(t.Year, t.ProgramID), Rows: dynamo.Cols(t.EmployeeID),
         Sums: dynamo.Cols(t.RecordedMinutes, t.Points)},
+    // one row per department × employee: Key.DepartmentID and Key.EmployeeID set on each row
+    {Name: "year", Keys: dynamo.Cols(t.Year), Rows: dynamo.Cols(t.DepartmentID, t.EmployeeID), Sums: dynamo.Cols(t.Points)},
 },
 
 rows, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).Exec()

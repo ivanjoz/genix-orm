@@ -58,12 +58,12 @@ func compileDataFrames(schema Schema, recordType reflect.Type, accessors map[str
 	}
 	specs := make([]dataframe.Spec, len(schema.DataFrames))
 	for i, declared := range schema.DataFrames {
-		if declared.Rows == nil {
-			panic(fmt.Sprintf("db: %s DataFrame %q needs Rows", recordName, declared.Name))
-		}
-		specs[i] = dataframe.Spec{Name: declared.Name, Rows: frameColumnOf(declared.Rows, declared.Name), Count: declared.Count}
+		specs[i] = dataframe.Spec{Name: declared.Name, Count: declared.Count}
 		for _, column := range declared.Keys {
 			specs[i].Keys = append(specs[i].Keys, frameColumnOf(column, declared.Name))
+		}
+		for _, column := range declared.Rows {
+			specs[i].Rows = append(specs[i].Rows, frameColumnOf(column, declared.Name))
 		}
 		for _, column := range declared.Sums {
 			specs[i].Sums = append(specs[i].Sums, frameColumnOf(column, declared.Name))
