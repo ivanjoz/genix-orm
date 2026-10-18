@@ -7,6 +7,8 @@ import (
 	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,8 +99,7 @@ func (r *Repo[T, E]) Entity() string { return r.meta.entity }
 func (r *Repo[T, E]) TableName() string { return tableName() }
 
 // DeleteRecordsAll scans this entity's key namespace and deletes every record,
-// returning the count removed. It projects only the pk/sk key attributes (never
-// decoding the "d" blob) and deletes in BatchWriteItem batches of 25 with the
+// returning the count removed. It projects only the pk/sk key attributes and deletes in BatchWriteItem batches of 25 with the
 // same unprocessed-item retry as PutMany.
 //
 // It is scoped to this entity's pk ranges (its base rows and its array index
@@ -106,10 +107,15 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 // table are untouched. The by-IDs slots go too: a recreated record is stamped a
 // later Updated, so it can't match a value a client holds. The returned count
 // includes array index rows and GroupBy counters. With TextSearch synced on write, the
-// index of every partition it emptied is dropped too.
+// index of every partition it emptied is dropped too. A table with a delta index logs
+// every record as deleted, so the clients' caches drop them on their next sync.
 // This is a destructive maintenance operation — there is no undo.
 func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	if err := r.meta.checkTextSearchBackend(); err != nil {
+		return 0, err
+	}
+	deletedRecordsLog, err := r.storedRecordsDeleteLog()
+	if err != nil {
 		return 0, err
 	}
 	var emptiedPartitionsValues [][]uint64
@@ -123,6 +129,9 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 	if err != nil {
 		return deleted, err
 	}
+	if err := r.meta.appendDeltaLogs(deletedRecordsLog); err != nil {
+		return deleted, err
+	}
 	for _, values := range emptiedPartitionsValues {
 		partitionValues := make([]any, len(values))
 		for i, value := range values {
@@ -133,6 +142,32 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 		}
 	}
 	return deleted, nil
+}
+
+// storedRecordsDeleteLog reads every stored record of a table with a delta index as the delete
+// appendDeltaLogs logs for it: the delta entries hold each record's folders and log ID, which only
+// the decoded record gives. Nil without a delta index.
+func (r *Repo[T, E]) storedRecordsDeleteLog() ([]deltaLogWrite, error) {
+	if len(r.meta.deltaIndexes) == 0 {
+		return nil, nil
+	}
+	client, err := Client()
+	if err != nil {
+		return nil, err
+	}
+	var deleteLog []deltaLogWrite
+	err = scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
+		for _, item := range items {
+			storedRecord := new(E)
+			if err := r.meta.unmarshalItem(item, storedRecord); err != nil {
+				return err
+			}
+			storedPtr := unsafe.Pointer(storedRecord)
+			deleteLog = append(deleteLog, deltaLogWrite{storedPtr: storedPtr, version: cache.NextVersion(r.meta.version.getI64(storedPtr))})
+		}
+		return nil
+	})
+	return deleteLog, err
 }
 
 // deleteItemsAll deletes every base and hidden row of the entity.

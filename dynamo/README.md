@@ -904,9 +904,11 @@ for _, c := range controllers {
 
 `DeleteRecordsAll` scans the entity's two pk ranges — base rows
 (`TableID ‖ 0…0` to `TableID ‖ 9…9`) and array index rows (3 digits longer) —
-projecting only the key attributes (it never decodes `d`), then deletes in
+projecting only the key attributes, then deletes in
 `BatchWriteItem` batches of 25 with the same unprocessed-item retry as `PutMany`.
 The returned count includes array index rows and GroupBy counters.
+A table with a delta index first reads its records whole, and after the delete
+logs each one as deleted: the clients' caches drop them on their next sync.
 The by-IDs slot files (S3) stay: a recreated record raises its slot to a later
 tick. Sibling entities and the internal
 sequence counters (pk 0) are outside those ranges and untouched.
