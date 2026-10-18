@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/dataframe"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // FrameRow is one row of a DataFrame file, as Group is one GroupBy counter.
@@ -115,6 +116,32 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 		}
 	}
 	return frameRows, nil
+}
+
+// ExecChanged answers a client that keeps the raw files of the selection: heldGeneration and
+// heldFiles ("<keys>.<snapshot>.<slot>,…") describe its copies, and the answer is the wire body of
+// the files it must replace, as current as the records (dataframe/changed.go). Fresh is implied.
+func (q *FrameQuery[E]) ExecChanged(heldGeneration string, heldFiles string) ([]byte, error) {
+	if q.planErr != nil {
+		return nil, q.planErr
+	}
+	selection, err := q.selection()
+	if err != nil {
+		return nil, err
+	}
+	held, err := dataframe.ParseHeldFiles(heldFiles)
+	if err != nil {
+		return nil, err
+	}
+	backend, err := frameBackendOf[E](q.meta)
+	if err != nil {
+		return nil, err
+	}
+	answer, err := dataframe.ReadChanged(q.meta.frames, q.frame, backend, cache.FileStore(), selection, heldGeneration, held, utils.SUnixTimeOf(Now()))
+	if err != nil {
+		return nil, err
+	}
+	return dataframe.AppendChangedFiles(nil, answer), nil
 }
 
 // selection reads the predicates: an Eq or Between on Keys[0], then Eqs on a leading run of the rest.

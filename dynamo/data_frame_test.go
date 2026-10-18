@@ -123,3 +123,18 @@ func TestFrameTrackedValuesAndTheWriteCheck(t *testing.T) {
 		t.Fatalf("Delete on a table with DataFrames must fail, got %v", err)
 	}
 }
+
+// TestFrameExecChangedRefusesBeforeReading: a bad selection or held list fails before any storage
+// read (the reads themselves are tested in the dataframe module).
+func TestFrameExecChangedRefusesBeforeReading(t *testing.T) {
+	table := frameEnrollments.T
+	if _, err := frameEnrollments.QueryFrame("year-program").Eq(table.ProgramID, 3).ExecChanged("", ""); err == nil || !strings.Contains(err.Error(), "needs an Eq or a Between") {
+		t.Fatalf("no Keys[0] predicate, got %v", err)
+	}
+	if _, err := frameEnrollments.QueryFrame("year-program").Eq(table.Year, 2026).ExecChanged("g", "2026.x.1"); err == nil {
+		t.Fatal("a bad held list must fail")
+	}
+	if _, err := frameEnrollments.QueryFrame("missing").ExecChanged("", ""); err == nil {
+		t.Fatal("an undeclared frame must fail")
+	}
+}

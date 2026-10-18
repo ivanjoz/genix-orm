@@ -132,7 +132,8 @@ func (table *Table) runFrame(backend Backend, store utils.FileStore, frame *Fram
 }
 
 // moveFiles rewrites, at target, every file the records of histories were in between the snapshot w
-// and target, each conditioned on the ETag read.
+// and target, each conditioned on the ETag read. Their slots are raised to target first (the new
+// files get theirs), so the versions file is never behind the files.
 func (table *Table) moveFiles(ctx context.Context, store utils.FileStore, frame *Frame, generation string, histories []History, snapshot, target int64) error {
 	fileKeys := table.filesHeldBetween(frame, generation, histories, snapshot, target)
 	loaded, err := loadFiles(store, frame, fileKeys, snapshot)
@@ -140,16 +141,38 @@ func (table *Table) moveFiles(ctx context.Context, store utils.FileStore, frame 
 		return err
 	}
 	table.moveRecords(frame, generation, histories, loaded, target)
-	return utils.RunParallel(len(fileKeys), func(fileIndex int) error {
-		fileKey := fileKeys[fileIndex]
+
+	var writtenKeys []string
+	var writtenFiles []File
+	var rewrittenSlots []uint8
+	var newFileIndexes []int
+	for _, fileKey := range fileKeys {
 		if loaded.snapshotByFileKey[fileKey] >= target {
-			return nil // a run that crashed after writing it already brought it here
+			continue // a run that crashed after writing it already brought it here
 		}
 		file := loaded.rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
 		if file.rowCount() == 0 && loaded.etagByFileKey[fileKey] == "" {
-			return nil // a file no record is left in is not created
+			continue // a file no record is left in is not created
 		}
-		_, err := store.PutFileIfMatch(ctx, fileKey, EncodeFile(file), loaded.etagByFileKey[fileKey])
+		if file.Slot = loaded.slotByFileKey[fileKey]; file.Slot == 0 {
+			newFileIndexes = append(newFileIndexes, len(writtenFiles))
+		} else {
+			rewrittenSlots = append(rewrittenSlots, file.Slot)
+		}
+		writtenKeys, writtenFiles = append(writtenKeys, fileKey), append(writtenFiles, file)
+	}
+	if len(writtenFiles) == 0 {
+		return nil
+	}
+	newSlots, err := allocateAndRaiseSlots(ctx, store, len(newFileIndexes), rewrittenSlots, target)
+	if err != nil {
+		return err
+	}
+	for i, fileIndex := range newFileIndexes {
+		writtenFiles[fileIndex].Slot = newSlots[i]
+	}
+	return utils.RunParallel(len(writtenFiles), func(fileIndex int) error {
+		_, err := store.PutFileIfMatch(ctx, writtenKeys[fileIndex], EncodeFile(writtenFiles[fileIndex]), loaded.etagByFileKey[writtenKeys[fileIndex]])
 		return err
 	})
 }
@@ -170,15 +193,29 @@ func (table *Table) filesHeldBetween(frame *Frame, generation string, histories 
 	isListed := map[string]bool{}
 	var fileKeys []string
 	for _, history := range histories {
-		for _, moment := range append([]int64{from, to}, history.changeMoments(from, to)...) {
-			values := table.frameValuesAt(frame, history, moment)
-			if values == nil {
-				continue
-			}
-			if fileKey := frame.fileKeyOf(generation, values.keys); !isListed[fileKey] {
+		for _, fileKey := range table.filesOfHistory(frame, generation, history, from, to) {
+			if !isListed[fileKey] {
 				isListed[fileKey] = true
 				fileKeys = append(fileKeys, fileKey)
 			}
+		}
+	}
+	return fileKeys
+}
+
+// filesOfHistory lists the files one record was in at any moment of [from, to], repeats included: at
+// from, at to, after each change and after its insert, which leaves no changelog entry. Without the
+// insert, a record inserted and moved out within the window would be in no listed file, and a run
+// would leave that file as is while a reader holds a fresh copy that counted the record.
+func (table *Table) filesOfHistory(frame *Frame, generation string, history History, from, to int64) []string {
+	moments := append([]int64{from, to}, history.changeMoments(from, to)...)
+	if history.created > from && history.created <= to {
+		moments = append(moments, history.created)
+	}
+	var fileKeys []string
+	for _, moment := range moments {
+		if values := table.frameValuesAt(frame, history, moment); values != nil {
+			fileKeys = append(fileKeys, frame.fileKeyOf(generation, values.keys))
 		}
 	}
 	return fileKeys
@@ -207,18 +244,21 @@ func (table *Table) moveRecords(frame *Frame, generation string, histories []His
 	}
 }
 
-// loadedFiles are files read to be brought forward: their rows, snapshot and ETag ("" for a missing
-// file), and the moment each one already holds (max(snapshot, w)).
+// loadedFiles are files read to be brought forward: their rows, snapshot, slot, ETag ("" for a
+// missing file) and stored bytes, and the moment each one already holds (max(snapshot, w)).
 type loadedFiles struct {
 	rowsByFileKey     map[string]frameRows
 	snapshotByFileKey map[string]int64
+	slotByFileKey     map[string]uint8
 	appliedThrough    map[string]int64
 	etagByFileKey     map[string]string
+	contentByFileKey  map[string][]byte
 }
 
 func loadFiles(store utils.FileStore, frame *Frame, fileKeys []string, snapshot int64) (loadedFiles, error) {
 	files := make([]File, len(fileKeys))
 	etags := make([]string, len(fileKeys))
+	contents := make([][]byte, len(fileKeys))
 	err := utils.RunParallel(len(fileKeys), func(fileIndex int) error {
 		content, etag, err := store.GetFile(fileKeys[fileIndex])
 		if errors.Is(err, utils.ErrFileNotFound) {
@@ -230,15 +270,18 @@ func loadFiles(store utils.FileStore, frame *Frame, fileKeys []string, snapshot 
 		if files[fileIndex], err = DecodeFile(content, len(frame.Rows), frame.SumsCount); err != nil {
 			return fmt.Errorf("%s: %w", fileKeys[fileIndex], err)
 		}
-		etags[fileIndex] = etag
+		etags[fileIndex], contents[fileIndex] = etag, content
 		return nil
 	})
-	loaded := loadedFiles{rowsByFileKey: map[string]frameRows{}, snapshotByFileKey: map[string]int64{}, appliedThrough: map[string]int64{}, etagByFileKey: map[string]string{}}
+	loaded := loadedFiles{rowsByFileKey: map[string]frameRows{}, snapshotByFileKey: map[string]int64{}, slotByFileKey: map[string]uint8{},
+		appliedThrough: map[string]int64{}, etagByFileKey: map[string]string{}, contentByFileKey: map[string][]byte{}}
 	for i, fileKey := range fileKeys {
 		loaded.rowsByFileKey[fileKey] = rowsOfFile(files[i])
 		loaded.snapshotByFileKey[fileKey] = files[i].Snapshot
+		loaded.slotByFileKey[fileKey] = files[i].Slot
 		loaded.appliedThrough[fileKey] = max(files[i].Snapshot, snapshot)
 		loaded.etagByFileKey[fileKey] = etags[i]
+		loaded.contentByFileKey[fileKey] = contents[i]
 	}
 	return loaded, err
 }
@@ -258,10 +301,17 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 		return fmt.Errorf("dataframe: %s frame %q reading the records: %w", table.Name, frame.Name, err)
 	}
 
+	// Every file of the new generation takes a new slot: the readers holding the old generation
+	// fetch the whole frame again anyway.
 	fileKeys := slices.Collect(maps.Keys(rowsByFileKey))
+	slots, err := allocateAndRaiseSlots(lock.ctx, store, len(fileKeys), nil, target)
+	if err != nil {
+		return fmt.Errorf("dataframe: %s frame %q: %w", table.Name, frame.Name, err)
+	}
 	err = utils.RunParallel(len(fileKeys), func(fileIndex int) error {
-		content := EncodeFile(rowsByFileKey[fileKeys[fileIndex]].fileAt(target, len(frame.Rows), frame.SumsCount))
-		_, err := store.PutFileIfMatch(lock.ctx, fileKeys[fileIndex], content, "")
+		file := rowsByFileKey[fileKeys[fileIndex]].fileAt(target, len(frame.Rows), frame.SumsCount)
+		file.Slot = slots[fileIndex]
+		_, err := store.PutFileIfMatch(lock.ctx, fileKeys[fileIndex], EncodeFile(file), "")
 		return err
 	})
 	if err != nil {

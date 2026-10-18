@@ -559,11 +559,14 @@ rows, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 
 rows[0].Key.ProgramID; rows[0].Key.EmployeeID; rows[0].Sum(Enrollments.T.Points)
 rows, err = Enrollments.QueryFrame("enrollment-report").Between(Enrollments.T.Year, 2025, 2026).
     Eq(Enrollments.T.ProgramID, 3).Fresh().Exec()                     // as the records are now
+body, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).
+    ExecChanged(req.Params["g"], req.Params["h"])                     // raw files a client must replace
 ```
 
 ```text
 dtf/<TableID>/<frame>/<generation>/<k1>            a 1-key frame's file
 dtf/<TableID>/<frame>/<generation>/<k1>/<k2>_<k3>  a 2–3-key frame's file
+dtf/versions                                       255 slots × the last rewrite moment, every frame
 state item: pk = base pk ‖ 000, sk = "f" + name: gen, sh (shape), w (snapshot, a SUnixTime), lk/lid (lock)
 ```
 
@@ -593,6 +596,11 @@ state item: pk = base pk ‖ 000, sk = "f" + name: gen, sh (shape), w (snapshot,
   Eq on a leading run, or nothing: then the folder of each Keys[0] value is
   listed. Before the first run builds the frame, a read fails with
   `ErrFrameNotBuilt`.
+- **Raw files for a client** (`ExecChanged(heldGeneration, heldFiles)`): the
+  client keeps the files and sends what it holds (`<keys>.<snapshot>.<slot>,…`);
+  the answer is a binary body with only the files it must replace, as current as
+  `Fresh()`. Stale copies are found through each file's slot in `dtf/versions`
+  (DATAFRAMES.md 3.4, 7.1).
 - **Rebuild** (`RebuildDataFrames(name)`, `""` every frame; also `Reprocess(true)`):
   sums what every record held at now − 2 minutes into a new generation, exact
   whatever writes land meanwhile.

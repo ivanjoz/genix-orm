@@ -179,7 +179,8 @@ func (table *Table) FrameNamed(name string) *Frame {
 }
 
 // shapeOf hashes what the files are laid out by: the column ids of the Keys, the Rows and the Sums,
-// the record count, and the layout version (v4: nested Rows columns), so a frame built otherwise is rebuilt.
+// the record count, and the layout version (v5: nested Rows columns, the slot byte), so a frame built
+// otherwise is rebuilt.
 func shapeOf(frame Frame) string {
 	columnIDs := func(columns []FrameColumn) string {
 		ids := make([]string, len(columns))
@@ -188,7 +189,7 @@ func shapeOf(frame Frame) string {
 		}
 		return strings.Join(ids, ".")
 	}
-	layout := fmt.Sprintf("v4|%s|%s|%s|%t", columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords)
+	layout := fmt.Sprintf("v5|%s|%s|%s|%t", columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords)
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(layout)))
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -381,16 +382,88 @@ func readAll(t *testing.T, table *Table, frame *Frame, backend Backend, store ut
 	return rows
 }
 
+// simClient is a browser keeping raw frame files from ReadChanged answers.
+type simClient struct {
+	generation string
+	fileByKeys map[string]ChangedFile
+}
+
+// sync asks for the selection's changed files and applies the answer.
+func (client *simClient) sync(t *testing.T, table *Table, frame *Frame, backend Backend, store utils.FileStore, now int64) {
+	t.Helper()
+	var held []HeldFile
+	for _, file := range client.fileByKeys {
+		held = append(held, HeldFile{Keys: file.Keys, Snapshot: file.Snapshot, Slot: file.Slot})
+	}
+	// Through the wire, both ways, as the browser does.
+	parsedHeld, err := ParseHeldFiles(FormatHeldFiles(held))
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := ReadChanged(table, frame, backend, store, Selection{FromKey: 2025, ToKey: 2027}, client.generation, parsedHeld, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer, err = DecodeChangedFiles(AppendChangedFiles(nil, answer)); err != nil {
+		t.Fatal(err)
+	}
+	if answer.Generation != client.generation {
+		client.generation, client.fileByKeys = answer.Generation, map[string]ChangedFile{}
+	}
+	for _, file := range answer.Files {
+		client.fileByKeys[fmt.Sprint(file.Keys)] = file
+	}
+}
+
+// rows decodes the held files into rows, by Keys then by RowValues, as Read returns them.
+func (client *simClient) rows(t *testing.T, frame *Frame) []Row {
+	t.Helper()
+	files := slices.Collect(maps.Values(client.fileByKeys))
+	slices.SortFunc(files, func(a, b ChangedFile) int { return slices.Compare(a.Keys, b.Keys) })
+	var rows []Row
+	for _, changed := range files {
+		if changed.Content == nil {
+			continue
+		}
+		file, err := DecodeFile(changed.Content, len(frame.Rows), frame.SumsCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range file.rowCount() {
+			row := Row{Keys: changed.Keys, RowValues: make([]int64, len(frame.Rows)), Sums: make([]int64, frame.SumsCount)}
+			for c := range row.RowValues {
+				row.RowValues[c] = file.Rows[c][i]
+			}
+			for s := range row.Sums {
+				row.Sums[s] = file.Sums[s][i]
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
 // TestRunsSurviveCrashes: a rebuild, then runs at random moments, some crashing after a random part of
 // their files, leave the files equal to the brute force at their target, and a fresh read equal to it
-// at the read's moment, for both test frames.
+// at the read's moment, for both test frames. A client syncing raw files with ReadChanged holds the
+// brute force at every read too, through occasional rebuilds; half the seeds cycle 2 slots, so every
+// slot is shared.
 func TestRunsSurviveCrashes(t *testing.T) {
 	table := compileTestTable(t)
+	defer func() { slotCycle = slotCount }()
 	for seed := range uint64(30) {
+		slotCycle = slotCount
+		if seed%2 == 1 {
+			slotCycle = 2
+		}
 		rng := rand.New(rand.NewPCG(seed, 99))
 		sim := simulateWrites(t, table, rng, 40000)
 		store := &crashingFileStore{MemoryFileStore: utils.NewMemoryFileStore(), rng: rng}
 		backend := newMemoryBackend(sim)
+		clients := make([]*simClient, len(table.Frames))
+		for i := range clients {
+			clients[i] = &simClient{fileByKeys: map[string]ChangedFile{}}
+		}
 
 		// The first Materialize builds the frame; each record is read a little after the target.
 		now := simStart + 2000 + rng.Int64N(3000)
@@ -410,6 +483,11 @@ func TestRunsSurviveCrashes(t *testing.T) {
 			store.isCrashing = rng.IntN(3) == 0
 			err := Materialize(table, backend, store, timeOfSUnix(now))
 			store.isCrashing = false
+			if rng.IntN(12) == 0 {
+				if err := Rebuild(table, backend, store, "", timeOfSUnix(now)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for i := range table.Frames {
 				frame := &table.Frames[i]
 				if err == nil {
@@ -417,8 +495,15 @@ func TestRunsSurviveCrashes(t *testing.T) {
 						t.Fatalf("seed %d frame %s: the files after the run at %d differ from the brute force", seed, frame.Name, now)
 					}
 				}
-				if got, want := readAll(t, table, frame, backend, store, true), sim.bruteForceRows(frame, backend.readAt); !reflect.DeepEqual(got, want) {
+				want := sim.bruteForceRows(frame, backend.readAt)
+				if got := readAll(t, table, frame, backend, store, true); !reflect.DeepEqual(got, want) {
 					t.Fatalf("seed %d frame %s: the fresh read at %d differs from the brute force", seed, frame.Name, backend.readAt)
+				}
+				if rng.IntN(3) > 0 { // the client doesn't look at every moment
+					clients[i].sync(t, table, frame, backend, store, backend.readAt)
+					if got := clients[i].rows(t, frame); !reflect.DeepEqual(got, want) {
+						t.Fatalf("seed %d frame %s (slot cycle %d): the client's files at %d differ from the brute force", seed, frame.Name, slotCycle, backend.readAt)
+					}
 				}
 			}
 		}

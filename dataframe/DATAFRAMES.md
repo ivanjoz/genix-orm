@@ -12,9 +12,11 @@ its write path (section 9). It depends only on the standard library and genix-or
 dataframe/
   table.go       Column, Spec → Compile → Table / Frame; file keys, the write check
   codec.go       the frame file format (section 3)
+  versions.go    the versions file: 255 slots, the moment each was last raised (section 3.4)
   changelog.go   the per-record changelog and valuesAt (section 4)
   run.go         Materialize: build, rebuild and incremental runs (sections 5–6)
   read.go        Read: plain and fresh (section 7)
+  changed.go     ReadChanged: the files a client holding raw copies must replace (section 7.1)
   backend.go     Backend, State, ErrFrameNotBuilt (section 9)
 ```
 
@@ -86,6 +88,7 @@ Four ideas carry everything:
 ```text
 dtf/<table id>/<frame>/<generation>/<k1>            file of a 1-key frame
 dtf/<table id>/<frame>/<generation>/<k1>/<k2>_<k3>  file of a 2–3-key frame
+dtf/versions                                        the versions file, one for every frame (3.4)
 ```
 
 - `<table id>` is the backend's numeric table id and `<generation>` the build time in Unix
@@ -116,7 +119,8 @@ column per Sum (in declaration order), then the record count when the frame has 
 stored as integers, `round(v × 10⁶)`, so adding and subtracting the same value is exact.
 
 ```text
-u8       format version (2)
+u8       format version (3)
+u8       slot: the file's versions slot, 1..255 (section 3.4)
 uvarint  snapshot: the SUnixTime this file is exact at
 uvarint  row count n                       (nothing follows when n = 0)
 rows     the Rows columns, nested (below)
@@ -168,8 +172,30 @@ Worked example: the file above (3 rows, two Sums).
 | RecordedMinutes | 120, 60, 300 | min 60: 60, 0, 240 | 10 | 6, 0, 24 | 5 bits |
 | Points | 10, 5, 20 | min 5: 5, 0, 15 | 5 | 1, 0, 3 | 2 bits |
 
-The whole file is 22 bytes, 7 of them header. A file of thousands of rows stays a few bytes per row.
+The whole file is 23 bytes, 8 of them header. A file of thousands of rows stays a few bytes per row.
 `codec_test.go` compares the sizes with and without each step.
+
+### 3.4 The versions file: which copies are stale
+
+A client (the browser) keeps raw files and must learn which of its copies changed without asking
+for each one. `dtf/versions` (1,025 bytes) answers that for every frame of every table:
+
+```text
+u8        version (1)
+u32       counter: how many slots were ever handed out
+u32 × 255 per slot 1..255, the last moment (SUnixTime) a file on it was rewritten
+```
+
+- A file gets a slot when it is first written: `counter % 255 + 1`, round-robin, stored in the
+  file's header. Files share slots; there is no eviction.
+- Before a run or a build writes files, it **raises** their slots to its target T (never lowers
+  them), with a conditional write on the ETag, retried. Raising comes before the file writes and
+  before the commit, so a crash leaves slots too new (a needless refetch), never too old.
+- A copy taken at snapshot S on slot k is stale when `SlotTime(k) > S`. Another file on the same
+  slot rewritten later makes it look stale too: a refetch of an unchanged file, which is cheap. Slot
+  0 (a file no run created yet) always reads as stale.
+
+The client never reads the versions file itself: `ReadChanged` (7.1) checks it server-side.
 
 ## 4. How records feed the frames: created and changelog
 
@@ -210,7 +236,8 @@ Step by step (`rebuildFrame`):
 2. Pick the target `T = now − 2 minutes` (`TargetLag`) and a new generation name.
 3. `ScanHistories`: read every record of the table, page by page, and add what each one held **at T**
    (`valuesAt(T)`) to its file and row in memory. Records created after T are left out.
-4. Write every file of the new generation at snapshot T. The files are new (`If-None-Match`).
+4. Give every file a new slot raised to T (3.4), then write the files of the new generation at
+   snapshot T. The files are new (`If-None-Match`).
 5. `CommitGeneration`: switch the state to the new generation, with the frame's shape and w = T.
    From this moment reads use it.
 6. Delete every other generation in the frame's folder.
@@ -229,12 +256,15 @@ T. The next run picks up everything written after T.
 3. **Find what moved:** `HistoriesWrittenAfter(w)`, the only records whose values can differ from
    what the files hold.
 4. **Find the files to touch:** every file those records were in at any moment of `[w, T]`: at w,
-   after each of their changes, and at T. A record that moved from Program 3 to Program 4 touches
-   both files.
-5. **Rewrite each file:** read it (rows, its own snapshot `s`, its ETag). Then, for every moved
-   record, subtract what it held at `max(s, w)` and add what it holds at T. Write the file at
-   snapshot T, conditioned on the ETag read. A file already at T or later is left as is. A missing
-   file that would stay empty is not created.
+   at their creation, after each of their changes, and at T (`filesOfHistory`). A record that moved
+   from Program 3 to Program 4 touches both files. The creation moment counts because an insert
+   has no changelog entry: a record inserted and moved away within `[w, T]` passed through a file
+   that a client may hold with it inside.
+5. **Rewrite each file:** read it (rows, its own snapshot `s`, its slot, its ETag). Then, for every
+   moved record, subtract what it held at `max(s, w)` and add what it holds at T. Raise the slots of
+   the files to rewrite to T and give the new ones a slot (3.4), then write each at snapshot T,
+   conditioned on the ETag read. A file already at T or later is left as is. A missing file that
+   would stay empty is not created.
 6. **Commit:** `CommitSnapshot(w → T)`, only if the lock, the generation and w are still the ones
    read.
 
@@ -269,6 +299,43 @@ rows, err := types.Enrollments.QueryFrame("enrollment-report").
 for _, row := range rows {
     minutes := row.Sum(types.Enrollments.T.RecordedMinutes)
 }
+```
+
+### 7.1 Raw files for a client: ReadChanged
+
+`ReadChanged(table, frame, backend, store, selection, heldGeneration, held, now)` (dynamo:
+`QueryFrame(name)…ExecChanged(heldGeneration, heldFiles)`) serves a client that keeps the raw files
+and decodes them itself. The client sends the generation of its copies and, per file, its keys,
+snapshot and slot, in the query string:
+
+```text
+g=P49QA9-&h=2026_3.396172200.7,2026_4.396172200.12      <keys '_'-joined>.<snapshot>.<slot>
+```
+
+The answer holds only the selected files the client must replace:
+
+| Case | What goes out |
+|---|---|
+| another generation (a rebuild), or a file it doesn't hold | every selected file |
+| a held copy on slot 0, or whose slot time is past its snapshot | the stored bytes |
+| a file a record written since w touches, last at or after the copy's snapshot | the file moved to `now`, as a fresh read |
+| a held file that no longer exists | no rows, snapshot `now`, slot 0 |
+
+A copy at snapshot S holds every write up to S: a later write was either taken by a run (which
+raised the file's slot past S before moving w) or is among the records written after w. So the
+client ends as current as a fresh read. Held copies in the selection are always checked, even
+unlisted ones, so a file whose records all left is answered empty.
+
+The wire body (`AppendChangedFiles`, `DecodeChangedFiles`; the browser has its own decoder):
+
+```text
+u8       wire version (1)
+uvarint  generation length, generation bytes
+u8       Rows columns, u8 summed columns (Sums, then the count): what the files decode with
+uvarint  w: the frame's snapshot
+uvarint  file count
+file*    uvarint key count, uvarint × keys, uvarint snapshot, u8 slot,
+         uvarint content length (0 = no rows), the file's bytes (3.3)
 ```
 
 ## 8. Declaring frames
@@ -354,7 +421,9 @@ A `History` is built with `NewHistory(recordKey, trackedValues, created, updated
 - `dataframe_test.go` drives the real `Materialize` and `Read` with an in-memory `Backend` and file
   store over random histories, and checks them against brute force. The histories include inserts,
   updates of every column, floats, negative sums, soft deletes and restores, and runs that crash
-  halfway.
+  halfway, forced rebuilds and a tiny slot cycle (2 slots). A simulated client syncs through
+  `ReadChanged` and the wire at random moments and must always match the brute force.
+- `changed_test.go` covers the versions file (round-robin, raise-only, no-op writes) and the wire.
 - It also covers the changelog's sizes, its shift/drop rules, and `valuesAt` against the recorded
   history.
 - `codec_test.go` covers the file format and its compression steps, 1 to 3 nested Rows columns,

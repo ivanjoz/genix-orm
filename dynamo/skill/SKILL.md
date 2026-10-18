@@ -399,7 +399,14 @@ DataFrames: []dynamo.DataFrame{
 rows, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).Exec()
 rows[0].Key.ProgramID; rows[0].Key.EmployeeID; rows[0].Sum(Enrollments.T.Points) // SumFloat, Count()
 Enrollments.QueryFrame("enrollment-report").Between(Enrollments.T.Year, 2025, 2026).Eq(Enrollments.T.ProgramID, 3).Fresh().Exec()
+// the browser keeps the raw files: answer only the ones it must replace (binary body)
+body, err := Enrollments.QueryFrame("enrollment-report").Eq(Enrollments.T.Year, 2026).ExecChanged(req.Params["g"], req.Params["h"])
 ```
+
+- **Raw files in the browser:** a route answers `ExecChanged(g, h)` as `application/octet-stream`;
+  genix-ui's frame cache sends `g` (generation) and `h` (`<keys>.<snapshot>.<slot>,…`) and decodes
+  the files itself. A copy is refetched when its slot in `dtf/versions` moved past it, or a record
+  written since the last run touches it.
 
 - **Freshness:** every item keeps, in its own attribute `cgl`, the values its frame fields held
   before each change of the last ~36 h. A run every 10 minutes (berryapps: the `frames-materialize`

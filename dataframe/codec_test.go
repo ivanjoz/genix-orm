@@ -23,7 +23,7 @@ var everyFrameCodecOptions = []codecOptions{
 // Rows column, by up to maxStep, and restarts the later ones at a random value: with several columns
 // the rows nest in groups of random sizes, many of a single row.
 func randomFrameFile(rng *rand.Rand, rowCount, rowColumnCount, sumsCount, sumBits int, maxStep int64) File {
-	file := File{Snapshot: rng.Int64N(1 << 31), Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
+	file := File{Snapshot: rng.Int64N(1 << 31), Slot: uint8(rng.IntN(256)), Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
 	current := make([]int64, rowColumnCount)
 	for c := range current {
 		current[c] = rng.Int64N(1 << 20)
@@ -56,7 +56,7 @@ func randomFrameFile(rng *rand.Rand, rowCount, rowColumnCount, sumsCount, sumBit
 // cloneFrameFile copies the columns: the encoder transforms its own copies, but a test compares
 // against the original after encoding.
 func cloneFrameFile(file File) File {
-	clone := File{Snapshot: file.Snapshot, Rows: make([][]int64, len(file.Rows)), Sums: make([][]int64, len(file.Sums))}
+	clone := File{Snapshot: file.Snapshot, Slot: file.Slot, Rows: make([][]int64, len(file.Rows)), Sums: make([][]int64, len(file.Sums))}
 	for i := range file.Rows {
 		clone.Rows[i] = slices.Clone(file.Rows[i])
 	}

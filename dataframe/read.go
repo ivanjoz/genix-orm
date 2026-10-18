@@ -41,8 +41,8 @@ type Row struct {
 // also moves the records written since the frame's snapshot to their current values.
 func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, selection Selection, isFresh bool) ([]Row, error) {
 	readName := fmt.Sprintf("dataframe: %s frame %q", table.Name, frame.Name)
-	if selection.FromKey < 0 || selection.ToKey < selection.FromKey || selection.ToKey-selection.FromKey >= MaxFirstKeys || len(selection.PinnedKeys) >= len(frame.Keys) {
-		return nil, fmt.Errorf("%s takes 1 to %d non-negative values of %s and at most %d later Keys", readName, MaxFirstKeys, frame.Keys[0].FieldName, len(frame.Keys)-1)
+	if err := frame.checkSelection(readName, selection); err != nil {
+		return nil, err
 	}
 	for attempt := 1; ; attempt++ {
 		state, err := backend.ReadState(frame)
@@ -89,6 +89,13 @@ func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, se
 		}
 		return frame.rowsOf(state.Generation, fileKeys, loaded.rowsByFileKey), nil
 	}
+}
+
+func (frame *Frame) checkSelection(readName string, selection Selection) error {
+	if selection.FromKey < 0 || selection.ToKey < selection.FromKey || selection.ToKey-selection.FromKey >= MaxFirstKeys || len(selection.PinnedKeys) >= len(frame.Keys) {
+		return fmt.Errorf("%s takes 1 to %d non-negative values of %s and at most %d later Keys", readName, MaxFirstKeys, frame.Keys[0].FieldName, len(frame.Keys)-1)
+	}
+	return nil
 }
 
 // selectedFileKeys names the selected files: directly when every Key is pinned, otherwise by listing

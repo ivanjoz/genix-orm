@@ -11,6 +11,7 @@ import (
 // DataFrame file codec: raw bytes, columnar.
 //
 //	u8        format version
+//	u8        slot: the file's slot in the versions file (versions.go), 0 = none yet
 //	uvarint   snapshot: the SUnixTime the file holds its frame at
 //	uvarint   row count n (no columns follow when n = 0)
 //	rows      the Rows columns, nested (below)
@@ -38,8 +39,8 @@ import (
 // smallest step subtracted, and each Sums column (and the counts and first values
 // of the nested Rows) has its minimum subtracted (frame of reference), which leaves
 // every residual >= 0 even when a value is negative. The residuals are then divided
-// by the largest of 1000, 100, 10, 8, 5 and 2 that divides them all (quantities stored as multiples of 1000 lose
-// 10 bits each) and written in blocks of 128:
+// by the largest of 1000, 100, 10, 8, 5 and 2 that divides them all (quantities
+// stored as multiples of 1000 lose 10 bits each) and written in blocks of 128:
 //
 //	residuals := uvarint divisor, block*
 //	block     := u8 head      bits 0–6 width w (0..64), bit 7 patched
@@ -56,7 +57,7 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	formatVersion    = 2
+	formatVersion    = 3
 	blockSize        = 128
 	blockPatchedFlag = 0x80
 	blockWidthMask   = 0x7F
@@ -67,11 +68,13 @@ const (
 
 var errCorrupt = errors.New("dataframe: frame file is truncated or corrupt")
 
-// File is a decoded frame file: the frame at Snapshot. Rows holds one column per Rows column of the
-// frame, all of one length: row i is (Rows[0][i], Rows[1][i]...), strictly ascending in that order and
-// >= 0. Each column of Sums is parallel to them.
+// File is a decoded frame file: the frame at Snapshot. Slot is the file's slot in the versions file,
+// kept by every rewrite (0 = no run created the file yet). Rows holds one column per Rows column of
+// the frame, all of one length: row i is (Rows[0][i], Rows[1][i]...), strictly ascending in that
+// order and >= 0. Each column of Sums is parallel to them.
 type File struct {
 	Snapshot int64
+	Slot     uint8
 	Rows     [][]int64
 	Sums     [][]int64
 }
@@ -96,7 +99,7 @@ func EncodeFile(file File) []byte { return appendFile(nil, file, codecOptions{})
 
 // appendFile encodes file onto out.
 func appendFile(out []byte, file File, options codecOptions) []byte {
-	out = append(out, formatVersion)
+	out = append(out, formatVersion, file.Slot)
 	out = binary.AppendUvarint(out, uint64(file.Snapshot))
 	out = binary.AppendUvarint(out, uint64(file.rowCount()))
 	if file.rowCount() == 0 {
@@ -395,6 +398,10 @@ func DecodeFile(content []byte, rowColumnCount, sumsCount int) (File, error) {
 	if err != nil || version != formatVersion {
 		return File{}, errCorrupt
 	}
+	slot, err := decoder.readByte()
+	if err != nil {
+		return File{}, err
+	}
 	snapshot, err := decoder.readUvarint()
 	if err != nil {
 		return File{}, err
@@ -405,7 +412,7 @@ func DecodeFile(content []byte, rowColumnCount, sumsCount int) (File, error) {
 	if err != nil || rowCount > uint64(decoder.end)*blockSize+1 {
 		return File{}, errCorrupt
 	}
-	file := File{Snapshot: int64(snapshot), Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
+	file := File{Snapshot: int64(snapshot), Slot: slot, Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
 	if rowCount == 0 {
 		return file, nil
 	}
