@@ -343,6 +343,9 @@ Products.Query().Eq(Products.T.NameHash, hash).Consistent().Exec(&out)
 
 ## 3d. GroupBy counters (`GroupBy`, `QueryGroups`)
 
+Designing a report on GroupBy counters or DataFrames (which one, Keys/Rows choice, derived 0/1
+columns, distinct counts): the `dataframes-groupby` skill.
+
 Use it for "count and totals per group" without reading the records: one counter item per base
 partition and per distinct value of the Index Keys.
 
