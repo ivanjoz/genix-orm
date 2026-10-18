@@ -59,6 +59,8 @@ type Controller interface {
 	MaterializeDataFrames() error
 	// RebuildDataFrames computes a DataFrame ("" every one) again from the records.
 	RebuildDataFrames(frameName string) error
+	// DropDataFrame deletes the state item and files of a frame the schema no longer declares.
+	DropDataFrame(frameName string) (int, error)
 	// The four below maintain the text index of an entity that declares TextSearch
 	// (textsearch.go); on any other entity they do nothing. A partition is given by
 	// one value per Partition column, as in TopN.

@@ -604,6 +604,8 @@ state item: pk = base pk ‖ 000, sk = "f" + name: gen, sh (shape), w (snapshot,
 - **Rebuild** (`RebuildDataFrames(name)`, `""` every frame; also `Reprocess(true)`):
   sums what every record held at now − 2 minutes into a new generation, exact
   whatever writes land meanwhile.
+- **Drop** (`DropDataFrame(name)`): a frame removed from the schema leaves its
+  state item and files behind; this deletes both. It refuses a declared frame.
 - **Best-effort, like GroupBy:** two plain Puts racing on one record compute their
   changelog from the same read, an `InsertMany` of a stored record drops its
   changelog, a `ReprocessRecords` writes without moving `Updated`, and Lambdas on

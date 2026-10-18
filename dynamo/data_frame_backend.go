@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/ivanjoz/genix-orm/db/cache"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -74,6 +75,34 @@ func (r *Repo[T, E]) RebuildDataFrames(frameName string) error {
 		return err
 	}
 	return dataframe.Rebuild(r.meta.frames, backend, cache.FileStore(), frameName, Now())
+}
+
+// DropDataFrame deletes what a frame the schema no longer declares left behind: its state item and
+// every file of its folder. It refuses a declared frame. Returns the files deleted.
+func (r *Repo[T, E]) DropDataFrame(frameName string) (int, error) {
+	if r.meta.frames == nil || len(r.meta.frames.Frames) == 0 {
+		return 0, fmt.Errorf("db: %s has no DataFrame: its frames' folder is unknown", r.meta.recordType.Name())
+	}
+	if r.meta.frames.FrameNamed(frameName) != nil || frameName == "" || strings.Contains(frameName, "/") {
+		return 0, fmt.Errorf("db: %s DataFrame %q is declared or not a frame name: only an undeclared frame is dropped", r.meta.recordType.Name(), frameName)
+	}
+	backend, err := frameBackendOf[E](r.meta)
+	if err != nil {
+		return 0, err
+	}
+	declared := r.meta.frames.Frames[0]
+	folder := strings.TrimSuffix(declared.Folder, declared.Name+"/") + frameName + "/"
+	fileKeys, err := cache.FileStore().ListFiles(folder)
+	if err != nil {
+		return 0, err
+	}
+	if err := cache.FileStore().DeleteFiles(context.Background(), fileKeys...); err != nil {
+		return 0, err
+	}
+	_, err = backend.client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
+		TableName: aws.String(tableName()), Key: itemKey(groupCountersPK(r.meta.tableID), frameStateSKPrefix+frameName),
+	})
+	return len(fileKeys), err
 }
 
 func (backend *frameBackend[E]) stateKey(frame *dataframe.Frame) map[string]types.AttributeValue {
