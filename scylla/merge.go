@@ -2,9 +2,10 @@ package scylla
 
 import (
 	"fmt"
-	"github.com/ivanjoz/genix-orm/db"
+	"time"
+	"unsafe"
 
-	"github.com/viant/xunsafe"
+	"github.com/ivanjoz/genix-orm/db"
 )
 
 type bulkLookupRecord struct {
@@ -38,20 +39,17 @@ func isNonPositiveNumericValue(value any) bool {
 	return false
 }
 
-func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
-	records *[]T,
-	scyllaTable ScyllaTable,
-) (map[string]*T, error) {
-	existingByRecordKey := map[string]*T{}
+// preloadExistingRecordsBySingleKey reads the stored version of every record, by primary key, and
+// returns them by record key. The stored records live in a reflect-built []T of their own.
+func preloadExistingRecordsBySingleKey(records recordSlice, scyllaTable ScyllaTable) (map[string]unsafe.Pointer, error) {
+	existingByRecordKey := map[string]unsafe.Pointer{}
 
 	partitionColumn := scyllaTable.GetPartKey()
 	keyColumn := scyllaTable.GetKeys()[0]
-	queryTable := db.InitStructTable[E, T](new(E))
 	groupsByPartition := map[string]*bulkLookupGroup{}
 
-	for recordIndex := range *records {
-		currentRecord := &(*records)[recordIndex]
-		recordPointer := xunsafe.AsPointer(currentRecord)
+	for recordIndex := range records.len() {
+		recordPointer := records.at(recordIndex)
 		recordKey := makePrimaryKeyRecordKey(recordPointer, scyllaTable)
 		keyValue := keyColumn.GetRawValue(recordPointer)
 
@@ -93,7 +91,6 @@ func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchema
 			continue
 		}
 
-		queryResult := []T{}
 		statements := []ColumnStatement{
 			{Col: keyColumn.GetName(), Operator: "IN", Values: group.keyValues},
 		}
@@ -104,22 +101,20 @@ func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchema
 			})
 		}
 
-		queryInfo := &TableInfo{
-			RefSlice:   &queryResult,
-			Statements: statements,
-		}
-
-		if err := execQuery[E, T](queryTable, queryInfo, nil); err != nil {
+		queryResult := records.newRecordList()
+		queryInfo := &TableInfo{Statements: statements}
+		if err := selectExec(makeReflectRecordSink(queryResult), queryInfo, scyllaTable, nil, time.Now()); err != nil {
 			return nil, err
 		}
 
-		foundByKeyToken := map[string]*T{}
-		for resultIndex := range queryResult {
-			foundRecord := &queryResult[resultIndex]
-			foundPointer := xunsafe.AsPointer(foundRecord)
+		// The view is taken once the read is done: no later append can move the records.
+		foundRecords := makeReflectRecordSlice(queryResult)
+		foundByKeyToken := map[string]unsafe.Pointer{}
+		for resultIndex := range foundRecords.len() {
+			foundPointer := foundRecords.at(resultIndex)
 			foundKeyToken := keyColumn.GetValueString(foundPointer)
 			if _, alreadyMapped := foundByKeyToken[foundKeyToken]; !alreadyMapped {
-				foundByKeyToken[foundKeyToken] = foundRecord
+				foundByKeyToken[foundKeyToken] = foundPointer
 			}
 		}
 
@@ -136,10 +131,7 @@ func preloadExistingRecordsBySingleKey[T TableBaseInterface[E, T], E TableSchema
 // textSearchRecordChanged reports whether a record's indexed text or status differs between the
 // previously-stored record and the incoming one. When neither changed, the index write for that
 // record is redundant and is skipped.
-func textSearchRecordChanged[T any](info *textSearchIndexInfo, previous, current *T) bool {
-	previousPointer := xunsafe.AsPointer(previous)
-	currentPointer := xunsafe.AsPointer(current)
-
+func textSearchRecordChanged(info *textSearchIndexInfo, previousPointer, currentPointer unsafe.Pointer) bool {
 	for _, column := range info.columns {
 		if !column.FieldsEqual(previousPointer, currentPointer) {
 			return true
@@ -166,14 +158,22 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 		return nil
 	}
 
-	queryTable := db.InitStructTable[E, T](new(E))
-	scyllaTable := getOrCompileScyllaTable(queryTable)
+	// Only the handlers need T; the merge itself runs on records by pointer.
+	return mergeRecords(makeRecordSlice(records), MakeScyllaTable[T, E](), columnsToExcludeUpdate,
+		func(previous, current unsafe.Pointer) bool { return onUpdateHandler((*T)(previous), (*T)(current)) },
+		func(record unsafe.Pointer) { onInsertHandler((*T)(record)) })
+}
+
+func mergeRecords(
+	records recordSlice, scyllaTable ScyllaTable, columnsToExcludeUpdate []Coln,
+	recordNeedsUpdate func(previous, current unsafe.Pointer) bool, onInsert func(record unsafe.Pointer),
+) error {
 	if len(scyllaTable.GetKeys()) != 1 {
 		return Err(`merge requires exactly one key column in schema`)
 	}
 
-	recordsToInsert := []T{}
-	recordsToUpdate := []T{}
+	recordsToInsert := records.newRecordList()
+	recordsToUpdate := records.newRecordList()
 	insertRecordIndexes := []int{}
 	skipTextSearchRecordsIDs := []int64{}
 	textSearchInfo := scyllaTable.textSearchIndex
@@ -182,17 +182,16 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 		return Err("merge bulk lookup failed:", err)
 	}
 
-	for recordIndex := range *records {
-		currentRecord := &(*records)[recordIndex]
-		currentRecordPointer := xunsafe.AsPointer(currentRecord)
+	for recordIndex := range records.len() {
+		currentRecordPointer := records.at(recordIndex)
 		recordKey := makePrimaryKeyRecordKey(currentRecordPointer, scyllaTable)
 
-		if previousRecord, wasFound := existingByRecordKey[recordKey]; wasFound {
-			if recordNeedsUpdate := onUpdateHandler(previousRecord, currentRecord); recordNeedsUpdate {
-				recordsToUpdate = append(recordsToUpdate, *currentRecord)
+		if previousRecordPointer, wasFound := existingByRecordKey[recordKey]; wasFound {
+			if recordNeedsUpdate(previousRecordPointer, currentRecordPointer) {
+				records.appendCopy(recordsToUpdate, currentRecordPointer)
 				// We already hold the previous record, so decide here whether the searchable
 				// content actually changed and let the write path skip unchanged re-indexes.
-				if textSearchInfo != nil && !textSearchRecordChanged(textSearchInfo, previousRecord, currentRecord) {
+				if textSearchInfo != nil && !textSearchRecordChanged(textSearchInfo, previousRecordPointer, currentRecordPointer) {
 					recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(currentRecordPointer))
 					skipTextSearchRecordsIDs = append(skipTextSearchRecordsIDs, recordID)
 				}
@@ -200,22 +199,25 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 			continue
 		}
 
-		onInsertHandler(currentRecord)
-		recordsToInsert = append(recordsToInsert, *currentRecord)
+		onInsert(currentRecordPointer)
+		records.appendCopy(recordsToInsert, currentRecordPointer)
 		insertRecordIndexes = append(insertRecordIndexes, recordIndex)
 	}
 
-	if len(recordsToInsert) == 0 && len(recordsToUpdate) == 0 {
+	insertRecords := makeReflectRecordSlice(recordsToInsert)
+	updateRecords := makeReflectRecordSlice(recordsToUpdate)
+	if insertRecords.len() == 0 && updateRecords.len() == 0 {
 		return nil
 	}
 
 	// Combine inserts and updates into a single batch so the merge issues one Scylla round-trip,
 	// one managed-counter prefetch, one cache-version bump, and one text-search sync.
-	fmt.Println("Merge | records to Insert:", len(recordsToInsert), "Update:", len(recordsToUpdate), "| Text skip:", len(skipTextSearchRecordsIDs))
+	fmt.Println("Merge | records to Insert:", insertRecords.len(), "Update:", updateRecords.len(), "| Text skip:", len(skipTextSearchRecordsIDs))
 
-	if err := executeInsertUpdateBatch(insertUpdateBatchParams[T, E]{
-		recordsForInsert:         &recordsToInsert,
-		recordsForUpdate:         &recordsToUpdate,
+	if err := executeInsertUpdateBatchErased(erasedInsertUpdateParams{
+		insertRecords:            insertRecords,
+		updateRecords:            updateRecords,
+		compiledTable:            scyllaTable,
 		columnsToUpdate:          columnsToExcludeUpdate,
 		skipTextSearchRecordsIDs: skipTextSearchRecordsIDs,
 	}); err != nil {
@@ -224,7 +226,7 @@ func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 
 	// Insert may mutate records (e.g. autoincrement IDs), so propagate persisted values back.
 	for insertIndex, originalRecordIndex := range insertRecordIndexes {
-		(*records)[originalRecordIndex] = recordsToInsert[insertIndex]
+		records.copyRecord(records.at(originalRecordIndex), insertRecords.at(insertIndex))
 	}
 
 	return nil

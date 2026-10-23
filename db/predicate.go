@@ -69,3 +69,31 @@ type TableInfo struct {
 	// so the driver boundary stays free of type parameters.
 	RefSlice any
 }
+
+// The predicate setters live on TableInfo rather than only on TableStruct so a read built at
+// runtime (ApplyFilters, the driver's controller) can fill one without a typed table struct.
+
+func (t *TableInfo) SetWhere(colname string, operator string, value any) {
+	t.Statements = append(t.Statements, ColumnStatement{Col: colname, Operator: operator, Value: value})
+}
+
+// SetWhereIn adds an IN predicate. It exists next to SetWhere because ColumnStatement carries IN
+// operands in Values rather than in Value.
+func (t *TableInfo) SetWhereIn(colname string, values []any) {
+	t.Statements = append(t.Statements, ColumnStatement{Col: colname, Operator: "IN", Values: values})
+}
+
+// SetBetween adds a BETWEEN predicate from runtime values, mirroring Col.Between for callers that
+// only know the column by name. Its bounds go in From/To, like every other BETWEEN.
+func (t *TableInfo) SetBetween(colname string, from, to any) {
+	t.Statements = append(t.Statements, ColumnStatement{
+		Col:      colname,
+		Operator: "BETWEEN",
+		From:     []ColumnStatement{{Col: colname, Value: from}},
+		To:       []ColumnStatement{{Col: colname, Value: to}},
+	})
+}
+
+func (t *TableInfo) SetOrderDesc() {
+	t.OrderBy = "ORDER BY %v DESC"
+}

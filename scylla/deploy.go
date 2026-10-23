@@ -36,63 +36,90 @@ func (e *ScyllaController[T, E]) GetTableName() string {
 	return e.Table.Name
 }
 
-func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any) []any {
+// Every ScyllaController method is a one-line shim over a non-generic body that takes the
+// compiled table and, when it needs records, the record type as a reflect.Type. The controller is
+// instantiated once per table and its methods are kept alive by the db.Controller interface, so a
+// body left generic is compiled once per table. These are admin, backup and JSON paths that run
+// per call rather than per row, which is where reflection costs nothing that matters.
 
-	records := []T{}
-	query := any(Query(&records)).(TableQueryInterface[E])
+// readTableRecords runs a read described by tableInfo into a new reflect-built []recordType and
+// returns the pointer to it. It is the same select a typed Query(...).Exec() runs.
+func readTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, tableInfo *TableInfo) (reflect.Value, error) {
+	recordsPointer := reflect.New(reflect.SliceOf(recordType))
+	// Empty rather than nil, as the []T{} the typed callers start from: JSON renders it as [].
+	recordsPointer.Elem().Set(reflect.MakeSlice(recordsPointer.Elem().Type(), 0, 0))
+	err := selectExec(makeReflectRecordSink(recordsPointer), tableInfo, *scyllaTable, nil, time.Now())
+	return recordsPointer, err
+}
 
-	pk := e.Table.GetPartKey()
+// readPartitionRecords reads one partition (every record when partValue is 0), from lastKey on
+// when it is set.
+func readPartitionRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, lastKey any) (reflect.Value, error) {
+	tableInfo := &TableInfo{}
+	pk := scyllaTable.GetPartKey()
 	if partValue > 0 && pk != nil && !pk.IsNil() {
-		query.SetWhere(pk.GetName(), "=", partValue)
+		tableInfo.SetWhere(pk.GetName(), "=", partValue)
 	}
-
 	// Add lastKey filter if provided (for pagination)
-	if lastKey != nil && len(e.Table.Keys) > 0 {
-		query.SetWhere(e.Table.Keys[0].GetName(), ">=", lastKey)
+	if lastKey != nil && len(scyllaTable.Keys) > 0 {
+		tableInfo.SetWhere(scyllaTable.Keys[0].GetName(), ">=", lastKey)
 	}
+	return readTableRecords(scyllaTable, recordType, tableInfo)
+}
 
-	// Execute the query
-	fmt.Println("Obteniendo registros de::", e.Table.Name)
-	if err := query.Exec(); err != nil {
-		fmt.Println("Error al consultar", e.Table.Name, ":", err)
+// insertTableRecords is Insert over a recordSlice: the same managed write path, every managed
+// column and sync included.
+func insertTableRecords(scyllaTable *ScyllaTable, records recordSlice, columnsToExclude []Coln) error {
+	return executeInsertUpdateBatchErased(erasedInsertUpdateParams{
+		insertRecords:           records,
+		compiledTable:           *scyllaTable,
+		useIncludeUpdateColumns: true,
+		columnsToExcludeInsert:  columnsToExclude,
+	})
+}
+
+func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any) []any {
+	return getTableRecords(&e.Table, reflect.TypeFor[T](), partValue, lastKey)
+}
+
+func getTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, lastKey any) []any {
+	fmt.Println("Obteniendo registros de::", scyllaTable.Name)
+	recordsPointer, err := readPartitionRecords(scyllaTable, recordType, partValue, lastKey)
+	if err != nil {
+		fmt.Println("Error al consultar", scyllaTable.Name, ":", err)
 		return nil
 	}
-	fmt.Println("reqgistros obtenidos (1)::", len(records))
+	records := recordsPointer.Elem()
+	fmt.Println("reqgistros obtenidos (1)::", records.Len())
 
-	recordsAny := []any{}
-	for _, e := range records {
-		recordsAny = append(recordsAny, any(e))
+	recordsAny := make([]any, records.Len())
+	for index := range recordsAny {
+		recordsAny[index] = records.Index(index).Interface()
 	}
-
 	return recordsAny
 }
 
 func (e *ScyllaController[T, E]) ExportRecordsColbin(
 	partValue int32, batchSize int, emitBatch func(encoded []byte, rowsCount int32) error,
 ) (int32, error) {
-	return exportToColbin[T](&e.Table, partValue, batchSize, emitBatch)
+	return exportToColbin(&e.Table, reflect.TypeFor[T](), partValue, batchSize, emitBatch)
 }
 
 func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
-	records := []T{}
-	query := any(Query(&records)).(TableQueryInterface[E])
+	return reloadTableRecords(&e.Table, reflect.TypeFor[T](), partValue)
+}
 
-	pk := e.Table.GetPartKey()
-	if partValue > 0 && pk != nil && !pk.IsNil() {
-		query.SetWhere(pk.GetName(), "=", partValue)
-	}
-
-	if err := query.Exec(); err != nil {
-		fmt.Println("Error al consultar", e.Table.Name, ":", err)
+// reloadTableRecords reads a partition and writes it back through Insert, which recomputes every
+// derived value: virtual columns, views, indexes and caches.
+func reloadTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32) error {
+	recordsPointer, err := readPartitionRecords(scyllaTable, recordType, partValue, nil)
+	if err != nil {
+		fmt.Println("Error al consultar", scyllaTable.Name, ":", err)
 		return err
 	}
-
-	if len(records) > 0 {
-		if err := Insert(&records); err != nil {
-			return Err("Error al re-insertar registros:", err)
-		}
+	if err := insertTableRecords(scyllaTable, makeReflectRecordSlice(recordsPointer), nil); err != nil {
+		return Err("Error al re-insertar registros:", err)
 	}
-
 	return nil
 }
 
@@ -521,23 +548,31 @@ func applyCounterReset(namespace, counterName string, maxKeyValue int64) (int64,
 // that land while it runs are kept: they reach the index after their row is stored, so the
 // backend applies them on top of what it read.
 func (e *ScyllaController[T, E]) ReindexTextSearch(partValue int32) error {
-	return e.withTextSearch(partValue, "ReindexTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
-		return backend.Rebuild(context.Background(), table, partition, textSearchSource(&e.Table, int64(partValue)))
+	return reindexTextSearchForTable(&e.Table, partValue)
+}
+
+func reindexTextSearchForTable(scyllaTable *ScyllaTable, partValue int32) error {
+	return withTextSearch(scyllaTable, partValue, "ReindexTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Rebuild(context.Background(), table, partition, textSearchSource(scyllaTable, int64(partValue)))
 	})
 }
 
 // ReindexTextSearchAll rebuilds the text index of every partition that has records, one at a time.
 // It does not drop the index of a partition left with none: DropTextSearch does that.
 func (e *ScyllaController[T, E]) ReindexTextSearchAll() error {
-	if e.Table.textSearchIndex == nil {
+	return reindexTextSearchAllForTable(&e.Table)
+}
+
+func reindexTextSearchAllForTable(scyllaTable *ScyllaTable) error {
+	if scyllaTable.textSearchIndex == nil {
 		return nil
 	}
-	partValues, err := scanPartitionValues(&e.Table)
+	partValues, err := scanPartitionValues(scyllaTable)
 	if err != nil {
-		return Err("ReindexTextSearchAll failed to list the partitions of", e.Table.Name, ":", err)
+		return Err("ReindexTextSearchAll failed to list the partitions of", scyllaTable.Name, ":", err)
 	}
 	for _, partValue := range partValues {
-		if err := e.ReindexTextSearch(partValue); err != nil {
+		if err := reindexTextSearchForTable(scyllaTable, partValue); err != nil {
 			return err
 		}
 	}
@@ -569,21 +604,25 @@ func scanPartitionValues(scyllaTable *ScyllaTable) ([]int32, error) {
 
 // CompactTextSearch folds the partition's pending index writes, for backends with a write log.
 func (e *ScyllaController[T, E]) CompactTextSearch(partValue int32) error {
-	return e.withTextSearch(partValue, "CompactTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+	return withTextSearch(&e.Table, partValue, "CompactTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
 		return backend.Compact(context.Background(), table, partition)
 	})
 }
 
 // DropTextSearch empties the partition's text index.
 func (e *ScyllaController[T, E]) DropTextSearch(partValue int32) error {
-	return e.withTextSearch(partValue, "DropTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+	return dropTextSearchForTable(&e.Table, partValue)
+}
+
+func dropTextSearchForTable(scyllaTable *ScyllaTable, partValue int32) error {
+	return withTextSearch(scyllaTable, partValue, "DropTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
 		return backend.Drop(context.Background(), table, partition)
 	})
 }
 
 // withTextSearch runs one index maintenance step, or nothing for a table without TextSearch.
-func (e *ScyllaController[T, E]) withTextSearch(partValue int32, step string, run func(backend db.TextSearchBackend, table, partition string) error) error {
-	if e.Table.textSearchIndex == nil {
+func withTextSearch(scyllaTable *ScyllaTable, partValue int32, step string, run func(backend db.TextSearchBackend, table, partition string) error) error {
+	if scyllaTable.textSearchIndex == nil {
 		return nil
 	}
 	backend, err := db.GetTextSearchBackend()
@@ -592,10 +631,10 @@ func (e *ScyllaController[T, E]) withTextSearch(partValue int32, step string, ru
 	}
 	partition := db.TextSearchPartition(int64(partValue))
 	start := time.Now()
-	if err := run(backend, e.Table.Name, partition); err != nil {
-		return Err(step, "failed for table", e.Table.Name, "partition", partition, ":", err)
+	if err := run(backend, scyllaTable.Name, partition); err != nil {
+		return Err(step, "failed for table", scyllaTable.Name, "partition", partition, ":", err)
 	}
-	fmt.Printf("%s | table=%s | partition=%s | %s\n", step, e.Table.Name, partition, time.Since(start))
+	fmt.Printf("%s | table=%s | partition=%s | %s\n", step, scyllaTable.Name, partition, time.Since(start))
 	return nil
 }
 
@@ -705,9 +744,12 @@ func getSequenceCurrentValue(counterName string) (int64, error) {
 }
 
 func (e *ScyllaController[T, E]) GetRecordsGob(partValue, limit int32, lastKey any) ([]byte, error) {
+	return getTableRecordsGob(&e.Table, reflect.TypeFor[T](), partValue, lastKey)
+}
 
-	gob.Register(*new(T))
-	records := e.GetRecords(partValue, limit, lastKey)
+func getTableRecordsGob(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, lastKey any) ([]byte, error) {
+	gob.Register(reflect.Zero(recordType).Interface())
+	records := getTableRecords(scyllaTable, recordType, partValue, lastKey)
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -728,34 +770,36 @@ func (e *ScyllaController[T, E]) GetRecordsGob(partValue, limit int32, lastKey a
 func (e *ScyllaController[T, E]) RestoreRecordsColbin(
 	partValue int32, encoded []byte, deletePartitionFirst bool,
 ) (int, error) {
-	records, err := colbinToRecords[T](&e.Table, encoded, partValue)
+	return restoreColbinBatch(&e.Table, reflect.TypeFor[T](), partValue, encoded, deletePartitionFirst)
+}
+
+func restoreColbinBatch(
+	scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, encoded []byte, deletePartitionFirst bool,
+) (int, error) {
+	records, err := colbinToRecords(scyllaTable, recordType, encoded, partValue)
 	if err != nil {
 		return 0, err
 	}
 
-	partKey := e.Table.GetPartKey()
+	partKey := scyllaTable.GetPartKey()
 	if deletePartitionFirst && partValue > 0 && partKey != nil && !partKey.IsNil() {
 		statement := fmt.Sprintf(`DELETE FROM %v WHERE %v = %v`,
-			e.Table.GetFullName(), partKey.GetName(), partValue)
+			scyllaTable.GetFullName(), partKey.GetName(), partValue)
 		if err := QueryExec(statement); err != nil {
 			fmt.Println("Error en statement: ", statement)
 			return 0, Err("Error al eliminar registros:", err)
 		}
 		// The rows are gone, so their index entries go too; the inserts below put back the
 		// restored ones.
-		if err := e.DropTextSearch(partValue); err != nil {
+		if err := dropTextSearchForTable(scyllaTable, partValue); err != nil {
 			return 0, err
 		}
 	}
 
-	if len(records) == 0 {
-		return 0, nil
-	}
-
-	if err := Insert(&records); err != nil {
+	if err := insertTableRecords(scyllaTable, records, nil); err != nil {
 		return 0, Err("Error al insertar registros:", err)
 	}
-	return len(records), nil
+	return records.len(), nil
 }
 
 type ScyllaColumns struct {

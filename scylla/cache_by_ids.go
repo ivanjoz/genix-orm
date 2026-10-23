@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
@@ -153,7 +154,7 @@ func forEachIDsBatch(
 
 // readRecordsByIDs reads whole records by ID at LocalQuorum: a read that follows a slot or log
 // write must not hit a replica the row write has not reached yet.
-func readRecordsByIDs[T any](scyllaTable ScyllaTable, idsOfPartition map[int64][]int64) ([]T, error) {
+func readRecordsByIDs(sink recordSink, scyllaTable ScyllaTable, idsOfPartition map[int64][]int64) error {
 	columnNames := make([]string, 0, len(scyllaTable.Columns))
 	for _, column := range scyllaTable.Columns {
 		if !column.GetInfo().IsVirtual {
@@ -161,14 +162,12 @@ func readRecordsByIDs[T any](scyllaTable ScyllaTable, idsOfPartition map[int64][
 		}
 	}
 	scyllaTable.readConsistency = gocql.LocalQuorum
-	records := []T{}
 	scanColumns := buildDefaultScanColumns(columnNames)
-	err := forEachIDsBatch(scyllaTable, idsOfPartition, strings.Join(columnNames, ", "),
+	return forEachIDsBatch(scyllaTable, idsOfPartition, strings.Join(columnNames, ", "),
 		func(queryString string, queryValues []any, _ int64) error {
 			return scanSelectQueryRows(queryString, queryValues, scanColumns, scyllaTable,
-				makeRecordSink(&records), nil, nil, time.Now())
+				sink, nil, nil, time.Now())
 		})
-	return records, err
 }
 
 // QueryCachedIDs returns, per partition, the requested records whose slot moved since the tick the
@@ -177,27 +176,56 @@ func QueryCachedIDs[T TableBaseInterface[E, T], E TableSchemaInterface[E]](reque
 	if len(request.IDs) == 0 {
 		return nil, nil
 	}
-	scyllaTable := MakeScyllaTable[T, E]()
+	var emptyRecords []T
+	partitionsRead, err := queryCachedIDs(MakeScyllaTable[T, E](), request, makeRecordSink(&emptyRecords))
+	if err != nil || partitionsRead == nil {
+		return nil, err
+	}
+	partitions := make([]cache.CachedPartition[T], len(partitionsRead))
+	for i, partitionRead := range partitionsRead {
+		partitions[i].Partition = partitionRead.partition
+		partitions[i].Records = make([]T, len(partitionRead.records))
+		for j, record := range partitionRead.records {
+			partitions[i].Records[j] = *(*T)(record)
+		}
+	}
+	return partitions, nil
+}
+
+// cachedPartitionRead is one partition of a QueryCachedIDs answer, its records by pointer.
+type cachedPartitionRead struct {
+	partition int64
+	records   []unsafe.Pointer
+}
+
+// queryCachedIDs is QueryCachedIDs over records by pointer, its partitions in ascending order so
+// the response is stable. sink only allocates the records: they come back grouped, not appended.
+func queryCachedIDs(scyllaTable ScyllaTable, request cache.CachedIDsRequest, sink recordSink) ([]cachedPartitionRead, error) {
 	plan, err := planCachedIDsRead(scyllaTable, request, "QueryCachedIDs")
 	if err != nil || len(plan.IDsToRead) == 0 {
 		return nil, err
 	}
-	records, err := readRecordsByIDs[T](scyllaTable, idsByPartition(plan.IDsToRead))
-	if err != nil {
+	var records []unsafe.Pointer
+	if err := readRecordsByIDs(sink.collectInto(&records), scyllaTable, idsByPartition(plan.IDsToRead)); err != nil {
 		return nil, err
 	}
 
-	recordsByPartition := map[int64][]T{}
-	recordsView := makeRecordSlice(&records)
-	for i := range recordsView.len() {
-		recordPointer := recordsView.at(i)
+	recordsByPartition := map[int64][]unsafe.Pointer{}
+	for _, recordPointer := range records {
 		partition := convertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer))
 		id := convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 		scyllaTable.UpdatedCol.SetValue(recordPointer,
 			coerceManagedIntegerValue(scyllaTable.UpdatedCol, plan.HeldUpdated(partition, id)))
-		recordsByPartition[partition] = append(recordsByPartition[partition], records[i])
+		recordsByPartition[partition] = append(recordsByPartition[partition], recordPointer)
 	}
-	return groupCachedPartitions(recordsByPartition), nil
+	partitions := make([]cachedPartitionRead, 0, len(recordsByPartition))
+	for partition, partitionRecords := range recordsByPartition {
+		partitions = append(partitions, cachedPartitionRead{partition: partition, records: partitionRecords})
+	}
+	slices.SortFunc(partitions, func(left, right cachedPartitionRead) int {
+		return cmp.Compare(left.partition, right.partition)
+	})
+	return partitions, nil
 }
 
 // groupCachedPartitions lists the partitions in ascending order, so the response is stable.

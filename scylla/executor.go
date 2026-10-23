@@ -22,7 +22,7 @@ func (Exec[TableT, RecordT]) Select(
 	schema *TableT, tableInfo *TableInfo, dst *[]RecordT, scan func(record *RecordT) bool,
 ) error {
 	selectStartTime := time.Now()
-	return selectExec(dst, tableInfo, getOrCompileScyllaTable(schema), scan, selectStartTime)
+	return selectExec(makeRecordSink(dst), tableInfo, getOrCompileScyllaTable(schema), erasedScanHandler(scan), selectStartTime)
 }
 
 func (Exec[TableT, RecordT]) SelectGrouped(schema *TableT, tableInfo *TableInfo) error {

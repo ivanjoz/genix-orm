@@ -111,26 +111,15 @@ func (e TableStruct[D, T, E]) GetSchema() TableSchema {
 }
 
 func (e *TableStruct[D, T, E]) SetWhere(colname string, operator string, value any) {
-	cs := ColumnStatement{Col: colname, Operator: operator, Value: value}
-	e.tableInfo.Statements = append(e.tableInfo.Statements, cs)
+	e.tableInfo.SetWhere(colname, operator, value)
 }
 
-// SetWhereIn adds an IN predicate. It exists next to SetWhere because ColumnStatement carries IN
-// operands in Values rather than in Value.
 func (e *TableStruct[D, T, E]) SetWhereIn(colname string, values []any) {
-	e.tableInfo.Statements = append(e.tableInfo.Statements,
-		ColumnStatement{Col: colname, Operator: "IN", Values: values})
+	e.tableInfo.SetWhereIn(colname, values)
 }
 
-// SetBetween adds a BETWEEN predicate from runtime values, mirroring Col.Between for callers that
-// only know the column by name. Its bounds go in From/To, like every other BETWEEN.
 func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
-	e.tableInfo.Statements = append(e.tableInfo.Statements, ColumnStatement{
-		Col:      colname,
-		Operator: "BETWEEN",
-		From:     []ColumnStatement{{Col: colname, Value: from}},
-		To:       []ColumnStatement{{Col: colname, Value: to}},
-	})
+	e.tableInfo.SetBetween(colname, from, to)
 }
 
 // Delta turns the query into a delta-cache read (db/cache). An empty cursor is a first sync: it lists
@@ -224,7 +213,7 @@ func (e *TableStruct[D, T, E]) Limit(limit int32) *T {
 }
 
 func (e *TableStruct[D, T, E]) OrderDesc() *T {
-	e.tableInfo.OrderBy = "ORDER BY %v DESC"
+	e.tableInfo.SetOrderDesc()
 	return e.schemaStruct
 }
 
@@ -288,8 +277,15 @@ func getCollectionFrozenDefaultForTableField(tableFieldType reflect.Type) (bool,
 // column handle's name and type from the cached record metadata, then points all
 // handles at a fresh TableInfo. Immutable record metadata is built once per record
 // type; only the per-call query state is allocated here.
+//
+// Only the shim is generic: the body takes the *T as `any` and E as a reflect.Type, so it compiles
+// once instead of once per table. It runs on every Query, which is why its size mattered.
 func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
-	structRefType := reflect.TypeOf(*new(E))
+	bindStructTable(schemaStruct, (*schemaStruct).GetSchema(), reflect.TypeFor[E]())
+	return schemaStruct
+}
+
+func bindStructTable(schemaStruct any, schema TableSchema, structRefType reflect.Type) {
 	recordMetadata := getOrBuildStructFieldMetadata(structRefType)
 	refTableInfo := &TableInfo{}
 
@@ -297,7 +293,7 @@ func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
 	structType := structValue.Type()
 
 	// Read schema-level flags once so the slice-default swap can be applied per column below.
-	useListAsDefault := (*schemaStruct).GetSchema().UseListAsDefault
+	useListAsDefault := schema.UseListAsDefault
 
 	for i := 0; i < structValue.NumField(); i++ {
 		field := structValue.Field(i)
@@ -340,13 +336,6 @@ func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
 			}
 
 			if column1, ok1 := fieldAddr.Interface().(Coln); ok1 {
-				// Transfer properties from Col if they were set
-				if c, ok := any(column1).(*Col[T, E]); ok {
-					colInfo.SlotBits = c.info.SlotBits
-					colInfo.AutoincrementRandBits = c.info.AutoincrementRandBits
-					colInfo.UseInt32Packing = c.info.UseInt32Packing
-				}
-
 				if column1.GetInfo().Name == "" {
 					panic("No se seteo el nombre: " + columnName)
 				}
@@ -361,8 +350,7 @@ func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
 		column.SetTableInfo(refTableInfo)
 	}
 
-	if tableStructMeta, ok := any(schemaStruct).(tableStructCacheMetaSetter); ok {
+	if tableStructMeta, ok := schemaStruct.(tableStructCacheMetaSetter); ok {
 		tableStructMeta.setBaseStructType(recordMetadata.recordType)
 	}
-	return schemaStruct
 }

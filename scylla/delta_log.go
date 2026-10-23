@@ -257,7 +257,7 @@ func selectDeltaIndex(scyllaTable ScyllaTable, equalityValues map[string]any, ne
 
 // execDelta is Exec for a Delta() read (db/cache's delta_log.go describes the protocol). Its reads
 // run at LocalQuorum: they follow a log the writes appended after their rows landed.
-func execDelta[E any](records *[]E, tableInfo *TableInfo, scyllaTable ScyllaTable, selectStartTime time.Time) error {
+func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable, selectStartTime time.Time) error {
 	if cache.FileStore() == nil {
 		return fmt.Errorf(`table %q: Delta() reads a delta log and no file store holds it: call db.SetFileStore at boot`, scyllaTable.Name)
 	}
@@ -300,27 +300,27 @@ func execDelta[E any](records *[]E, tableInfo *TableInfo, scyllaTable ScyllaTabl
 				Col: deltaIndex.syncFilter.GetName(), Operator: "IN", Values: deltaRead.SyncFilterValues,
 			})
 		}
-		err = selectExec(records, &listingInfo, scyllaTable, nil, selectStartTime)
+		err = selectExec(sink, &listingInfo, scyllaTable, nil, selectStartTime)
 	} else {
-		err = appendLoggedRecords(records, scyllaTable, convertToInt64(partitionValue), logRead, deltaIndex.is64BitScale)
+		err = appendLoggedRecords(sink, scyllaTable, convertToInt64(partitionValue), logRead, deltaIndex.is64BitScale)
 	}
 	if err != nil {
 		return err
 	}
 
 	for _, metadataFile := range logRead.MetadataFiles(deltaIndex.is64BitScale, nil) {
-		metadataRecord, err := deltaMetadataRecord[E](scyllaTable, metadataFile)
+		metadataRecord, err := deltaMetadataRecord(sink, scyllaTable, metadataFile)
 		if err != nil {
 			return err
 		}
-		*records = append(*records, metadataRecord)
+		sink.appendRecord(metadataRecord)
 	}
 	return nil
 }
 
 // appendLoggedRecords reads the records the log entries past the cursor name, the last entry per log
 // ID winning, and appends those not deleted.
-func appendLoggedRecords[E any](records *[]E, scyllaTable ScyllaTable, partitionValue int64, logRead *cache.DeltaLogRead, is64BitScale bool) error {
+func appendLoggedRecords(sink recordSink, scyllaTable ScyllaTable, partitionValue int64, logRead *cache.DeltaLogRead, is64BitScale bool) error {
 	entries, err := logRead.LoggedEntries(is64BitScale)
 	if err != nil {
 		return fmt.Errorf("table %q: %w", scyllaTable.Name, err)
@@ -335,22 +335,20 @@ func appendLoggedRecords[E any](records *[]E, scyllaTable ScyllaTable, partition
 		return nil
 	}
 	slices.Sort(ids)
-	loggedRecords, err := readRecordsByIDs[E](scyllaTable, map[int64][]int64{partitionValue: ids})
-	*records = append(*records, loggedRecords...)
-	return err
+	return readRecordsByIDs(sink, scyllaTable, map[int64][]int64{partitionValue: ids})
 }
 
 // deltaMetadataRecord is the Metadata record of one log file: −bucket as its key, the Metadata text
 // in its `Metadata *string json:"mdt,omitempty"` field.
-func deltaMetadataRecord[E any](scyllaTable ScyllaTable, metadataFile cache.DeltaMetadataFile) (E, error) {
-	var record E
-	metadataField := reflect.ValueOf(&record).Elem().FieldByName("Metadata")
+func deltaMetadataRecord(sink recordSink, scyllaTable ScyllaTable, metadataFile cache.DeltaMetadataFile) (unsafe.Pointer, error) {
+	record := sink.newRecord()
+	metadataField := reflect.ValueOf(sink.asRecordPointer(record)).Elem().FieldByName("Metadata")
 	if !metadataField.IsValid() || metadataField.Type() != reflect.TypeFor[*string]() {
-		return record, fmt.Errorf(`table %q: Delta() returns Metadata records and the record has no field "Metadata *string" (json "mdt,omitempty")`, scyllaTable.Name)
+		return nil, fmt.Errorf(`table %q: Delta() returns Metadata records and the record has no field "Metadata *string" (json "mdt,omitempty")`, scyllaTable.Name)
 	}
 	metadataText := metadataFile.Text
 	metadataField.Set(reflect.ValueOf(&metadataText))
 	keyColumn := scyllaTable.Keys[0]
-	keyColumn.SetValue(unsafe.Pointer(&record), coerceManagedIntegerValue(keyColumn, -metadataFile.Bucket))
+	keyColumn.SetValue(record, coerceManagedIntegerValue(keyColumn, -metadataFile.Bucket))
 	return record, nil
 }

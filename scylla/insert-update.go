@@ -675,27 +675,30 @@ func InsertUpdateBase[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	})
 }
 
-func splitInsertAndUpdateRecords[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
-	records *[]T, isInsert func(e *T) bool,
-) ([]T, []T) {
+// erasedIsInsert adapts the caller's typed classifier to records by pointer.
+func erasedIsInsert[T any](isInsert func(e *T) bool) func(unsafe.Pointer) bool {
 	if isInsert == nil {
 		panic("Se requiere la función isInsert para clasificar los registros.")
 	}
+	return func(record unsafe.Pointer) bool { return isInsert((*T)(record)) }
+}
 
-	recordsForInsert := make([]T, 0, len(*records))
-	recordsForUpdate := make([]T, 0, len(*records))
+// splitInsertAndUpdateRecords copies the records into an insert list and an update list.
+func splitInsertAndUpdateRecords(records recordSlice, isInsert func(unsafe.Pointer) bool) (recordSlice, recordSlice) {
+	recordsForInsert := records.newRecordList()
+	recordsForUpdate := records.newRecordList()
 
 	// Classify the mixed payload once so the combined batch can reuse the shared insert/update flow.
-	for recordIndex := range *records {
-		record := &(*records)[recordIndex]
-		if isInsert(record) {
-			recordsForInsert = append(recordsForInsert, *record)
+	for recordIndex := range records.len() {
+		recordPointer := records.at(recordIndex)
+		if isInsert(recordPointer) {
+			records.appendCopy(recordsForInsert, recordPointer)
 		} else {
-			recordsForUpdate = append(recordsForUpdate, *record)
+			records.appendCopy(recordsForUpdate, recordPointer)
 		}
 	}
 
-	return recordsForInsert, recordsForUpdate
+	return makeReflectRecordSlice(recordsForInsert), makeReflectRecordSlice(recordsForUpdate)
 }
 
 type insertUpdateBatchParams[T TableBaseInterface[E, T], E TableSchemaInterface[E]] struct {
@@ -731,16 +734,9 @@ func executeInsertUpdateBatch[T TableBaseInterface[E, T], E TableSchemaInterface
 		return nil
 	}
 
-	insertRecords := makeRecordSlice(recordsForInsert)
-	updateRecords := makeRecordSlice(recordsForUpdate)
-	// SelfParse runs before anything reads a column, and it mutates records in place without
-	// reallocating, so the views taken above stay valid.
-	runSelfParseIfDefined(insertRecords)
-	runSelfParseIfDefined(updateRecords)
-
 	return executeInsertUpdateBatchErased(erasedInsertUpdateParams{
-		insertRecords:            insertRecords,
-		updateRecords:            updateRecords,
+		insertRecords:            makeRecordSlice(recordsForInsert),
+		updateRecords:            makeRecordSlice(recordsForUpdate),
 		compiledTable:            getOrCompileScyllaTable(db.InitStructTable[E, T](new(E))),
 		useIncludeUpdateColumns:  params.useIncludeUpdateColumns,
 		columnsToUpdate:          params.columnsToUpdate,
@@ -763,6 +759,14 @@ type erasedInsertUpdateParams struct {
 func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	insertRecords := params.insertRecords
 	updateRecords := params.updateRecords
+	if insertRecords.len() == 0 && updateRecords.len() == 0 {
+		return nil
+	}
+	// SelfParse runs before anything reads a column, and it mutates records in place without
+	// reallocating, so the views stay valid.
+	runSelfParseIfDefined(insertRecords)
+	runSelfParseIfDefined(updateRecords)
+
 	scyllaTable := params.compiledTable
 	useIncludeUpdateColumns := params.useIncludeUpdateColumns
 	columnsToUpdate := params.columnsToUpdate
@@ -990,10 +994,11 @@ func InsertUpdateInclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	columnsToIncludeUpdate []Coln,
 	columnsToExcludeInsert ...Coln,
 ) error {
-	recordsForInsert, recordsForUpdate := splitInsertAndUpdateRecords(records, isInsert)
-	return executeInsertUpdateBatch(insertUpdateBatchParams[T, E]{
-		recordsForInsert:        &recordsForInsert,
-		recordsForUpdate:        &recordsForUpdate,
+	insertRecords, updateRecords := splitInsertAndUpdateRecords(makeRecordSlice(records), erasedIsInsert(isInsert))
+	return executeInsertUpdateBatchErased(erasedInsertUpdateParams{
+		insertRecords:           insertRecords,
+		updateRecords:           updateRecords,
+		compiledTable:           MakeScyllaTable[T, E](),
 		useIncludeUpdateColumns: true,
 		columnsToUpdate:         columnsToIncludeUpdate,
 		columnsToExcludeInsert:  columnsToExcludeInsert,
@@ -1006,10 +1011,11 @@ func InsertUpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	columnsToExcludeUpdate []Coln,
 	columnsToExcludeInsert ...Coln,
 ) error {
-	recordsForInsert, recordsForUpdate := splitInsertAndUpdateRecords(records, isInsert)
-	return executeInsertUpdateBatch(insertUpdateBatchParams[T, E]{
-		recordsForInsert:       &recordsForInsert,
-		recordsForUpdate:       &recordsForUpdate,
+	insertRecords, updateRecords := splitInsertAndUpdateRecords(makeRecordSlice(records), erasedIsInsert(isInsert))
+	return executeInsertUpdateBatchErased(erasedInsertUpdateParams{
+		insertRecords:          insertRecords,
+		updateRecords:          updateRecords,
+		compiledTable:          MakeScyllaTable[T, E](),
 		columnsToUpdate:        columnsToExcludeUpdate,
 		columnsToExcludeInsert: columnsToExcludeInsert,
 	})

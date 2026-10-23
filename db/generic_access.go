@@ -240,7 +240,7 @@ func toFloat64Exact(value any) (float64, error) {
 // rather than in a driver because nothing about it is storage-specific: names resolve against the
 // compiled table and values coerce against the column type, and what reaches the driver is the
 // same ColumnStatement the typed fluent API produces.
-func ApplyFilters[T any](query TableGenericQuery[T], table Table, filters []FilterSpec) error {
+func ApplyFilters(query *TableInfo, table Table, filters []FilterSpec) error {
 	for _, filter := range filters {
 		column, err := ResolveColumn(table, filter.Column)
 		if err != nil {

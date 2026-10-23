@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -29,78 +30,99 @@ type indexGroupFetchState struct {
 // loadIndexGroupFreshnessRows is overridable in tests so grouped planning can be verified without Scylla.
 var loadIndexGroupFreshnessRows = loadIndexGroupFreshnessRowsFromScylla
 
+// execIndexGroupQuery is the typed doorway of a grouped read: the read runs on records by pointer
+// (RecordGroup[unsafe.Pointer]) and only the final copy into the caller's groups names E.
 func execIndexGroupQuery[T TableSchemaInterface[T], E any](schemaStruct *T, tableInfo *TableInfo) error {
-	if len(tableInfo.ColumnsInclude) > 0 || len(tableInfo.ColumnsExclude) > 0 {
-		return fmt.Errorf("QueryIndexGroup does not support Select() or Exclude() yet")
-	}
-	if len(tableInfo.GroupByColumns) > 0 {
-		return fmt.Errorf("QueryIndexGroup does not support GroupBy()")
-	}
-	if tableInfo.OrderBy != "" {
-		return fmt.Errorf("QueryIndexGroup does not support OrderDesc() yet")
-	}
-	if tableInfo.Limit > 0 {
-		return fmt.Errorf("QueryIndexGroup does not support Limit() yet")
-	}
-	if tableInfo.AllowFilter {
-		return fmt.Errorf("QueryIndexGroup does not support AllowFilter()")
-	}
-
 	refGroups := tableInfo.RefSlice.(*[]RecordGroup[E])
 	*refGroups = (*refGroups)[:0]
 
-	scyllaTable := getOrCompileScyllaTable(schemaStruct)
+	erasedGroups, err := queryIndexGroups(getOrCompileScyllaTable(schemaStruct), tableInfo, makeRecordSink(&[]E{}))
+	for _, erasedGroup := range erasedGroups {
+		records := make([]E, len(erasedGroup.Records))
+		for recordIndex, recordPointer := range erasedGroup.Records {
+			records[recordIndex] = *(*E)(recordPointer)
+		}
+		*refGroups = append(*refGroups, RecordGroup[E]{
+			IndexID:          erasedGroup.IndexID,
+			GroupHash:        erasedGroup.GroupHash,
+			IndexGroupValues: erasedGroup.IndexGroupValues,
+			Records:          records,
+			UpdateCounter:    erasedGroup.UpdateCounter,
+		})
+	}
+	return err
+}
+
+// queryIndexGroups returns the groups of a grouped read in hash order. sink only allocates the
+// records: they come back grouped, not appended.
+func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink recordSink) ([]RecordGroup[unsafe.Pointer], error) {
+	if len(tableInfo.ColumnsInclude) > 0 || len(tableInfo.ColumnsExclude) > 0 {
+		return nil, fmt.Errorf("QueryIndexGroup does not support Select() or Exclude() yet")
+	}
+	if len(tableInfo.GroupByColumns) > 0 {
+		return nil, fmt.Errorf("QueryIndexGroup does not support GroupBy()")
+	}
+	if tableInfo.OrderBy != "" {
+		return nil, fmt.Errorf("QueryIndexGroup does not support OrderDesc() yet")
+	}
+	if tableInfo.Limit > 0 {
+		return nil, fmt.Errorf("QueryIndexGroup does not support Limit() yet")
+	}
+	if tableInfo.AllowFilter {
+		return nil, fmt.Errorf("QueryIndexGroup does not support AllowFilter()")
+	}
+
 	if len(scyllaTable.Namespace) == 0 {
 		scyllaTable.Namespace = connParams.Keyspace
 	}
 	if len(scyllaTable.Namespace) == 0 {
-		return fmt.Errorf("no se ha especificado un keyspace")
+		return nil, fmt.Errorf("no se ha especificado un keyspace")
 	}
 
 	queryPlan, err := buildIndexGroupSelectPlan(tableInfo, scyllaTable)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	hashValues := extractQueryIndexGroupHashes(queryPlan.hashGroups)
 	serverFreshnessByHash, err := loadIndexGroupFreshnessRows(scyllaTable, queryPlan.indexGroup, queryPlan.partitionValue, hashValues)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	fetchStates, cachedStates := splitIndexGroupFetches(queryPlan.hashGroups, serverFreshnessByHash, tableInfo.CachedIndexGroups)
 	if len(fetchStates) == 0 && len(cachedStates) == 0 {
 		fmt.Printf("QueryIndexGroup skipped all groups: table=%s partition=%d hashes=%d\n",
 			scyllaTable.Name, queryPlan.partitionValue, len(hashValues))
-		return nil
+		return nil, nil
 	}
 
-	fetchedGroups, err := fetchIndexGroupRecordGroups[E](scyllaTable, queryPlan, fetchStates, collectSelectStatements(tableInfo), time.Now())
+	fetchedGroups, err := fetchIndexGroupRecordGroups(sink, scyllaTable, queryPlan, fetchStates, collectSelectStatements(tableInfo), time.Now())
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	groupsByHash := map[int32]RecordGroup[E]{}
+	groupsByHash := map[int32]RecordGroup[unsafe.Pointer]{}
 	for _, cachedState := range cachedStates {
 		// Metadata-only groups let the frontend read unchanged records from IndexedDB by igVal key.
-		groupsByHash[cachedState.hashValue] = RecordGroup[E]{
+		groupsByHash[cachedState.hashValue] = RecordGroup[unsafe.Pointer]{
 			IndexID:          queryPlan.indexGroup.indexID,
 			GroupHash:        cachedState.hashValue,
 			IndexGroupValues: append([]int64(nil), cachedState.indexGroupValues...),
-			Records:          []E{},
 			UpdateCounter:    cachedState.updateCounter,
 		}
 	}
 	for _, fetchedGroup := range fetchedGroups {
 		groupsByHash[fetchedGroup.GroupHash] = fetchedGroup
 	}
+	groups := []RecordGroup[unsafe.Pointer]{}
 	for _, hashGroup := range queryPlan.hashGroups {
 		groupRecord, exists := groupsByHash[hashGroup.hashValue]
 		if exists {
-			*refGroups = append(*refGroups, groupRecord)
+			groups = append(groups, groupRecord)
 		}
 	}
-	return nil
+	return groups, nil
 }
 
 func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*indexGroupSelectPlan, error) {
@@ -405,15 +427,18 @@ func splitIndexGroupFetches(
 	return fetchStates, cachedStates
 }
 
-func fetchIndexGroupRecordGroups[E any](
+// fetchIndexGroupRecordGroups reads the groups concurrently. Each goroutine collects into its own
+// pointer list, so the shared sink is only asked to allocate.
+func fetchIndexGroupRecordGroups(
+	sink recordSink,
 	scyllaTable ScyllaTable,
 	queryPlan *indexGroupSelectPlan,
 	fetchStates []indexGroupFetchState,
 	postFilterStatements []ColumnStatement,
 	queryNoticeTime time.Time,
-) ([]RecordGroup[E], error) {
+) ([]RecordGroup[unsafe.Pointer], error) {
 	_, scanColumns, selectExpressions := buildSelectProjection(&TableInfo{}, scyllaTable)
-	groupsByIndex := make([]RecordGroup[E], len(fetchStates))
+	groupsByIndex := make([]RecordGroup[unsafe.Pointer], len(fetchStates))
 
 	eg := errgroup.Group{}
 	for fetchIndex, fetchState := range fetchStates {
@@ -422,13 +447,13 @@ func fetchIndexGroupRecordGroups[E any](
 
 		eg.Go(func() error {
 			queryStr, queryValues := buildIndexGroupFetchQuery(scyllaTable, queryPlan, fetchState, selectExpressions)
-			records := []E{}
+			var records []unsafe.Pointer
 			if err := scanSelectQueryRows(
 				queryStr,
 				queryValues,
 				scanColumns,
 				scyllaTable,
-				makeRecordSink(&records),
+				sink.collectInto(&records),
 				postFilterStatements,
 				nil,
 				queryNoticeTime,
@@ -436,7 +461,7 @@ func fetchIndexGroupRecordGroups[E any](
 				return err
 			}
 
-			groupsByIndex[fetchIndex] = RecordGroup[E]{
+			groupsByIndex[fetchIndex] = RecordGroup[unsafe.Pointer]{
 				IndexID:          queryPlan.indexGroup.indexID,
 				GroupHash:        fetchState.hashValue,
 				IndexGroupValues: append([]int64(nil), fetchState.indexGroupValues...),

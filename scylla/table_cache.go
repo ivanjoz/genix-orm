@@ -15,8 +15,12 @@ type scyllaTableCacheEntry struct {
 
 var scyllaTableCache sync.Map
 
-func getOrCompileScyllaTable[T TableInterface[T]](schemaStruct *T) ScyllaTable {
-	cacheKey := reflect.TypeOf(schemaStruct).Elem().PkgPath() + "." + reflect.TypeOf(schemaStruct).Elem().Name()
+// getOrCompileScyllaTable takes the *T table struct as an interface rather than a type parameter:
+// the body only reflects on it and calls GetSchema, so one compiled copy serves every table. It is
+// `any` because Go gives a *T of a type parameter no methods, so callers could not pass a TableHandle.
+func getOrCompileScyllaTable(schemaStruct any) ScyllaTable {
+	schemaType := reflect.TypeOf(schemaStruct).Elem()
+	cacheKey := schemaType.PkgPath() + "." + schemaType.Name()
 
 	cacheEntryAny, _ := scyllaTableCache.LoadOrStore(cacheKey, &scyllaTableCacheEntry{})
 	cacheEntry := cacheEntryAny.(*scyllaTableCacheEntry)
@@ -24,7 +28,7 @@ func getOrCompileScyllaTable[T TableInterface[T]](schemaStruct *T) ScyllaTable {
 		if ShouldLogFull() {
 			fmt.Printf("Compiling ScyllaTable metadata once for %s\n", cacheKey)
 		}
-		cacheEntry.table = makeTable((*schemaStruct).GetSchema(), reflect.ValueOf(schemaStruct).Elem())
+		cacheEntry.table = makeTable(schemaStruct.(TableHandle).GetSchema(), reflect.ValueOf(schemaStruct).Elem())
 	})
 	return cacheEntry.table
 }

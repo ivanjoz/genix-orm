@@ -6,10 +6,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/db"
-
-	"github.com/viant/xunsafe"
 )
 
 // resolveTextSearchTable compiles table E and asserts it declares TextSearch, so a misconfigured
@@ -49,14 +48,18 @@ func SearchText[T TableBaseInterface[E, T], E TableSchemaInterface[E]](refSlice 
 	if err != nil {
 		return hits, err
 	}
+	return hits, appendTextSearchRecords(makeRecordSink(refSlice), scyllaTable, partition, hits)
+}
 
+// appendTextSearchRecords reads the records of the hits and appends them in the order of the hits.
+func appendTextSearchRecords(sink recordSink, scyllaTable ScyllaTable, partition int32, hits []TextHit) error {
 	ids := make([]int64, len(hits))
 	for i, hit := range hits {
 		ids[i] = int64(hit.ID)
 	}
-	fetched := []T{}
-	if err := selectRecordsByPartitionIDs(scyllaTable, partition, ids, &fetched); err != nil {
-		return hits, err
+	var fetched []unsafe.Pointer
+	if err := selectRecordsByPartitionIDs(sink.collectInto(&fetched), scyllaTable, partition, ids); err != nil {
+		return err
 	}
 
 	// The IN-clause select returns rows in clustering-key order, not relevance order.
@@ -65,23 +68,25 @@ func SearchText[T TableBaseInterface[E, T], E TableSchemaInterface[E]](refSlice 
 		rankByID[hit.ID] = i
 	}
 	sort.SliceStable(fetched, func(a, b int) bool {
-		return rankByID[recordKeyID(scyllaTable, &fetched[a])] < rankByID[recordKeyID(scyllaTable, &fetched[b])]
+		return rankByID[recordKeyID(scyllaTable, fetched[a])] < rankByID[recordKeyID(scyllaTable, fetched[b])]
 	})
-	*refSlice = append(*refSlice, fetched...)
-	return hits, nil
+	for _, record := range fetched {
+		sink.appendRecord(record)
+	}
+	return nil
 }
 
 // recordKeyID reads a record's single primary-key value as int32, the same way the text-search
 // write path reads it.
-func recordKeyID[T any](scyllaTable ScyllaTable, record *T) int32 {
-	return convertToInt32(scyllaTable.Keys[0].GetRawValue(xunsafe.AsPointer(record)))
+func recordKeyID(scyllaTable ScyllaTable, record unsafe.Pointer) int32 {
+	return convertToInt32(scyllaTable.Keys[0].GetRawValue(record))
 }
 
 // selectRecordsByPartitionIDs loads records by primary key within one
-// partition into refSlice, reusing the batched IN-clause select that
+// partition into sink, reusing the batched IN-clause select that
 // QueryCachedIDs uses. No cache-version filtering — every requested ID is
 // fetched.
-func selectRecordsByPartitionIDs[T any](scyllaTable ScyllaTable, partition int32, ids []int64, refSlice *[]T) error {
+func selectRecordsByPartitionIDs(sink recordSink, scyllaTable ScyllaTable, partition int32, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -116,7 +121,7 @@ func selectRecordsByPartitionIDs[T any](scyllaTable ScyllaTable, partition int32
 		)
 		if err := scanSelectQueryRows(
 			queryString, queryValues, buildDefaultScanColumns(columnNames),
-			scyllaTable, makeRecordSink(refSlice), nil, nil, time.Now(),
+			scyllaTable, sink, nil, nil, time.Now(),
 		); err != nil {
 			return err
 		}

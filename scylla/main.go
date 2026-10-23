@@ -155,7 +155,7 @@ func execQuery[T TableSchemaInterface[T], E any](
 	selectStartTime := time.Now()
 	records := (tableInfo.RefSlice).(*[]E)
 	scyllaTable := getOrCompileScyllaTable(schemaStruct)
-	return selectExec(records, tableInfo, scyllaTable, scanHandler, selectStartTime)
+	return selectExec(makeRecordSink(records), tableInfo, scyllaTable, erasedScanHandler(scanHandler), selectStartTime)
 }
 
 /* Increment Table */

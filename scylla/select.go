@@ -9,7 +9,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/viant/xunsafe"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -72,23 +71,23 @@ func canUseProjectedView(selectedColumnNames []string, view *viewInfo) bool {
 	return true
 }
 
-func deduplicateRecordsByPrimaryKey[E any](records *[]E, scyllaTable ScyllaTable) {
-	if records == nil || len(*records) <= 1 {
+func deduplicateRecordsByPrimaryKey(sink recordSink, scyllaTable ScyllaTable) {
+	records := sink.heldRecords()
+	if len(records) <= 1 {
 		return
 	}
 
-	recordsUniqueMap := map[string]E{}
-	for _, record := range *records {
-		recordPointer := xunsafe.AsPointer(&record)
+	recordsUniqueMap := map[string]unsafe.Pointer{}
+	for _, recordPointer := range records {
 		recordKey := makePrimaryKeyRecordKey(recordPointer, scyllaTable)
-		recordsUniqueMap[recordKey] = record
+		recordsUniqueMap[recordKey] = recordPointer
 	}
 
-	recordsDeduplicated := make([]E, 0, len(recordsUniqueMap))
-	for _, record := range recordsUniqueMap {
-		recordsDeduplicated = append(recordsDeduplicated, record)
+	recordsDeduplicated := make([]unsafe.Pointer, 0, len(recordsUniqueMap))
+	for _, recordPointer := range recordsUniqueMap {
+		recordsDeduplicated = append(recordsDeduplicated, recordPointer)
 	}
-	*records = recordsDeduplicated
+	sink.replaceRecords(recordsDeduplicated)
 }
 
 func buildRemainingWhereClauses(statements []ColumnStatement) []boundWhereClause {
@@ -655,12 +654,12 @@ func scanSelectQueryRows(
 	return err
 }
 
-func executeBoundSelectQueries[E any](
-	recordsGetted *[]E,
+func executeBoundSelectQueries(
+	sink recordSink,
 	boundStatements []BoundSelectStatement,
 	scanColumns []selectScanColumn,
 	requiresDeduplication bool,
-	scanHandler func(record *E) bool,
+	scanHandler func(unsafe.Pointer) bool,
 	scyllaTable ScyllaTable,
 	queryNoticeTime time.Time,
 ) error {
@@ -669,19 +668,19 @@ func executeBoundSelectQueries[E any](
 		return nil
 	}
 
-	recordsMap := map[int]*[]E{}
+	// Each statement of a fan-out scans into its own list, so the goroutines never share one.
+	recordsMap := map[int]*[]unsafe.Pointer{}
 	for statementIndex := range boundStatements {
-		recordsMap[statementIndex] = &[]E{}
+		recordsMap[statementIndex] = &[]unsafe.Pointer{}
 	}
 
 	eg := errgroup.Group{}
 	// Cap fanout so a chunked IN query (often 100+ statements) can't flood a single coordinator and trigger read timeouts.
 	eg.SetLimit(8)
 	for statementIndex, boundStatement := range boundStatements {
-		records := recordsMap[statementIndex]
-		recordsTarget := records
+		recordsTarget := sink.collectInto(recordsMap[statementIndex])
 		if len(boundStatements) == 1 {
-			recordsTarget = recordsGetted
+			recordsTarget = sink
 		}
 
 		// fmt.Println("Query::", boundStatement.QueryStr)
@@ -698,9 +697,9 @@ func executeBoundSelectQueries[E any](
 				boundStatement.QueryValues,
 				scanColumns,
 				scyllaTable,
-				makeRecordSink(recordsTarget),
+				recordsTarget,
 				boundStatement.PostFilterStatements,
-				erasedScanHandler(scanHandler),
+				scanHandler,
 				queryNoticeTime,
 			)
 		})
@@ -711,20 +710,14 @@ func executeBoundSelectQueries[E any](
 	}
 
 	if len(boundStatements) > 1 {
-		if requiresDeduplication {
-			recordsMerged := []E{}
-			for _, records := range recordsMap {
-				recordsMerged = append(recordsMerged, (*records)...)
-			}
-			*recordsGetted = append(*recordsGetted, recordsMerged...)
-			deduplicateRecordsByPrimaryKey(recordsGetted, scyllaTable)
-		} else {
-			for _, records := range recordsMap {
-				*recordsGetted = append(*recordsGetted, *records...)
+		for _, records := range recordsMap {
+			for _, record := range *records {
+				sink.appendRecord(record)
 			}
 		}
-	} else if requiresDeduplication {
-		deduplicateRecordsByPrimaryKey(recordsGetted, scyllaTable)
+	}
+	if requiresDeduplication {
+		deduplicateRecordsByPrimaryKey(sink, scyllaTable)
 	}
 
 	return nil
@@ -867,11 +860,11 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 }
 
 // selectExec executes a query using TableSchema and TableInfo
-func selectExec[E any](
-	recordsGetted *[]E,
+func selectExec(
+	sink recordSink,
 	tableInfo *TableInfo,
 	scyllaTable ScyllaTable,
-	scanHandler func(record *E) bool,
+	scanHandler func(unsafe.Pointer) bool,
 	selectStartTime time.Time,
 ) error {
 	if len(scyllaTable.Namespace) == 0 {
@@ -881,7 +874,7 @@ func selectExec[E any](
 		return errors.New("no se ha especificado un keyspace")
 	}
 	if tableInfo.Delta != nil {
-		return execDelta(recordsGetted, tableInfo, scyllaTable, selectStartTime)
+		return execDelta(sink, tableInfo, scyllaTable, selectStartTime)
 	}
 
 	compiledSelect, err := tryGetOrCompileSelectStatement(tableInfo, scyllaTable)
@@ -895,7 +888,7 @@ func selectExec[E any](
 	}
 
 	if err := executeBoundSelectQueries(
-		recordsGetted,
+		sink,
 		boundPlan.Statements,
 		boundPlan.ScanColumns,
 		boundPlan.RequiresDeduplication,

@@ -132,12 +132,15 @@ func TestDeltaMetadataRecord(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
-	record, err := deltaMetadataRecord[deltaViewRecord](scyllaTable, cache.DeltaMetadataFile{Bucket: 5000, Text: "abc"})
-	if err != nil || record.ID != -5000 || record.Metadata == nil || *record.Metadata != "abc" {
-		t.Fatalf("metadata record = %+v, err %v", record, err)
+	recordPointer, err := deltaMetadataRecord(makeRecordSink(&[]deltaViewRecord{}), scyllaTable, cache.DeltaMetadataFile{Bucket: 5000, Text: "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record := (*deltaViewRecord)(recordPointer); record.ID != -5000 || record.Metadata == nil || *record.Metadata != "abc" {
+		t.Fatalf("metadata record = %+v", record)
 	}
 	// A record without the Metadata field cannot carry the cursor.
-	if _, err := deltaMetadataRecord[deltaMultiShapeRecord](scyllaTable, cache.DeltaMetadataFile{Bucket: 1}); err == nil {
+	if _, err := deltaMetadataRecord(makeRecordSink(&[]deltaMultiShapeRecord{}), scyllaTable, cache.DeltaMetadataFile{Bucket: 1}); err == nil {
 		t.Fatal("expected an error for a record without Metadata")
 	}
 }
