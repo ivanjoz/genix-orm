@@ -46,8 +46,12 @@ func (row FrameRow[E]) Count() int64 {
 	return row.sums[row.frame.SumsCount-1]
 }
 
-// FrameQuery reads the files of one DataFrame.
-type FrameQuery[E any] struct {
+// FrameQuery reads the files of one DataFrame. It is a thin typed shell over frameQueryState, as
+// QueryBuilder is over queryState.
+type FrameQuery[E any] struct{ frameQueryState }
+
+// frameQueryState is a frame query's selection, and everything that reads it.
+type frameQueryState struct {
 	meta    *tableMeta
 	frame   *dataframe.Frame
 	preds   []predicate
@@ -60,7 +64,11 @@ type FrameQuery[E any] struct {
 // Keys[0] value. The rows are as of the frame's last run, 2 to 12 minutes behind the records, unless
 // the query is Fresh.
 func (r *Repo[T, E]) QueryFrame(frameName string) *FrameQuery[E] {
-	query := &FrameQuery[E]{meta: r.meta}
+	return &FrameQuery[E]{r.frameQuery(frameName)}
+}
+
+func (r *repoCore) frameQuery(frameName string) frameQueryState {
+	query := frameQueryState{meta: r.meta}
 	if r.meta.frames != nil {
 		query.frame = r.meta.frames.FrameNamed(frameName)
 	}
@@ -89,6 +97,20 @@ func (q *FrameQuery[E]) Fresh() *FrameQuery[E] {
 
 // Exec returns the rows sorted by the frame Keys, then by Rows. A missing file has no rows.
 func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
+	rows, err := q.readRows()
+	if err != nil {
+		return nil, err
+	}
+	frameRows := make([]FrameRow[E], len(rows))
+	for i, row := range rows {
+		frameRows[i] = FrameRow[E]{frame: q.frame, sums: row.Sums}
+		q.setRowKey(unsafe.Pointer(&frameRows[i].Key), row)
+	}
+	return frameRows, nil
+}
+
+// readRows reads the selected rows from the frame's files.
+func (q *frameQueryState) readRows() ([]dataframe.Row, error) {
 	if q.planErr != nil {
 		return nil, q.planErr
 	}
@@ -96,32 +118,27 @@ func (q *FrameQuery[E]) Exec() ([]FrameRow[E], error) {
 	if err != nil {
 		return nil, err
 	}
-	backend, err := frameBackendOf[E](q.meta)
+	backend, err := frameBackendOf(q.meta)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), selection, q.isFresh)
-	if err != nil {
-		return nil, err
+	return dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), selection, q.isFresh)
+}
+
+// setRowKey sets the frame's Keys and Rows columns of the key record at keyPtr from a row.
+func (q *frameQueryState) setRowKey(keyPtr unsafe.Pointer, row dataframe.Row) {
+	for k, key := range q.frame.Keys {
+		q.meta.trackedAccessors[key.TrackedIndex].setI64(keyPtr, row.Keys[k])
 	}
-	frameRows := make([]FrameRow[E], len(rows))
-	for i, row := range rows {
-		frameRows[i] = FrameRow[E]{frame: q.frame, sums: row.Sums}
-		keyPtr := unsafe.Pointer(&frameRows[i].Key)
-		for k, key := range q.frame.Keys {
-			q.meta.trackedAccessors[key.TrackedIndex].setI64(keyPtr, row.Keys[k])
-		}
-		for c, rowColumn := range q.frame.Rows {
-			q.meta.trackedAccessors[rowColumn.TrackedIndex].setI64(keyPtr, row.RowValues[c])
-		}
+	for c, rowColumn := range q.frame.Rows {
+		q.meta.trackedAccessors[rowColumn.TrackedIndex].setI64(keyPtr, row.RowValues[c])
 	}
-	return frameRows, nil
 }
 
 // ExecChanged answers a client that keeps the raw files of the selection: heldGeneration and
 // heldFiles ("<keys>.<snapshot>.<slot>,…") describe its copies, and the answer is the wire body of
 // the files it must replace, as current as the records (dataframe/changed.go). Fresh is implied.
-func (q *FrameQuery[E]) ExecChanged(heldGeneration string, heldFiles string) ([]byte, error) {
+func (q *frameQueryState) ExecChanged(heldGeneration string, heldFiles string) ([]byte, error) {
 	if q.planErr != nil {
 		return nil, q.planErr
 	}
@@ -133,7 +150,7 @@ func (q *FrameQuery[E]) ExecChanged(heldGeneration string, heldFiles string) ([]
 	if err != nil {
 		return nil, err
 	}
-	backend, err := frameBackendOf[E](q.meta)
+	backend, err := frameBackendOf(q.meta)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +162,7 @@ func (q *FrameQuery[E]) ExecChanged(heldGeneration string, heldFiles string) ([]
 }
 
 // selection reads the predicates: an Eq or Between on Keys[0], then Eqs on a leading run of the rest.
-func (q *FrameQuery[E]) selection() (dataframe.Selection, error) {
+func (q *frameQueryState) selection() (dataframe.Selection, error) {
 	queryName := fmt.Sprintf("db: %s QueryFrame(%q)", q.meta.recordType.Name(), q.frame.Name)
 	byField := map[string]predicate{}
 	for _, p := range q.preds {

@@ -1,7 +1,6 @@
 package dynamo
 
 import (
-	"fmt"
 	"reflect"
 	"slices"
 )
@@ -86,20 +85,14 @@ type TableSchema struct {
 // struct (the one that embeds db.Model and defines GetSchema), e.g.
 //
 //	db.GetSchema[models.ProductTable]()
-func GetSchema[T any]() TableSchema {
-	tablePtr := new(T)
-	populateColumnNames(tablePtr)
+func GetSchema[T any]() TableSchema { return schemaOfTable(new(T)) }
 
-	sp, ok := any(*tablePtr).(schemaProvider)
-	if !ok {
-		var t T
-		panic(fmt.Sprintf("db: %T does not implement GetSchema()", t))
-	}
-	schema := sp.GetSchema()
-
+// schemaOfTable is GetSchema for tablePtr, a *T.
+func schemaOfTable(tablePtr any) TableSchema {
+	schema := declaredSchema(tablePtr)
 	out := TableSchema{
 		Name:      schema.Name,
-		Struct:    reflect.TypeOf((*T)(nil)).Elem().Name(),
+		Struct:    reflect.TypeOf(tablePtr).Elem().Name(),
 		Entity:    schema.Entity,
 		TableID:   resolveTableID(schema),
 		TableName: tableName(),

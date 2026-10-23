@@ -72,7 +72,7 @@ func (m *tableMeta) appendDeltaLogs(writes []deltaLogWrite) error {
 }
 
 // execDelta is Exec for a Delta() read (db/cache's delta_log.go describes the protocol).
-func (q *QueryBuilder[E]) execDelta(client *dynamodb.Client, dst *[]E) error {
+func (q *queryState) execDelta(client *dynamodb.Client, appendRecord recordSink) error {
 	if q.planErr != nil {
 		return q.planErr
 	}
@@ -102,30 +102,29 @@ func (q *QueryBuilder[E]) execDelta(client *dynamodb.Client, dst *[]E) error {
 		return fmt.Errorf("db: %s %w", q.meta.recordType.Name(), err)
 	}
 	if logRead.IsReplace {
-		err = q.execPlans(client, dst)
+		err = q.execPlans(client, appendRecord)
 	} else {
-		err = q.appendLoggedRecords(client, partitionValues, byField, logRead, dst)
+		err = q.appendLoggedRecords(client, partitionValues, byField, logRead, appendRecord)
 	}
 	if err != nil {
 		return err
 	}
 	for _, metadataFile := range logRead.MetadataFiles(q.deltaIndex.is64BitScale, q.deltaIndex.logIDColumnBits) {
-		*dst = append(*dst, q.deltaMetadataRecord(metadataFile))
+		appendRecord(q.deltaMetadataRecord(metadataFile))
 	}
 	return nil
 }
 
 // appendLoggedRecords reads the records the log entries past the cursor name, the last entry per log
-// ID winning, and appends those not deleted to dst.
-func (q *QueryBuilder[E]) appendLoggedRecords(client *dynamodb.Client, partitionValues []uint64, byField map[string]predicate, logRead *cache.DeltaLogRead, dst *[]E) error {
+// ID winning, and appends those not deleted through appendRecord.
+func (q *queryState) appendLoggedRecords(client *dynamodb.Client, partitionValues []uint64, byField map[string]predicate, logRead *cache.DeltaLogRead, appendRecord recordSink) error {
 	entries, err := logRead.LoggedEntries(q.deltaIndex.is64BitScale)
 	if err != nil {
 		return fmt.Errorf("db: %s %w", q.meta.recordType.Name(), err)
 	}
 
 	// Every key shares the partition and the pinned Keys columns; the log ID fills in the rest.
-	var keyTemplate E
-	keyTemplateValue := reflect.ValueOf(&keyTemplate).Elem()
+	keyTemplateValue := reflect.New(q.meta.recordType).Elem()
 	for i, column := range q.meta.partition {
 		setKeyField(keyTemplateValue, column.fieldName, partitionValues[i])
 	}
@@ -139,8 +138,9 @@ func (q *QueryBuilder[E]) appendLoggedRecords(client *dynamodb.Client, partition
 		if entry.IsDeleted {
 			continue
 		}
-		recordKey := keyTemplate
-		recordKeyValue := reflect.ValueOf(&recordKey).Elem()
+		recordKey := reflect.New(q.meta.recordType)
+		recordKeyValue := recordKey.Elem()
+		recordKeyValue.Set(keyTemplateValue)
 		logIDValues := []uint64{entry.LogID}
 		if len(q.deltaIndex.logIDColumns) > 1 {
 			logIDValues = cache.UnpackDeltaLogID(entry.LogID, q.deltaIndex.logIDColumnBits)
@@ -148,30 +148,30 @@ func (q *QueryBuilder[E]) appendLoggedRecords(client *dynamodb.Client, partition
 		for j, column := range q.deltaIndex.logIDColumns {
 			setKeyField(recordKeyValue, column.fieldName, logIDValues[j])
 		}
-		itemKeys = append(itemKeys, q.meta.keyOnly(unsafe.Pointer(&recordKey)))
+		itemKeys = append(itemKeys, q.meta.keyOnly(recordKey.UnsafePointer()))
 	}
 	items, _, err := batchGet(client, itemKeys, true)
 	if err != nil {
 		return err
 	}
 	for _, item := range items {
-		var record E
-		if err := q.meta.unmarshalItem(item, &record); err != nil {
+		recordPtr, err := q.meta.decodeRecord(item)
+		if err != nil {
 			return err
 		}
-		*dst = append(*dst, record)
+		appendRecord(recordPtr)
 	}
 	return nil
 }
 
 // deltaMetadataRecord is the Metadata record of one log file: −bucket in its log ID's last column.
-func (q *QueryBuilder[E]) deltaMetadataRecord(metadataFile cache.DeltaMetadataFile) E {
-	var record E
-	recordValue := reflect.ValueOf(&record).Elem()
+func (q *queryState) deltaMetadataRecord(metadataFile cache.DeltaMetadataFile) unsafe.Pointer {
+	record := reflect.New(q.meta.recordType)
+	recordValue := record.Elem()
 	setKeyField(recordValue, q.deltaIndex.logIDColumns[len(q.deltaIndex.logIDColumns)-1].fieldName, -metadataFile.Bucket)
 	metadataText := metadataFile.Text
 	recordValue.FieldByName(metadataFieldName).Set(reflect.ValueOf(&metadataText))
-	return record
+	return record.UnsafePointer()
 }
 
 // setKeyField sets a key field of a record from any integer or string value.

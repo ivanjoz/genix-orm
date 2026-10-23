@@ -96,17 +96,17 @@ type QueryPredicate struct {
 // order when desc is set (newest first on an autoincrement ID). See the package
 // comment above for the strict key rules it enforces.
 func (r *Repo[T, E]) QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
-	return r.queryRecords(r.Query(), preds, limit, desc)
+	return r.Query().queryRecords(preds, limit, desc)
 }
 
 // QueryScanRecords is QueryRecords over QueryScan: a partition or full GSI key
 // must still serve the read, and the predicates no key serves are filtered in
 // memory after it, within QueryScan's 5 MB read budget.
 func (r *Repo[T, E]) QueryScanRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
-	return r.queryRecords(r.QueryScan(), preds, limit, desc)
+	return r.QueryScan().queryRecords(preds, limit, desc)
 }
 
-func (r *Repo[T, E]) queryRecords(q *QueryBuilder[E], preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
+func (q *queryState) queryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
 	if limit <= 0 || limit > queryRecordsMaxLimit {
 		limit = queryRecordsMaxLimit
 	}
@@ -116,9 +116,9 @@ func (r *Repo[T, E]) queryRecords(q *QueryBuilder[E], preds []QueryPredicate, li
 		if err != nil {
 			return nil, err
 		}
-		acc, ok := r.meta.accessors[p.Field]
+		acc, ok := q.meta.accessors[p.Field]
 		if !ok {
-			return nil, fmt.Errorf("db: %s has no field %q", r.meta.recordType.Name(), p.Field)
+			return nil, fmt.Errorf("db: %s has no field %q", q.meta.recordType.Name(), p.Field)
 		}
 		v1, err := coerceValue(acc.kind, p.Value, p.Field)
 		if err != nil {
@@ -135,19 +135,17 @@ func (r *Repo[T, E]) queryRecords(q *QueryBuilder[E], preds []QueryPredicate, li
 
 	// Exec plans before any DynamoDB call and rejects a missing partition/index; a
 	// strict Query also rejects a predicate no index serves.
-	q.Limit(limit)
-	if desc {
-		q.Desc()
-	}
-	var out []E
-	if err := q.Exec(&out); err != nil {
+	q.limit, q.desc = limit, desc
+	// Each record goes out as an E value, as a typed Exec would return it.
+	records := []any{}
+	err := q.exec(func(recordPtr unsafe.Pointer) int {
+		records = append(records, reflect.NewAt(q.meta.recordType, recordPtr).Elem().Interface())
+		return len(records)
+	})
+	if err != nil {
 		return nil, err
 	}
-	res := make([]any, len(out))
-	for i := range out {
-		res[i] = out[i]
-	}
-	return res, nil
+	return records, nil
 }
 
 // parseOp maps a wire operator token to an internal op. Both symbol ("=", ">=")
@@ -233,8 +231,14 @@ func coerceValue(kind valueKind, v any, field string) (any, error) {
 	}
 }
 
-// QueryBuilder accumulates predicates for one entity. E is the record type.
-type QueryBuilder[E any] struct {
+// QueryBuilder accumulates predicates for one entity. E is the record type. It is a
+// thin typed shell over queryState: Go compiles a generic method once per record
+// type, so the planning and reading live on the non-generic queryState and compile
+// once for every table.
+type QueryBuilder[E any] struct{ queryState }
+
+// queryState is a query's predicates and options, and everything that plans and runs it.
+type queryState struct {
 	meta    *tableMeta
 	preds   []predicate
 	limit   int32
@@ -253,27 +257,32 @@ type QueryBuilder[E any] struct {
 	consistentRead bool
 }
 
-func (q *QueryBuilder[E]) add(c Coln, o op, v1, v2 any) *QueryBuilder[E] {
+func (q *queryState) add(c Coln, o op, v1, v2 any) {
 	q.preds = append(q.preds, predicate{field: c.col().fieldName, op: o, v1: v1, v2: v2})
-	return q
+}
+
+// addEq adds an Eq; on a ColSlice it is Contains with that one value.
+func (q *queryState) addEq(c Coln, v any) {
+	if _, isSlice := c.(SliceColn); isSlice {
+		q.add(c, opContains, []any{v}, nil)
+		return
+	}
+	q.add(c, opEq, v, nil)
 }
 
 // Eq on a ColSlice is Contains with that one value: records whose slice holds v.
-func (q *QueryBuilder[E]) Eq(c Coln, v any) *QueryBuilder[E] {
-	if _, isSlice := c.(SliceColn); isSlice {
-		return q.add(c, opContains, []any{v}, nil)
-	}
-	return q.add(c, opEq, v, nil)
-}
-func (q *QueryBuilder[E]) Gt(c Coln, v any) *QueryBuilder[E]  { return q.add(c, opGt, v, nil) }
-func (q *QueryBuilder[E]) Gte(c Coln, v any) *QueryBuilder[E] { return q.add(c, opGte, v, nil) }
-func (q *QueryBuilder[E]) Lt(c Coln, v any) *QueryBuilder[E]  { return q.add(c, opLt, v, nil) }
-func (q *QueryBuilder[E]) Lte(c Coln, v any) *QueryBuilder[E] { return q.add(c, opLte, v, nil) }
+func (q *QueryBuilder[E]) Eq(c Coln, v any) *QueryBuilder[E]  { q.addEq(c, v); return q }
+func (q *QueryBuilder[E]) Gt(c Coln, v any) *QueryBuilder[E]  { q.add(c, opGt, v, nil); return q }
+func (q *QueryBuilder[E]) Gte(c Coln, v any) *QueryBuilder[E] { q.add(c, opGte, v, nil); return q }
+func (q *QueryBuilder[E]) Lt(c Coln, v any) *QueryBuilder[E]  { q.add(c, opLt, v, nil); return q }
+func (q *QueryBuilder[E]) Lte(c Coln, v any) *QueryBuilder[E] { q.add(c, opLte, v, nil); return q }
 func (q *QueryBuilder[E]) Between(c Coln, a, b any) *QueryBuilder[E] {
-	return q.add(c, opBetween, a, b)
+	q.add(c, opBetween, a, b)
+	return q
 }
 func (q *QueryBuilder[E]) BeginsWith(c Coln, prefix string) *QueryBuilder[E] {
-	return q.add(c, opBeginsWith, prefix, nil)
+	q.add(c, opBeginsWith, prefix, nil)
+	return q
 }
 
 // Contains matches records whose slice field holds ANY of the values. The field
@@ -282,7 +291,8 @@ func (q *QueryBuilder[E]) BeginsWith(c Coln, prefix string) *QueryBuilder[E] {
 // value; a record matching several is returned once, and results come value by
 // value (each in row sk order).
 func (q *QueryBuilder[E]) Contains(c SliceColn, values ...any) *QueryBuilder[E] {
-	return q.add(c, opContains, values, nil)
+	q.add(c, opContains, values, nil)
+	return q
 }
 
 // Limit caps the number of returned items.
@@ -316,19 +326,21 @@ type queryPlan struct {
 }
 
 // Exec runs the query and appends results into *dst.
-func (q *QueryBuilder[E]) Exec(dst *[]E) error {
+func (q *QueryBuilder[E]) Exec(dst *[]E) error { return q.exec(appendTo(dst)) }
+
+func (q *queryState) exec(appendRecord recordSink) error {
 	client, err := Client()
 	if err != nil {
 		return err
 	}
 	if q.readsDeltaLog {
-		return q.execDelta(client, dst)
+		return q.execDelta(client, appendRecord)
 	}
-	return q.execPlans(client, dst)
+	return q.execPlans(client, appendRecord)
 }
 
-// execPlans runs the query's plans, appending what they read to *dst.
-func (q *QueryBuilder[E]) execPlans(client *dynamodb.Client, dst *[]E) error {
+// execPlans runs the query's plans, appending what they read through appendRecord.
+func (q *queryState) execPlans(client *dynamodb.Client, appendRecord recordSink) error {
 	plans, err := q.plans()
 	if err != nil {
 		return err
@@ -366,7 +378,7 @@ func (q *QueryBuilder[E]) execPlans(client *dynamodb.Client, dst *[]E) error {
 				}
 				readUnits += baseReadUnits
 			}
-			isLimitReached, err := q.appendRecords(plan, items, rowSKs, returnedSKs, dst)
+			isLimitReached, err := q.appendRecords(plan, items, rowSKs, returnedSKs, appendRecord)
 			if err != nil || isLimitReached {
 				return err
 			}
@@ -380,7 +392,7 @@ func (q *QueryBuilder[E]) execPlans(client *dynamodb.Client, dst *[]E) error {
 }
 
 // queryInput is the DynamoDB Query of one plan, first page.
-func (q *QueryBuilder[E]) queryInput(plan *queryPlan) (*dynamodb.QueryInput, error) {
+func (q *queryState) queryInput(plan *queryPlan) (*dynamodb.QueryInput, error) {
 	input := &dynamodb.QueryInput{
 		TableName:                 aws.String(tableName()),
 		KeyConditionExpression:    aws.String(plan.keyCond),
@@ -406,15 +418,15 @@ func (q *QueryBuilder[E]) queryInput(plan *queryPlan) (*dynamodb.QueryInput, err
 	return input, nil
 }
 
-// appendRecords decodes the items one page of a plan led to into *dst, and reports whether the
-// query's limit was reached. rowSKs are the hidden rows the items came from (nil without them).
-func (q *QueryBuilder[E]) appendRecords(plan *queryPlan, items []map[string]types.AttributeValue, rowSKs []string, returnedSKs map[string]bool, dst *[]E) (bool, error) {
+// appendRecords decodes the items one page of a plan led to through appendRecord, and reports
+// whether the query's limit was reached. rowSKs are the hidden rows the items came from (nil
+// without them).
+func (q *queryState) appendRecords(plan *queryPlan, items []map[string]types.AttributeValue, rowSKs []string, returnedSKs map[string]bool, appendRecord recordSink) (bool, error) {
 	for i, item := range items {
-		var record E
-		if err := q.meta.unmarshalItem(item, &record); err != nil {
+		ptr, err := q.meta.decodeRecord(item)
+		if err != nil {
 			return false, err
 		}
-		ptr := unsafe.Pointer(&record)
 		if plan.arrayIndex != nil {
 			recordSK := q.meta.skValue(ptr)
 			// A row left behind by a crash or a concurrent writer points at a
@@ -427,8 +439,7 @@ func (q *QueryBuilder[E]) appendRecords(plan *queryPlan, items []map[string]type
 		if !q.meta.matchesFilter(ptr, plan.keyFilter) || !q.meta.matchesFilter(ptr, plan.postFilter) {
 			continue
 		}
-		*dst = append(*dst, record)
-		if q.limit > 0 && int32(len(*dst)) >= q.limit {
+		if recordCount := appendRecord(ptr); q.limit > 0 && int32(recordCount) >= q.limit {
 			return true, nil
 		}
 	}
@@ -450,7 +461,7 @@ func (q *QueryBuilder[E]) First(dst *E) (bool, error) {
 
 // plans resolves the predicates into one queryPlan, or into one per value when
 // the query has a Contains (each value is its own begins_with on the array rows).
-func (q *QueryBuilder[E]) plans() ([]*queryPlan, error) {
+func (q *queryState) plans() ([]*queryPlan, error) {
 	if q.planErr != nil {
 		return nil, q.planErr
 	}
@@ -501,7 +512,7 @@ func (q *QueryBuilder[E]) plans() ([]*queryPlan, error) {
 
 // plan resolves predicates into a queryPlan. With an arrayIndex it targets that
 // index's rows for one element instead of the base table or a GSI.
-func (q *QueryBuilder[E]) plan(arrayIndex *arrayIndexMeta, element any) (*queryPlan, error) {
+func (q *queryState) plan(arrayIndex *arrayIndexMeta, element any) (*queryPlan, error) {
 	byField := map[string]predicate{}
 	for _, p := range q.preds {
 		byField[p.field] = p
@@ -564,7 +575,7 @@ func pinPartition(byField map[string]predicate, partition []keyCol, used map[str
 // planArrayRows targets the fan-out (or delta) rows of arrayIndex: they live
 // under the base pk ‖ the index cb id, and their sk is the index Keys then the
 // base Keys. A Contains element pins the slice column like an Eq.
-func (q *QueryBuilder[E]) planArrayRows(byField map[string]predicate, arrayIndex *arrayIndexMeta, element any) (*queryPlan, map[string]bool, error) {
+func (q *queryState) planArrayRows(byField map[string]predicate, arrayIndex *arrayIndexMeta, element any) (*queryPlan, map[string]bool, error) {
 	m := q.meta
 	used := map[string]bool{}
 	partitionValues, pinned := pinPartition(byField, m.partition, used)
@@ -596,7 +607,7 @@ func (q *QueryBuilder[E]) planArrayRows(byField map[string]predicate, arrayIndex
 // path is usable when its partition columns all have an Eq, and the one whose
 // key condition serves the most predicates wins (the earlier on a tie, so the
 // base table before any GSI).
-func (q *QueryBuilder[E]) planBestAccessPath(byField map[string]predicate) (*queryPlan, map[string]bool, error) {
+func (q *queryState) planBestAccessPath(byField map[string]predicate) (*queryPlan, map[string]bool, error) {
 	m := q.meta
 	type accessPath struct {
 		gsi         *indexMeta      // nil: the base table, or a local index

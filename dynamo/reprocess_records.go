@@ -53,17 +53,24 @@ type RecordsReport struct {
 const reprocessSampleCount = 3
 
 // reprocessedRecord is a record the transform changed, with the item it was read from.
-type reprocessedRecord[E any] struct {
-	record     *E
+type reprocessedRecord struct {
+	recordPtr  unsafe.Pointer
 	storedItem map[string]types.AttributeValue
 	item       map[string]types.AttributeValue
 	isMove     bool
 }
 
+// recordTransform edits the record at recordPtr (a *E) in place and says whether it changed it.
+type recordTransform func(recordPtr unsafe.Pointer) (bool, error)
+
 // ReprocessRecords runs transform over every record of the entity and writes back the ones it
 // changed (see the top of this file). With write false it is a dry run: it counts and samples, and
 // reserves no autoincrement ID.
 func (r *Repo[T, E]) ReprocessRecords(transform func(record *E) (bool, error), write bool) (RecordsReport, error) {
+	return r.reprocessRecords(func(recordPtr unsafe.Pointer) (bool, error) { return transform((*E)(recordPtr)) }, write)
+}
+
+func (r *repoCore) reprocessRecords(transform recordTransform, write bool) (RecordsReport, error) {
 	report := RecordsReport{}
 	client, err := Client()
 	if err != nil {
@@ -100,25 +107,25 @@ func (r *Repo[T, E]) ReprocessRecords(transform func(record *E) (bool, error), w
 // reprocessPage decodes a page of stored items, runs the transform on each record and returns the
 // changed ones with the items to write, counting into report. assignsIDs reserves the autoincrement
 // IDs still 0 (a dry run reserves none, so its moved records keep ID 0).
-func (r *Repo[T, E]) reprocessPage(storedItems []map[string]types.AttributeValue, transform func(record *E) (bool, error), assignsIDs bool, report *RecordsReport) ([]reprocessedRecord[E], error) {
+func (r *repoCore) reprocessPage(storedItems []map[string]types.AttributeValue, transform recordTransform, assignsIDs bool, report *RecordsReport) ([]reprocessedRecord, error) {
 	m := r.meta
-	var changedRecords []reprocessedRecord[E]
+	var changedRecords []reprocessedRecord
 	for _, storedItem := range storedItems {
-		record := new(E)
-		if err := m.unmarshalItem(storedItem, record); err != nil {
+		recordPtr, err := m.decodeRecord(storedItem)
+		if err != nil {
 			report.Failures = append(report.Failures, itemName(storedItem)+": "+err.Error())
 			continue
 		}
 		report.Scanned++
 		isChanged := false
-		err := recoverAsError(func() (err error) {
-			if isChanged, err = transform(record); err != nil || isChanged {
+		err = recoverAsError(func() (err error) {
+			if isChanged, err = transform(recordPtr); err != nil || isChanged {
 				return err
 			}
 			// Stored under a key the schema no longer builds (its Keys or a Size changed, or an
 			// autoincrement ID is still 0): no read finds it, so it moves even when the transform
 			// changed nothing.
-			isChanged = m.recordKey(unsafe.Pointer(record)) != attrText(storedItem["pk"])+keySeparator+attrText(storedItem["sk"])
+			isChanged = m.recordKey(recordPtr) != attrText(storedItem["pk"])+keySeparator+attrText(storedItem["sk"])
 			return nil
 		})
 		if err != nil {
@@ -126,23 +133,23 @@ func (r *Repo[T, E]) reprocessPage(storedItems []map[string]types.AttributeValue
 			continue
 		}
 		if isChanged {
-			changedRecords = append(changedRecords, reprocessedRecord[E]{record: record, storedItem: storedItem})
+			changedRecords = append(changedRecords, reprocessedRecord{recordPtr: recordPtr, storedItem: storedItem})
 		}
 	}
 	if assignsIDs {
 		ptrs := make([]unsafe.Pointer, len(changedRecords))
 		for i := range changedRecords {
-			ptrs[i] = unsafe.Pointer(changedRecords[i].record)
+			ptrs[i] = changedRecords[i].recordPtr
 		}
 		if _, err := m.assignAutoIDs(ptrs); err != nil {
 			return nil, err
 		}
 	}
 
-	var pageWrites []reprocessedRecord[E]
+	var pageWrites []reprocessedRecord
 	for _, changed := range changedRecords {
 		err := recoverAsError(func() (err error) {
-			changed.item, err = m.marshalItem(unsafe.Pointer(changed.record), changed.record)
+			changed.item, err = m.marshalItem(changed.recordPtr, m.recordPointer(changed.recordPtr))
 			return err
 		})
 		// A reprocessed record keeps when it was created and its changelog.
@@ -161,7 +168,7 @@ func (r *Repo[T, E]) reprocessPage(storedItems []map[string]types.AttributeValue
 			report.Moved++
 		}
 		if len(report.Samples) < reprocessSampleCount {
-			report.Samples = append(report.Samples, r.sampleOfChange(changed.storedItem, changed.record))
+			report.Samples = append(report.Samples, r.sampleOfChange(changed.storedItem, changed.recordPtr))
 		}
 		pageWrites = append(pageWrites, changed)
 	}
@@ -212,8 +219,8 @@ func writeReprocessedItem(client *dynamodb.Client, item, storedItem map[string]t
 
 // ReprocessRecordsAny is ReprocessRecords for a type-erased caller (a Controller): record is the *E.
 // It lets one transform run over every registered table.
-func (r *Repo[T, E]) ReprocessRecordsAny(transform func(record any) (bool, error), write bool) (RecordsReport, error) {
-	return r.ReprocessRecords(func(record *E) (bool, error) { return transform(record) }, write)
+func (r *repoCore) ReprocessRecordsAny(transform func(record any) (bool, error), write bool) (RecordsReport, error) {
+	return r.reprocessRecords(func(recordPtr unsafe.Pointer) (bool, error) { return transform(r.meta.recordPointer(recordPtr)) }, write)
 }
 
 // recoverAsError runs step and turns a panic into its error: a transform's own bug, or a key value
@@ -229,12 +236,12 @@ func recoverAsError(step func() error) (err error) {
 
 // sampleOfChange renders a changed record as "before → after" JSON, decoding the stored item again for
 // the before. json:"-" fields don't show.
-func (r *Repo[T, E]) sampleOfChange(storedItem map[string]types.AttributeValue, record *E) string {
-	storedRecord := new(E)
-	if err := r.meta.unmarshalItem(storedItem, storedRecord); err != nil {
+func (r *repoCore) sampleOfChange(storedItem map[string]types.AttributeValue, recordPtr unsafe.Pointer) string {
+	storedPtr, err := r.meta.decodeRecord(storedItem)
+	if err != nil {
 		return itemName(storedItem) + ": " + err.Error()
 	}
-	beforeJSON, _ := json.Marshal(storedRecord)
-	afterJSON, _ := json.Marshal(record)
+	beforeJSON, _ := json.Marshal(r.meta.recordPointer(storedPtr))
+	afterJSON, _ := json.Marshal(r.meta.recordPointer(recordPtr))
 	return string(beforeJSON) + " → " + string(afterJSON)
 }

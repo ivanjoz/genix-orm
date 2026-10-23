@@ -12,6 +12,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+// productTransform is a typed transform as reprocessPage takes it.
+func productTransform(transform func(product *Product) (bool, error)) recordTransform {
+	return func(recordPtr unsafe.Pointer) (bool, error) { return transform((*Product)(recordPtr)) }
+}
+
 // storedProductItem is the item a Product is stored as, at Version 3.
 func storedProductItem(t *testing.T, r *Repo[ProductTable, Product], product Product) map[string]types.AttributeValue {
 	t.Helper()
@@ -30,13 +35,13 @@ func TestReprocessPageWritesOnlyChangedRecords(t *testing.T) {
 		storedProductItem(t, r, Product{ID: "b", CategoryID: 7, Created: 2, Name: "kept"}),
 	}
 	report := RecordsReport{}
-	changed, err := r.reprocessPage(storedItems, func(product *Product) (bool, error) {
+	changed, err := r.reprocessPage(storedItems, productTransform(func(product *Product) (bool, error) {
 		if product.Name != "old" {
 			return false, nil
 		}
 		product.Name = "new"
 		return true, nil
-	}, false, &report)
+	}), false, &report)
 	if err != nil || report.Scanned != 2 || report.Changed != 1 || report.Moved != 0 || len(changed) != 1 || len(report.Samples) != 1 {
 		t.Fatalf("report = %+v, %d changed, %v", report, len(changed), err)
 	}
@@ -54,10 +59,10 @@ func TestReprocessPageMovesARecordWhoseKeyChanged(t *testing.T) {
 	r := newProducts(t)
 	storedItem := storedProductItem(t, r, Product{ID: "a", CategoryID: 7, Created: 1})
 	report := RecordsReport{}
-	changed, err := r.reprocessPage([]map[string]types.AttributeValue{storedItem}, func(product *Product) (bool, error) {
+	changed, err := r.reprocessPage([]map[string]types.AttributeValue{storedItem}, productTransform(func(product *Product) (bool, error) {
 		product.ID = "b"
 		return true, nil
-	}, false, &report)
+	}), false, &report)
 	if err != nil || report.Moved != 1 || len(changed) != 1 || !changed[0].isMove {
 		t.Fatalf("report = %+v, %v", report, err)
 	}
@@ -71,9 +76,9 @@ func TestReprocessPageMovesARecordStoredUnderAnOldKey(t *testing.T) {
 	storedItem := storedProductItem(t, r, Product{ID: "a", CategoryID: 7, Created: 1})
 	storedItem["sk"] = &types.AttributeValueMemberB{Value: []byte("an-old-key-shape")}
 	report := RecordsReport{}
-	changed, err := r.reprocessPage([]map[string]types.AttributeValue{storedItem}, func(product *Product) (bool, error) {
+	changed, err := r.reprocessPage([]map[string]types.AttributeValue{storedItem}, productTransform(func(product *Product) (bool, error) {
 		return false, nil
-	}, false, &report)
+	}), false, &report)
 	if err != nil || report.Moved != 1 || len(changed) != 1 || attrText(changed[0].item["sk"]) == "an-old-key-shape" {
 		t.Fatalf("a record under a key the schema no longer builds must move: %+v, %v", report, err)
 	}
@@ -87,12 +92,12 @@ func TestReprocessPageFailsOneRecordNotTheRun(t *testing.T) {
 		{"pk": numberAttr(1), "sk": &types.AttributeValueMemberB{Value: []byte("broken")}},
 	}
 	report := RecordsReport{}
-	changed, err := r.reprocessPage(storedItems, func(product *Product) (bool, error) {
+	changed, err := r.reprocessPage(storedItems, productTransform(func(product *Product) (bool, error) {
 		if product.ID == "a" {
 			product.CategoryID = -1 // a key the encoding refuses: it panics there
 		}
 		return true, nil
-	}, false, &report)
+	}), false, &report)
 	if err != nil || len(changed) != 1 || len(report.Failures) != 2 {
 		t.Fatalf("report = %+v, %d changed, %v", report, len(changed), err)
 	}
@@ -105,7 +110,7 @@ func TestSampleOfChangeShowsBeforeAndAfter(t *testing.T) {
 	r := newProducts(t)
 	storedItem := storedProductItem(t, r, Product{ID: "a", CategoryID: 7, Created: 1, Name: "old"})
 	changed := Product{ID: "a", CategoryID: 7, Created: 1, Name: "new"}
-	sample := r.sampleOfChange(storedItem, &changed)
+	sample := r.sampleOfChange(storedItem, unsafe.Pointer(&changed))
 	before, after, found := strings.Cut(sample, " → ")
 	if !found || !strings.Contains(before, `"Name":"old"`) || !strings.Contains(after, `"Name":"new"`) {
 		t.Fatalf("sample = %s", sample)

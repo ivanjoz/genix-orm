@@ -386,8 +386,12 @@ func (g Group[E]) sumPosition(column Coln, isFloat bool) int {
 	panic(fmt.Sprintf("db: %q is not a column of this GroupBy", fieldName))
 }
 
-// GroupQuery reads the counters of one GroupBy in one base partition.
-type GroupQuery[E any] struct {
+// GroupQuery reads the counters of one GroupBy in one base partition. It is a thin
+// typed shell over groupQueryState, as QueryBuilder is over queryState.
+type GroupQuery[E any] struct{ groupQueryState }
+
+// groupQueryState is a GroupBy read's predicates, and everything that runs it.
+type groupQueryState struct {
 	meta       *tableMeta
 	groupIndex *groupIndexMeta
 	preds      []predicate
@@ -399,7 +403,11 @@ type GroupQuery[E any] struct {
 // the group Keys take an Eq on a leading run, then one range, as Keys do in Query.
 // Groups whose count fell to 0 are left out.
 func (r *Repo[T, E]) QueryGroups(groupKeys ...Coln) *GroupQuery[E] {
-	query := &GroupQuery[E]{meta: r.meta}
+	return &GroupQuery[E]{r.groupQuery(groupKeys)}
+}
+
+func (r *repoCore) groupQuery(groupKeys []Coln) groupQueryState {
+	query := groupQueryState{meta: r.meta}
 	for i := range r.meta.groupIndexes {
 		groupIndex := &r.meta.groupIndexes[i]
 		isMatch := len(groupIndex.keys) == len(groupKeys)
@@ -416,25 +424,53 @@ func (r *Repo[T, E]) QueryGroups(groupKeys ...Coln) *GroupQuery[E] {
 	return query
 }
 
-func (q *GroupQuery[E]) add(column Coln, o op, v1, v2 any) *GroupQuery[E] {
+func (q *groupQueryState) add(column Coln, o op, v1, v2 any) {
 	q.preds = append(q.preds, predicate{field: column.col().fieldName, op: o, v1: v1, v2: v2})
-	return q
 }
 
 // Eq on a ColSlice group Key pins its element: the one group of that element.
-func (q *GroupQuery[E]) Eq(column Coln, v any) *GroupQuery[E]  { return q.add(column, opEq, v, nil) }
-func (q *GroupQuery[E]) Gt(column Coln, v any) *GroupQuery[E]  { return q.add(column, opGt, v, nil) }
-func (q *GroupQuery[E]) Gte(column Coln, v any) *GroupQuery[E] { return q.add(column, opGte, v, nil) }
-func (q *GroupQuery[E]) Lt(column Coln, v any) *GroupQuery[E]  { return q.add(column, opLt, v, nil) }
-func (q *GroupQuery[E]) Lte(column Coln, v any) *GroupQuery[E] { return q.add(column, opLte, v, nil) }
+func (q *GroupQuery[E]) Eq(column Coln, v any) *GroupQuery[E] {
+	q.add(column, opEq, v, nil)
+	return q
+}
+func (q *GroupQuery[E]) Gt(column Coln, v any) *GroupQuery[E] {
+	q.add(column, opGt, v, nil)
+	return q
+}
+func (q *GroupQuery[E]) Gte(column Coln, v any) *GroupQuery[E] {
+	q.add(column, opGte, v, nil)
+	return q
+}
+func (q *GroupQuery[E]) Lt(column Coln, v any) *GroupQuery[E] {
+	q.add(column, opLt, v, nil)
+	return q
+}
+func (q *GroupQuery[E]) Lte(column Coln, v any) *GroupQuery[E] {
+	q.add(column, opLte, v, nil)
+	return q
+}
 func (q *GroupQuery[E]) Between(column Coln, a, b any) *GroupQuery[E] {
-	return q.add(column, opBetween, a, b)
+	q.add(column, opBetween, a, b)
+	return q
 }
 
 // Exec reads the groups in group key order.
 func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
+	var groups []Group[E]
+	err := q.exec(func(keyPtr unsafe.Pointer, count int64, sums []int64) {
+		groups = append(groups, Group[E]{Key: *(*E)(keyPtr), Count: count, groupIndex: q.groupIndex, sums: sums})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
+// exec reads the groups in group key order, handing each one's key record (a *E), count and sums
+// to appendGroup.
+func (q *groupQueryState) exec(appendGroup func(keyPtr unsafe.Pointer, count int64, sums []int64)) error {
 	if q.planErr != nil {
-		return nil, q.planErr
+		return q.planErr
 	}
 	m := q.meta
 	recordName := m.recordType.Name()
@@ -447,7 +483,7 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 	for i, kc := range m.partition {
 		p, ok := byField[kc.fieldName]
 		if !ok || p.op != opEq {
-			return nil, fmt.Errorf("db: %s QueryGroups needs an Eq on every Partition column: counters are kept per partition", recordName)
+			return fmt.Errorf("db: %s QueryGroups needs an Eq on every Partition column: counters are kept per partition", recordName)
 		}
 		partitionValues[i] = uint64(valueToInt64(p.v1, kc.fieldName))
 		delete(byField, kc.fieldName)
@@ -459,11 +495,11 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 	byField[groupTagKeyField] = predicate{field: groupTagKeyField, op: opEq, v1: q.groupIndex.tag}
 	usedFields, err := resolveKeys(byField, plan, sortColumns, "sk")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for field := range byField {
 		if !usedFields[field] {
-			return nil, fmt.Errorf("db: %s QueryGroups cannot filter %s: it takes an Eq on a leading run of the group Keys, then one range", recordName, field)
+			return fmt.Errorf("db: %s QueryGroups cannot filter %s: it takes an Eq on a leading run of the group Keys, then one range", recordName, field)
 		}
 	}
 	// A strict < under a prefix is a BETWEEN whose upper bound is the one sk to drop.
@@ -474,7 +510,7 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 
 	client, err := Client()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	input := &dynamodb.QueryInput{
 		TableName:                 aws.String(tableName()),
@@ -482,35 +518,32 @@ func (q *GroupQuery[E]) Exec() ([]Group[E], error) {
 		ExpressionAttributeNames:  plan.names,
 		ExpressionAttributeValues: plan.values,
 	}
-	var groups []Group[E]
 	for {
 		out, err := client.Query(context.Background(), input)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, item := range out.Items {
 			if binaryKeyText(item["sk"]) == excludedSK {
 				continue
 			}
-			group := Group[E]{
-				Count:      numberAttrValue(item, groupCountAttr),
-				groupIndex: q.groupIndex,
-				sums:       make([]int64, len(q.groupIndex.sums)),
-			}
-			if group.Count == 0 {
+			count := numberAttrValue(item, groupCountAttr)
+			if count == 0 {
 				continue
 			}
-			if err := m.unmarshalItem(item, &group.Key); err != nil {
-				return nil, err
+			keyPtr, err := m.decodeRecord(item)
+			if err != nil {
+				return err
 			}
 			// A column added to the GroupBy after the counter was written reads 0 until Reprocess.
+			sums := make([]int64, len(q.groupIndex.sums))
 			for j, sum := range q.groupIndex.sums {
-				group.sums[j] = numberAttrValue(item, sum.attr)
+				sums[j] = numberAttrValue(item, sum.attr)
 			}
-			groups = append(groups, group)
+			appendGroup(keyPtr, count, sums)
 		}
 		if len(out.LastEvaluatedKey) == 0 {
-			return groups, nil
+			return nil
 		}
 		input.ExclusiveStartKey = out.LastEvaluatedKey
 	}
@@ -539,11 +572,11 @@ func numberAttr(value int64) types.AttributeValue {
 // compares them with the stored ones and Puts only those that differ: a stored
 // counter no record produces anymore is deleted, unless the writes already zeroed it.
 // With write false it only counts the counters it would write.
-func (r *Repo[T, E]) rebuildPartitionGroups(client *dynamodb.Client, basePK string, records []E, write bool) (int, error) {
+func (r *repoCore) rebuildPartitionGroups(client *dynamodb.Client, basePK string, recordPtrs []unsafe.Pointer, write bool) (int, error) {
 	m := r.meta
 	expectedDeltas := map[string]*groupCounterDelta{}
-	for i := range records {
-		if err := m.addGroupCounterDeltas(expectedDeltas, nil, unsafe.Pointer(&records[i])); err != nil {
+	for _, recordPtr := range recordPtrs {
+		if err := m.addGroupCounterDeltas(expectedDeltas, nil, recordPtr); err != nil {
 			return 0, err
 		}
 	}

@@ -50,7 +50,7 @@ type expectedHiddenRow struct {
 
 // Reprocess rebuilds the entity's derived data from its records (see the top of this file). With
 // write false it is a dry run: it reads everything and counts what it would write.
-func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
+func (r *repoCore) Reprocess(write bool) (DerivedReport, error) {
 	m := r.meta
 	report := DerivedReport{}
 	client, err := Client()
@@ -58,16 +58,15 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 		return report, err
 	}
 
-	var records []E
+	var recordPtrs []unsafe.Pointer
 	expectedRows := map[string]expectedHiddenRow{} // keyed by pk # sk
 	err = scanItems(client, tableName(), []pkRange{m.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		for _, item := range items {
-			var record E
-			if err := m.unmarshalItem(item, &record); err != nil {
+			ptr, err := m.decodeRecord(item)
+			if err != nil {
 				return err
 			}
-			records = append(records, record)
-			ptr := unsafe.Pointer(&record)
+			recordPtrs = append(recordPtrs, ptr)
 			basePK := m.pkValue(ptr)
 			for i := range m.arrayIndexes {
 				arrayIndex := &m.arrayIndexes[i]
@@ -85,7 +84,7 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 	if err != nil {
 		return report, err
 	}
-	report.Records = len(records)
+	report.Records = len(recordPtrs)
 
 	// The stored hidden rows: each one is kept, refreshed or deleted against the expected set. The
 	// counters (pk ‖ 000) only name the partitions to recompute, unless no GroupBy is declared.
@@ -130,13 +129,13 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 	}
 
 	if len(m.groupIndexes) > 0 {
-		recordsByPK := map[string][]E{}
+		recordsByPK := map[string][]unsafe.Pointer{}
 		for basePK := range partitionsWithCounters {
 			recordsByPK[basePK] = nil // a partition with counters and no records gets them zeroed
 		}
-		for i := range records {
-			basePK := m.pkValue(unsafe.Pointer(&records[i]))
-			recordsByPK[basePK] = append(recordsByPK[basePK], records[i])
+		for _, ptr := range recordPtrs {
+			basePK := m.pkValue(ptr)
+			recordsByPK[basePK] = append(recordsByPK[basePK], ptr)
 		}
 		for basePK, partitionRecords := range recordsByPK {
 			rewritten, err := r.rebuildPartitionGroups(client, basePK, partitionRecords, write)
@@ -151,8 +150,7 @@ func (r *Repo[T, E]) Reprocess(write bool) (DerivedReport, error) {
 		// Slot files of past cycles are never read again; a record not written this cycle keeps tick 1.
 		currentCycle := CurrentYearCycle()
 		var currentCyclePtrs []unsafe.Pointer
-		for i := range records {
-			ptr := unsafe.Pointer(&records[i])
+		for _, ptr := range recordPtrs {
 			if cache.YearCycleOf(cache.SUnixTimeToTime(m.updated.acc.getI64(ptr))) == currentCycle {
 				currentCyclePtrs = append(currentCyclePtrs, ptr)
 			}

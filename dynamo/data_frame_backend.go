@@ -7,7 +7,6 @@ import (
 	"github.com/ivanjoz/genix-orm/db/cache"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -35,12 +34,12 @@ const frameStateSKPrefix = "f"
 // ErrFrameNotBuilt: the frame has no files in its current shape yet. The next MaterializeDataFrames builds it.
 var ErrFrameNotBuilt = dataframe.ErrFrameNotBuilt
 
-type frameBackend[E any] struct {
+type frameBackend struct {
 	meta   *tableMeta
 	client *dynamodb.Client
 }
 
-func frameBackendOf[E any](meta *tableMeta) (*frameBackend[E], error) {
+func frameBackendOf(meta *tableMeta) (*frameBackend, error) {
 	if cache.FileStore() == nil {
 		return nil, fmt.Errorf("db: %s has DataFrames and no file store holds their files: call SetFileStore at boot", meta.recordType.Name())
 	}
@@ -48,16 +47,16 @@ func frameBackendOf[E any](meta *tableMeta) (*frameBackend[E], error) {
 	if err != nil {
 		return nil, err
 	}
-	return &frameBackend[E]{meta: meta, client: client}, nil
+	return &frameBackend{meta: meta, client: client}, nil
 }
 
 // MaterializeDataFrames brings every DataFrame of the table up to date (dataframe.Materialize).
 // berryapps runs it every 10 minutes.
-func (r *Repo[T, E]) MaterializeDataFrames() error {
+func (r *repoCore) MaterializeDataFrames() error {
 	if r.meta.frames == nil {
 		return nil
 	}
-	backend, err := frameBackendOf[E](r.meta)
+	backend, err := frameBackendOf(r.meta)
 	if err != nil {
 		return err
 	}
@@ -66,11 +65,11 @@ func (r *Repo[T, E]) MaterializeDataFrames() error {
 
 // RebuildDataFrames computes the files of the frame frameName ("" every frame) again from the
 // records: the fix for drift. It fails when a run holds the frame; retry it.
-func (r *Repo[T, E]) RebuildDataFrames(frameName string) error {
+func (r *repoCore) RebuildDataFrames(frameName string) error {
 	if r.meta.frames == nil {
 		return fmt.Errorf("db: %s has no DataFrame %q", r.meta.recordType.Name(), frameName)
 	}
-	backend, err := frameBackendOf[E](r.meta)
+	backend, err := frameBackendOf(r.meta)
 	if err != nil {
 		return err
 	}
@@ -79,14 +78,14 @@ func (r *Repo[T, E]) RebuildDataFrames(frameName string) error {
 
 // DropDataFrame deletes what a frame the schema no longer declares left behind: its state item and
 // every file of its folder. It refuses a declared frame. Returns the files deleted.
-func (r *Repo[T, E]) DropDataFrame(frameName string) (int, error) {
+func (r *repoCore) DropDataFrame(frameName string) (int, error) {
 	if r.meta.frames == nil || len(r.meta.frames.Frames) == 0 {
 		return 0, fmt.Errorf("db: %s has no DataFrame: its frames' folder is unknown", r.meta.recordType.Name())
 	}
 	if r.meta.frames.FrameNamed(frameName) != nil || frameName == "" || strings.Contains(frameName, "/") {
 		return 0, fmt.Errorf("db: %s DataFrame %q is declared or not a frame name: only an undeclared frame is dropped", r.meta.recordType.Name(), frameName)
 	}
-	backend, err := frameBackendOf[E](r.meta)
+	backend, err := frameBackendOf(r.meta)
 	if err != nil {
 		return 0, err
 	}
@@ -105,7 +104,7 @@ func (r *Repo[T, E]) DropDataFrame(frameName string) (int, error) {
 	return len(fileKeys), err
 }
 
-func (backend *frameBackend[E]) stateKey(frame *dataframe.Frame) map[string]types.AttributeValue {
+func (backend *frameBackend) stateKey(frame *dataframe.Frame) map[string]types.AttributeValue {
 	return itemKey(groupCountersPK(backend.meta.tableID), frameStateSKPrefix+frame.Name)
 }
 
@@ -120,7 +119,7 @@ func frameStateOf(item map[string]types.AttributeValue) dataframe.State {
 	return state
 }
 
-func (backend *frameBackend[E]) ReadState(frame *dataframe.Frame) (dataframe.State, error) {
+func (backend *frameBackend) ReadState(frame *dataframe.Frame) (dataframe.State, error) {
 	out, err := backend.client.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName: aws.String(tableName()), Key: backend.stateKey(frame), ConsistentRead: aws.Bool(true),
 	})
@@ -130,7 +129,7 @@ func (backend *frameBackend[E]) ReadState(frame *dataframe.Frame) (dataframe.Sta
 	return frameStateOf(out.Item), nil
 }
 
-func (backend *frameBackend[E]) TakeLock(frame *dataframe.Frame, holderID string, now, lockedUntil time.Time) (dataframe.State, bool, error) {
+func (backend *frameBackend) TakeLock(frame *dataframe.Frame, holderID string, now, lockedUntil time.Time) (dataframe.State, bool, error) {
 	out, err := backend.client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -150,7 +149,7 @@ func (backend *frameBackend[E]) TakeLock(frame *dataframe.Frame, holderID string
 	return frameStateOf(out.Attributes), true, nil
 }
 
-func (backend *frameBackend[E]) ReleaseLock(frame *dataframe.Frame, holderID string) {
+func (backend *frameBackend) ReleaseLock(frame *dataframe.Frame, holderID string) {
 	backend.client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -161,7 +160,7 @@ func (backend *frameBackend[E]) ReleaseLock(frame *dataframe.Frame, holderID str
 	})
 }
 
-func (backend *frameBackend[E]) CommitSnapshot(ctx context.Context, frame *dataframe.Frame, holderID string, state dataframe.State, snapshot int64) error {
+func (backend *frameBackend) CommitSnapshot(ctx context.Context, frame *dataframe.Frame, holderID string, state dataframe.State, snapshot int64) error {
 	_, err := backend.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -173,7 +172,7 @@ func (backend *frameBackend[E]) CommitSnapshot(ctx context.Context, frame *dataf
 	return err
 }
 
-func (backend *frameBackend[E]) CommitGeneration(ctx context.Context, frame *dataframe.Frame, holderID string, generation string, snapshot int64) error {
+func (backend *frameBackend) CommitGeneration(ctx context.Context, frame *dataframe.Frame, holderID string, generation string, snapshot int64) error {
 	_, err := backend.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -186,8 +185,8 @@ func (backend *frameBackend[E]) CommitGeneration(ctx context.Context, frame *dat
 }
 
 // HistoriesWrittenAfter reads, through the GSI on Updated, every record written after moment.
-func (backend *frameBackend[E]) HistoriesWrittenAfter(moment int64) ([]dataframe.History, error) {
-	query := &QueryBuilder[E]{meta: backend.meta, preds: []predicate{{field: updatedFieldName, op: opGt, v1: moment}}}
+func (backend *frameBackend) HistoriesWrittenAfter(moment int64) ([]dataframe.History, error) {
+	query := &queryState{meta: backend.meta, preds: []predicate{{field: updatedFieldName, op: opGt, v1: moment}}}
 	plans, err := query.plans()
 	if err != nil {
 		return nil, err
@@ -213,7 +212,7 @@ func (backend *frameBackend[E]) HistoriesWrittenAfter(moment int64) ([]dataframe
 }
 
 // ScanHistories reads every record of the table, page by page.
-func (backend *frameBackend[E]) ScanHistories(onPage func(histories []dataframe.History) error) error {
+func (backend *frameBackend) ScanHistories(onPage func(histories []dataframe.History) error) error {
 	return scanItems(backend.client, tableName(), []pkRange{backend.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		histories, err := backend.appendHistories(nil, items)
 		if err != nil {
@@ -223,13 +222,13 @@ func (backend *frameBackend[E]) ScanHistories(onPage func(histories []dataframe.
 	})
 }
 
-func (backend *frameBackend[E]) appendHistories(histories []dataframe.History, items []map[string]types.AttributeValue) ([]dataframe.History, error) {
+func (backend *frameBackend) appendHistories(histories []dataframe.History, items []map[string]types.AttributeValue) ([]dataframe.History, error) {
 	for _, item := range items {
-		var record E
-		if err := backend.meta.unmarshalItem(item, &record); err != nil {
+		recordPtr, err := backend.meta.decodeRecord(item)
+		if err != nil {
 			return nil, err
 		}
-		history, err := backend.meta.historyOf(item, unsafe.Pointer(&record))
+		history, err := backend.meta.historyOf(item, recordPtr)
 		if err != nil {
 			return nil, err
 		}

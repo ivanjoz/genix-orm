@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/ivanjoz/genix-orm/db/cache"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -31,28 +32,87 @@ import (
 //
 // Products.T is the compiled table struct: its column handles carry their names,
 // so you reference them in queries with full static typing.
+//
+// Go compiles a generic method once per record type, so Repo's own methods are
+// thin typed shells: they turn records into pointers and call repoCore, the
+// non-generic engine every table shares. Its methods that take no record (the
+// Controller's maintenance operations) are promoted to Repo as they are.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Repo[T any, E any] struct {
-	meta *tableMeta
+	repoCore
 	// T exposes the named column handles for use in query predicates.
 	T T
+}
+
+// repoCore is one entity's reads and writes over records held by pointer (each a *E).
+type repoCore struct {
+	meta *tableMeta
 }
 
 // NewRepo compiles (and caches) the schema and returns a ready repo.
 func NewRepo[T any, E any]() *Repo[T, E] {
 	meta, table := getOrCompile[T, E]()
-	return &Repo[T, E]{meta: meta, T: table}
+	return &Repo[T, E]{repoCore: repoCore{meta: meta}, T: table}
 }
+
+// ── Records by pointer ───────────────────────────────────────────────────────
+
+// recordSink appends a record (recordPtr is a *E) to the caller's typed slice and
+// returns the slice's new length. It is the only typed step of a read.
+type recordSink func(recordPtr unsafe.Pointer) int
+
+// appendTo is the recordSink of a typed slice.
+func appendTo[E any](dst *[]E) recordSink {
+	return func(recordPtr unsafe.Pointer) int {
+		*dst = append(*dst, *(*E)(recordPtr))
+		return len(*dst)
+	}
+}
+
+// pointersOf points at each record of records, in place.
+func pointersOf[E any](records []E) []unsafe.Pointer {
+	ptrs := make([]unsafe.Pointer, len(records))
+	for i := range records {
+		ptrs[i] = unsafe.Pointer(&records[i])
+	}
+	return ptrs
+}
+
+// newRecord allocates a zero record of the entity.
+func (m *tableMeta) newRecord() unsafe.Pointer { return reflect.New(m.recordType).UnsafePointer() }
+
+// recordPointer is the record at ptr as a typed *E behind an any, for colbin and encoding/json.
+func (m *tableMeta) recordPointer(ptr unsafe.Pointer) any {
+	return reflect.NewAt(m.recordType, ptr).Interface()
+}
+
+// recordValue is a copy of the record at ptr as an E behind an any, for the type-erased Controller.
+func (m *tableMeta) recordValue(ptr unsafe.Pointer) any {
+	return reflect.NewAt(m.recordType, ptr).Elem().Interface()
+}
+
+// copyRecord copies the record at sourcePtr over the one at targetPtr.
+func (m *tableMeta) copyRecord(targetPtr, sourcePtr unsafe.Pointer) {
+	reflect.NewAt(m.recordType, targetPtr).Elem().Set(reflect.NewAt(m.recordType, sourcePtr).Elem())
+}
+
+// decodeRecord decodes an item into a new record of the entity and returns a pointer to it.
+func (m *tableMeta) decodeRecord(item map[string]types.AttributeValue) (unsafe.Pointer, error) {
+	ptr := m.newRecord()
+	if err := m.unmarshalItem(item, m.recordPointer(ptr)); err != nil {
+		return nil, err
+	}
+	return ptr, nil
+}
+
+// ── Writes ───────────────────────────────────────────────────────────────────
 
 // Put upserts a single record. When the entity uses autoincrement and the
 // record's ID is still zero, a fresh ID is reserved and written into *record
 // before it is stored. It is PutMany of one, so array index rows sync the same way.
 func (r *Repo[T, E]) Put(record *E) error {
-	records := []E{*record}
-	err := r.PutMany(records)
-	*record = records[0]
-	return err
+	return r.putMany([]unsafe.Pointer{unsafe.Pointer(record)}, false)
 }
 
 // PutIfAbsent writes the record, at Version 1, only when no item with its key
@@ -61,16 +121,19 @@ func (r *Repo[T, E]) Put(record *E) error {
 // of the same key exactly one wins — the primitive for "enqueue once" and "claim
 // once". Autoincrement IDs are assigned as in Put.
 func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
+	return r.putIfAbsent(unsafe.Pointer(record))
+}
+
+func (r *repoCore) putIfAbsent(ptr unsafe.Pointer) (bool, error) {
 	if err := r.meta.checkTextSearchBackend(); err != nil {
 		return false, err
 	}
-	ptr := unsafe.Pointer(record)
 	if _, err := r.meta.assignAutoIDs([]unsafe.Pointer{ptr}); err != nil {
 		return false, err
 	}
 	r.meta.stampUpdated([]unsafe.Pointer{ptr})
 	r.meta.version.setI64(ptr, 1)
-	item, err := r.meta.marshalItem(ptr, record)
+	item, err := r.meta.marshalItem(ptr, r.meta.recordPointer(ptr))
 	if err != nil {
 		return false, err
 	}
@@ -128,29 +191,25 @@ func (r *Repo[T, E]) PutIfAbsent(record *E) (bool, error) {
 //
 // Then the delta logs are appended (delta_log.go), and with CacheByIDs the touched
 // slots are set last.
-func (r *Repo[T, E]) PutMany(records []E) error { return r.putMany(records, false) }
+func (r *Repo[T, E]) PutMany(records []E) error { return r.putMany(pointersOf(records), false) }
 
 // InsertMany is PutMany for records the caller knows are not stored yet, such as
 // rows keyed by an ID reserved in the same operation (AssignIDs): it writes them at
 // Version 1 with BatchWriteItem, reading nothing. A record that was in fact stored
 // is overwritten at Version 1, keeps its old hidden rows and counts twice in its
 // GroupBy groups until Reprocess.
-func (r *Repo[T, E]) InsertMany(records []E) error { return r.putMany(records, true) }
+func (r *Repo[T, E]) InsertMany(records []E) error { return r.putMany(pointersOf(records), true) }
 
 // AssignIDs reserves and sets the autoincrement ID of every record whose ID is
 // still zero, as Put would, so related records can be keyed by it before anything
 // is written. Write the records with InsertMany: their IDs are new.
 func (r *Repo[T, E]) AssignIDs(records []E) error {
-	ptrs := make([]unsafe.Pointer, len(records))
-	for i := range records {
-		ptrs[i] = unsafe.Pointer(&records[i])
-	}
-	_, err := r.meta.assignAutoIDs(ptrs)
+	_, err := r.meta.assignAutoIDs(pointersOf(records))
 	return err
 }
 
-func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
-	if len(records) == 0 {
+func (r *repoCore) putMany(ptrs []unsafe.Pointer, areAllNew bool) error {
+	if len(ptrs) == 0 {
 		return nil
 	}
 	if err := r.meta.checkTextSearchBackend(); err != nil {
@@ -159,10 +218,6 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	client, err := Client()
 	if err != nil {
 		return err
-	}
-	ptrs := make([]unsafe.Pointer, len(records))
-	for i := range records {
-		ptrs[i] = unsafe.Pointer(&records[i])
 	}
 	assignedPtrs, err := r.meta.assignAutoIDs(ptrs)
 	if err != nil {
@@ -175,20 +230,20 @@ func (r *Repo[T, E]) putMany(records []E, areAllNew bool) error {
 	case !r.meta.readsStoredVersion():
 		return r.putRaisingVersions(client, ptrs)
 	default:
-		return r.putOverStoredVersions(client, records, assignedPtrs)
+		return r.putOverStoredVersions(client, ptrs, assignedPtrs)
 	}
 }
 
 // insertNew writes records known to be new at Version 1, with BatchWriteItem: the new hidden rows
 // first, then the base items (array_index.go), then the GroupBy counters, the logs and the slots.
-func (r *Repo[T, E]) insertNew(client *dynamodb.Client, ptrs []unsafe.Pointer) error {
+func (r *repoCore) insertNew(client *dynamodb.Client, ptrs []unsafe.Pointer) error {
 	baseWrites := make([]types.WriteRequest, 0, len(ptrs))
 	var arrayRowPuts []types.WriteRequest
 	logWrites := make([]deltaLogWrite, len(ptrs))
 	groupDeltas := map[string]*groupCounterDelta{}
 	for i, ptr := range ptrs {
 		r.meta.version.setI64(ptr, 1)
-		item, err := r.meta.marshalItem(ptr, (*E)(ptr))
+		item, err := r.meta.marshalItem(ptr, r.meta.recordPointer(ptr))
 		if err != nil {
 			return err
 		}
@@ -221,11 +276,11 @@ func (r *Repo[T, E]) insertNew(client *dynamodb.Client, ptrs []unsafe.Pointer) e
 
 // putRaisingVersions writes records of a table that diffs nothing (no hidden rows, no GroupBy): one
 // UpdateItem each, in parallel, raising its Version with no read.
-func (r *Repo[T, E]) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) error {
+func (r *repoCore) putRaisingVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) error {
 	items := make([]map[string]types.AttributeValue, len(ptrs))
 	for i, ptr := range ptrs {
 		var err error
-		if items[i], err = r.meta.marshalItem(ptr, (*E)(ptr)); err != nil {
+		if items[i], err = r.meta.marshalItem(ptr, r.meta.recordPointer(ptr)); err != nil {
 			return err
 		}
 	}
@@ -302,23 +357,25 @@ func setClausesOf(item map[string]types.AttributeValue, names map[string]string,
 // putOverStoredVersions writes records of a table that diffs its hidden rows or counters: each one is
 // conditioned on the version just read, and the ones that lost to a concurrent write are read and
 // written again, up to modifyMaxAttempts rounds. A record whose ID this call assigned is not read.
-func (r *Repo[T, E]) putOverStoredVersions(client *dynamodb.Client, records []E, assignedPtrs []unsafe.Pointer) error {
+// Each round writes copies: only a written record goes back to the caller's, with its new Version. One
+// still losing after the last round keeps no new Version, but its ID and Updated, set by putMany
+// before the rounds, stay assigned.
+func (r *repoCore) putOverStoredVersions(client *dynamodb.Client, ptrs []unsafe.Pointer, assignedPtrs []unsafe.Pointer) error {
 	isAssignedNow := map[unsafe.Pointer]bool{}
 	for _, assignedPtr := range assignedPtrs {
 		isAssignedNow[assignedPtr] = true
 	}
-	pendingIndexes := make([]int, len(records))
+	pendingIndexes := make([]int, len(ptrs))
 	for i := range pendingIndexes {
 		pendingIndexes[i] = i
 	}
 	for attempt := 1; ; attempt++ {
-		round := make([]E, len(pendingIndexes))
 		roundPtrs := make([]unsafe.Pointer, len(pendingIndexes))
 		var possiblyStoredPtrs []unsafe.Pointer
 		for i, recordIndex := range pendingIndexes {
-			round[i] = records[recordIndex]
-			roundPtrs[i] = unsafe.Pointer(&round[i])
-			if !isAssignedNow[unsafe.Pointer(&records[recordIndex])] {
+			roundPtrs[i] = r.meta.newRecord()
+			r.meta.copyRecord(roundPtrs[i], ptrs[recordIndex])
+			if !isAssignedNow[ptrs[recordIndex]] {
 				possiblyStoredPtrs = append(possiblyStoredPtrs, roundPtrs[i])
 			}
 		}
@@ -333,7 +390,7 @@ func (r *Repo[T, E]) putOverStoredVersions(client *dynamodb.Client, records []E,
 			}
 			r.meta.version.setI64(ptr, storedVersion)
 		}
-		lostIndexes, err := r.putIfVersion(client, round, storedByKey)
+		lostIndexes, err := r.putIfVersion(client, roundPtrs, storedByKey)
 		if err != nil {
 			return err
 		}
@@ -343,7 +400,7 @@ func (r *Repo[T, E]) putOverStoredVersions(client *dynamodb.Client, records []E,
 				nextPendingIndexes = append(nextPendingIndexes, recordIndex)
 				continue
 			}
-			records[recordIndex] = round[i]
+			r.meta.copyRecord(ptrs[recordIndex], roundPtrs[i])
 		}
 		if len(nextPendingIndexes) == 0 {
 			return nil
@@ -364,7 +421,7 @@ type storedRecord struct {
 
 // storedVersions reads (consistently) the stored version of each record, keyed by recordKey, so its
 // hidden rows, GroupBy counters and DataFrame changelog can be diffed. Nil without them.
-func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]storedRecord, error) {
+func (r *repoCore) storedVersions(client *dynamodb.Client, ptrs []unsafe.Pointer) (map[string]storedRecord, error) {
 	if !r.meta.readsStoredVersion() {
 		return nil, nil
 	}
@@ -378,11 +435,11 @@ func (r *Repo[T, E]) storedVersions(client *dynamodb.Client, ptrs []unsafe.Point
 	}
 	storedByKey := make(map[string]storedRecord, len(items))
 	for _, item := range items {
-		record := new(E)
-		if err := r.meta.unmarshalItem(item, record); err != nil {
+		recordPtr, err := r.meta.decodeRecord(item)
+		if err != nil {
 			return nil, err
 		}
-		storedByKey[r.meta.recordKey(unsafe.Pointer(record))] = storedRecord{ptr: unsafe.Pointer(record), changelog: changelogOf(item)}
+		storedByKey[r.meta.recordKey(recordPtr)] = storedRecord{ptr: recordPtr, changelog: changelogOf(item)}
 	}
 	return storedByKey, nil
 }
@@ -393,7 +450,7 @@ func (m *tableMeta) recordKey(ptr unsafe.Pointer) string {
 }
 
 // batchWriteAll writes any number of requests in BatchWriteItem chunks of 25, in order.
-func (r *Repo[T, E]) batchWriteAll(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) error {
+func (r *repoCore) batchWriteAll(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) error {
 	for start := 0; start < len(writes); start += 25 {
 		if err := r.batchWrite(ctx, client, writes[start:min(start+25, len(writes))]); err != nil {
 			return err
@@ -403,7 +460,7 @@ func (r *Repo[T, E]) batchWriteAll(ctx context.Context, client *dynamodb.Client,
 }
 
 // batchWrite issues one BatchWriteItem and retries any unprocessed items.
-func (r *Repo[T, E]) batchWrite(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) error {
+func (r *repoCore) batchWrite(ctx context.Context, client *dynamodb.Client, writes []types.WriteRequest) error {
 	table := tableName()
 	req := map[string][]types.WriteRequest{table: writes}
 	for attempt := 0; attempt < 8; attempt++ {
@@ -426,7 +483,9 @@ func (r *Repo[T, E]) batchWrite(ctx context.Context, client *dynamodb.Client, wr
 // the DeleteItem (ALL_OLD), with no read before it: its hidden rows are deleted
 // after it, its GroupBy counters move, and its logs get a deleted entry one
 // Version above it. The record's Updated is set to the delete's.
-func (r *Repo[T, E]) Delete(record *E) error {
+func (r *Repo[T, E]) Delete(record *E) error { return r.delete(unsafe.Pointer(record)) }
+
+func (r *repoCore) delete(ptr unsafe.Pointer) error {
 	// A record that vanishes takes its changelog with it, so the frames could never move it out.
 	if r.meta.frames != nil {
 		return fmt.Errorf("db: %s has DataFrames and is never deleted: set its Status to 0", r.meta.recordType.Name())
@@ -438,7 +497,6 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	if err != nil {
 		return err
 	}
-	ptr := unsafe.Pointer(record)
 	out, err := client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
 		TableName:    aws.String(tableName()),
 		Key:          r.meta.keyOnly(ptr),
@@ -450,11 +508,10 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	// The delete's Updated: the value of its by-IDs slot.
 	r.meta.stampUpdated([]unsafe.Pointer{ptr})
 	if len(out.Attributes) > 0 {
-		storedRecord := new(E)
-		if err := r.meta.unmarshalItem(out.Attributes, storedRecord); err != nil {
+		storedPtr, err := r.meta.decodeRecord(out.Attributes)
+		if err != nil {
 			return err
 		}
-		storedPtr := unsafe.Pointer(storedRecord)
 		_, arrayRowDeletes := r.meta.arrayIndexWrites(storedPtr, nil, nil)
 		if err := r.batchWriteAll(context.Background(), client, arrayRowDeletes); err != nil {
 			return err
@@ -477,16 +534,23 @@ func (r *Repo[T, E]) Delete(record *E) error {
 	return r.meta.setSlotsUpdated([]unsafe.Pointer{ptr})
 }
 
+// ── Reads ────────────────────────────────────────────────────────────────────
+
 // Get fetches one item by its full key. `key` only needs its partition and sort
 // fields set. It returns (nil, nil) when the item does not exist.
 func (r *Repo[T, E]) Get(key E) (*E, error) {
+	recordPtr, err := r.get(unsafe.Pointer(&key))
+	return (*E)(recordPtr), err
+}
+
+func (r *repoCore) get(keyPtr unsafe.Pointer) (unsafe.Pointer, error) {
 	client, err := Client()
 	if err != nil {
 		return nil, err
 	}
 	out, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName: aws.String(tableName()),
-		Key:       r.meta.keyOnly(unsafe.Pointer(&key)),
+		Key:       r.meta.keyOnly(keyPtr),
 	})
 	if err != nil {
 		return nil, err
@@ -494,11 +558,7 @@ func (r *Repo[T, E]) Get(key E) (*E, error) {
 	if len(out.Item) == 0 {
 		return nil, nil
 	}
-	var record E
-	if err := r.meta.unmarshalItem(out.Item, &record); err != nil {
-		return nil, err
-	}
-	return &record, nil
+	return r.meta.decodeRecord(out.Item)
 }
 
 // GetMany reads records by key with a consistent BatchGetItem (100 keys per call;
@@ -506,7 +566,7 @@ func (r *Repo[T, E]) Get(key E) (*E, error) {
 // keys only need their partition and sort fields set. Missing records are left
 // out, and the order is not the keys' order.
 func (r *Repo[T, E]) GetMany(keys []E) ([]E, error) {
-	return r.getMany(keys, false)
+	return getManyAs(&r.repoCore, keys, false)
 }
 
 // GetManyForUpdate is GetMany for records about to go through PutManyIfVersion:
@@ -514,43 +574,53 @@ func (r *Repo[T, E]) GetMany(keys []E) ([]E, error) {
 // so that write diffs their hidden rows without reading them again. On a table
 // without fan-out or delta indexes it is GetMany.
 func (r *Repo[T, E]) GetManyForUpdate(keys []E) ([]E, error) {
-	return r.getMany(keys, true)
+	return getManyAs(&r.repoCore, keys, true)
 }
 
-func (r *Repo[T, E]) getMany(keys []E, rememberForUpdate bool) ([]E, error) {
+// getManyAs is getMany into a typed slice: nil for no keys, never nil otherwise.
+func getManyAs[E any](r *repoCore, keys []E, rememberForUpdate bool) ([]E, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
-	client, err := Client()
-	if err != nil {
+	records := make([]E, 0, len(keys))
+	if err := r.getMany(pointersOf(keys), rememberForUpdate, appendTo(&records)); err != nil {
 		return nil, err
 	}
-	itemKeys := make([]map[string]types.AttributeValue, len(keys))
-	for i := range keys {
-		itemKeys[i] = r.meta.keyOnly(unsafe.Pointer(&keys[i]))
+	return records, nil
+}
+
+func (r *repoCore) getMany(keyPtrs []unsafe.Pointer, rememberForUpdate bool, appendRecord recordSink) error {
+	client, err := Client()
+	if err != nil {
+		return err
+	}
+	itemKeys := make([]map[string]types.AttributeValue, len(keyPtrs))
+	for i, keyPtr := range keyPtrs {
+		itemKeys[i] = r.meta.keyOnly(keyPtr)
 	}
 	items, _, err := batchGet(client, itemKeys, true)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// Without hidden rows or GroupBy a write diffs nothing, so there is nothing worth keeping.
 	if rememberForUpdate && r.meta.readsStoredVersion() {
 		rememberStoredItems(items)
 	}
-	records := make([]E, len(items))
-	for i, item := range items {
-		if err := r.meta.unmarshalItem(item, &records[i]); err != nil {
-			return nil, err
+	for _, item := range items {
+		recordPtr, err := r.meta.decodeRecord(item)
+		if err != nil {
+			return err
 		}
+		appendRecord(recordPtr)
 	}
-	return records, nil
+	return nil
 }
 
 // Query starts a new statically-typed query for this entity. It is strict:
 // every predicate must be served by the key condition, and Exec fails on one
 // that would have to be filtered in memory (use QueryScan for that).
 func (r *Repo[T, E]) Query() *QueryBuilder[E] {
-	return &QueryBuilder[E]{meta: r.meta}
+	return &QueryBuilder[E]{queryState{meta: r.meta}}
 }
 
 // QueryScan is Query plus an in-memory filter: one index still has to serve it
@@ -559,7 +629,7 @@ func (r *Repo[T, E]) Query() *QueryBuilder[E] {
 // range holds, not only the ones it returns, so it fails once it has read 5 MB
 // and still has more to read (see queryScanMaxReadUnits).
 func (r *Repo[T, E]) QueryScan() *QueryBuilder[E] {
-	return &QueryBuilder[E]{meta: r.meta, allowsMemoryFilter: true}
+	return &QueryBuilder[E]{queryState{meta: r.meta, allowsMemoryFilter: true}}
 }
 
 // TopN returns up to n records from a single partition, in ascending sort-key
@@ -567,45 +637,51 @@ func (r *Repo[T, E]) QueryScan() *QueryBuilder[E] {
 // per Partition column, in schema order; pass none for an entity that declares
 // no Partition column (the whole entity lives in one partition).
 func (r *Repo[T, E]) TopN(n int32, partitionValues ...any) ([]E, error) {
-	if len(partitionValues) != len(r.meta.partition) {
-		return nil, fmt.Errorf("db: %s has %d partition column(s), got %d value(s)",
-			r.meta.recordType.Name(), len(r.meta.partition), len(partitionValues))
-	}
-	q := r.Query()
-	for i, kc := range r.meta.partition {
-		q.preds = append(q.preds, predicate{field: kc.fieldName, op: opEq, v1: partitionValues[i]})
-	}
-	q.Limit(n)
 	var out []E
-	if err := q.Exec(&out); err != nil {
+	if err := r.topN(n, partitionValues, appendTo(&out)); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (r *repoCore) topN(n int32, partitionValues []any, appendRecord recordSink) error {
+	if len(partitionValues) != len(r.meta.partition) {
+		return fmt.Errorf("db: %s has %d partition column(s), got %d value(s)",
+			r.meta.recordType.Name(), len(r.meta.partition), len(partitionValues))
+	}
+	q := &queryState{meta: r.meta, limit: n}
+	for i, kc := range r.meta.partition {
+		q.preds = append(q.preds, predicate{field: kc.fieldName, op: opEq, v1: partitionValues[i]})
+	}
+	return q.exec(appendRecord)
 }
 
 // Scan returns up to limit records of this entity from the base table,
 // regardless of partition (scanItems) — handy for admin/debug listings, not for
 // hot paths. Order is unspecified (physical). limit <= 0 means no cap.
 func (r *Repo[T, E]) Scan(limit int32) ([]E, error) {
+	var out []E
+	err := r.scan(limit, appendTo(&out))
+	return out, err
+}
+
+func (r *repoCore) scan(limit int32, appendRecord recordSink) error {
 	client, err := Client()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var out []E
-	err = scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
+	return scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		for _, item := range items {
-			var record E
-			if err := r.meta.unmarshalItem(item, &record); err != nil {
+			recordPtr, err := r.meta.decodeRecord(item)
+			if err != nil {
 				return err
 			}
-			out = append(out, record)
-			if limit > 0 && int32(len(out)) >= limit {
+			if recordCount := appendRecord(recordPtr); limit > 0 && int32(recordCount) >= limit {
 				return errStopScan
 			}
 		}
 		return nil
 	})
-	return out, err
 }
 
 // pkRange is a span of pks one read covers: an entity's base rows, or its hidden rows (the fan-out,

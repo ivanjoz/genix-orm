@@ -3,6 +3,7 @@ package dynamo
 import (
 	"context"
 	"strings"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -75,13 +76,13 @@ func CopySequencesFrom(sourceTable string, write bool) (int, error) {
 // CopyRecordsFrom writes every record of the entity stored in sourceTable into the current table, at
 // the key the schema builds now, with Updated and Version as stored (no log append, no stamp). A
 // record the current table already holds at the same or a higher Version is skipped. With write false it is a dry run.
-func (r *Repo[T, E]) CopyRecordsFrom(sourceTable string, write bool) (RecordsReport, error) {
+func (r *repoCore) CopyRecordsFrom(sourceTable string, write bool) (RecordsReport, error) {
 	report := RecordsReport{}
 	client, err := Client()
 	if err != nil {
 		return report, err
 	}
-	copyEveryRecord := func(record *E) (bool, error) { return true, nil }
+	copyEveryRecord := func(recordPtr unsafe.Pointer) (bool, error) { return true, nil }
 	err = scanItems(client, sourceTable, []pkRange{r.meta.baseRowsRange()}, nil, func(storedItems []map[string]types.AttributeValue) error {
 		pageWrites, err := r.reprocessPage(storedItems, copyEveryRecord, write, &report)
 		if err != nil || !write {

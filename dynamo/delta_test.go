@@ -350,7 +350,7 @@ func TestDeltaMetadataRecords(t *testing.T) {
 	query := visits.Query().Eq(visits.T.CreatedBy, 9).Delta(DeltaCursor{5000: 3}, 1)
 	content := []byte{1, 2, 3}
 	metadataText := utils.EncodeSafe85(cache.DeltaMetadataBytes(cache.DeltaMetadataFlag64BitScale|cache.DeltaMetadataFlagSealed, 5000, []int8{16, 32}, content))
-	record := query.deltaMetadataRecord(cache.DeltaMetadataFile{Bucket: 5000, Text: metadataText})
+	record := (*deltaVisit)(query.deltaMetadataRecord(cache.DeltaMetadataFile{Bucket: 5000, Text: metadataText}))
 	// −bucket goes in the log ID's last column; the rest of the key stays zero.
 	if record.ID != -5000 || record.Date != 0 || record.Metadata == nil {
 		t.Fatalf("record = %+v", record)

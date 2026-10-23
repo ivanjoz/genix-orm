@@ -2,7 +2,6 @@ package dynamo
 
 import (
 	"context"
-	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -16,7 +15,7 @@ import (
 // crt; delete it once every environment ran it. It returns how many records lack one (write false
 // is a dry run), each written only while it still lacks it, and the items it can't decode, left as
 // they are.
-func (r *Repo[T, E]) BackfillCreated(write bool) (int, []string, error) {
+func (r *repoCore) BackfillCreated(write bool) (int, []string, error) {
 	client, err := Client()
 	if err != nil {
 		return 0, nil, err
@@ -32,12 +31,12 @@ func (r *Repo[T, E]) BackfillCreated(write bool) (int, []string, error) {
 			}
 			created := int64(0)
 			if r.meta.updated != nil {
-				var record E
-				if err := r.meta.unmarshalItem(item, &record); err != nil {
+				recordPtr, err := r.meta.decodeRecord(item)
+				if err != nil {
 					failures = append(failures, itemName(item)+": "+err.Error())
 					continue
 				}
-				created = r.meta.updated.acc.getI64(unsafe.Pointer(&record))
+				created = r.meta.updated.acc.getI64(recordPtr)
 			}
 			lackingItems = append(lackingItems, item)
 			createdValues = append(createdValues, created)

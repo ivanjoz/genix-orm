@@ -231,7 +231,7 @@ func (m *tableMeta) syncTextSearch(writes []deltaLogWrite) error {
 // ── Search ──────────────────────────────────────────────────────────────────
 
 // textSearchPartitionOf names the partition of one value per Partition column, as in TopN.
-func (r *Repo[T, E]) textSearchPartitionOf(partitionValues []any) (string, error) {
+func (r *repoCore) textSearchPartitionOf(partitionValues []any) (string, error) {
 	if r.meta.textSearch == nil {
 		return "", fmt.Errorf("db: %s does not declare TextSearch", r.meta.recordType.Name())
 	}
@@ -249,7 +249,7 @@ func (r *Repo[T, E]) textSearchPartitionOf(partitionValues []any) (string, error
 // SearchTextIDs queries the text index of one partition (one value per Partition
 // column, as in TopN) and returns the matching active records' IDs, best first,
 // without reading DynamoDB. limit <= 0 lets the backend apply its default.
-func (r *Repo[T, E]) SearchTextIDs(query string, limit, offset int, partitionValues ...any) ([]db.TextHit, error) {
+func (r *repoCore) SearchTextIDs(query string, limit, offset int, partitionValues ...any) ([]db.TextHit, error) {
 	partitionName, err := r.textSearchPartitionOf(partitionValues)
 	if err != nil {
 		return nil, err
@@ -265,29 +265,33 @@ func (r *Repo[T, E]) SearchTextIDs(query string, limit, offset int, partitionVal
 // to *dst in the order of the hits. A hit the table no longer holds is absent from
 // *dst. The hits are returned for their scores.
 func (r *Repo[T, E]) SearchText(dst *[]E, query string, limit, offset int, partitionValues ...any) ([]db.TextHit, error) {
+	return r.searchText(appendTo(dst), query, limit, offset, partitionValues)
+}
+
+func (r *repoCore) searchText(appendRecord recordSink, query string, limit, offset int, partitionValues []any) ([]db.TextHit, error) {
 	hits, err := r.SearchTextIDs(query, limit, offset, partitionValues...)
 	if err != nil || len(hits) == 0 {
 		return hits, err
 	}
-	keys := make([]E, len(hits))
+	keyPtrs := make([]unsafe.Pointer, len(hits))
 	for i, hit := range hits {
-		keyPtr := unsafe.Pointer(&keys[i])
+		keyPtrs[i] = r.meta.newRecord()
 		for partitionIndex, partitionColumn := range r.meta.partition {
-			partitionColumn.acc.setI64(keyPtr, valueToInt64(partitionValues[partitionIndex], partitionColumn.fieldName))
+			partitionColumn.acc.setI64(keyPtrs[i], valueToInt64(partitionValues[partitionIndex], partitionColumn.fieldName))
 		}
-		r.meta.textSearch.id.acc.setI64(keyPtr, int64(hit.ID))
+		r.meta.textSearch.id.acc.setI64(keyPtrs[i], int64(hit.ID))
 	}
-	records, err := r.GetMany(keys)
+	recordByID := make(map[int64]unsafe.Pointer, len(hits))
+	err = r.getMany(keyPtrs, false, func(recordPtr unsafe.Pointer) int {
+		recordByID[r.meta.textSearch.id.acc.getI64(recordPtr)] = recordPtr
+		return len(recordByID)
+	})
 	if err != nil {
 		return hits, err
 	}
-	recordByID := make(map[int64]E, len(records))
-	for _, record := range records {
-		recordByID[r.meta.textSearch.id.acc.getI64(unsafe.Pointer(&record))] = record
-	}
 	for _, hit := range hits {
-		if record, isStored := recordByID[int64(hit.ID)]; isStored {
-			*dst = append(*dst, record)
+		if recordPtr, isStored := recordByID[int64(hit.ID)]; isStored {
+			appendRecord(recordPtr)
 		}
 	}
 	return hits, nil
@@ -297,7 +301,7 @@ func (r *Repo[T, E]) SearchText(dst *[]E, query string, limit, offset int, parti
 
 // ReindexTextSearch rebuilds one partition's text index from its active records.
 // Writes that land while it runs are kept.
-func (r *Repo[T, E]) ReindexTextSearch(partitionValues ...any) error {
+func (r *repoCore) ReindexTextSearch(partitionValues ...any) error {
 	if r.meta.textSearch == nil {
 		return nil
 	}
@@ -314,7 +318,7 @@ func (r *Repo[T, E]) ReindexTextSearch(partitionValues ...any) error {
 
 // ReindexTextSearchAll rebuilds the text index of every partition that has records:
 // it lists the entity's pks first, then reads each partition inside its rebuild.
-func (r *Repo[T, E]) ReindexTextSearchAll() error {
+func (r *repoCore) ReindexTextSearchAll() error {
 	if r.meta.textSearch == nil {
 		return nil
 	}
@@ -336,7 +340,7 @@ func (r *Repo[T, E]) ReindexTextSearchAll() error {
 
 // CompactTextSearch folds the partition's pending index writes, for backends with
 // a write log.
-func (r *Repo[T, E]) CompactTextSearch(partitionValues ...any) error {
+func (r *repoCore) CompactTextSearch(partitionValues ...any) error {
 	if r.meta.textSearch == nil {
 		return nil
 	}
@@ -352,7 +356,7 @@ func (r *Repo[T, E]) CompactTextSearch(partitionValues ...any) error {
 }
 
 // DropTextSearch empties the partition's text index.
-func (r *Repo[T, E]) DropTextSearch(partitionValues ...any) error {
+func (r *repoCore) DropTextSearch(partitionValues ...any) error {
 	if r.meta.textSearch == nil {
 		return nil
 	}
@@ -368,14 +372,18 @@ func (r *Repo[T, E]) DropTextSearch(partitionValues ...any) error {
 }
 
 // textSource lists the active records of one partition, as TopN reads it.
-func (r *Repo[T, E]) textSource(partitionValues []any) db.TextSource {
+func (r *repoCore) textSource(partitionValues []any) db.TextSource {
 	return func(ctx context.Context, yield func(db.TextDoc) error) error {
-		records, err := r.TopN(0, partitionValues...)
+		var recordPtrs []unsafe.Pointer
+		err := r.topN(0, partitionValues, func(recordPtr unsafe.Pointer) int {
+			recordPtrs = append(recordPtrs, recordPtr)
+			return len(recordPtrs)
+		})
 		if err != nil {
 			return err
 		}
-		for i := range records {
-			doc, err := r.meta.textDocOf(unsafe.Pointer(&records[i]))
+		for _, recordPtr := range recordPtrs {
+			doc, err := r.meta.textDocOf(recordPtr)
 			if err != nil {
 				return err
 			}
@@ -391,7 +399,7 @@ func (r *Repo[T, E]) textSource(partitionValues []any) db.TextSource {
 }
 
 // storedPartitionsValues lists the Partition values of every base pk the entity holds.
-func (r *Repo[T, E]) storedPartitionsValues() ([][]uint64, error) {
+func (r *repoCore) storedPartitionsValues() ([][]uint64, error) {
 	client, err := Client()
 	if err != nil {
 		return nil, err

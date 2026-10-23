@@ -262,14 +262,21 @@ type DeltaCursor = cache.DeltaCursor
 func (q *QueryBuilder[E]) Delta(cursor DeltaCursor, syncFilterValues ...any) *QueryBuilder[E] {
 	q.deltaCursor, q.readsDeltaLog = cursor, true
 	if len(cursor) > 0 {
-		return q.selectDelta(false)
+		q.selectDelta(false)
+		return q
 	}
-	return q.DeltaList(syncFilterValues...)
+	q.selectDeltaList(syncFilterValues)
+	return q
 }
 
 // DeltaList lists a delta index's view as a first sync does, with no Metadata records: the read of
 // a handler that needs the records, not a client's cache.
 func (q *QueryBuilder[E]) DeltaList(syncFilterValues ...any) *QueryBuilder[E] {
+	q.selectDeltaList(syncFilterValues)
+	return q
+}
+
+func (q *queryState) selectDeltaList(syncFilterValues []any) {
 	if len(syncFilterValues) > 0 {
 		q.syncFilter = &predicate{op: opIn, v1: syncFilterValues}
 	}
@@ -277,21 +284,19 @@ func (q *QueryBuilder[E]) DeltaList(syncFilterValues ...any) *QueryBuilder[E] {
 	if q.syncFilter != nil && q.deltaIndex != nil {
 		q.syncFilter.field = q.deltaIndex.syncFilterField
 	}
-	return q
 }
 
-func (q *QueryBuilder[E]) selectDelta(needsSyncFilter bool) *QueryBuilder[E] {
+func (q *queryState) selectDelta(needsSyncFilter bool) {
 	deltaIndex, err := q.meta.selectDeltaIndex(q.preds, needsSyncFilter)
 	if err != nil {
 		q.planErr = err
-		return q
+		return
 	}
 	q.deltaIndex = deltaIndex
-	return q
 }
 
 // deltaRows is the hidden-rows index that lists the delta read's view, nil when the base table does.
-func (q *QueryBuilder[E]) deltaRows() *arrayIndexMeta {
+func (q *queryState) deltaRows() *arrayIndexMeta {
 	if q.deltaIndex == nil || q.deltaIndex.rowsIndex < 0 {
 		return nil
 	}

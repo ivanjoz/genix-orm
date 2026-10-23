@@ -51,7 +51,7 @@ type ReprocessReport struct {
 // ReprocessBlobs re-encodes every colbin "d" blob of this entity whose bytes differ from what the
 // current colbin writes. decodeLegacy decodes a blob written by the previous colbin into a *E.
 // With write false it is a dry run: it decodes and counts, and writes nothing.
-func (r *Repo[T, E]) ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error) {
+func (r *repoCore) ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error) {
 	report := ReprocessReport{}
 	client, err := Client()
 	if err != nil {

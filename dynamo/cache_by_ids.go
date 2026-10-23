@@ -70,6 +70,28 @@ func (m *tableMeta) setSlotsUpdated(ptrs []unsafe.Pointer) error {
 // come grouped by partition, ascending, and carry toUpdated(slot tick) in Updated, or 0 while the
 // tick is younger than slotTrustTicks.
 func (r *Repo[T, E]) QueryCachedIDs(request CachedIDsRequest) ([]CachedPartition[E], error) {
+	partitionsRead, err := r.queryCachedIDs(request)
+	if err != nil || partitionsRead == nil {
+		return nil, err
+	}
+	cachedPartitions := make([]CachedPartition[E], len(partitionsRead))
+	for i, partitionRead := range partitionsRead {
+		cachedPartitions[i].Partition = partitionRead.partition
+		for _, recordPtr := range partitionRead.recordPtrs {
+			cachedPartitions[i].Records = append(cachedPartitions[i].Records, *(*E)(recordPtr))
+		}
+	}
+	return cachedPartitions, nil
+}
+
+// cachedPartitionRead is one partition of a QueryCachedIDs answer, its records (each a *E) by pointer.
+type cachedPartitionRead struct {
+	partition  int64
+	recordPtrs []unsafe.Pointer
+}
+
+// queryCachedIDs is QueryCachedIDs over records by pointer, its partitions ascending.
+func (r *repoCore) queryCachedIDs(request CachedIDsRequest) ([]cachedPartitionRead, error) {
 	m := r.meta
 	if m.cacheByIDs == nil {
 		return nil, fmt.Errorf("db: %s QueryCachedIDs needs CacheByIDs in its schema", m.recordType.Name())
@@ -84,8 +106,7 @@ func (r *Repo[T, E]) QueryCachedIDs(request CachedIDsRequest) ([]CachedPartition
 
 	// A scratch record carries each partition and ID in turn, so the keys are built by the same code
 	// as on write.
-	var keyRecord E
-	keyPtr := unsafe.Pointer(&keyRecord)
+	keyPtr := m.newRecord()
 	basePKByPartition := map[int64]string{}
 	for _, cachedID := range request.IDs {
 		if cachedID.ID < 0 || uint64(cachedID.ID) > maxValueForBits(idColumn.bits) {
@@ -133,24 +154,23 @@ func (r *Repo[T, E]) QueryCachedIDs(request CachedIDsRequest) ([]CachedPartition
 	if err != nil {
 		return nil, err
 	}
-	recordsByPartition := map[int64][]E{}
+	recordPtrsByPartition := map[int64][]unsafe.Pointer{}
 	for _, item := range items {
-		var record E
-		if err := m.unmarshalItem(item, &record); err != nil {
+		recordPtr, err := m.decodeRecord(item)
+		if err != nil {
 			return nil, err
 		}
-		recordPtr := unsafe.Pointer(&record)
 		var partition int64
 		if len(m.partition) > 0 {
 			partition = m.partition[0].acc.getI64(recordPtr)
 		}
 		m.updated.acc.setI64(recordPtr, plan.HeldUpdated(partition, idColumn.acc.getI64(recordPtr)))
-		recordsByPartition[partition] = append(recordsByPartition[partition], record)
+		recordPtrsByPartition[partition] = append(recordPtrsByPartition[partition], recordPtr)
 	}
-	cachedPartitions := make([]CachedPartition[E], 0, len(recordsByPartition))
-	for partition, records := range recordsByPartition {
-		cachedPartitions = append(cachedPartitions, CachedPartition[E]{Partition: partition, Records: records})
+	partitionsRead := make([]cachedPartitionRead, 0, len(recordPtrsByPartition))
+	for partition, recordPtrs := range recordPtrsByPartition {
+		partitionsRead = append(partitionsRead, cachedPartitionRead{partition: partition, recordPtrs: recordPtrs})
 	}
-	slices.SortFunc(cachedPartitions, func(a, b CachedPartition[E]) int { return cmp.Compare(a.Partition, b.Partition) })
-	return cachedPartitions, nil
+	slices.SortFunc(partitionsRead, func(a, b cachedPartitionRead) int { return cmp.Compare(a.partition, b.partition) })
+	return partitionsRead, nil
 }

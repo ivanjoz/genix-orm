@@ -85,7 +85,7 @@ func ReserveIDs(name string, count int) (int64, error) { return reserveSequence(
 
 // GetAutoincrementValue returns the entity's sequence counter: the last value
 // handed out, 0 for a sequence that never reserved one.
-func (r *Repo[T, E]) GetAutoincrementValue() (int64, error) {
+func (r *repoCore) GetAutoincrementValue() (int64, error) {
 	if r.meta.autoinc == nil {
 		return 0, fmt.Errorf("db: entity %q does not use autoincrement", r.meta.entity)
 	}
@@ -108,7 +108,7 @@ func (r *Repo[T, E]) GetAutoincrementValue() (int64, error) {
 // and returns what it held before (genix's SetCounterValue). The next generated
 // ID uses value+1. Moving it below an ID already in use makes the ORM hand that
 // ID out again, and Put is an upsert: the caller owns that check.
-func (r *Repo[T, E]) SetAutoincrementValue(value int64) (int64, error) {
+func (r *repoCore) SetAutoincrementValue(value int64) (int64, error) {
 	if r.meta.autoinc == nil {
 		return 0, fmt.Errorf("db: entity %q does not use autoincrement", r.meta.entity)
 	}

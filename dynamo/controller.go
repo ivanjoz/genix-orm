@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -93,10 +94,10 @@ type Controller interface {
 func NewController[T any, E any]() Controller { return NewRepo[T, E]() }
 
 // Entity returns the entity's name.
-func (r *Repo[T, E]) Entity() string { return r.meta.entity }
+func (r *repoCore) Entity() string { return r.meta.entity }
 
 // TableName returns the physical DynamoDB table name.
-func (r *Repo[T, E]) TableName() string { return tableName() }
+func (r *repoCore) TableName() string { return tableName() }
 
 // DeleteRecordsAll scans this entity's key namespace and deletes every record,
 // returning the count removed. It projects only the pk/sk key attributes and deletes in BatchWriteItem batches of 25 with the
@@ -110,7 +111,7 @@ func (r *Repo[T, E]) TableName() string { return tableName() }
 // index of every partition it emptied is dropped too. A table with a delta index logs
 // every record as deleted, so the clients' caches drop them on their next sync.
 // This is a destructive maintenance operation — there is no undo.
-func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
+func (r *repoCore) DeleteRecordsAll() (int, error) {
 	if err := r.meta.checkTextSearchBackend(); err != nil {
 		return 0, err
 	}
@@ -147,7 +148,7 @@ func (r *Repo[T, E]) DeleteRecordsAll() (int, error) {
 // storedRecordsDeleteLog reads every stored record of a table with a delta index as the delete
 // appendDeltaLogs logs for it: the delta entries hold each record's folders and log ID, which only
 // the decoded record gives. Nil without a delta index.
-func (r *Repo[T, E]) storedRecordsDeleteLog() ([]deltaLogWrite, error) {
+func (r *repoCore) storedRecordsDeleteLog() ([]deltaLogWrite, error) {
 	if len(r.meta.deltaIndexes) == 0 {
 		return nil, nil
 	}
@@ -158,11 +159,10 @@ func (r *Repo[T, E]) storedRecordsDeleteLog() ([]deltaLogWrite, error) {
 	var deleteLog []deltaLogWrite
 	err = scanItems(client, tableName(), []pkRange{r.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		for _, item := range items {
-			storedRecord := new(E)
-			if err := r.meta.unmarshalItem(item, storedRecord); err != nil {
+			storedPtr, err := r.meta.decodeRecord(item)
+			if err != nil {
 				return err
 			}
-			storedPtr := unsafe.Pointer(storedRecord)
 			deleteLog = append(deleteLog, deltaLogWrite{storedPtr: storedPtr, version: cache.NextVersion(r.meta.version.getI64(storedPtr))})
 		}
 		return nil
@@ -171,7 +171,7 @@ func (r *Repo[T, E]) storedRecordsDeleteLog() ([]deltaLogWrite, error) {
 }
 
 // deleteItemsAll deletes every base and hidden row of the entity.
-func (r *Repo[T, E]) deleteItemsAll() (int, error) {
+func (r *repoCore) deleteItemsAll() (int, error) {
 	client, err := Client()
 	if err != nil {
 		return 0, err
@@ -196,9 +196,10 @@ func (r *Repo[T, E]) deleteItemsAll() (int, error) {
 // value that overflows its Size(bits) or is negative panics on the write path;
 // here it comes back as an error, so a type-erased caller can validate a payload
 // without writing it.
-func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error) {
-	var decodedRecords []E
-	if err := json.Unmarshal(recordsJSON, &decodedRecords); err != nil {
+func (r *repoCore) DecodeRecords(recordsJSON []byte) (records []any, err error) {
+	// A []E built through reflect: json fills it as it would a typed slice.
+	decodedRecords := reflect.New(reflect.SliceOf(r.meta.recordType))
+	if err := json.Unmarshal(recordsJSON, decodedRecords.Interface()); err != nil {
 		return nil, fmt.Errorf("db: %s records are not a valid JSON array: %w", r.meta.recordType.Name(), err)
 	}
 	defer func() {
@@ -206,10 +207,10 @@ func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error
 			records, err = nil, fmt.Errorf("%v", recovered)
 		}
 	}()
-	records = make([]any, len(decodedRecords))
-	for i := range decodedRecords {
-		ptr := unsafe.Pointer(&decodedRecords[i])
-		if _, err := r.meta.marshalItem(ptr, &decodedRecords[i]); err != nil {
+	records = make([]any, decodedRecords.Elem().Len())
+	for i := range records {
+		ptr := decodedRecords.Elem().Index(i).Addr().UnsafePointer()
+		if _, err := r.meta.marshalItem(ptr, r.meta.recordPointer(ptr)); err != nil {
 			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
 		}
 		for arrayIndex := range r.meta.arrayIndexes {
@@ -219,27 +220,27 @@ func (r *Repo[T, E]) DecodeRecords(recordsJSON []byte) (records []any, err error
 		if err := r.meta.addGroupCounterDeltas(map[string]*groupCounterDelta{}, nil, ptr); err != nil {
 			return nil, fmt.Errorf("db: %s record %d: %w", r.meta.recordType.Name(), i, err)
 		}
-		records[i] = decodedRecords[i]
+		records[i] = r.meta.recordValue(ptr)
 	}
 	return records, nil
 }
 
 // PutRecords is PutMany for type-erased records: each must be an E value.
-func (r *Repo[T, E]) PutRecords(records []any) ([]any, error) {
-	typedRecords := make([]E, len(records))
+func (r *repoCore) PutRecords(records []any) ([]any, error) {
+	ptrs := make([]unsafe.Pointer, len(records))
 	for i, record := range records {
-		typedRecord, isRecord := record.(E)
-		if !isRecord {
+		if reflect.TypeOf(record) != r.meta.recordType {
 			return nil, fmt.Errorf("db: %s PutRecords got a %T at %d", r.meta.recordType.Name(), record, i)
 		}
-		typedRecords[i] = typedRecord
+		ptrs[i] = r.meta.newRecord()
+		reflect.NewAt(r.meta.recordType, ptrs[i]).Elem().Set(reflect.ValueOf(record))
 	}
-	if err := r.PutMany(typedRecords); err != nil {
+	if err := r.putMany(ptrs, false); err != nil {
 		return nil, err
 	}
-	writtenRecords := make([]any, len(typedRecords))
-	for i := range typedRecords {
-		writtenRecords[i] = typedRecords[i]
+	writtenRecords := make([]any, len(ptrs))
+	for i, ptr := range ptrs {
+		writtenRecords[i] = r.meta.recordValue(ptr)
 	}
 	return writtenRecords, nil
 }

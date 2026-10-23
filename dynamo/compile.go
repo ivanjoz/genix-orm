@@ -108,27 +108,35 @@ type schemaProvider interface{ GetSchema() Schema }
 // getOrCompile returns the cached tableMeta and the name-populated table struct.
 func getOrCompile[T any, E any]() (*tableMeta, T) {
 	tablePtr := new(T)
-	populateColumnNames(tablePtr)
-
-	recordType := reflect.TypeOf((*E)(nil)).Elem()
-	if cached, ok := metaCache.Load(recordType); ok {
-		return cached.(*tableMeta), *tablePtr
-	}
-
-	sp, ok := any(*tablePtr).(schemaProvider)
-	if !ok {
-		panic(fmt.Sprintf("db: %s does not implement GetSchema()", recordType.Name()))
-	}
-	schema := sp.GetSchema()
-
-	meta := buildTableMeta(schema, recordType)
-	metaCache.Store(recordType, meta)
+	meta := compileTable(tablePtr, reflect.TypeOf((*E)(nil)).Elem())
 	return meta, *tablePtr
 }
 
+// compileTable is getOrCompile for tablePtr, a *T: it names its columns and returns the cached
+// tableMeta of recordType, compiling it the first time.
+func compileTable(tablePtr any, recordType reflect.Type) *tableMeta {
+	if cached, ok := metaCache.Load(recordType); ok {
+		populateColumnNames(tablePtr)
+		return cached.(*tableMeta)
+	}
+	meta := buildTableMeta(declaredSchema(tablePtr), recordType)
+	metaCache.Store(recordType, meta)
+	return meta
+}
+
+// declaredSchema names the columns of tablePtr (a *T) and returns the Schema its GetSchema declares.
+func declaredSchema(tablePtr any) Schema {
+	populateColumnNames(tablePtr)
+	sp, ok := reflect.ValueOf(tablePtr).Elem().Interface().(schemaProvider)
+	if !ok {
+		panic(fmt.Sprintf("db: %s does not implement GetSchema()", reflect.TypeOf(tablePtr).Elem()))
+	}
+	return sp.GetSchema()
+}
+
 // populateColumnNames stamps each Col field's Go name into its metadata, so that
-// GetSchema() can reference columns by identity.
-func populateColumnNames[T any](tablePtr *T) {
+// GetSchema() can reference columns by identity. tablePtr is a *T.
+func populateColumnNames(tablePtr any) {
 	rv := reflect.ValueOf(tablePtr).Elem()
 	rt := rv.Type()
 	for i := 0; i < rv.NumField(); i++ {
