@@ -26,7 +26,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.1 // indirect
 	github.com/aws/smithy-go v1.28.2 // indirect
-	github.com/ivanjoz/colbin v0.6.2 // indirect
+	github.com/ivanjoz/colbin v0.8.0 // indirect
 	github.com/ivanjoz/genix-orm/utils v0.0.0 // indirect
 	github.com/viant/xunsafe v0.11.0 // indirect
 )
