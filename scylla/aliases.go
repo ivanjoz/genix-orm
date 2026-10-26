@@ -66,6 +66,7 @@ var Cols = db.Cols
 type (
 	TextHit    = db.TextHit
 	TextSearch = db.TextSearch
+	DataFrame  = db.DataFrame
 )
 
 var (

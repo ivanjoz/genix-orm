@@ -5,6 +5,7 @@ go 1.27
 require github.com/ivanjoz/genix-orm/db v0.0.0
 
 require (
+	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0 // indirect
 	github.com/viant/xunsafe v0.11.0 // indirect
 )
@@ -12,3 +13,5 @@ require (
 replace github.com/ivanjoz/genix-orm/db => ../../db
 
 replace github.com/ivanjoz/genix-orm/utils => ../../utils
+
+replace github.com/ivanjoz/genix-orm/dataframe => ../../dataframe

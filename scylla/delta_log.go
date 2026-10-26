@@ -52,9 +52,9 @@ func deltaLogFolder(scyllaTable ScyllaTable, partitionValue int64, deltaIndex de
 
 /* Write */
 
-// deltaWritePhase is one half of a write call: its records and the columns it writes. A column it
-// does not write keeps its stored value, which is what the log must see.
-type deltaWritePhase struct {
+// writePhase is one half of a write call: its records and the columns it writes. A column it does not
+// write keeps its stored value, which is what the delta log and the frame log must see.
+type writePhase struct {
 	records        recordSlice
 	writtenColumns []IColInfo
 }
@@ -88,11 +88,23 @@ func deltaTrackedColumns(scyllaTable ScyllaTable) []IColInfo {
 	return trackedColumns
 }
 
-// stampDeltaVersions reads the stored state of every written record, stamps each with its next
-// Version, and returns what the records will append to the logs once the rows are written. The
-// keys must be final (after handlePreInsert).
-func stampDeltaVersions(scyllaTable ScyllaTable, phases []deltaWritePhase) ([]deltaWrittenRecord, error) {
-	if len(scyllaTable.deltaIndexes) == 0 {
+// storedRows are the stored columns of the written records, read before the write, by (partition,
+// key) and column name; a record not stored is absent and a null column has no entry.
+type storedRows map[[2]int64]map[string]any
+
+// readStoredWrittenRows reads, in one select per partition, what the delta indexes and the DataFrames
+// need of the records about to be written: the version and the delta tracked columns, the frames'
+// tracked columns. nil when the table has neither. The keys must be final (after handlePreInsert).
+func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (storedRows, error) {
+	var columns []IColInfo
+	if len(scyllaTable.deltaIndexes) > 0 {
+		columns = append(columns, scyllaTable.VersionCol)
+		columns = append(columns, deltaTrackedColumns(scyllaTable)...)
+	}
+	if scyllaTable.dataFrames != nil {
+		columns = append(columns, scyllaTable.dataFrames.trackedColumns...)
+	}
+	if len(columns) == 0 {
 		return nil, nil
 	}
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
@@ -104,11 +116,17 @@ func stampDeltaVersions(scyllaTable ScyllaTable, phases []deltaWritePhase) ([]de
 			idsOfPartition[partition] = append(idsOfPartition[partition], convertToInt64(keyColumn.GetRawValue(recordPointer)))
 		}
 	}
-	trackedColumns := deltaTrackedColumns(scyllaTable)
-	storedRows, err := readStoredDeltaRows(scyllaTable, idsOfPartition, trackedColumns)
-	if err != nil {
-		return nil, err
+	return readStoredRows(scyllaTable, idsOfPartition, columns)
+}
+
+// stampDeltaVersions stamps every written record with its next Version and returns what the records
+// will append to the logs once the rows are written.
+func stampDeltaVersions(scyllaTable ScyllaTable, phases []writePhase, stored storedRows) []deltaWrittenRecord {
+	if len(scyllaTable.deltaIndexes) == 0 {
+		return nil
 	}
+	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
+	trackedColumns := deltaTrackedColumns(scyllaTable)
 
 	var writtenRecords []deltaWrittenRecord
 	for _, phase := range phases {
@@ -123,17 +141,20 @@ func stampDeltaVersions(scyllaTable ScyllaTable, phases []deltaWritePhase) ([]de
 				logID:         convertToInt64(keyColumn.GetRawValue(recordPointer)),
 				writtenValues: map[string]int64{},
 			}
-			storedRow, isStored := storedRows[[2]int64{written.partition, written.logID}]
-			written.version = int16(cache.NextVersion(storedRow[managedVersionColumnName]))
+			storedRow, isStored := stored[[2]int64{written.partition, written.logID}]
+			written.version = int16(cache.NextVersion(storedIntegerOf(storedRow, managedVersionColumnName)))
 			scyllaTable.VersionCol.SetValue(recordPointer, coerceManagedIntegerValue(scyllaTable.VersionCol, int64(written.version)))
 			if isStored {
-				written.storedValues = storedRow
+				written.storedValues = map[string]int64{}
+				for _, column := range trackedColumns {
+					written.storedValues[column.GetName()] = storedIntegerOf(storedRow, column.GetName())
+				}
 			}
 			for _, column := range trackedColumns {
 				if isWritten[column.GetName()] || !isStored {
 					written.writtenValues[column.GetName()] = convertToInt64(column.GetRawValue(recordPointer))
 				} else {
-					written.writtenValues[column.GetName()] = storedRow[column.GetName()]
+					written.writtenValues[column.GetName()] = written.storedValues[column.GetName()]
 				}
 			}
 			// Status 0 leaves every view: physical deletes are not part of the app's flow, so the
@@ -143,22 +164,32 @@ func stampDeltaVersions(scyllaTable ScyllaTable, phases []deltaWritePhase) ([]de
 			writtenRecords = append(writtenRecords, written)
 		}
 	}
-	return writtenRecords, nil
+	return writtenRecords
 }
 
-// readStoredDeltaRows reads the version and the tracked columns of the given keys, by partition and
-// key, at LocalQuorum so a write right after another sees its version.
-func readStoredDeltaRows(scyllaTable ScyllaTable, idsOfPartition map[int64][]int64, trackedColumns []IColInfo) (map[[2]int64]map[string]int64, error) {
-	columnNames := []string{scyllaTable.Keys[0].GetName(), managedVersionColumnName}
-	for _, column := range trackedColumns {
-		columnNames = append(columnNames, column.GetName())
+// storedIntegerOf is an integer column of a stored row: 0 for a null column or a record not stored.
+func storedIntegerOf(storedRow map[string]any, columnName string) int64 {
+	if storedValue, isSet := storedRow[columnName]; isSet {
+		return convertToInt64(storedValue)
+	}
+	return 0
+}
+
+// readStoredRows reads columns of the given keys, by partition and key, at LocalQuorum so a write
+// right after another sees it.
+func readStoredRows(scyllaTable ScyllaTable, idsOfPartition map[int64][]int64, columns []IColInfo) (storedRows, error) {
+	columnNames := []string{scyllaTable.Keys[0].GetName()}
+	for _, column := range columns {
+		if !slices.Contains(columnNames, column.GetName()) {
+			columnNames = append(columnNames, column.GetName())
+		}
 	}
 	for partition := range idsOfPartition {
 		slices.Sort(idsOfPartition[partition])
 		idsOfPartition[partition] = slices.Compact(idsOfPartition[partition])
 	}
 
-	storedRows := map[[2]int64]map[string]int64{}
+	stored := storedRows{}
 	err := forEachIDsBatch(scyllaTable, idsOfPartition, strings.Join(columnNames, ", "),
 		func(queryString string, queryValues []any, partition int64) error {
 			iterator := getScyllaConnection().Query(queryString, queryValues...).Consistency(gocql.LocalQuorum).Iter()
@@ -167,20 +198,20 @@ func readStoredDeltaRows(scyllaTable ScyllaTable, idsOfPartition map[int64][]int
 				if !iterator.MapScan(row) {
 					break
 				}
-				storedRow := map[string]int64{}
+				storedRow := map[string]any{}
 				for _, columnName := range columnNames[1:] {
-					if storedValue := row[columnName]; storedValue != nil { // a null column reads as 0
-						storedRow[columnName] = convertToInt64(storedValue)
+					if storedValue := row[columnName]; storedValue != nil {
+						storedRow[columnName] = storedValue
 					}
 				}
-				storedRows[[2]int64{partition, convertToInt64(row[columnNames[0]])}] = storedRow
+				stored[[2]int64{partition, convertToInt64(row[columnNames[0]])}] = storedRow
 			}
 			return iterator.Close()
 		})
 	if err != nil {
-		return nil, fmt.Errorf("table %q: reading the stored versions: %w", scyllaTable.Name, err)
+		return nil, fmt.Errorf("table %q: reading the stored rows: %w", scyllaTable.Name, err)
 	}
-	return storedRows, nil
+	return stored, nil
 }
 
 // appendDeltaLogs appends the landed writes to the log of every delta index. It runs after the rows

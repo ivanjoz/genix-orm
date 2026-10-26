@@ -15,30 +15,31 @@ func TestVersionsAllocateRoundRobinAndOnlyRaise(t *testing.T) {
 	slotCycle = 3
 	store := utils.NewMemoryFileStore()
 	ctx := context.Background()
-	slots, err := allocateAndRaiseSlots(ctx, store, 4, nil, 100)
+	versionsKey := compileTestTable(t).versionsKeyOf(7)
+	slots, err := allocateAndRaiseSlots(ctx, store, versionsKey, 4, nil, 100)
 	if err != nil || !reflect.DeepEqual(slots, []uint8{1, 2, 3, 1}) {
 		t.Fatalf("first allocation: %v, %v", slots, err)
 	}
-	if slots, _ = allocateAndRaiseSlots(ctx, store, 1, []uint8{3}, 90); !reflect.DeepEqual(slots, []uint8{2}) {
+	if slots, _ = allocateAndRaiseSlots(ctx, store, versionsKey, 1, []uint8{3}, 90); !reflect.DeepEqual(slots, []uint8{2}) {
 		t.Fatalf("second allocation: %v", slots)
 	}
-	versions, etag, _ := ReadVersions(store)
+	versions, etag, _ := readVersions(store, versionsKey)
 	if versions.Counter != 5 || versions.SlotTime(1) != 100 || versions.SlotTime(2) != 100 || versions.SlotTime(3) != 100 {
 		t.Fatalf("a raise to 90 must not lower slots at 100: %+v", versions.SlotTimes[:3])
 	}
-	if _, err := allocateAndRaiseSlots(ctx, store, 0, []uint8{1, 2}, 100); err != nil {
+	if _, err := allocateAndRaiseSlots(ctx, store, versionsKey, 0, []uint8{1, 2}, 100); err != nil {
 		t.Fatal(err)
 	}
-	if _, etagAfter, _ := ReadVersions(store); etagAfter != etag {
+	if _, etagAfter, _ := readVersions(store, versionsKey); etagAfter != etag {
 		t.Fatal("a raise that changes nothing must not write the versions file")
 	}
 	if versions.SlotTime(0) <= 1<<40 {
 		t.Fatal("slot 0 (no slot yet) must never read as unchanged")
 	}
-	if _, err := allocateAndRaiseSlots(ctx, store, 0, []uint8{2}, 120); err != nil {
+	if _, err := allocateAndRaiseSlots(ctx, store, versionsKey, 0, []uint8{2}, 120); err != nil {
 		t.Fatal(err)
 	}
-	if versions, _, _ = ReadVersions(store); versions.SlotTime(2) != 120 || versions.SlotTime(1) != 100 {
+	if versions, _, _ = readVersions(store, versionsKey); versions.SlotTime(2) != 120 || versions.SlotTime(1) != 100 {
 		t.Fatalf("raise of slot 2: %+v", versions.SlotTimes[:3])
 	}
 }

@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	// Folder is the store prefix of every frame: dtf/<table id>/<frame>/<generation>/..., the table id
-	// and the generation in utils.EncodeUintBase64.
+	// Folder is the store prefix of every frame: dtf/<table id>/<frame>/<generation>/<partition>/...,
+	// the table id and the generation in utils.EncodeUintBase64, the partition in decimal.
 	Folder = "dtf/"
 	// FloatScale turns a float into the int64 frames keep it as: 6 decimals, so adding and
 	// subtracting the same value is exact.
@@ -82,7 +82,10 @@ type Frame struct {
 // Keys, Rows and Sums, plus the Status column, in column id order. A backend reads a record into a
 // tracked-values slice in that order (floats × FloatScale).
 type Table struct {
-	Name    string
+	Name string
+	// Folder is the table's store prefix, dtf/<table id>/: its frames' folders and the versions file of
+	// each partition (versionsKeyOf).
+	Folder  string
 	Frames  []Frame
 	Tracked []Column
 	// StatusIndex is the Status column in Tracked, -1 without one: a record with Status 0 is in no file.
@@ -92,8 +95,8 @@ type Table struct {
 // Compile checks the specs and compiles them. tableID names the table's folder (utils.EncodeUintBase64); status
 // is the record's soft-delete column (nil without one).
 func Compile(tableName string, tableID uint64, specs []Spec, status *Column) (*Table, error) {
-	table := &Table{Name: tableName}
 	tableFolder := Folder + utils.EncodeUintBase64(tableID) + "/"
+	table := &Table{Name: tableName, Folder: tableFolder}
 	var trackedColumns []Column
 	for _, spec := range specs {
 		if !frameNamePattern.MatchString(spec.Name) || slices.ContainsFunc(table.Frames, func(frame Frame) bool { return frame.Name == spec.Name }) {
@@ -256,10 +259,15 @@ func (table *Table) valuesOf(frame *Frame, tracked []int64) *frameValues {
 	return values
 }
 
-// fileKeyOf is the store key of the file of keys in a generation folder:
-// <folder><generation>/<k1> for one key, <folder><generation>/<k1>/<k2>_<k3> for two or three.
-func (frame *Frame) fileKeyOf(generation string, keys []int64) string {
-	fileKey := frame.Folder + generation + "/" + strconv.FormatInt(keys[0], 10)
+// partitionFolderOf is the folder of one partition's files in a generation: <folder><generation>/<partition>/.
+func (frame *Frame) partitionFolderOf(generation string, partition int64) string {
+	return frame.Folder + generation + "/" + strconv.FormatInt(partition, 10) + "/"
+}
+
+// fileKeyOf is the store key of the file of keys of a partition in a generation folder:
+// <partition folder><k1> for one key, <partition folder><k1>/<k2>_<k3> for two or three.
+func (frame *Frame) fileKeyOf(generation string, partition int64, keys []int64) string {
+	fileKey := frame.partitionFolderOf(generation, partition) + strconv.FormatInt(keys[0], 10)
 	if len(keys) > 1 {
 		laterKeys := make([]string, len(keys)-1)
 		for i, key := range keys[1:] {
@@ -270,11 +278,17 @@ func (frame *Frame) fileKeyOf(generation string, keys []int64) string {
 	return fileKey
 }
 
-// keysOfFile parses a file key of a generation folder back into its keys (false: not a frame file).
-func (frame *Frame) keysOfFile(generation, fileKey string) ([]int64, bool) {
+// keysOfFile parses a file key of a generation folder back into its partition and keys (false: not
+// a frame file).
+func (frame *Frame) keysOfFile(generation, fileKey string) (int64, []int64, bool) {
 	relativeKey, isInFolder := strings.CutPrefix(fileKey, frame.Folder+generation+"/")
 	if !isInFolder {
-		return nil, false
+		return 0, nil, false
+	}
+	partitionText, relativeKey, hasKeys := strings.Cut(relativeKey, "/")
+	partition, err := strconv.ParseInt(partitionText, 10, 64)
+	if !hasKeys || err != nil || partition < 0 {
+		return 0, nil, false
 	}
 	firstKey, laterKeys, hasLaterKeys := strings.Cut(relativeKey, "/")
 	parts := []string{firstKey}
@@ -282,15 +296,21 @@ func (frame *Frame) keysOfFile(generation, fileKey string) ([]int64, bool) {
 		parts = append(parts, strings.Split(laterKeys, "_")...)
 	}
 	if len(parts) != len(frame.Keys) {
-		return nil, false
+		return 0, nil, false
 	}
 	keys := make([]int64, len(parts))
 	for i, part := range parts {
 		key, err := strconv.ParseInt(part, 10, 64)
 		if err != nil || key < 0 {
-			return nil, false
+			return 0, nil, false
 		}
 		keys[i] = key
 	}
-	return keys, true
+	return partition, keys, true
+}
+
+// versionsKeyOf is the store key of a partition's versions file (versions.go): dtf/<table id>/<partition>.versions,
+// beside the frames' folders and never inside one.
+func (table *Table) versionsKeyOf(partition int64) string {
+	return table.Folder + strconv.FormatInt(partition, 10) + ".versions"
 }

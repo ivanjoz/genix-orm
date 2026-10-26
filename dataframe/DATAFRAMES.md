@@ -4,20 +4,25 @@ A DataFrame is a **precomputed group-by report of a table, stored as small colum
 file store (S3). It answers questions like "minutes and points per employee, for a year and a
 program" with one GET, without reading the records.
 
-This module holds all the logic and no database code. A backend (genix-orm's `dynamo` today,
-`scylla` later) plugs in through the `Backend` interface, a `utils.FileStore`, and a few duties on
-its write path (section 9). It depends only on the standard library and genix-orm's `utils`.
+This module holds all the logic and no database code. A backend (genix-orm's `dynamo` and `scylla`)
+plugs in through the `Backend` interface, a `utils.FileStore`, and a few duties on its write path
+(section 9). It depends only on the standard library and genix-orm's `utils`.
+
+A frame follows the table's **partition** (a company): every partition has its own files and its own
+versions file, and a read names one partition. One state, one lock and one run cover every partition
+of a frame. dynamo has no partitions and puts every record in partition 0.
 
 ```text
 dataframe/
   table.go       Column, Spec → Compile → Table / Frame; file keys, the write check
   codec.go       the frame file format (section 3)
   versions.go    the versions file: 255 slots, the moment each was last raised (section 3.4)
-  changelog.go   the per-record changelog and valuesAt (section 4)
-  run.go         Materialize: build, rebuild and incremental runs (sections 5–6)
+  changelog.go   the per-record changelog, History and valuesAt (section 4)
+  run.go         Materialize: build, rebuild and incremental runs; RebuildPartition (sections 5–6)
   read.go        Read: plain and fresh (section 7)
   changed.go     ReadChanged: the files a client holding raw copies must replace (section 7.1)
   backend.go     Backend, State, ErrFrameNotBuilt (section 9)
+  state_file.go  FileState: the state in a file of the store, for scylla (section 3.2)
 ```
 
 ## 1. What a frame is
@@ -34,7 +39,7 @@ So every distinct `(Year, ProgramID)` gets one file, and inside it one row per e
 sum of that employee's minutes and points over their enrollments in that year and program:
 
 ```text
-file dtf/3gz10/enrollment-report/P49QA9-/2026/3      (Year 2026, ProgramID 3)
+file dtf/3gz10/enrollment-report/P49QA9-/0/2026/3    (partition 0, Year 2026, ProgramID 3)
 
   EmployeeID   RecordedMinutes   Points
   1001         120               10
@@ -86,24 +91,33 @@ Four ideas carry everything:
 ### 3.1 Folders and generations
 
 ```text
-dtf/<table id>/<frame>/<generation>/<k1>            file of a 1-key frame
-dtf/<table id>/<frame>/<generation>/<k1>/<k2>_<k3>  file of a 2–3-key frame
-dtf/versions                                        the versions file, one for every frame (3.4)
+dtf/<table id>/<frame>/<generation>/<partition>/<k1>            file of a 1-key frame
+dtf/<table id>/<frame>/<generation>/<partition>/<k1>/<k2>_<k3>  file of a 2–3-key frame
+dtf/<table id>/<partition>.versions                             the partition's versions file (3.4)
+dtf/<table id>/<frame>.state                                    the frame's state (scylla, 3.2)
 ```
 
 - `<table id>` is the backend's numeric table id and `<generation>` the build time in Unix
   milliseconds, both in `utils.EncodeUintBase64` (genix-orm's URL-safe base64 in ASCII order):
   `78901377` → `3gz10`, a 2026 build → 7 characters such as `P49QA9-`. A build writes a whole new
-  generation beside the old one, switches the state to it, then deletes the old one, so readers
-  never see a half-built frame.
-- Keys are non-negative integers written in decimal. Grouping by `<k1>/` lets a read select a
-  range of the first Key and list the files under each value (section 7).
+  generation beside the old one, for every partition, switches the state to it, then deletes the
+  old one, so readers never see a half-built frame.
+- The partition comes after the generation: a generation spans every partition, so the build's
+  "delete every other generation" stays one listing of the frame's folder.
+- The partition and the Keys are non-negative integers written in decimal. Grouping by `<k1>/`
+  lets a read select a range of the first Key and list the files under each value (section 7).
+- The versions and state files sit beside the frames' folders with a suffix (`.versions`,
+  `.state`), never inside one, so no listing of a frame's folder sees them.
 - A missing file means "no rows". A file whose rows all sum to 0 is not created.
 
 ### 3.2 The frame state
 
-One record per frame, kept by the backend (dynamo: an item `pk = <table base pk>‖000`,
-`sk = "f" + <frame name>`):
+One record per frame, for every partition, kept by the backend. dynamo: an item `pk = <table base
+pk>‖000`, `sk = "f" + <frame name>`, with conditional updates. scylla: `FileState`, the file
+`dtf/<table id>/<frame>.state` (`{"g", "s", "w"}`), written conditioned on the ETag it had when the
+lock was taken, with the lock itself external (`AcquireLock`: fareward in genix). The lock only
+spares duplicate work: a run whose lock lapsed and that another overtook fails its file writes and
+its commit on their ETags.
 
 | Field | Meaning |
 |---|---|
@@ -178,7 +192,8 @@ The whole file is 23 bytes, 8 of them header. A file of thousands of rows stays 
 ### 3.4 The versions file: which copies are stale
 
 A client (the browser) keeps raw files and must learn which of its copies changed without asking
-for each one. `dtf/versions` (1,025 bytes) answers that for every frame of every table:
+for each one. `dtf/<table id>/<partition>.versions` (1,025 bytes) answers that for every frame of
+the table in that partition, so one company's writes never mark another's copies stale:
 
 ```text
 u8        version (1)
@@ -223,6 +238,12 @@ every write (section 9).
 Because every operation only asks "what did this record hold at X?", runs, builds and fresh reads
 are exact whatever order the writes landed in.
 
+**scylla keeps no changelog on the record.** Each write that inserts a record or changes a tracked
+column appends one row to the table's change log, `<table>__dtf_log`, with the same content as a
+changelog entry: the values the changed columns held before it, or an insert flag. A History is
+then built from the record's values now, read from the table, and its logged changes
+(`Table.NewHistoryOfChanges`); valuesAt undoes them the same way. See section 12.
+
 ## 5. Building and rebuilding a frame
 
 A frame is **built** when it has no generation yet, when its shape changed, or when its snapshot is
@@ -244,6 +265,14 @@ Step by step (`rebuildFrame`):
 
 Writes that land during the scan don't break it: each record's changelog still says what it held at
 T. The next run picks up everything written after T.
+
+**One partition** (`RebuildPartition(table, backend, store, partition, now)`): after a partition's
+rows changed outside the write path (a backup restore deletes them), its files are computed again
+in the current generation, frame by frame under the lock: scan the partition, write every file of
+it at T conditioned on its ETag, w left as is. A stored file no record is in any more is rewritten
+empty, not deleted, so a later run that moves a record out of it still finds what it held. Each
+file's own snapshot (T, past w) is what the next run subtracts from. A frame not built yet is left
+to Materialize.
 
 ## 6. Keeping it current: the incremental run
 
@@ -274,7 +303,8 @@ twice or lost. A run whose lock expired fails its conditional writes and its com
 
 ## 7. Reading a frame
 
-`Read(table, frame, backend, store, selection, isFresh)` (dynamo: `Repo.QueryFrame(name)`).
+`Read(table, frame, backend, store, partition, selection, isFresh)` (dynamo: `Repo.QueryFrame(name)`;
+scylla: `db.QueryFrame[Record](partition, name)`). Every step below is within the partition.
 
 1. **Select the files.** A `Selection` takes a range of the first Key (at most 400 values) and, for
    the later Keys, the values of a leading run (`PinnedKeys`):
@@ -284,7 +314,7 @@ twice or lost. A run whose lock expired fails its conditional writes and its com
    `ErrFrameNotBuilt`; the next `Materialize` builds it.
 3. **Plain read:** decode the files and return their rows, as the last run left them (2 to 12
    minutes behind with a 10-minute schedule).
-4. **Fresh read:** also read `HistoriesWrittenAfter(w)` and bring the selected files up to the
+4. **Fresh read:** also read `PartitionHistoriesWrittenAfter(partition, w)` and bring the selected files up to the
    records' current values, the same subtract/add as a run, including files a change created that
    are not listed yet. If a run moved w while it read, it starts over (3 attempts).
 5. Rows come back sorted by Keys, then Rows values, as `Row{Keys, RowValues, Sums}`. RowValues
@@ -303,7 +333,7 @@ for _, row := range rows {
 
 ### 7.1 Raw files for a client: ReadChanged
 
-`ReadChanged(table, frame, backend, store, selection, heldGeneration, held, now)` (dynamo:
+`ReadChanged(table, frame, backend, store, partition, selection, heldGeneration, held, now)` (dynamo:
 `QueryFrame(name)…ExecChanged(heldGeneration, heldFiles)`) serves a client that keeps the raw files
 and decodes them itself. The client sends the generation of its copies and, per file, its keys,
 snapshot and slot, in the query string:
@@ -389,10 +419,15 @@ is the in-memory one for tests.
 | `ReleaseLock(frame, holderID)` | free it if still held by holderID (best effort) |
 | `CommitSnapshot(ctx, frame, holderID, state, w)` | move the snapshot, only if the lock, generation and old snapshot still hold |
 | `CommitGeneration(ctx, frame, holderID, generation, w)` | make a built generation current (with `frame.Shape`) |
-| `HistoriesWrittenAfter(moment)` | every record with `Updated > moment`, as `History` (dynamo: the GSI on Updated) |
+| `HistoriesWrittenAfter(moment)` | every record of every partition written after moment, as `History` (dynamo: the GSI on Updated; scylla: the change log) |
+| `PartitionHistoriesWrittenAfter(partition, moment)` | the same for one partition (fresh reads) |
 | `ScanHistories(onPage)` | every record of the table, page by page |
+| `ScanPartitionHistories(partition, onPage)` | every record of one partition, page by page (`RebuildPartition`) |
 
-A `History` is built with `NewHistory(recordKey, trackedValues, created, updated, changelog)`.
+A `History` names its partition and is built with `NewHistory(partition, recordKey, trackedValues,
+created, updated, changelog)` (dynamo), or `Table.NewHistoryOfChanges(partition, recordKey,
+trackedValues, changes)` from logged changes, newest first (scylla). `FileState` implements the five
+state methods over a file of the store.
 
 ### Duties on the write path
 
@@ -421,20 +456,51 @@ A `History` is built with `NewHistory(recordKey, trackedValues, created, updated
 - `dataframe_test.go` drives the real `Materialize` and `Read` with an in-memory `Backend` and file
   store over random histories, and checks them against brute force. The histories include inserts,
   updates of every column, floats, negative sums, soft deletes and restores, and runs that crash
-  halfway, forced rebuilds and a tiny slot cycle (2 slots). A simulated client syncs through
+  halfway, forced rebuilds, rebuilds of one partition and a tiny slot cycle (2 slots), over records
+  spread on 3 partitions, every check per partition. A simulated client per partition syncs through
   `ReadChanged` and the wire at random moments and must always match the brute force.
+- `TestHistoryOfChangesMatchesTheHistory` builds Histories the scylla way (values now plus logged
+  changes after a window's start) and checks `valuesAt` against the recorded history.
+- `state_file_test.go` covers `FileState`: a held lock refuses a second taker, and a holder another
+  run overtook fails its commit.
 - `changed_test.go` covers the versions file (round-robin, raise-only, no-op writes) and the wire.
 - It also covers the changelog's sizes, its shift/drop rules, and `valuesAt` against the recorded
   history.
 - `codec_test.go` covers the file format and its compression steps, 1 to 3 nested Rows columns,
   truncated files and a decode fuzzer. The simulation runs a frame of one Rows column and one of two.
 
-## 12. Adding a backend (scylla)
+## 12. The scylla backend
 
-1. Map the schema's frame declarations to `Spec`/`Column` and call `Compile`.
-2. Store `created` and the changelog as two columns of the row, outside the record's blob, and
-   follow the write-path duties (section 9).
-3. Keep one state row per frame (generation, shape, snapshot, lock expiry and holder), with
-   conditional updates (LWT) for `TakeLock` / `CommitSnapshot` / `CommitGeneration`.
-4. Serve `HistoriesWrittenAfter` from an index or a materialized view on `Updated`.
-5. Pass the same `utils.FileStore` as the other features (S3).
+genix-orm's `scylla` (`data_frame.go`, `data_frame_log.go`, `data_frame_backend.go`):
+
+- **Declaration:** `TableSchema.DataFrames` (`db.DataFrame`). The table needs an int32 partition
+  column and one integer key; frame columns are persisted integers or floats, the status column is
+  the one named `status`. A column's id is its field position, so moving a field changes the shapes
+  and rebuilds the frames; the change log names columns by a 16-bit hash of their name instead, so
+  its rows keep their meaning across such a deploy.
+- **Change log**, one table per table with frames, created by `DeployScylla`:
+
+  ```sql
+  CREATE TABLE <table>__dtf_log (
+    half_hour int, partition_id int, ts int, record_id int, changes blob,
+    PRIMARY KEY ((half_hour), partition_id, ts, record_id)
+  ) WITH default_time_to_live = 172800 AND compaction = {TimeWindowCompactionStrategy, 6 h}
+  ```
+
+  `half_hour` is unix seconds / 1800 and `ts` the microseconds since it started: a run reads every
+  partition's writes of a half hour with one query, a fresh read slices its partition. `changes` is
+  `u8 format, u8 flags (insert), then per changed column: u16 name hash, zigzag varint before`.
+- **Write path:** one select per partition reads the stored tracked columns (shared with the delta
+  log's read), then the write logs every record it inserts or whose tracked columns it changes, in
+  an unlogged batch at LocalQuorum, **before** the record rows. A change the table holds always has
+  its log row; a log row whose write then failed is harmless, because a History starts from the
+  values the table holds and only undoes changes. A write that changes nothing tracked logs nothing.
+- **Histories:** the log after w, then the values of the records it names, then the log again: a
+  write landing between the value read and the second log read is undone back to what the record
+  held before it. A record only the second read names changed after the run's target and is left
+  to the next run. A rebuild scans the table a page at a time and reads the log after each page.
+- **State and lock:** `dataframe.FileState`, with `scylla.AcquireFrameLock` as the lock (genix
+  installs a fareward try-lock). LWT is not used: it does not run on tablet keyspaces.
+- **Concurrent writes:** two writers of one record that both read the stored row before either
+  writes may log a stale before value for an intermediate moment. The frame still ends on what the
+  table holds, because every History starts from the stored values.

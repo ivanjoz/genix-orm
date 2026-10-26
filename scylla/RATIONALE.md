@@ -1,3 +1,38 @@
+## DataFrame log rows hold before values only; Histories start from the table
+**Context** — The agreed plan logged each write's after values with the same explicit
+`USING TIMESTAMP` as its rows, so the log replayed Scylla's last-write-wins exactly. Logging
+"only real changes" (the choice made) already gives up exactness under a race, and after values
+plus timestamps cost bytes on every row and a timestamp on every write of the table.
+**Decision** — A log row is the `cgl` entry: the before values of the changed columns, or an
+insert flag. A History is the record's values read from the table, undone by its logged changes.
+No explicit write timestamps. The log is read after the values, and again after them for
+`HistoriesWrittenAfter`; a rebuild reads the log after each page of 5000 records. The column is
+`partition_id`, not `empresa_id`: the ORM names no tenant.
+**Rationale** — A frame always ends on what the table holds, whatever the writers raced, because
+every History starts from the stored row. It costs a read of the changed records' values per
+run and fresh read (one select per partition) and a second log read.
+
+## The DataFrame log is written before the rows, in its own batch
+**Context** — An unlogged batch is not atomic across partitions, and the log's partition (the half
+hour) is never the record's. A row change that lands without its log row would be wrong in the
+frames until a rebuild.
+**Decision** — `writeDataFrameLog` runs before the row batches, as its own unlogged batch at
+LocalQuorum (one partition, so it is cheap). A write that logged and then failed leaves a log row
+for a change the table doesn't hold.
+**Rationale** — That stray row is harmless: the History starts from the stored values, and undoing
+a change to the value the row still holds changes nothing. It costs one more round trip of latency
+on writes to tables with frames, and none on other tables.
+
+## Frame columns: field position as the id, a name hash in the log
+**Context** — `dataframe` names columns by an id 1..255 in shapes; scylla has no `cb` tag. The id
+must also decode log rows written up to 48 h earlier.
+**Decision** — The frame column id is the field's position (`Idx`); the log names a column by 16
+bits of the CRC32 of its name, and a collision among a table's tracked columns panics at compile.
+Keys, Rows and Sums take signed integers and floats only.
+**Rationale** — Moving a field changes the shapes, which rebuilds the frames: correct and
+automatic. The log rows keep their meaning across that deploy. A collision is unlikely and fails
+loudly with a "rename" message.
+
 ## Type-erased read, merge and controller paths
 **Context** — Go compiles a generic function once per record struct, so every body that took `T`
 existed 55 times in genix. The write path and the row scan were already erased (`recordSlice`,

@@ -258,6 +258,27 @@ hits, err = db.SearchText(&products, empresaID, "polo rojo", 20, 0)   // also re
 
 ---
 
+### DataFrames
+
+A table declares group-by reports in its schema; they are kept as small columnar files in the file
+store, one set per partition, and read with one GET per file. See `dataframe/DATAFRAMES.md`.
+
+```go
+DataFrames: []db.DataFrame{{
+    Name: "sales-by-month", Keys: db.Cols(e.Month), Rows: db.Cols(e.ProductID),
+    Sums: db.Cols(e.Quantity, e.Amount), Count: true,
+}},
+
+rows, err := db.QueryFrame[Sale](empresaID, "sales-by-month").Between(q.Month, 202601, 202612).Exec()
+quantity := rows[0].Sum(q.Quantity)
+```
+
+Every write logs what it changed in `<table>__dtf_log` (scylla); `MaterializeDataFrames` on the
+controller, every few minutes, moves the files forward. The frames' lock is
+`scylla.AcquireFrameLock`, installed by the application.
+
+---
+
 ## 6. Two databases at once
 
 The declared driver is a *default*. `.Via()` overrides it for one query, and the
@@ -307,7 +328,9 @@ to compile.
 | Column projection, `Limit`, `OrderDesc` | yes |
 | `KeyIntPacking`, `KeyConcatenated` | Scylla-specific |
 | `TypeInheritFromKey`, `UseIndexGroup`, `CompositeBucketing` | Scylla-specific |
-| Text search, `GenericRecord` by-IDs reads | Scylla-specific |
+| Text search (`db.TextSearchBackend`: genix-s3 or the daemon) | both drivers |
+| DataFrames (`dataframe/DATAFRAMES.md`), per partition on scylla | both drivers |
+| `GenericRecord` by-IDs reads | Scylla-specific |
 | Materialized views with arbitrary key reordering | Scylla-specific |
 
 "Portable" here means the shared layer expresses it and any conforming driver can

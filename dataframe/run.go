@@ -144,8 +144,6 @@ func (table *Table) moveFiles(ctx context.Context, store utils.FileStore, frame 
 
 	var writtenKeys []string
 	var writtenFiles []File
-	var rewrittenSlots []uint8
-	var newFileIndexes []int
 	for _, fileKey := range fileKeys {
 		if loaded.snapshotByFileKey[fileKey] >= target {
 			continue // a run that crashed after writing it already brought it here
@@ -154,25 +152,46 @@ func (table *Table) moveFiles(ctx context.Context, store utils.FileStore, frame 
 		if file.rowCount() == 0 && loaded.etagByFileKey[fileKey] == "" {
 			continue // a file no record is left in is not created
 		}
-		if file.Slot = loaded.slotByFileKey[fileKey]; file.Slot == 0 {
-			newFileIndexes = append(newFileIndexes, len(writtenFiles))
-		} else {
-			rewrittenSlots = append(rewrittenSlots, file.Slot)
-		}
+		file.Slot = loaded.slotByFileKey[fileKey]
 		writtenKeys, writtenFiles = append(writtenKeys, fileKey), append(writtenFiles, file)
 	}
-	if len(writtenFiles) == 0 {
-		return nil
+	return table.writeFiles(ctx, store, frame, generation, writtenKeys, writtenFiles, loaded.etagByFileKey, target)
+}
+
+// writeFiles gives every new file (Slot 0) a slot and raises the slots of the others to moment, in the
+// versions file of each file's partition, then writes the files conditioned on etagByFileKey ("" or
+// absent: the file must not exist). The slots move first, so a versions file is never behind its files.
+func (table *Table) writeFiles(ctx context.Context, store utils.FileStore, frame *Frame, generation string, fileKeys []string, files []File, etagByFileKey map[string]string, moment int64) error {
+	fileIndexesByPartition := map[int64][]int{}
+	for fileIndex, fileKey := range fileKeys {
+		partition, _, _ := frame.keysOfFile(generation, fileKey)
+		fileIndexesByPartition[partition] = append(fileIndexesByPartition[partition], fileIndex)
 	}
-	newSlots, err := allocateAndRaiseSlots(ctx, store, len(newFileIndexes), rewrittenSlots, target)
+	partitions := slices.Collect(maps.Keys(fileIndexesByPartition))
+	err := utils.RunParallel(len(partitions), func(partitionIndex int) error {
+		var newFileIndexes []int
+		var rewrittenSlots []uint8
+		for _, fileIndex := range fileIndexesByPartition[partitions[partitionIndex]] {
+			if files[fileIndex].Slot == 0 {
+				newFileIndexes = append(newFileIndexes, fileIndex)
+			} else {
+				rewrittenSlots = append(rewrittenSlots, files[fileIndex].Slot)
+			}
+		}
+		newSlots, err := allocateAndRaiseSlots(ctx, store, table.versionsKeyOf(partitions[partitionIndex]), len(newFileIndexes), rewrittenSlots, moment)
+		if err != nil {
+			return err
+		}
+		for i, fileIndex := range newFileIndexes {
+			files[fileIndex].Slot = newSlots[i]
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	for i, fileIndex := range newFileIndexes {
-		writtenFiles[fileIndex].Slot = newSlots[i]
-	}
-	return utils.RunParallel(len(writtenFiles), func(fileIndex int) error {
-		_, err := store.PutFileIfMatch(ctx, writtenKeys[fileIndex], EncodeFile(writtenFiles[fileIndex]), loaded.etagByFileKey[writtenKeys[fileIndex]])
+	return utils.RunParallel(len(files), func(fileIndex int) error {
+		_, err := store.PutFileIfMatch(ctx, fileKeys[fileIndex], EncodeFile(files[fileIndex]), etagByFileKey[fileKeys[fileIndex]])
 		return err
 	})
 }
@@ -215,7 +234,7 @@ func (table *Table) filesOfHistory(frame *Frame, generation string, history Hist
 	var fileKeys []string
 	for _, moment := range moments {
 		if values := table.frameValuesAt(frame, history, moment); values != nil {
-			fileKeys = append(fileKeys, frame.fileKeyOf(generation, values.keys))
+			fileKeys = append(fileKeys, frame.fileKeyOf(generation, history.Partition, values.keys))
 		}
 	}
 	return fileKeys
@@ -227,7 +246,7 @@ func (table *Table) moveRecords(frame *Frame, generation string, histories []His
 	appliedMoments := slices.Compact(slices.Sorted(maps.Values(loaded.appliedThrough)))
 	for _, history := range histories {
 		if values := table.frameValuesAt(frame, history, moment); values != nil {
-			if rows := loaded.rowsByFileKey[frame.fileKeyOf(generation, values.keys)]; rows != nil {
+			if rows := loaded.rowsByFileKey[frame.fileKeyOf(generation, history.Partition, values.keys)]; rows != nil {
 				rows.add(values, 1)
 			}
 		}
@@ -236,7 +255,7 @@ func (table *Table) moveRecords(frame *Frame, generation string, histories []His
 			if values == nil {
 				continue
 			}
-			fileKey := frame.fileKeyOf(generation, values.keys)
+			fileKey := frame.fileKeyOf(generation, history.Partition, values.keys)
 			if rows := loaded.rowsByFileKey[fileKey]; rows != nil && loaded.appliedThrough[fileKey] == appliedMoment {
 				rows.add(values, -1)
 			}
@@ -301,20 +320,14 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 		return fmt.Errorf("dataframe: %s frame %q reading the records: %w", table.Name, frame.Name, err)
 	}
 
-	// Every file of the new generation takes a new slot: the readers holding the old generation
-	// fetch the whole frame again anyway.
+	// Every file of the new generation takes a new slot (Slot 0 here): the readers holding the old
+	// generation fetch the whole frame again anyway.
 	fileKeys := slices.Collect(maps.Keys(rowsByFileKey))
-	slots, err := allocateAndRaiseSlots(lock.ctx, store, len(fileKeys), nil, target)
-	if err != nil {
-		return fmt.Errorf("dataframe: %s frame %q: %w", table.Name, frame.Name, err)
+	files := make([]File, len(fileKeys))
+	for i, fileKey := range fileKeys {
+		files[i] = rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
 	}
-	err = utils.RunParallel(len(fileKeys), func(fileIndex int) error {
-		file := rowsByFileKey[fileKeys[fileIndex]].fileAt(target, len(frame.Rows), frame.SumsCount)
-		file.Slot = slots[fileIndex]
-		_, err := store.PutFileIfMatch(lock.ctx, fileKeys[fileIndex], EncodeFile(file), "")
-		return err
-	})
-	if err != nil {
+	if err := table.writeFiles(lock.ctx, store, frame, generation, fileKeys, files, nil, target); err != nil {
 		return fmt.Errorf("dataframe: %s frame %q writing its files: %w", table.Name, frame.Name, err)
 	}
 	if err := backend.CommitGeneration(lock.ctx, frame, lock.holderID, generation, target); err != nil {
@@ -341,10 +354,75 @@ func (table *Table) sumAt(frame *Frame, generation string, histories []History, 
 		if values == nil {
 			continue
 		}
-		fileKey := frame.fileKeyOf(generation, values.keys)
+		fileKey := frame.fileKeyOf(generation, history.Partition, values.keys)
 		if rowsByFileKey[fileKey] == nil {
 			rowsByFileKey[fileKey] = frameRows{}
 		}
 		rowsByFileKey[fileKey].add(values, 1)
 	}
+}
+
+// RebuildPartition computes the files of one partition again from its records, in every frame's
+// current generation: the fix after the partition's rows changed outside the write path (a backup
+// restore). A frame not built yet is left to Materialize. It fails when a run holds a frame; retry it.
+func RebuildPartition(table *Table, backend Backend, store utils.FileStore, partition int64, now time.Time) error {
+	for i := range table.Frames {
+		frame := &table.Frames[i]
+		lock, state, err := takeLock(backend, frame, now)
+		if err != nil {
+			return err
+		}
+		if lock == nil {
+			return fmt.Errorf("dataframe: %s frame %q is held by a run: retry in a few minutes", table.Name, frame.Name)
+		}
+		if state.Generation != "" && state.Shape == frame.Shape {
+			err = table.rebuildPartitionFrame(backend, store, frame, lock, state, partition, now)
+		}
+		releaseLock(backend, frame, lock)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rebuildPartitionFrame rewrites every file of the partition at the target, w left as is: a file's own
+// snapshot past w is what the next run subtracts from. A stored file no record is in any more is
+// rewritten empty, not deleted, so a run that moves a record out of it still finds what it held.
+func (table *Table) rebuildPartitionFrame(backend Backend, store utils.FileStore, frame *Frame, lock *heldLock, state State, partition int64, now time.Time) error {
+	target := utils.SUnixTimeOf(now) - TargetLag
+	if target < state.Snapshot {
+		return fmt.Errorf("dataframe: %s frame %q: the clock is behind the frame's snapshot", table.Name, frame.Name)
+	}
+	rowsByFileKey := map[string]frameRows{}
+	err := backend.ScanPartitionHistories(partition, func(histories []History) error {
+		table.sumAt(frame, state.Generation, histories, target, rowsByFileKey)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("dataframe: %s frame %q reading the records of partition %d: %w", table.Name, frame.Name, partition, err)
+	}
+	storedKeys, err := store.ListFiles(frame.partitionFolderOf(state.Generation, partition))
+	if err != nil {
+		return fmt.Errorf("dataframe: %s listing frame %q: %w", table.Name, frame.Name, err)
+	}
+	fileKeys := slices.Collect(maps.Keys(rowsByFileKey))
+	for _, storedKey := range storedKeys {
+		if _, _, isFrameFile := frame.keysOfFile(state.Generation, storedKey); isFrameFile && rowsByFileKey[storedKey] == nil {
+			fileKeys = append(fileKeys, storedKey)
+		}
+	}
+	loaded, err := loadFiles(store, frame, fileKeys, state.Snapshot)
+	if err != nil {
+		return err
+	}
+	files := make([]File, len(fileKeys))
+	for i, fileKey := range fileKeys {
+		files[i] = rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
+		files[i].Slot = loaded.slotByFileKey[fileKey]
+	}
+	if err := table.writeFiles(lock.ctx, store, frame, state.Generation, fileKeys, files, loaded.etagByFileKey, target); err != nil {
+		return fmt.Errorf("dataframe: %s frame %q writing the files of partition %d: %w", table.Name, frame.Name, partition, err)
+	}
+	return nil
 }

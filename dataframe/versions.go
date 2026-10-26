@@ -15,7 +15,8 @@ import (
 // The versions file: when each frame file last changed, so a reader holding a copy
 // learns whether to fetch it again without the file being read.
 //
-//	dtf/versions   one per store, 1,025 bytes:
+//	dtf/<table id>/<partition>.versions   one per table and partition, shared by the
+//	                                      table's frames, 1,025 bytes:
 //	  u8        format version
 //	  uint32    counter: how many slots were ever handed out
 //	  255 × uint32  the SUnixTime of the last run that rewrote a file on that slot (0 = never)
@@ -31,8 +32,6 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	// VersionsKey is the store key of the versions file.
-	VersionsKey     = Folder + "versions"
 	versionsVersion = 1
 	slotCount       = 255
 	versionsSize    = 1 + 4 + slotCount*4
@@ -81,9 +80,9 @@ func decodeVersions(content []byte) (*Versions, error) {
 	return versions, nil
 }
 
-// ReadVersions reads the versions file and its ETag; a missing one is every slot at 0.
-func ReadVersions(store utils.FileStore) (*Versions, string, error) {
-	content, etag, err := store.GetFile(VersionsKey)
+// readVersions reads a versions file and its ETag; a missing one is every slot at 0.
+func readVersions(store utils.FileStore, versionsKey string) (*Versions, string, error) {
+	content, etag, err := store.GetFile(versionsKey)
 	if errors.Is(err, utils.ErrFileNotFound) {
 		return &Versions{}, "", nil
 	}
@@ -97,9 +96,9 @@ func ReadVersions(store utils.FileStore) (*Versions, string, error) {
 // allocateAndRaiseSlots hands newFileCount slots out round-robin and raises them, and the
 // rewrittenSlots, to moment (never lower), in one conditional write retried while another run wins
 // it. It returns the slots of the new files, in order.
-func allocateAndRaiseSlots(ctx context.Context, store utils.FileStore, newFileCount int, rewrittenSlots []uint8, moment int64) ([]uint8, error) {
+func allocateAndRaiseSlots(ctx context.Context, store utils.FileStore, versionsKey string, newFileCount int, rewrittenSlots []uint8, moment int64) ([]uint8, error) {
 	for attempt := 1; ; attempt++ {
-		versions, etag, err := ReadVersions(store)
+		versions, etag, err := readVersions(store, versionsKey)
 		if err != nil {
 			return nil, err
 		}
@@ -118,7 +117,7 @@ func allocateAndRaiseSlots(ctx context.Context, store utils.FileStore, newFileCo
 		if !isChanged {
 			return newSlots, nil
 		}
-		_, err = store.PutFileIfMatch(ctx, VersionsKey, encodeVersions(versions), etag)
+		_, err = store.PutFileIfMatch(ctx, versionsKey, encodeVersions(versions), etag)
 		if err == nil {
 			return newSlots, nil
 		}

@@ -29,6 +29,12 @@ func (selection Selection) matches(keys []int64) bool {
 	return keys[0] >= selection.FromKey && keys[0] <= selection.ToKey && slices.Equal(keys[1:1+len(selection.PinnedKeys)], selection.PinnedKeys)
 }
 
+// matchesFile says whether a file key of a generation is a file of the partition the selection takes.
+func (selection Selection) matchesFile(frame *Frame, generation string, partition int64, fileKey string) bool {
+	filePartition, keys, isFrameFile := frame.keysOfFile(generation, fileKey)
+	return isFrameFile && filePartition == partition && selection.matches(keys)
+}
+
 // Row is one row of a frame file: the file's Keys, its Rows values (Frame.Rows in order) and the sums
 // (Frame.Sums in order, then the record count when the frame counts records).
 type Row struct {
@@ -37,9 +43,10 @@ type Row struct {
 	Sums      []int64
 }
 
-// Read returns the selected rows, sorted by Keys then by RowValues, as the last run left them; isFresh
-// also moves the records written since the frame's snapshot to their current values.
-func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, selection Selection, isFresh bool) ([]Row, error) {
+// Read returns the selected rows of one partition, sorted by Keys then by RowValues, as the last run
+// left them; isFresh also moves the partition's records written since the frame's snapshot to their
+// current values.
+func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, selection Selection, isFresh bool) ([]Row, error) {
 	readName := fmt.Sprintf("dataframe: %s frame %q", table.Name, frame.Name)
 	if err := frame.checkSelection(readName, selection); err != nil {
 		return nil, err
@@ -52,19 +59,18 @@ func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, se
 		if state.Generation == "" || state.Shape != frame.Shape {
 			return nil, fmt.Errorf("%s: %w", readName, ErrFrameNotBuilt)
 		}
-		fileKeys, err := frame.selectedFileKeys(store, state.Generation, selection)
+		fileKeys, err := frame.selectedFileKeys(store, state.Generation, partition, selection)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", readName, err)
 		}
 		var histories []History
 		if isFresh {
-			if histories, err = backend.HistoriesWrittenAfter(state.Snapshot); err != nil {
+			if histories, err = backend.PartitionHistoriesWrittenAfter(partition, state.Snapshot); err != nil {
 				return nil, err
 			}
 			// A file a change creates is not listed yet.
 			for _, fileKey := range table.filesHeldBetween(frame, state.Generation, histories, state.Snapshot, math.MaxInt64) {
-				keys, _ := frame.keysOfFile(state.Generation, fileKey)
-				if selection.matches(keys) && !slices.Contains(fileKeys, fileKey) {
+				if selection.matchesFile(frame, state.Generation, partition, fileKey) && !slices.Contains(fileKeys, fileKey) {
 					fileKeys = append(fileKeys, fileKey)
 				}
 			}
@@ -100,21 +106,21 @@ func (frame *Frame) checkSelection(readName string, selection Selection) error {
 
 // selectedFileKeys names the selected files: directly when every Key is pinned, otherwise by listing
 // the folder of each Keys[0] value.
-func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, selection Selection) ([]string, error) {
+func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, partition int64, selection Selection) ([]string, error) {
 	firstKeyCount := int(selection.ToKey - selection.FromKey + 1)
 	if len(selection.PinnedKeys) == len(frame.Keys)-1 {
 		fileKeys := make([]string, firstKeyCount)
 		for i := range fileKeys {
-			fileKeys[i] = frame.fileKeyOf(generation, append([]int64{selection.FromKey + int64(i)}, selection.PinnedKeys...))
+			fileKeys[i] = frame.fileKeyOf(generation, partition, append([]int64{selection.FromKey + int64(i)}, selection.PinnedKeys...))
 		}
 		return fileKeys, nil
 	}
 	listedByFirstKey := make([][]string, firstKeyCount)
 	err := utils.RunParallel(firstKeyCount, func(firstKeyIndex int) error {
-		folder := frame.Folder + generation + "/" + strconv.FormatInt(selection.FromKey+int64(firstKeyIndex), 10) + "/"
+		folder := frame.partitionFolderOf(generation, partition) + strconv.FormatInt(selection.FromKey+int64(firstKeyIndex), 10) + "/"
 		listedKeys, err := store.ListFiles(folder)
 		for _, listedKey := range listedKeys {
-			if keys, isFrameFile := frame.keysOfFile(generation, listedKey); isFrameFile && selection.matches(keys) {
+			if selection.matchesFile(frame, generation, partition, listedKey) {
 				listedByFirstKey[firstKeyIndex] = append(listedByFirstKey[firstKeyIndex], listedKey)
 			}
 		}
@@ -127,7 +133,7 @@ func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, s
 func (frame *Frame) rowsOf(generation string, fileKeys []string, rowsByFileKey map[string]frameRows) []Row {
 	keysByFileKey := map[string][]int64{}
 	for _, fileKey := range fileKeys {
-		keysByFileKey[fileKey], _ = frame.keysOfFile(generation, fileKey)
+		_, keysByFileKey[fileKey], _ = frame.keysOfFile(generation, fileKey)
 	}
 	slices.SortFunc(fileKeys, func(a, b string) int { return slices.Compare(keysByFileKey[a], keysByFileKey[b]) })
 	var rows []Row

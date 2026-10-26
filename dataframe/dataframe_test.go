@@ -60,7 +60,7 @@ func compileTestTable(t *testing.T) *Table {
 func TestCompileRules(t *testing.T) {
 	table := compileTestTable(t)
 	frame := &table.Frames[0]
-	if frame.Folder != "dtf/3gz10/year-program/" || frame.SumsCount != 4 || len(frame.Shape) != 8 || len(table.Tracked) != 7 || table.StatusIndex != statusIndex {
+	if table.Folder != "dtf/3gz10/" || table.versionsKeyOf(12) != "dtf/3gz10/12.versions" || frame.Folder != "dtf/3gz10/year-program/" || frame.SumsCount != 4 || len(frame.Shape) != 8 || len(table.Tracked) != 7 || table.StatusIndex != statusIndex {
 		t.Fatalf("compiled: %+v", table)
 	}
 	if nested := &table.Frames[1]; len(nested.Rows) != 2 || nested.Rows[0].TrackedIndex != programIndex || nested.Rows[1].TrackedIndex != employeeIndex || nested.Shape == frame.Shape {
@@ -119,15 +119,15 @@ func TestValuesAndTheWriteCheck(t *testing.T) {
 
 func TestFileKeysRoundTrip(t *testing.T) {
 	frame := &compileTestTable(t).Frames[0]
-	fileKey := frame.fileKeyOf("g1", []int64{2026, 3})
-	if fileKey != "dtf/3gz10/year-program/g1/2026/3" {
+	fileKey := frame.fileKeyOf("g1", 12, []int64{2026, 3})
+	if fileKey != "dtf/3gz10/year-program/g1/12/2026/3" {
 		t.Fatalf("file key %q", fileKey)
 	}
-	if keys, isFrameFile := frame.keysOfFile("g1", fileKey); !isFrameFile || !slices.Equal(keys, []int64{2026, 3}) {
-		t.Fatalf("keys of %q: %v %v", fileKey, keys, isFrameFile)
+	if partition, keys, isFrameFile := frame.keysOfFile("g1", fileKey); !isFrameFile || partition != 12 || !slices.Equal(keys, []int64{2026, 3}) {
+		t.Fatalf("keys of %q: %d %v %v", fileKey, partition, keys, isFrameFile)
 	}
-	for _, otherKey := range []string{frame.Folder + "g2/2026/3", frame.Folder + "g1/2026"} {
-		if _, isFrameFile := frame.keysOfFile("g1", otherKey); isFrameFile {
+	for _, otherKey := range []string{frame.Folder + "g2/12/2026/3", frame.Folder + "g1/12/2026", frame.Folder + "g1/2026/3", frame.Folder + "g1/-1/2026/3"} {
+		if _, _, isFrameFile := frame.keysOfFile("g1", otherKey); isFrameFile {
 			t.Fatalf("%q read as a file of generation g1", otherKey)
 		}
 	}
@@ -259,28 +259,38 @@ func (sim simHistory) storedAt(moment int64) []simWrite {
 	return stored
 }
 
+// simPartitions: a record's partition is its employee id modulo it, so the simulated table has several.
+const simPartitions = 3
+
+func simPartitionOf(write simWrite) int64 { return write.values[employeeIndex] % simPartitions }
+
 // historiesAt is what a read at moment returns of the records written after since.
 func (sim simHistory) historiesAt(moment, since int64) []History {
 	var histories []History
 	for _, write := range sim.storedAt(moment) {
 		if write.updated > since {
-			history, _ := NewHistory(fmt.Sprint(write.values[employeeIndex]), write.values, write.created, write.updated, write.changelog)
+			history, _ := NewHistory(simPartitionOf(write), fmt.Sprint(write.values[employeeIndex]), write.values, write.created, write.updated, write.changelog)
 			histories = append(histories, history)
 		}
 	}
 	return histories
 }
 
-// bruteForceRows sums the records as stored at moment.
-func (sim simHistory) bruteForceRows(frame *Frame, moment int64) []Row {
+// partitionHistories keeps the histories of one partition.
+func partitionHistories(histories []History, partition int64) []History {
+	return slices.DeleteFunc(histories, func(history History) bool { return history.Partition != partition })
+}
+
+// bruteForceRows sums the records of a partition as stored at moment.
+func (sim simHistory) bruteForceRows(frame *Frame, partition, moment int64) []Row {
 	rowsByFileKey := map[string]frameRows{}
 	var fileKeys []string
 	for _, write := range sim.storedAt(moment) {
 		values := sim.table.valuesOf(frame, write.values)
-		if values == nil {
+		if values == nil || simPartitionOf(write) != partition {
 			continue
 		}
-		fileKey := frame.fileKeyOf("g", values.keys)
+		fileKey := frame.fileKeyOf("g", partition, values.keys)
 		if rowsByFileKey[fileKey] == nil {
 			rowsByFileKey[fileKey] = frameRows{}
 			fileKeys = append(fileKeys, fileKey)
@@ -304,6 +314,46 @@ func TestValuesAtMatchesTheHistory(t *testing.T) {
 			values, exists := table.valuesAt(history, moment)
 			if exists != existed || (exists && !slices.Equal(values, stored.values)) {
 				t.Fatalf("moment %d: values %v (%v), want %v (%v)", moment, values, exists, stored.values, existed)
+			}
+		}
+	}
+}
+
+// TestHistoryOfChangesMatchesTheHistory: a History built from a record's values now and the changes a
+// log keeps after a window's start (scylla: the before values of the changed columns, the insert
+// flagged) says what the record held at every moment from that start on, as the stored record does.
+func TestHistoryOfChangesMatchesTheHistory(t *testing.T) {
+	table := compileTestTable(t)
+	sim := simulateWrites(t, table, rand.New(rand.NewPCG(5, 6)), 30000)
+	for windowStart := int64(simStart - 5); windowStart < simStart+30000; windowStart += 4111 {
+		for _, writes := range sim.writesByEmployee {
+			var changes []HistoryChange // newest first, as the backend hands them
+			for i := len(writes) - 1; i >= 0 && writes[i].updated > windowStart; i-- {
+				change := HistoryChange{Moment: writes[i].updated, IsInsert: i == 0}
+				for c := range table.Tracked {
+					if i > 0 && writes[i-1].values[c] != writes[i].values[c] {
+						change.TrackedIndexes = append(change.TrackedIndexes, c)
+						change.Before = append(change.Before, writes[i-1].values[c])
+					}
+				}
+				if change.IsInsert || len(change.TrackedIndexes) > 0 { // only real changes are logged
+					changes = append(changes, change)
+				}
+			}
+			if len(changes) == 0 {
+				continue
+			}
+			history := table.NewHistoryOfChanges(simPartitionOf(writes[0]), "r", writes[len(writes)-1].values, changes)
+			for moment := windowStart; moment <= simStart+30000; moment += 13 {
+				var stored []int64
+				for _, write := range writes {
+					if write.updated <= moment {
+						stored = write.values
+					}
+				}
+				if values, exists := table.valuesAt(history, moment); exists != (stored != nil) || (exists && !slices.Equal(values, stored)) {
+					t.Fatalf("window %d moment %d: values %v (%v), want %v", windowStart, moment, values, exists, stored)
+				}
 			}
 		}
 	}
@@ -347,8 +397,14 @@ func (backend *memoryBackend) CommitGeneration(ctx context.Context, frame *Frame
 func (backend *memoryBackend) HistoriesWrittenAfter(moment int64) ([]History, error) {
 	return backend.sim.historiesAt(backend.readAt, moment), nil
 }
+func (backend *memoryBackend) PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]History, error) {
+	return partitionHistories(backend.sim.historiesAt(backend.readAt, moment), partition), nil
+}
 func (backend *memoryBackend) ScanHistories(onPage func([]History) error) error {
 	return onPage(backend.sim.historiesAt(backend.readAt, -1))
+}
+func (backend *memoryBackend) ScanPartitionHistories(partition int64, onPage func([]History) error) error {
+	return onPage(partitionHistories(backend.sim.historiesAt(backend.readAt, -1), partition))
 }
 
 // crashingFileStore is utils.MemoryFileStore whose writes fail half the time while isCrashing, like
@@ -372,18 +428,19 @@ func (store *crashingFileStore) PutFileIfMatch(ctx context.Context, key string, 
 
 func timeOfSUnix(moment int64) time.Time { return time.Unix(moment*2+1e9, 0) }
 
-// readAll is every row of a test frame (its Years are 2025..2027).
-func readAll(t *testing.T, table *Table, frame *Frame, backend Backend, store utils.FileStore, isFresh bool) []Row {
+// readAll is every row of a test frame in a partition (its Years are 2025..2027).
+func readAll(t *testing.T, table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, isFresh bool) []Row {
 	t.Helper()
-	rows, err := Read(table, frame, backend, store, Selection{FromKey: 2025, ToKey: 2027}, isFresh)
+	rows, err := Read(table, frame, backend, store, partition, Selection{FromKey: 2025, ToKey: 2027}, isFresh)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return rows
 }
 
-// simClient is a browser keeping raw frame files from ReadChanged answers.
+// simClient is a browser of one partition keeping raw frame files from ReadChanged answers.
 type simClient struct {
+	partition  int64
 	generation string
 	fileByKeys map[string]ChangedFile
 }
@@ -400,7 +457,7 @@ func (client *simClient) sync(t *testing.T, table *Table, frame *Frame, backend 
 	if err != nil {
 		t.Fatal(err)
 	}
-	answer, err := ReadChanged(table, frame, backend, store, Selection{FromKey: 2025, ToKey: 2027}, client.generation, parsedHeld, now)
+	answer, err := ReadChanged(table, frame, backend, store, client.partition, Selection{FromKey: 2025, ToKey: 2027}, client.generation, parsedHeld, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,8 +503,8 @@ func (client *simClient) rows(t *testing.T, frame *Frame) []Row {
 // TestRunsSurviveCrashes: a rebuild, then runs at random moments, some crashing after a random part of
 // their files, leave the files equal to the brute force at their target, and a fresh read equal to it
 // at the read's moment, for both test frames. A client syncing raw files with ReadChanged holds the
-// brute force at every read too, through occasional rebuilds; half the seeds cycle 2 slots, so every
-// slot is shared.
+// brute force at every read too, through occasional rebuilds of the frames and of one partition; half
+// the seeds cycle 2 slots, so every slot is shared. Every check runs per partition.
 func TestRunsSurviveCrashes(t *testing.T) {
 	table := compileTestTable(t)
 	defer func() { slotCycle = slotCount }()
@@ -460,9 +517,12 @@ func TestRunsSurviveCrashes(t *testing.T) {
 		sim := simulateWrites(t, table, rng, 40000)
 		store := &crashingFileStore{MemoryFileStore: utils.NewMemoryFileStore(), rng: rng}
 		backend := newMemoryBackend(sim)
-		clients := make([]*simClient, len(table.Frames))
+		// clients[frame][partition]
+		clients := make([][]*simClient, len(table.Frames))
 		for i := range clients {
-			clients[i] = &simClient{fileByKeys: map[string]ChangedFile{}}
+			for partition := range int64(simPartitions) {
+				clients[i] = append(clients[i], &simClient{partition: partition, fileByKeys: map[string]ChangedFile{}})
+			}
 		}
 
 		// The first Materialize builds the frame; each record is read a little after the target.
@@ -473,8 +533,10 @@ func TestRunsSurviveCrashes(t *testing.T) {
 		}
 		for i := range table.Frames {
 			frame := &table.Frames[i]
-			if got, want := readAll(t, table, frame, backend, store, false), sim.bruteForceRows(frame, now-TargetLag); !reflect.DeepEqual(got, want) {
-				t.Fatalf("seed %d frame %s: the rebuild at %d differs from the brute force", seed, frame.Name, now-TargetLag)
+			for partition := range int64(simPartitions) {
+				if got, want := readAll(t, table, frame, backend, store, partition, false), sim.bruteForceRows(frame, partition, now-TargetLag); !reflect.DeepEqual(got, want) {
+					t.Fatalf("seed %d frame %s partition %d: the rebuild at %d differs from the brute force", seed, frame.Name, partition, now-TargetLag)
+				}
 			}
 		}
 
@@ -483,26 +545,34 @@ func TestRunsSurviveCrashes(t *testing.T) {
 			store.isCrashing = rng.IntN(3) == 0
 			err := Materialize(table, backend, store, timeOfSUnix(now))
 			store.isCrashing = false
-			if rng.IntN(12) == 0 {
+			switch rng.IntN(12) {
+			case 0:
 				if err := Rebuild(table, backend, store, "", timeOfSUnix(now)); err != nil {
+					t.Fatal(err)
+				}
+			case 1:
+				if err := RebuildPartition(table, backend, store, rng.Int64N(simPartitions), timeOfSUnix(now)); err != nil {
 					t.Fatal(err)
 				}
 			}
 			for i := range table.Frames {
 				frame := &table.Frames[i]
-				if err == nil {
-					if got, want := readAll(t, table, frame, backend, store, false), sim.bruteForceRows(frame, now-TargetLag); !reflect.DeepEqual(got, want) {
-						t.Fatalf("seed %d frame %s: the files after the run at %d differ from the brute force", seed, frame.Name, now)
+				for partition := range int64(simPartitions) {
+					if err == nil {
+						if got, want := readAll(t, table, frame, backend, store, partition, false), sim.bruteForceRows(frame, partition, now-TargetLag); !reflect.DeepEqual(got, want) {
+							t.Fatalf("seed %d frame %s partition %d: the files after the run at %d differ from the brute force", seed, frame.Name, partition, now)
+						}
 					}
-				}
-				want := sim.bruteForceRows(frame, backend.readAt)
-				if got := readAll(t, table, frame, backend, store, true); !reflect.DeepEqual(got, want) {
-					t.Fatalf("seed %d frame %s: the fresh read at %d differs from the brute force", seed, frame.Name, backend.readAt)
-				}
-				if rng.IntN(3) > 0 { // the client doesn't look at every moment
-					clients[i].sync(t, table, frame, backend, store, backend.readAt)
-					if got := clients[i].rows(t, frame); !reflect.DeepEqual(got, want) {
-						t.Fatalf("seed %d frame %s (slot cycle %d): the client's files at %d differ from the brute force", seed, frame.Name, slotCycle, backend.readAt)
+					want := sim.bruteForceRows(frame, partition, backend.readAt)
+					if got := readAll(t, table, frame, backend, store, partition, true); !reflect.DeepEqual(got, want) {
+						t.Fatalf("seed %d frame %s partition %d: the fresh read at %d differs from the brute force", seed, frame.Name, partition, backend.readAt)
+					}
+					if rng.IntN(3) > 0 { // the client doesn't look at every moment
+						client := clients[i][partition]
+						client.sync(t, table, frame, backend, store, backend.readAt)
+						if got := client.rows(t, frame); !reflect.DeepEqual(got, want) {
+							t.Fatalf("seed %d frame %s partition %d (slot cycle %d): the client's files at %d differ from the brute force", seed, frame.Name, partition, slotCycle, backend.readAt)
+						}
 					}
 				}
 			}

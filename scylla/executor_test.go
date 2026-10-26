@@ -65,6 +65,12 @@ func (f *fakeExec[TableT, RecordT]) SearchText(
 ) ([]db.TextHit, error) {
 	return nil, nil
 }
+func (f *fakeExec[TableT, RecordT]) QueryFrame(_ db.FrameRequest) ([]db.FrameRow[RecordT], error) {
+	return nil, nil
+}
+func (f *fakeExec[TableT, RecordT]) QueryFrameChanged(_ db.FrameRequest, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 func (f *fakeExec[TableT, RecordT]) CompileTable(schema *TableT) db.Table {
 	return getOrCompileScyllaTable(schema)
 }

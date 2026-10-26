@@ -157,6 +157,25 @@ type TableSchema struct {
 	// override this default.
 	UseListAsDefault bool
 	FixedValues      []FixedValues
+	// DataFrames declares group-by reports of the table kept as columnar files in the file store
+	// (genix-orm/dataframe, DATAFRAMES.md), each partition with its own files. The table needs a
+	// partition column and one integer key; MaterializeDataFrames keeps them current.
+	DataFrames []DataFrame
+}
+
+// DataFrame is one group-by report of a table: one file per value of Keys, one row per value of Rows
+// in it, holding the Sums of the records with those values and, with Count, how many they are. A
+// soft-deleted record (status 0) is in no file.
+type DataFrame struct {
+	// Name: a-z, 0-9 and '-'. It names the frame's folder.
+	Name string
+	// Keys are 1 to 3 integer columns, non-negative: which file a record goes to.
+	Keys []Coln
+	// Rows are 1 to 3 integer columns, non-negative, the widest group first: which row of its file.
+	Rows []Coln
+	// Sums are the integer or float columns each row adds up.
+	Sums  []Coln
+	Count bool
 }
 
 // GenericRecordSchema declares which columns fill the generic by-IDs shape. Name is required; the

@@ -179,10 +179,12 @@ func decodeChangelog(content []byte) ([]changelogEntry, error) {
 	return entries, nil
 }
 
-// History is what a stored record says of its past: its tracked values now, when it was created and
-// last written (SUnixTimes), and its changelog. A backend builds one per record it reads for a run, a
-// rebuild or a fresh read.
+// History is what a stored record says of its past: its partition, its tracked values now, when it
+// was created and last written (SUnixTimes), and its changes. A backend builds one per record it reads
+// for a run, a rebuild or a fresh read.
 type History struct {
+	// Partition is the record's partition value (non-negative): the folder of its files.
+	Partition int64
 	RecordKey string
 	values    []int64
 	created   int64
@@ -191,12 +193,46 @@ type History struct {
 }
 
 // NewHistory decodes a stored record's changelog into its History. values are its tracked values.
-func NewHistory(recordKey string, values []int64, created, updated int64, changelog []byte) (History, error) {
+func NewHistory(partition int64, recordKey string, values []int64, created, updated int64, changelog []byte) (History, error) {
 	entries, err := decodeChangelog(changelog)
 	if err != nil {
 		return History{}, fmt.Errorf("%s: %w", recordKey, err)
 	}
-	return History{RecordKey: recordKey, values: values, created: created, updated: updated, entries: entries}, nil
+	return History{Partition: partition, RecordKey: recordKey, values: values, created: created, updated: updated, entries: entries}, nil
+}
+
+// HistoryChange is one logged write of a record, for a backend that logs writes beside the table
+// instead of keeping a changelog on the record (scylla): its moment (a SUnixTime), whether it was the
+// record's insert, and otherwise the values the columns it changed held before it, by their index in
+// Table.Tracked.
+type HistoryChange struct {
+	Moment         int64
+	IsInsert       bool
+	TrackedIndexes []int
+	Before         []int64
+}
+
+// NewHistoryOfChanges builds the History of a record from its tracked values now and its logged
+// changes, newest first. It reaches back to the oldest change given: the backend passes every change
+// after the earliest moment the History will be asked about.
+func (table *Table) NewHistoryOfChanges(partition int64, recordKey string, values []int64, changes []HistoryChange) History {
+	history := History{Partition: partition, RecordKey: recordKey, values: values}
+	if len(changes) > 0 {
+		history.updated = changes[0].Moment
+	}
+	for _, change := range changes {
+		if change.IsInsert {
+			// Before its insert the record did not exist: nothing older applies.
+			history.created = change.Moment
+			break
+		}
+		entry := changelogEntry{delta: history.updated - change.Moment}
+		for i, trackedIndex := range change.TrackedIndexes {
+			entry.values = append(entry.values, changelogValue{columnID: uint8(table.Tracked[trackedIndex].ColumnID), value: change.Before[i]})
+		}
+		history.entries = append(history.entries, entry)
+	}
+	return history
 }
 
 // valuesAt is what the record held at the SUnixTime moment: false before it was created. A change at

@@ -14,7 +14,7 @@ var ErrFrameNotBuilt = errors.New("db: the DataFrame is not built yet: the next 
 
 // State is a frame's state, which the backend keeps (dynamo: one item per frame).
 type State struct {
-	// Generation is the folder the current files are in; "" when the frame is not built.
+	// Generation is the folder of the current files, of every partition; "" when the frame is not built.
 	Generation string
 	// Shape is the Frame.Shape that generation was built with: another one is a rebuild.
 	Shape string
@@ -23,8 +23,13 @@ type State struct {
 }
 
 // Backend is what a database gives the frames of one table: their state and lock, and its records as
-// Histories. Every write of the table must keep the records' changelogs (Table.NextChangelog) and
-// their created moment, and never delete a record physically.
+// Histories. Every write of the table must keep what its records held over the last ~36 h (dynamo:
+// Table.NextChangelog and the created moment; scylla: a change log table), and never delete a record
+// physically.
+//
+// A frame follows the table's partition: every History names its partition, and each partition has
+// its own files and versions file. One state, one lock and one run cover every partition. A backend
+// without partitions puts every record in partition 0.
 type Backend interface {
 	ReadState(frame *Frame) (State, error)
 	// TakeLock sets the frame's lock to holderID until lockedUntil when it is free (absent or expired
@@ -37,9 +42,13 @@ type Backend interface {
 	CommitSnapshot(ctx context.Context, frame *Frame, holderID string, state State, snapshot int64) error
 	// CommitGeneration makes generation current, with frame.Shape and snapshot, while holderID holds the lock.
 	CommitGeneration(ctx context.Context, frame *Frame, holderID string, generation string, snapshot int64) error
-	// HistoriesWrittenAfter reads every record whose Updated is after moment (dynamo: a GSI on
-	// Updated). It may miss a write from the last couple of minutes, never an older one.
+	// HistoriesWrittenAfter reads every record, of every partition, written after moment (dynamo: a
+	// GSI on Updated). It may miss a write from the last couple of minutes, never an older one.
 	HistoriesWrittenAfter(moment int64) ([]History, error)
+	// PartitionHistoriesWrittenAfter is HistoriesWrittenAfter for one partition: what a fresh read needs.
+	PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]History, error)
 	// ScanHistories reads every record of the table, page by page.
 	ScanHistories(onPage func(histories []History) error) error
+	// ScanPartitionHistories reads every record of one partition, page by page.
+	ScanPartitionHistories(partition int64, onPage func(histories []History) error) error
 }

@@ -341,6 +341,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 	}
 
 	configureTextSearchIndex(&dbTable, schema)
+	configureDataFrames(&dbTable, schema)
 
 	// Identify autoincrement column from direct column definitions (backward compatibility)
 	// Only set if not already set during Keys processing

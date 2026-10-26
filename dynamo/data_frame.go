@@ -28,6 +28,8 @@ import (
 const (
 	createdColumn   = "crt"
 	changelogColumn = "cgl"
+	// framePartition is the one partition of every frame: an entity with DataFrames has no Partition.
+	framePartition = 0
 )
 
 // compileDataFrames resolves the schema's DataFrames into meta.frames. Every column carries a cb tag:
@@ -152,5 +154,5 @@ func (m *tableMeta) historyOf(item map[string]types.AttributeValue, ptr unsafe.P
 	if err != nil {
 		return dataframe.History{}, err
 	}
-	return dataframe.NewHistory(m.recordKey(ptr), trackedValues, numberAttrValue(item, createdColumn), m.updated.acc.getI64(ptr), changelogOf(item))
+	return dataframe.NewHistory(framePartition, m.recordKey(ptr), trackedValues, numberAttrValue(item, createdColumn), m.updated.acc.getI64(ptr), changelogOf(item))
 }

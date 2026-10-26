@@ -72,9 +72,10 @@ type ChangedFiles struct {
 	Files          []ChangedFile
 }
 
-// ReadChanged answers the selected files the client must replace (above). heldGeneration and held
-// describe the client's copies; now is the read's SUnixTime, the snapshot of the files it moves.
-func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileStore, selection Selection, heldGeneration string, held []HeldFile, now int64) (ChangedFiles, error) {
+// ReadChanged answers the selected files of one partition the client must replace (above).
+// heldGeneration and held describe the client's copies; now is the read's SUnixTime, the snapshot of
+// the files it moves.
+func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, selection Selection, heldGeneration string, held []HeldFile, now int64) (ChangedFiles, error) {
 	readName := fmt.Sprintf("dataframe: %s frame %q", table.Name, frame.Name)
 	if err := frame.checkSelection(readName, selection); err != nil {
 		return ChangedFiles{}, err
@@ -87,15 +88,15 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 		if state.Generation == "" || state.Shape != frame.Shape {
 			return ChangedFiles{}, fmt.Errorf("%s: %w", readName, ErrFrameNotBuilt)
 		}
-		versions, _, err := ReadVersions(store)
+		versions, _, err := readVersions(store, table.versionsKeyOf(partition))
 		if err != nil {
 			return ChangedFiles{}, err
 		}
-		histories, err := backend.HistoriesWrittenAfter(state.Snapshot)
+		histories, err := backend.PartitionHistoriesWrittenAfter(partition, state.Snapshot)
 		if err != nil {
 			return ChangedFiles{}, err
 		}
-		fileKeys, err := frame.selectedFileKeys(store, state.Generation, selection)
+		fileKeys, err := frame.selectedFileKeys(store, state.Generation, partition, selection)
 		if err != nil {
 			return ChangedFiles{}, fmt.Errorf("%s: %w", readName, err)
 		}
@@ -107,8 +108,7 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 			}
 		}
 		for fileKey := range lastWriteByFileKey {
-			keys, _ := frame.keysOfFile(state.Generation, fileKey)
-			if selection.matches(keys) && !slices.Contains(fileKeys, fileKey) {
+			if selection.matchesFile(frame, state.Generation, partition, fileKey) && !slices.Contains(fileKeys, fileKey) {
 				fileKeys = append(fileKeys, fileKey)
 			}
 		}
@@ -122,7 +122,7 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 				if len(heldFile.Keys) != len(frame.Keys) || !selection.matches(heldFile.Keys) {
 					continue
 				}
-				fileKey := frame.fileKeyOf(state.Generation, heldFile.Keys)
+				fileKey := frame.fileKeyOf(state.Generation, partition, heldFile.Keys)
 				heldByFileKey[fileKey] = heldFile
 				if !slices.Contains(fileKeys, fileKey) {
 					fileKeys = append(fileKeys, fileKey)
@@ -158,7 +158,7 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 		answer := ChangedFiles{Generation: state.Generation, RowColumnCount: uint8(len(frame.Rows)), SumsCount: uint8(frame.SumsCount),
 			Snapshot: state.Snapshot, Files: make([]ChangedFile, len(sentKeys))}
 		for i, fileKey := range sentKeys {
-			keys, _ := frame.keysOfFile(state.Generation, fileKey)
+			_, keys, _ := frame.keysOfFile(state.Generation, fileKey)
 			changed := ChangedFile{Keys: keys, Slot: loaded.slotByFileKey[fileKey]}
 			switch _, isTouched := lastWriteByFileKey[fileKey]; {
 			case isTouched:

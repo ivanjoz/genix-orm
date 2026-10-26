@@ -43,6 +43,8 @@ type ScyllaTable struct {
 	indexGroupIDs     map[int16]string
 	indexUpdatedTable *indexUpdatedTableInfo
 	textSearchIndex   *textSearchIndexInfo
+	// dataFrames is nil unless the schema declares DataFrames (data_frame.go).
+	dataFrames *dataFrameInfo
 	// selectStatementCache is shared across copied ScyllaTable values, so it must stay behind a pointer.
 	selectStatementCache *selectPlanCache
 }

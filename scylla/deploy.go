@@ -1081,6 +1081,13 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 			}
 		}
 
+		// The DataFrame change log is written before the rows, so it must exist before any write.
+		if table.dataFrames != nil {
+			if err := QueryExec(dataFrameLogCreateScript(table)); err != nil {
+				panic(fmt.Sprintf(`Error creando la tabla de log de DataFrames "%v" | %v`, table.dataFrames.logTableName, err))
+			}
+		}
+
 		// Revisa si posee índices, en su defecto los crea
 		tableIndexes := tableIndexesMap[tableName]
 

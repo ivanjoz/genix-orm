@@ -43,6 +43,10 @@ type Executor[TableT any, RecordT any] interface {
 	SearchTextIDs(partition int32, query string, limit, offset int) ([]TextHit, error)
 	// SearchText fills refSlice with the matching records, in the order of the returned hits.
 	SearchText(refSlice *[]RecordT, partition int32, query string, limit, offset int) ([]TextHit, error)
+	// QueryFrame reads the rows of one partition of a DataFrame (FrameQuery.Exec).
+	QueryFrame(request FrameRequest) ([]FrameRow[RecordT], error)
+	// QueryFrameChanged answers a client keeping a DataFrame's raw files (FrameQuery.ExecChanged).
+	QueryFrameChanged(request FrameRequest, heldGeneration, heldFiles string) ([]byte, error)
 	// CompileTable turns the declared schema into this driver's compiled form.
 	CompileTable(schema *TableT) Table
 }

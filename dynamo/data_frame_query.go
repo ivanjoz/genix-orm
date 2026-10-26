@@ -122,7 +122,7 @@ func (q *frameQueryState) readRows() ([]dataframe.Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), selection, q.isFresh)
+	return dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, q.isFresh)
 }
 
 // setRowKey sets the frame's Keys and Rows columns of the key record at keyPtr from a row.
@@ -154,7 +154,7 @@ func (q *frameQueryState) ExecChanged(heldGeneration string, heldFiles string) (
 	if err != nil {
 		return nil, err
 	}
-	answer, err := dataframe.ReadChanged(q.meta.frames, q.frame, backend, cache.FileStore(), selection, heldGeneration, held, utils.SUnixTimeOf(Now()))
+	answer, err := dataframe.ReadChanged(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, heldGeneration, held, utils.SUnixTimeOf(Now()))
 	if err != nil {
 		return nil, err
 	}

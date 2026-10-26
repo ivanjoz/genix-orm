@@ -27,6 +27,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.1 // indirect
 	github.com/aws/smithy-go v1.28.2 // indirect
 	github.com/ivanjoz/colbin v0.8.0 // indirect
+	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0 // indirect
 	github.com/viant/xunsafe v0.11.0 // indirect
 )
@@ -36,3 +37,5 @@ replace (
 	github.com/ivanjoz/genix-orm/utils => ../../utils
 	github.com/ivanjoz/genix-search/genix-s3 => ../../../../../genix-search/genix-s3
 )
+
+replace github.com/ivanjoz/genix-orm/dataframe => ../../dataframe

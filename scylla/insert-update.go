@@ -817,12 +817,19 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 		}
 	}
 
-	// The keys are final now, so the stored versions can be read and the next ones stamped.
-	deltaWrittenRecords, err := stampDeltaVersions(scyllaTable, []deltaWritePhase{
+	// The keys are final now, so the stored rows can be read: the delta indexes stamp the next
+	// versions from them, the DataFrames log what changed.
+	writePhases := []writePhase{
 		{records: insertRecords, writtenColumns: collectAffectedColumnsForInsert(&scyllaTable, columnsToExcludeInsert)},
 		{records: updateRecords, writtenColumns: updateAffectedColumns},
-	})
+	}
+	storedWrittenRows, err := readStoredWrittenRows(scyllaTable, writePhases)
 	if err != nil {
+		return err
+	}
+	deltaWrittenRecords := stampDeltaVersions(scyllaTable, writePhases, storedWrittenRows)
+	// Before the rows: a change in the table always has its log row (data_frame_log.go).
+	if err := writeDataFrameLog(scyllaTable, writePhases, storedWrittenRows); err != nil {
 		return err
 	}
 

@@ -211,6 +211,22 @@ func (backend *frameBackend) HistoriesWrittenAfter(moment int64) ([]dataframe.Hi
 	}
 }
 
+// PartitionHistoriesWrittenAfter is HistoriesWrittenAfter: every record is in framePartition.
+func (backend *frameBackend) PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]dataframe.History, error) {
+	if partition != framePartition {
+		return nil, fmt.Errorf("db: %s DataFrames have only partition %d", backend.meta.recordType.Name(), framePartition)
+	}
+	return backend.HistoriesWrittenAfter(moment)
+}
+
+// ScanPartitionHistories is ScanHistories: every record is in framePartition.
+func (backend *frameBackend) ScanPartitionHistories(partition int64, onPage func(histories []dataframe.History) error) error {
+	if partition != framePartition {
+		return fmt.Errorf("db: %s DataFrames have only partition %d", backend.meta.recordType.Name(), framePartition)
+	}
+	return backend.ScanHistories(onPage)
+}
+
 // ScanHistories reads every record of the table, page by page.
 func (backend *frameBackend) ScanHistories(onPage func(histories []dataframe.History) error) error {
 	return scanItems(backend.client, tableName(), []pkRange{backend.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
