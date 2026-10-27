@@ -67,9 +67,17 @@ func TestGolden(t *testing.T) {
 	golden, got := readGolden(t), map[string]string{}
 	var names []string
 	for _, c := range Cases() {
-		backend, store, err := c.build(true)
+		backend, store, err := c.build(fromHistories)
 		if err != nil {
 			t.Fatal(err)
+		}
+		// A build from the records themselves writes the same files.
+		_, recordStore, err := c.build(fromRecords)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest, _ := digestOf(t, recordStore, backend.state.Generation); digest != mustDigest(t, store, backend.state.Generation) {
+			t.Fatalf("%s: a build from records differs from one from Histories", c.Name)
 		}
 		builtGeneration := backend.state.Generation
 		digest, fileCount := digestOf(t, store, builtGeneration)
@@ -106,6 +114,11 @@ func TestGolden(t *testing.T) {
 			t.Errorf("%s: digest %s, golden %s", name, got[name], golden[name])
 		}
 	}
+}
+
+func mustDigest(t *testing.T, store *utils.MemoryFileStore, generation string) string {
+	digest, _ := digestOf(t, store, generation)
+	return digest
 }
 
 // decodedFiles are the rows and sums of every file with rows, by key without the generation.

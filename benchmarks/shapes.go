@@ -96,14 +96,13 @@ func saturateInt32(value int64) int32 {
 	return int32(max(min(value, math.MaxInt32), math.MinInt32))
 }
 
-// ToSaleSummaryFrames is genix's, with core's and finance's helpers inlined.
-func (e *SaleOrder) ToSaleSummaryFrames() []SaleSummaryFrame {
+// ToSaleSummaryFrames is genix's, with core's and finance's helpers inlined, appending to lines.
+func (e *SaleOrder) ToSaleSummaryFrames(lines []SaleSummaryFrame) []SaleSummaryFrame {
 	if e.Status == OrderStatusAnnulled {
-		return nil
+		return lines
 	}
 	isDeliveryPending := e.Status == OrderStatusPending || e.Status == OrderStatusPaid
 	isPaymentPending := e.Status == OrderStatusPending || e.Status == OrderStatusDelivered
-	lines := make([]SaleSummaryFrame, 0, len(e.DetailProductsIDs))
 	for lineIndex, productID := range e.DetailProductsIDs {
 		packedQuantity := getIndex(e.DetailQuantities, lineIndex)
 		if productID <= 0 || packedQuantity <= 0 {
@@ -229,11 +228,10 @@ type MovementFrame struct {
 	CostCents   int64   `frame:"sum"`
 }
 
-func (movement *StockMovement) ToMovementFrames() []MovementFrame {
+func (movement *StockMovement) ToMovementFrames(lines []MovementFrame) []MovementFrame {
 	if movement.Kind == 0 {
-		return nil
+		return lines
 	}
-	lines := make([]MovementFrame, 0, len(movement.ProductIDs))
 	for i, productID := range movement.ProductIDs {
 		quantity, unitCost := movement.Quantities[i], movement.UnitCosts[i]
 		line := MovementFrame{WarehouseID: movement.WarehouseID, Week: movement.Week, ProductID: productID, LotID: movement.LotIDs[i],

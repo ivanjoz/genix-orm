@@ -105,10 +105,50 @@ func (backend *memoryBackend) historiesOf(indexes []int) ([]dataframe.History, e
 	return page, nil
 }
 
+// recordBackend is memoryBackend as a dataframe.PartitionRecordScanner, as scylla is: the records
+// themselves, a History only for the ones with logged changes.
+type recordBackend struct{ *memoryBackend }
+
+func (backend recordBackend) ScanPartitionRecords(partition int64, onPage func(records []dataframe.ScannedRecord) error) error {
+	c := backend.c
+	for start := 0; start < len(c.Records); start += pageSize {
+		page := make([]dataframe.ScannedRecord, 0, pageSize)
+		for i := start; i < min(start+pageSize, len(c.Records)); i++ {
+			scanned := dataframe.ScannedRecord{Record: c.Records[i]}
+			if len(c.Changes[i]) > 0 {
+				histories, err := backend.historiesOf([]int{i})
+				if err != nil {
+					return err
+				}
+				scanned.History = &histories[0]
+			}
+			page = append(page, scanned)
+		}
+		if err := onPage(page); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildMode is how a build reads the records: precomputed Histories (the engine alone), Histories
+// computed page by page (dynamo), or the records themselves (scylla).
+type buildMode int
+
+const (
+	fromPrecomputedHistories buildMode = iota
+	fromHistories
+	fromRecords
+)
+
 // build rebuilds the case's partition at t0 into a new store.
-func (c *Case) build(computesHistories bool) (*memoryBackend, *utils.MemoryFileStore, error) {
-	backend, store := newMemoryBackend(c, computesHistories), utils.NewMemoryFileStore()
-	err := dataframe.Rebuild(c.Table, backend, store, partition, "", t0)
+func (c *Case) build(mode buildMode) (*memoryBackend, *utils.MemoryFileStore, error) {
+	backend, store := newMemoryBackend(c, mode != fromPrecomputedHistories), utils.NewMemoryFileStore()
+	var scanning dataframe.Backend = backend
+	if mode == fromRecords {
+		scanning = recordBackend{backend}
+	}
+	err := dataframe.Rebuild(c.Table, scanning, store, partition, "", t0)
 	return backend, store, err
 }
 

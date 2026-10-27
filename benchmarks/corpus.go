@@ -52,8 +52,8 @@ type Case struct {
 	Changes    [][]dataframe.HistoryChange
 	LastWrites []int64
 
-	linesOnce sync.Once
-	lines     []dataframe.RecordLines
+	linesOnce     sync.Once
+	lines         []dataframe.RecordLines
 	historiesOnce sync.Once
 	histories     []dataframe.History
 }

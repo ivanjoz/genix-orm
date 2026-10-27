@@ -13,8 +13,9 @@ import (
 //	Histories   lines + logged changes → History (NewHistoryOfChanges)
 //	Rebuild     the engine alone: precomputed Histories → files (sum at the target,
 //	            encode, slots, commit)
-//	Build       a real rebuild in memory: records → lines → Histories → files, page
-//	            by page as a database backend scans them. The number to bring down.
+//	Build       a real rebuild in memory, records → files, page by page as scylla
+//	            scans them (PartitionRecordScanner). The number to bring down.
+//	BuildHistories  the same through a History per record (dynamo's way)
 //	Compact     the run at t1 over a partition built at t0: ~1,200 records written
 //	            in between
 //
@@ -63,7 +64,7 @@ func BenchmarkHistories(b *testing.B) {
 func BenchmarkRebuild(b *testing.B) {
 	perCase(b, func(b *testing.B, c *Case) {
 		for b.Loop() {
-			if _, _, err := c.build(false); err != nil {
+			if _, _, err := c.build(fromPrecomputedHistories); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -73,7 +74,17 @@ func BenchmarkRebuild(b *testing.B) {
 func BenchmarkBuild(b *testing.B) {
 	perCase(b, func(b *testing.B, c *Case) {
 		for b.Loop() {
-			if _, _, err := c.build(true); err != nil {
+			if _, _, err := c.build(fromRecords); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkBuildHistories(b *testing.B) {
+	perCase(b, func(b *testing.B, c *Case) {
+		for b.Loop() {
+			if _, _, err := c.build(fromHistories); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -82,7 +93,7 @@ func BenchmarkBuild(b *testing.B) {
 
 func BenchmarkCompact(b *testing.B) {
 	perCase(b, func(b *testing.B, c *Case) {
-		builtBackend, builtStore, err := c.build(false)
+		builtBackend, builtStore, err := c.build(fromPrecomputedHistories)
 		if err != nil {
 			b.Fatal(err)
 		}
