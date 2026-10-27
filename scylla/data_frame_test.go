@@ -32,11 +32,10 @@ type frameTagLine struct {
 	Quantity int32 `frame:"sum"`
 }
 
-func (e *frameSaleRecord) toTagLines() []frameTagLine {
+func (e *frameSaleRecord) toTagLines(lines []frameTagLine) []frameTagLine {
 	if e.Status == 0 {
-		return nil
+		return lines
 	}
-	lines := []frameTagLine{}
 	for _, tagID := range e.TagIDs {
 		lines = append(lines, frameTagLine{Year: e.Year, TagID: tagID, Quantity: e.Quantity})
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"time"
+	"unsafe"
 )
 
 // The frame files live in genix-orm's file store (utils/filestore): the same one, and the same S3
@@ -49,4 +50,21 @@ type Backend interface {
 	PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]History, error)
 	// ScanPartitionHistories reads every record of one partition, page by page.
 	ScanPartitionHistories(partition int64, onPage func(histories []History) error) error
+}
+
+// PartitionRecordScanner is a Backend that can hand a rebuild its records themselves. A rebuild then
+// turns each record straight into the lines it sums, without the RecordLines and History of every
+// record: the Histories only of the few records the log names.
+type PartitionRecordScanner interface {
+	// ScanPartitionRecords reads every record of one partition, page by page, as
+	// ScanPartitionHistories does: the records it hands over are valid until onPage returns.
+	ScanPartitionRecords(partition int64, onPage func(records []ScannedRecord) error) error
+}
+
+// ScannedRecord is one record a PartitionRecordScanner reads: a pointer to the table's struct and,
+// for a record written (changed or inserted) within the log's reach, its History. A nil History says
+// the record holds now what it held at any moment a rebuild sums it at.
+type ScannedRecord struct {
+	Record  unsafe.Pointer
+	History *History
 }

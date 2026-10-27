@@ -112,6 +112,44 @@ func (backend *frameBackend) historyOf(recordKey [2]int64, stored storedRows, ch
 // ScanPartitionHistories reads every record of one partition, a page at a time, and the log after each
 // page: the changes since a little before the rebuild's target.
 func (backend *frameBackend) ScanPartitionHistories(partition int64, onPage func(histories []dataframe.History) error) error {
+	return backend.scanPartition(partition, func(page storedRows, logged map[[2]int64][]dataframe.HistoryChange) error {
+		histories := make([]dataframe.History, 0, len(page))
+		for recordKey := range page {
+			history, _, err := backend.historyOf(recordKey, page, logged[recordKey])
+			if err != nil {
+				return err
+			}
+			histories = append(histories, history)
+		}
+		return onPage(histories)
+	})
+}
+
+// ScanPartitionRecords is ScanPartitionHistories handing the records themselves: a History only for
+// the few the log names since a little before the rebuild's target, so the rest go straight from their
+// row to the rebuild's lines.
+func (backend *frameBackend) ScanPartitionRecords(partition int64, onPage func(records []dataframe.ScannedRecord) error) error {
+	info := backend.scyllaTable.dataFrames
+	return backend.scanPartition(partition, func(page storedRows, logged map[[2]int64][]dataframe.HistoryChange) error {
+		records := make([]dataframe.ScannedRecord, 0, len(page))
+		for recordKey, storedRow := range page {
+			scanned := dataframe.ScannedRecord{Record: info.newRecord(storedRow)}
+			if changes := logged[recordKey]; len(changes) > 0 {
+				history, _, err := backend.historyOf(recordKey, page, changes)
+				if err != nil {
+					return err
+				}
+				scanned.History = &history
+			}
+			records = append(records, scanned)
+		}
+		return onPage(records)
+	})
+}
+
+// scanPartition reads every record of one partition, a page of stored rows at a time, and the log after
+// each page: the changes since a little before the rebuild's target.
+func (backend *frameBackend) scanPartition(partition int64, onPage func(page storedRows, logged map[[2]int64][]dataframe.HistoryChange) error) error {
 	scyllaTable := backend.scyllaTable
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 	columnNames := []string{partitionColumn.GetName(), keyColumn.GetName()}
@@ -129,15 +167,7 @@ func (backend *frameBackend) ScanPartitionHistories(partition int64, onPage func
 		if err != nil {
 			return err
 		}
-		histories := make([]dataframe.History, 0, len(page))
-		for recordKey := range page {
-			history, _, err := backend.historyOf(recordKey, page, logged[recordKey])
-			if err != nil {
-				return err
-			}
-			histories = append(histories, history)
-		}
-		return onPage(histories)
+		return onPage(page, logged)
 	}
 
 	iterator := getScyllaConnection().Query(queryString, queryValues...).Consistency(gocql.LocalQuorum).PageSize(frameScanPageSize).Iter()

@@ -55,11 +55,10 @@ type testTagFrame struct {
 	Points  int32  `frame:"sum"`
 }
 
-func (record *testRecord) toTagFrames() []testTagFrame {
+func (record *testRecord) toTagFrames(frames []testTagFrame) []testTagFrame {
 	if record.Status == 0 {
-		return nil
+		return frames
 	}
-	frames := []testTagFrame{}
 	for _, tagID := range record.TagIDs {
 		frames = append(frames, testTagFrame{Year: record.Year, TagID: int32(tagID), Minutes: record.Minutes, Points: int32(record.Points)})
 	}

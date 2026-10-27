@@ -62,11 +62,11 @@ type frameActivityLine struct {
 	Minutes    int16 `frame:"sum"`
 }
 
-func (e *frameEnrollment) toActivityLines() []frameActivityLine {
+func (e *frameEnrollment) toActivityLines(lines []frameActivityLine) []frameActivityLine {
 	if e.Status == 0 {
-		return nil
+		return lines
 	}
-	return []frameActivityLine{{Year: e.Year, ActivityID: e.ActivityID, Minutes: e.Minutes}}
+	return append(lines, frameActivityLine{Year: e.Year, ActivityID: e.ActivityID, Minutes: e.Minutes})
 }
 
 var frameEnrollments = NewRepo[frameEnrollmentTable, frameEnrollment]()

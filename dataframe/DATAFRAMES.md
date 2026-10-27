@@ -84,10 +84,12 @@ type SaleSummaryFrame struct {
     AmountPEN  int32 `frame:"sum"`
     SoldUnits  int32 `frame:"sum"`
 }
-func (e *SaleOrder) ToSaleSummaryFrames() []SaleSummaryFrame
+func (e *SaleOrder) ToSaleSummaryFrames(lines []SaleSummaryFrame) []SaleSummaryFrame
 ```
 
-Two lines of one record with the same Keys and Rows add up in their row. `Count` adds 1 per line.
+The method appends its lines to the slice it gets and returns it: a rebuild hands every record the
+same buffer, so it must not keep it. Two lines of one record with the same Keys and Rows add up in
+their row. `Count` adds 1 per line.
 `Spec.Version` is part of the frame's shape: raise it when the method's logic changes and the frame
 is rebuilt.
 
@@ -304,9 +306,10 @@ Step by step (`rebuildFrame`):
 
 1. Take the partition's lock (40 s; its writes stop 5 s before it ends).
 2. Pick the target `T = now − 2 minutes` (`TargetLag`) and a new generation name.
-3. `ScanPartitionHistories`: read every record of the partition, page by page, and add what each one
-   held **at T** (its lines, `linesAt(frame, T)`) to their files and rows in memory. Records created
-   after T are left out.
+3. `ScanPartitionHistories` (or `ScanPartitionRecords`): read every record of the partition, page
+   by page, and add what each one held **at T** (its lines, `linesAt(frame, T)`) to an arena of
+   lines. Records created after T are left out. The lines are then radix sorted by Keys and Rows and
+   summed into the files' rows (aggregate.go).
 4. Give every file a new slot raised to T (3.4), then write the files of the new generation at
    snapshot T, at most 8 at a time. The files are new (`If-None-Match`).
 5. `CommitGeneration`: switch the partition's state to the new generation, with the frame's shape and
@@ -492,6 +495,11 @@ is the in-memory one for tests.
 | `CommitGeneration(ctx, frame, partition, holderID, generation, w)` | make a built generation current (with `frame.Shape`) |
 | `PartitionHistoriesWrittenAfter(partition, moment)` | every record of the partition written after moment, as `History` (dynamo: the GSI on Updated; scylla: the change log) |
 | `ScanPartitionHistories(partition, onPage)` | every record of one partition, page by page (a build) |
+
+A backend may also implement `PartitionRecordScanner`: `ScanPartitionRecords(partition, onPage)`
+hands a build the records themselves (`ScannedRecord{Record, History}`), with a `History` only for a
+record written within the log's reach. The build then turns each other record straight into lines,
+without its `RecordLines` and `History`: scylla does; dynamo builds from Histories.
 
 A `History` names its partition and is built with `Table.NewHistory(partition, recordKey, lines,
 created, updated, changelog)` (dynamo), or `Table.NewHistoryOfChanges(partition, recordKey, lines,

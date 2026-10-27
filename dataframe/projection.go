@@ -3,6 +3,7 @@ package dataframe
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"unsafe"
 )
 
@@ -17,11 +18,14 @@ import (
 //	    SubDivisor int16 `frame:"row"`
 //	    AmountPEN  int32 `frame:"sum"`  // what the row adds up
 //	}
-//	func (e *SaleOrder) ToSaleSummaryFrames() []SaleSummaryFrame
+//	func (e *SaleOrder) ToSaleSummaryFrames(lines []SaleSummaryFrame) []SaleSummaryFrame
 //
-// Keys, Rows and Sums follow the field order. The method must be pure: it is called on
-// what the record held before a write and on what it holds after it, and the frame
-// subtracts one from the other. A change of its logic needs the frame's Version bumped.
+// The method appends the record's lines to the slice it is given and returns it: a
+// rebuild hands every record the same buffer, emptied, so turning a partition into
+// lines allocates nothing per record. It must not keep the slice. Keys, Rows and Sums
+// follow the field order. The method must be pure: it is called on what the record
+// held before a write and on what it holds after it, and the frame subtracts one from
+// the other. A change of its logic needs the frame's Version bumped.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Projection is a compiled ToFrames method: the frame's columns, taken from the frame struct, and how
@@ -33,7 +37,13 @@ type Projection struct {
 	// fields are the frame struct's tagged fields in line order: Keys, Rows, then Sums.
 	fields  []projectedField
 	linesOf func(record unsafe.Pointer) ([]Line, error)
+	// newLineReader makes a lineReader that keeps its buffers from record to record (a rebuild's).
+	newLineReader func() lineReader
 }
+
+// lineReader adds every line a record puts in a frame to sums, checked as LinesOf checks them, through
+// buffers it keeps from record to record. It is not safe for concurrent use.
+type lineReader func(record unsafe.Pointer, sums *lineSums) error
 
 type projectedField struct {
 	name   string
@@ -41,9 +51,9 @@ type projectedField struct {
 	kind   reflect.Kind
 }
 
-// ProjectionOf compiles method, a ToFrames method of the record R returning its lines as F structs.
+// ProjectionOf compiles method, a ToFrames method of the record R appending its lines as F structs.
 // It panics on a frame struct it can't take, when the schema compiles.
-func ProjectionOf[R any, F any](method func(*R) []F) *Projection {
+func ProjectionOf[R any, F any](method func(*R, []F) []F) *Projection {
 	frameType := reflect.TypeFor[F]()
 	projection := &Projection{}
 	if frameType.Kind() != reflect.Struct {
@@ -80,8 +90,25 @@ func ProjectionOf[R any, F any](method func(*R) []F) *Projection {
 		panic(fmt.Sprintf(`dataframe: %v needs a frame:"key" and a frame:"row" field`, frameType))
 	}
 
+	// readFrame reads one frame struct into line.
+	readFrame := func(framePointer unsafe.Pointer, line Line) error {
+		for v, field := range projection.fields {
+			value, err := field.read(framePointer)
+			if err != nil {
+				return fmt.Errorf("%v %w", frameType, err)
+			}
+			line[v] = value
+		}
+		return nil
+	}
+	// The write path's buffers: a record's frames are copied into its lines at once, so the slice the
+	// method appends to is reused from call to call.
+	framesPool := sync.Pool{New: func() any { return new([]F) }}
 	projection.linesOf = func(record unsafe.Pointer) ([]Line, error) {
-		frames := method((*R)(record))
+		buffer := framesPool.Get().(*[]F)
+		defer framesPool.Put(buffer)
+		frames := method((*R)(record), (*buffer)[:0])
+		defer func() { clear(frames); *buffer = frames[:0] }()
 		if len(frames) == 0 {
 			return nil, nil
 		}
@@ -90,18 +117,29 @@ func ProjectionOf[R any, F any](method func(*R) []F) *Projection {
 		backing := make([]int64, len(frames)*lineLength)
 		lines := make([]Line, len(frames))
 		for i := range frames {
-			line := Line(backing[i*lineLength : (i+1)*lineLength : (i+1)*lineLength])
-			framePointer := unsafe.Pointer(&frames[i])
-			for v, field := range projection.fields {
-				value, err := field.read(framePointer)
-				if err != nil {
-					return nil, fmt.Errorf("%v %w", frameType, err)
-				}
-				line[v] = value
+			lines[i] = Line(backing[i*lineLength : (i+1)*lineLength : (i+1)*lineLength])
+			if err := readFrame(unsafe.Pointer(&frames[i]), lines[i]); err != nil {
+				return nil, err
 			}
-			lines[i] = line
 		}
 		return lines, nil
+	}
+	projection.newLineReader = func() lineReader {
+		var frames []F
+		line := make(Line, len(projection.fields))
+		return func(record unsafe.Pointer, sums *lineSums) error {
+			frames = method((*R)(record), frames[:0])
+			for i := range frames {
+				if err := readFrame(unsafe.Pointer(&frames[i]), line); err != nil {
+					return err
+				}
+				if err := sums.frame.checkLine(line); err != nil {
+					return err
+				}
+				sums.add(line)
+			}
+			return nil
+		}
 	}
 	return projection
 }
