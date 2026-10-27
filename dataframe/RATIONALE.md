@@ -134,3 +134,15 @@ every moment, with several concatenations each.
 keys of one generation by partition and Keys for the length of a run or a read.
 **Rationale** — Compact of 100k sales with today's ~1,200 written (A/B): 6.7 → 4.6 ms, allocations
 73k → 15k; movements (changes over every file) −4%, allocations −56%.
+
+## The summing pass prefetches the line 16 places ahead, in assembly
+**Context** — After the radix sort a rebuild sums the lines in sorted order, reading each one where
+it was added: a cache miss per line, ~15% of a rebuild. Scattering them into sorted order first
+cost as much. Go has no way to ask for a cache line ahead (colbin's PERFORMANCE.md: assembly pays
+where Go cannot say the thing, a prefetch).
+**Decision** — `prefetch` (prefetch_amd64.s: PREFETCHT0; prefetch_arm64.s: PRFM PLDL1KEEP; a no-op
+elsewhere and under the `purego` tag) on the Sums of the line 16 sorted places ahead. 32 places,
+and a second prefetch on the line's last value, measured no better.
+**Rationale** — Bytes identical. A/B on amd64, 6 rounds: Rebuild sales −10%, enrollment −21%,
+movements −7%; Build −5%. The arm64 build is compiled and vetted but not measured here (no arm64
+machine): the Lambda run should confirm it.

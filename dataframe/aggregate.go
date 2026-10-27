@@ -3,6 +3,7 @@ package dataframe
 import (
 	"math/bits"
 	"slices"
+	"unsafe"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -21,6 +22,9 @@ import (
 const (
 	chunkLinesShift = 14
 	chunkLines      = 1 << chunkLinesShift
+	// prefetchDistance is how many sorted lines ahead the summing pass asks for: far enough for a
+	// miss to land before its turn.
+	prefetchDistance = 16
 )
 
 type lineSums struct {
@@ -175,6 +179,9 @@ func (sums *lineSums) files(generation string, partition int64, snapshot int64) 
 			clear(groupSums)
 			end := start
 			for ; end < len(order) && (end == start || isSameGroup(end, start)); end++ {
+				if ahead := end + prefetchDistance; ahead < len(order) {
+					prefetch(unsafe.Pointer(&sums.lineAt(int(order[ahead]))[width]))
+				}
 				for s, value := range sums.lineAt(int(order[end]))[width:] {
 					groupSums[s] += value
 				}
