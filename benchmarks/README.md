@@ -50,3 +50,18 @@ git switch benchmarks && git merge main
 ```
 
 Never merge `benchmarks` into `main`. Results of each step are in `results/`.
+
+## Where it stands (2026-10-27, laptop, GOMAXPROCS=1, 100k records each)
+
+| | baseline | now |
+|---|---:|---:|
+| Build sales / enrollment / movements | 401 / 68 / 640 ms | 119 / 19 / 176 ms |
+| Rebuild (engine alone) | 326 / 58 / 559 ms | 86 / 15 / 146 ms |
+| Compact enrollment / movements (changes over every file) | 32 / 249 ms | 12 / 138 ms |
+| Compact sales (today's ~1,200 sales) | — | 3.9 ms |
+| allocations of a Build, sales | 1.82M | 50k |
+
+`results/00-baseline.txt` and `results/07-final.txt`; each step's A/B in between, and what was
+tried and dropped in `results/NOTES.md`. Left on the table: the summing pass reads the sorted lines
+at random (~15% of a rebuild; scattering them instead didn't pay), the encoder (~25%), and the
+format itself, which a compaction must decode and encode whole for every file it touches.
