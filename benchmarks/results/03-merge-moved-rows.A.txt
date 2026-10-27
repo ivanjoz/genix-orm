@@ -1,0 +1,32 @@
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkCompact/sales         	       3	 160367108 ns/op	       306.5 ns/line	184724397 B/op	  417555 allocs/op
+BenchmarkCompact/enrollment    	       3	  37784700 ns/op	       389.6 ns/line	47520866 B/op	  139106 allocs/op
+BenchmarkCompact/movements     	       3	 253440455 ns/op	       398.3 ns/line	298995669 B/op	  633303 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkCompact/sales         	       3	 160271420 ns/op	       306.3 ns/line	184724397 B/op	  417555 allocs/op
+BenchmarkCompact/enrollment    	       3	  36289797 ns/op	       374.2 ns/line	47520850 B/op	  139106 allocs/op
+BenchmarkCompact/movements     	       3	 259559519 ns/op	       407.9 ns/line	298995664 B/op	  633303 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkCompact/sales         	       3	 161281959 ns/op	       308.2 ns/line	184724392 B/op	  417555 allocs/op
+BenchmarkCompact/enrollment    	       3	  36936946 ns/op	       380.9 ns/line	47520850 B/op	  139106 allocs/op
+BenchmarkCompact/movements     	       3	 262974366 ns/op	       413.3 ns/line	298995669 B/op	  633303 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkCompact/sales         	       3	 162011554 ns/op	       309.6 ns/line	184743522 B/op	  417555 allocs/op
+BenchmarkCompact/enrollment    	       3	  36537570 ns/op	       376.8 ns/line	47520866 B/op	  139106 allocs/op
+BenchmarkCompact/movements     	       3	 264816859 ns/op	       416.2 ns/line	298995669 B/op	  633303 allocs/op
+PASS
