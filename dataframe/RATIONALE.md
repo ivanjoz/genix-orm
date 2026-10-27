@@ -78,3 +78,18 @@ deadline is counted from when the lock is granted, not from the read's `now` (wh
 **Rationale** — A compaction of one partition is expected to take seconds. The cost: a dynamo
 rebuild of a large table (berryapps) that takes longer than 35 s now stops writing and fails, where
 the old 5-minute lock let it finish.
+
+## A rebuild sums its lines by sorting them, not in per-file maps
+**Context** — A rebuild built each line's file key string, looked it up in a map of files, then its
+row in a `map[rowKey][]int64` that allocated per row, and sorted each file's map keys to write it.
+On 100k records (benchmarks branch) most lines name a row no other line does: 523k lines → 305k
+rows (sales), 636k → 605k (stock movements), so the maps merged little and cost ~45% of a rebuild,
+plus the garbage the GC scanned.
+**Decision** — `lineSums` (aggregate.go) copies every line into chunked arenas, packs each line's
+Keys and Rows into a uint64 (each column less its minimum, in the bits its range needs), radix sorts
+once and sums runs of one group into rows, which come out ascending, file after file; the file key is
+built once per file. Groups wider than 64 bits fall back to a comparison sort. Files are produced
+ascending by Keys, so a rebuild hands slots out in that order instead of map order.
+**Rationale** — Bytes identical (golden hashes). A/B at GOMAXPROCS=1, 100k records: Rebuild
+sales 326 → 89 ms, enrollment 58 → 15 ms, movements 559 → 185 ms; allocations −98%, bytes −40%. The
+arena holds every line until the files are built (sales: 37 MB), about what the maps held.

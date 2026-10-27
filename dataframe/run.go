@@ -280,9 +280,14 @@ func loadFiles(store utils.FileStore, frame *Frame, fileKeys []string, snapshot 
 func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *Frame, partition int64, lock *heldLock, now time.Time) error {
 	target := utils.SUnixTimeOf(now) - TargetLag
 	generation := utils.EncodeUintBase64(uint64(now.UnixMilli()))
-	rowsByFileKey := map[string]frameRows{}
+	sums := newLineSums(frame)
 	err := backend.ScanPartitionHistories(partition, func(histories []History) error {
-		table.sumAt(frame, generation, histories, target, rowsByFileKey)
+		for _, history := range histories {
+			lines, _ := history.linesAt(frame, target)
+			for _, line := range lines {
+				sums.add(line)
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -291,11 +296,7 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 
 	// Every file of the new generation takes a new slot (Slot 0 here): the readers holding the old
 	// generation fetch the whole partition again anyway.
-	fileKeys := slices.Collect(maps.Keys(rowsByFileKey))
-	files := make([]File, len(fileKeys))
-	for i, fileKey := range fileKeys {
-		files[i] = rowsByFileKey[fileKey].fileAt(target, frame)
-	}
+	fileKeys, files := sums.files(generation, partition, target)
 	if err := table.writeFiles(lock.ctx, store, partition, fileKeys, files, nil, target); err != nil {
 		return fmt.Errorf("dataframe: %s frame %q partition %d writing its files: %w", table.Name, frame.Name, partition, err)
 	}
@@ -314,18 +315,4 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 		}
 	}
 	return store.DeleteFiles(lock.ctx, staleKeys...)
-}
-
-// sumAt adds the lines every record held at moment to the files of a generation.
-func (table *Table) sumAt(frame *Frame, generation string, histories []History, moment int64, rowsByFileKey map[string]frameRows) {
-	for _, history := range histories {
-		lines, _ := history.linesAt(frame, moment)
-		for _, line := range lines {
-			fileKey := frame.fileKeyOf(generation, history.Partition, frame.keysOf(line))
-			if rowsByFileKey[fileKey] == nil {
-				rowsByFileKey[fileKey] = frameRows{}
-			}
-			rowsByFileKey[fileKey].add(frame, line, 1)
-		}
-	}
 }
