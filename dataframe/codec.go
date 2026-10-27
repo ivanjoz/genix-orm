@@ -108,6 +108,20 @@ func (file File) rowCount() int {
 type codecOptions struct {
 	skipsDivisor bool
 	skipsPatches bool
+	// scratch holds the residuals of one column at a time: appendFile reuses it for every column of
+	// the file instead of allocating each one's.
+	scratch *[]uint64
+}
+
+// residualsBuffer is count residuals to fill, the scratch's when there is one.
+func (options codecOptions) residualsBuffer(count int) []uint64 {
+	if options.scratch == nil {
+		return make([]uint64, count)
+	}
+	if cap(*options.scratch) < count {
+		*options.scratch = make([]uint64, count)
+	}
+	return (*options.scratch)[:count]
 }
 
 // EncodeFile encodes a file with every compression step on.
@@ -120,6 +134,9 @@ func appendFile(out []byte, file File, options codecOptions) []byte {
 		formatByte |= zeroSumsMaskFlag
 	}
 	out = append(out, formatByte, file.Slot)
+	if options.scratch == nil {
+		options.scratch = new([]uint64)
+	}
 	out = binary.AppendUvarint(out, uint64(file.Snapshot))
 	out = binary.AppendUvarint(out, uint64(file.rowCount()))
 	if file.rowCount() == 0 {
@@ -156,8 +173,16 @@ func appendRowColumns(out []byte, rowColumns [][]int64, options codecOptions) []
 	levelCount := len(rowColumns)
 	// valuesByLevel[k]: the nodes of level k, one per distinct prefix (Rows[0..k]), in row order.
 	// childCountsByLevel[k] (k ≥ 1): how many nodes of level k each node of level k − 1 holds.
+	rowCount := len(rowColumns[0])
 	valuesByLevel := make([][]int64, levelCount)
 	childCountsByLevel := make([][]int64, levelCount)
+	for level := range levelCount {
+		// A level holds at most a node per row: sized once, never grown.
+		valuesByLevel[level] = make([]int64, 0, rowCount)
+		if level > 0 {
+			childCountsByLevel[level] = make([]int64, 0, rowCount)
+		}
+	}
 	for row := range rowColumns[0] {
 		// The first level whose prefix changes on this row: every level from it starts a node.
 		changedLevel := 0
@@ -206,7 +231,7 @@ func appendRowColumns(out []byte, rowColumns [][]int64, options codecOptions) []
 // steps between neighbours. Consecutive IDs become a run of zeros.
 func appendAscendingColumn(out []byte, values []int64, options codecOptions) []byte {
 	out = binary.AppendUvarint(out, uint64(values[0]))
-	steps := make([]uint64, len(values)-1)
+	steps := options.residualsBuffer(len(values) - 1)
 	for i := 1; i < len(values); i++ {
 		steps[i-1] = uint64(values[i] - values[i-1])
 	}
@@ -231,7 +256,7 @@ func appendSteps(out []byte, steps []uint64, options codecOptions) []byte {
 func appendSumsColumn(out []byte, values []int64, options codecOptions) []byte {
 	minimum := slices.Min(values)
 	out = binary.AppendVarint(out, minimum)
-	residuals := make([]uint64, len(values))
+	residuals := options.residualsBuffer(len(values))
 	for i, value := range values {
 		residuals[i] = uint64(value) - uint64(minimum)
 	}
@@ -339,17 +364,17 @@ func appendBlock(out []byte, block []uint64, options codecOptions) []byte {
 	for widest > 0 && countByBitLength[widest] == 0 {
 		widest--
 	}
-	width, smallestCost := widest, blockCost(len(block), &countByBitLength, widest)
+	width, smallestCost := widest, blockCost(len(block), &countByBitLength, widest, widest)
 	if !options.skipsPatches {
 		for candidate := 0; candidate < widest; candidate++ {
-			if cost := blockCost(len(block), &countByBitLength, candidate); cost < smallestCost {
+			if cost := blockCost(len(block), &countByBitLength, candidate, widest); cost < smallestCost {
 				width, smallestCost = candidate, cost
 			}
 		}
 	}
 
 	patchCount := 0
-	for bitLength := width + 1; bitLength <= 64; bitLength++ {
+	for bitLength := width + 1; bitLength <= widest; bitLength++ {
 		patchCount += countByBitLength[bitLength]
 	}
 	if patchCount == 0 {
@@ -370,11 +395,12 @@ func appendBlock(out []byte, block []uint64, options codecOptions) []byte {
 
 // blockCost is the bytes a block takes at width: its head, the packed run and, when residuals
 // are longer than width, the patch count and one patch each. It needs only how many residuals have
-// each bit length, so every width is scored without another pass over the block.
-func blockCost(count int, countByBitLength *[65]int, width int) int {
+// each bit length, so every width is scored without another pass over the block; none is longer
+// than widest.
+func blockCost(count int, countByBitLength *[65]int, width, widest int) int {
 	cost := 1 + (count*width+7)/8
 	isPatched := false
-	for bitLength := width + 1; bitLength <= 64; bitLength++ {
+	for bitLength := width + 1; bitLength <= widest; bitLength++ {
 		if countByBitLength[bitLength] == 0 {
 			continue
 		}

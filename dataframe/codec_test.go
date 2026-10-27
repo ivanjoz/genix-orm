@@ -205,7 +205,7 @@ func TestFrameBlockCostIsExactAndSmallest(t *testing.T) {
 		}
 		smallestCost := math.MaxInt
 		for width := 0; width <= 64; width++ {
-			smallestCost = min(smallestCost, blockCost(len(block), &countByBitLength, width))
+			smallestCost = min(smallestCost, blockCost(len(block), &countByBitLength, width, 64))
 		}
 		if written := len(appendBlock(nil, block, codecOptions{})); written != smallestCost {
 			t.Fatalf("block of %d residuals: wrote %d bytes, the smallest width costs %d", len(block), written, smallestCost)
