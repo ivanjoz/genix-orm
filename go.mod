@@ -17,7 +17,7 @@ require (
 require (
 	github.com/fatih/color v1.19.0
 	github.com/gocql/gocql v1.6.0
-	github.com/ivanjoz/colbin v0.8.0
+	github.com/ivanjoz/colbin v0.8.1
 	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/db v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0

@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.31
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.0
 	github.com/aws/smithy-go v1.27.3
-	github.com/ivanjoz/colbin v0.8.0
+	github.com/ivanjoz/colbin v0.8.1
 	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/db v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0

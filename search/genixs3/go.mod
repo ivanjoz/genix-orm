@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.47.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.4
+	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/db v0.0.0
 	github.com/ivanjoz/genix-search/genix-s3 v0.0.0
 )
@@ -26,8 +27,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.1 // indirect
 	github.com/aws/smithy-go v1.28.2 // indirect
-	github.com/ivanjoz/colbin v0.8.0 // indirect
-	github.com/ivanjoz/genix-orm/dataframe v0.0.0
+	github.com/ivanjoz/colbin v0.8.1 // indirect
 	github.com/ivanjoz/genix-orm/utils v0.0.0 // indirect
 	github.com/viant/xunsafe v0.11.0 // indirect
 )
