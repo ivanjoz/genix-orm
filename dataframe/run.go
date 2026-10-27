@@ -178,8 +178,9 @@ func (table *Table) writeFiles(ctx context.Context, store utils.FileStore, parti
 func (table *Table) filesHeldBetween(frame *Frame, generation string, histories []History, from, to int64) []string {
 	isListed := map[string]bool{}
 	var fileKeys []string
+	fileKeyOf := frame.newFileKeyCache(generation)
 	for _, history := range histories {
-		for _, fileKey := range table.filesOfHistory(frame, generation, history, from, to) {
+		for _, fileKey := range fileKeyOf.filesOfHistory(history, from, to) {
 			if !isListed[fileKey] {
 				isListed[fileKey] = true
 				fileKeys = append(fileKeys, fileKey)
@@ -193,7 +194,8 @@ func (table *Table) filesHeldBetween(frame *Frame, generation string, histories 
 // from, at to, after each change and after its insert, which leaves no changelog entry. Without the
 // insert, a record inserted and moved out within the window would be in no listed file, and a run
 // would leave that file as is while a reader holds a fresh copy that counted the record.
-func (table *Table) filesOfHistory(frame *Frame, generation string, history History, from, to int64) []string {
+func (fileKeyOf *fileKeyCache) filesOfHistory(history History, from, to int64) []string {
+	frame := fileKeyOf.frame
 	moments := append([]int64{from, to}, history.changeMoments(from, to)...)
 	if history.created > from && history.created <= to {
 		moments = append(moments, history.created)
@@ -202,7 +204,7 @@ func (table *Table) filesOfHistory(frame *Frame, generation string, history Hist
 	for _, moment := range moments {
 		lines, _ := history.linesAt(frame, moment)
 		for _, line := range lines {
-			fileKeys = append(fileKeys, frame.fileKeyOf(generation, history.Partition, frame.keysOf(line)))
+			fileKeys = append(fileKeys, fileKeyOf.of(history.Partition, frame.keysOf(line)))
 		}
 	}
 	return fileKeys
@@ -212,17 +214,18 @@ func (table *Table) filesOfHistory(frame *Frame, generation string, history Hist
 // it held at moment minus the ones it held at appliedThrough[file] (max(the file's snapshot, w)).
 func (table *Table) moveRecords(frame *Frame, generation string, histories []History, loaded loadedFiles, moment int64) {
 	appliedMoments := slices.Compact(slices.Sorted(maps.Values(loaded.appliedThrough)))
+	fileKeyOf := frame.newFileKeyCache(generation)
 	for _, history := range histories {
 		lines, _ := history.linesAt(frame, moment)
 		for _, line := range lines {
-			if rows := loaded.rowsByFileKey[frame.fileKeyOf(generation, history.Partition, frame.keysOf(line))]; rows != nil {
+			if rows := loaded.rowsByFileKey[fileKeyOf.of(history.Partition, frame.keysOf(line))]; rows != nil {
 				rows.add(frame, line, 1)
 			}
 		}
 		for _, appliedMoment := range appliedMoments {
 			appliedLines, _ := history.linesAt(frame, appliedMoment)
 			for _, line := range appliedLines {
-				fileKey := frame.fileKeyOf(generation, history.Partition, frame.keysOf(line))
+				fileKey := fileKeyOf.of(history.Partition, frame.keysOf(line))
 				if rows := loaded.rowsByFileKey[fileKey]; rows != nil && loaded.appliedThrough[fileKey] == appliedMoment {
 					rows.add(frame, line, -1)
 				}
