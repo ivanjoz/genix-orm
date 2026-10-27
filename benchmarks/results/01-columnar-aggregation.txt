@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	 102262459 ns/op	       195.4 ns/line	131477130 B/op	   24269 allocs/op
+BenchmarkRebuild/sales         	       3	  88699599 ns/op	       169.5 ns/line	131475541 B/op	   24263 allocs/op
+BenchmarkRebuild/sales         	       3	  89292118 ns/op	       170.7 ns/line	131475536 B/op	   24263 allocs/op
+BenchmarkRebuild/enrollment    	       3	  15321738 ns/op	       158.0 ns/line	31313280 B/op	    9282 allocs/op
+BenchmarkRebuild/enrollment    	       3	  15065434 ns/op	       155.4 ns/line	31313280 B/op	    9282 allocs/op
+BenchmarkRebuild/enrollment    	       3	  14921358 ns/op	       153.9 ns/line	31313280 B/op	    9282 allocs/op
+BenchmarkRebuild/movements     	       3	 194251378 ns/op	       305.3 ns/line	224650405 B/op	   70344 allocs/op
+BenchmarkRebuild/movements     	       3	 175514334 ns/op	       275.8 ns/line	224650058 B/op	   70340 allocs/op
+BenchmarkRebuild/movements     	       3	 185129030 ns/op	       290.9 ns/line	224650058 B/op	   70340 allocs/op
+BenchmarkBuild/sales           	       3	 136083068 ns/op	       260.1 ns/line	208877122 B/op	  429442 allocs/op
+BenchmarkBuild/sales           	       3	 141805928 ns/op	       271.0 ns/line	208876861 B/op	  429440 allocs/op
+BenchmarkBuild/sales           	       3	 141746390 ns/op	       270.9 ns/line	208876861 B/op	  429440 allocs/op
+BenchmarkBuild/enrollment      	       3	  22823698 ns/op	       235.4 ns/line	42898341 B/op	  320748 allocs/op
+BenchmarkBuild/enrollment      	       3	  20841992 ns/op	       214.9 ns/line	42898341 B/op	  320748 allocs/op
+BenchmarkBuild/enrollment      	       3	  21045301 ns/op	       217.0 ns/line	42898352 B/op	  320749 allocs/op
+BenchmarkBuild/movements       	       3	 254732077 ns/op	       400.3 ns/line	317100269 B/op	  481706 allocs/op
+BenchmarkBuild/movements       	       3	 232663983 ns/op	       365.6 ns/line	317100269 B/op	  481706 allocs/op
+BenchmarkBuild/movements       	       3	 232139576 ns/op	       364.8 ns/line	317100253 B/op	  481706 allocs/op
+PASS
+ok  	github.com/ivanjoz/genix-orm/benchmarks	8.439s
