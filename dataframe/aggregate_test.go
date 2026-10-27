@@ -14,7 +14,7 @@ func TestLineSumsMatchesFrameRows(t *testing.T) {
 		for _, frame := range compileTestTable(t).Frames {
 			rng := rand.New(rand.NewPCG(7, uint64(spread)))
 			sums := newLineSums(&frame)
-			rowsByFileKey := map[string]frameRows{}
+			rowsByFileKey := map[string]*frameRows{}
 			for i := range 3 * chunkLines / 2 {
 				line := make(Line, frame.lineLength())
 				for v := range len(frame.Keys) + len(frame.Rows) {
@@ -27,7 +27,7 @@ func TestLineSumsMatchesFrameRows(t *testing.T) {
 				sums.add(line)
 				fileKey := frame.fileKeyOf("g", 3, frame.keysOf(line))
 				if rowsByFileKey[fileKey] == nil {
-					rowsByFileKey[fileKey] = frameRows{}
+					rowsByFileKey[fileKey] = rowsOfFile(File{})
 				}
 				rowsByFileKey[fileKey].add(&frame, line, 1)
 			}
