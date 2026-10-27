@@ -148,7 +148,7 @@ func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, p
 }
 
 // rowsOf turns the files into rows, by Keys then by RowValues.
-func (frame *Frame) rowsOf(generation string, partition int64, fileKeys []string, rowsByFileKey map[string]frameRows) []Row {
+func (frame *Frame) rowsOf(generation string, partition int64, fileKeys []string, rowsByFileKey map[string]*frameRows) []Row {
 	keysByFileKey := map[string][]int64{}
 	for _, fileKey := range fileKeys {
 		keysByFileKey[fileKey], _ = frame.keysOfFile(generation, partition, fileKey)
@@ -175,33 +175,28 @@ func (frame *Frame) rowsOf(generation string, partition int64, fileKeys []string
 	return rows
 }
 
-// frameRows is the content of one file while it is being changed: the sums per row.
-type frameRows map[rowKey][]int64
-
-func rowsOfFile(file File) frameRows {
-	rows := make(frameRows, file.rowCount())
-	for i := range file.rowCount() {
-		var row rowKey
-		for c := range file.Rows {
-			row[c] = file.Rows[c][i]
-		}
-		sums := make([]int64, len(file.Sums))
-		for j := range file.Sums {
-			sums[j] = file.Sums[j][i]
-		}
-		rows[row] = sums
-	}
-	return rows
+// frameRows is the content of one file while it is being changed: the rows it was read with, as
+// decoded (ascending, never a row of zero sums), and what the lines moved since add to each row they
+// touch. A run moves a few rows of many files, so the read rows are never put in a map: fileAt merges
+// the two once, when the file is written.
+type frameRows struct {
+	read  File
+	moved map[rowKey][]int64
 }
+
+func rowsOfFile(file File) *frameRows { return &frameRows{read: file} }
 
 // add moves the row of a line of the frame by sign (+1 joins it, −1 leaves it): its Sums, and 1 to
 // the count when the frame counts records.
-func (rows frameRows) add(frame *Frame, line Line, sign int64) {
+func (rows *frameRows) add(frame *Frame, line Line, sign int64) {
+	if rows.moved == nil {
+		rows.moved = map[rowKey][]int64{}
+	}
 	row := frame.rowOf(line)
-	sums := rows[row]
+	sums := rows.moved[row]
 	if sums == nil {
 		sums = make([]int64, frame.SumsCount)
-		rows[row] = sums
+		rows.moved[row] = sums
 	}
 	for i, sum := range frame.sumsOf(line) {
 		sums[i] += sign * sum
@@ -211,20 +206,65 @@ func (rows frameRows) add(frame *Frame, line Line, sign int64) {
 	}
 }
 
-// fileAt encodes the rows as a file of the frame at snapshot, rows ascending; a row whose sums are all
-// 0 is dropped.
-func (rows frameRows) fileAt(snapshot int64, frame *Frame) File {
-	file := File{Snapshot: snapshot, Rows: make([][]int64, len(frame.Rows)), Sums: make([][]int64, frame.SumsCount), UsesZeroSumsMask: frame.UsesZeroSumsMask}
-	for _, row := range slices.SortedFunc(maps.Keys(rows), compareRowKeys) {
-		sums := rows[row]
+// fileAt is the rows as a file of the frame at snapshot, rows ascending; a row whose sums are all 0 is
+// dropped. A nil frameRows is a file without rows.
+func (rows *frameRows) fileAt(snapshot int64, frame *Frame) File {
+	rowColumnCount, sumsCount := len(frame.Rows), frame.SumsCount
+	file := File{Snapshot: snapshot, Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount), UsesZeroSumsMask: frame.UsesZeroSumsMask}
+	if rows == nil {
+		return file
+	}
+	movedRows := slices.SortedFunc(maps.Keys(rows.moved), compareRowKeys)
+	readCount := rows.read.rowCount()
+	capacity := readCount + len(movedRows)
+	if capacity == 0 {
+		return file
+	}
+	backing := make([]int64, capacity*(rowColumnCount+sumsCount))
+	for c := range file.Rows {
+		file.Rows[c], backing = backing[:0:capacity], backing[capacity:]
+	}
+	for s := range file.Sums {
+		file.Sums[s], backing = backing[:0:capacity], backing[capacity:]
+	}
+	readRowAt := func(r int) rowKey {
+		var row rowKey
+		for c := range rowColumnCount {
+			row[c] = rows.read.Rows[c][r]
+		}
+		return row
+	}
+	sums := make([]int64, sumsCount)
+	for r, m := 0, 0; r < readCount || m < len(movedRows); {
+		var row rowKey
+		order := -1 // the read row comes first
+		if r == readCount {
+			order = 1
+		} else if row = readRowAt(r); m < len(movedRows) {
+			order = compareRowKeys(row, movedRows[m])
+		}
+		clear(sums)
+		if order <= 0 {
+			for s := range sums {
+				sums[s] = rows.read.Sums[s][r]
+			}
+			r++
+		}
+		if order >= 0 {
+			row = movedRows[m]
+			for s, sum := range rows.moved[row] {
+				sums[s] += sum
+			}
+			m++
+		}
 		if !slices.ContainsFunc(sums, func(sum int64) bool { return sum != 0 }) {
 			continue
 		}
 		for c := range file.Rows {
 			file.Rows[c] = append(file.Rows[c], row[c])
 		}
-		for j, sum := range sums {
-			file.Sums[j] = append(file.Sums[j], sum)
+		for s, sum := range sums {
+			file.Sums[s] = append(file.Sums[s], sum)
 		}
 	}
 	return file

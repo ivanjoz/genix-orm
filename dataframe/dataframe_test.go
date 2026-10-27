@@ -387,7 +387,7 @@ func partitionHistories(histories []History, partition int64) []History {
 
 // bruteForceRows sums the records of a partition as stored at moment.
 func (sim simHistory) bruteForceRows(frame *Frame, partition, moment int64) []Row {
-	rowsByFileKey := map[string]frameRows{}
+	rowsByFileKey := map[string]*frameRows{}
 	var fileKeys []string
 	for _, write := range sim.storedAt(moment) {
 		if simPartitionOf(write) != partition {
@@ -396,7 +396,7 @@ func (sim simHistory) bruteForceRows(frame *Frame, partition, moment int64) []Ro
 		for _, line := range linesOfRecord(sim.t, sim.table, write.record)[frame.Index] {
 			fileKey := frame.fileKeyOf("g", partition, frame.keysOf(line))
 			if rowsByFileKey[fileKey] == nil {
-				rowsByFileKey[fileKey] = frameRows{}
+				rowsByFileKey[fileKey] = rowsOfFile(File{})
 				fileKeys = append(fileKeys, fileKey)
 			}
 			rowsByFileKey[fileKey].add(frame, line, 1)

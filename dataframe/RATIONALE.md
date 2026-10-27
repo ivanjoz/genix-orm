@@ -103,3 +103,11 @@ for each candidate width (~2,000 steps per block of 128 values).
 at the block's widest residual (no residual is longer, so the costs are the same).
 **Rationale** — Bytes identical. Rebuild of 100k records: movements 185 → 135 ms, sales 89 → 77 ms;
 allocations of a rebuild halved.
+
+## A run merges the moved rows into the file it read, instead of a map of every row
+**Context** — A run (and a fresh read) turned every file it touched into a map with a []int64 per
+row, then sorted the map's keys to write it back, though a run moves a few rows of each file.
+**Decision** — `frameRows` keeps the decoded file as read (already ascending, no row of zero sums)
+and a map of only the rows its lines moved; `fileAt` sorts the moved rows and merges the two once.
+**Rationale** — Bytes identical. Compact of 100k records with ~1,200 written since the build (A/B):
+sales 161 → 74 ms, enrollment 37 → 12 ms, movements 261 → 147 ms; bytes −45%.

@@ -234,7 +234,7 @@ func (table *Table) moveRecords(frame *Frame, generation string, histories []His
 // loadedFiles are files read to be brought forward: their rows, snapshot, slot, ETag ("" for a
 // missing file) and stored bytes, and the moment each one already holds (max(snapshot, w)).
 type loadedFiles struct {
-	rowsByFileKey     map[string]frameRows
+	rowsByFileKey     map[string]*frameRows
 	snapshotByFileKey map[string]int64
 	slotByFileKey     map[string]uint8
 	appliedThrough    map[string]int64
@@ -260,7 +260,7 @@ func loadFiles(store utils.FileStore, frame *Frame, fileKeys []string, snapshot 
 		etags[fileIndex], contents[fileIndex] = etag, content
 		return nil
 	})
-	loaded := loadedFiles{rowsByFileKey: map[string]frameRows{}, snapshotByFileKey: map[string]int64{}, slotByFileKey: map[string]uint8{},
+	loaded := loadedFiles{rowsByFileKey: map[string]*frameRows{}, snapshotByFileKey: map[string]int64{}, slotByFileKey: map[string]uint8{},
 		appliedThrough: map[string]int64{}, etagByFileKey: map[string]string{}, contentByFileKey: map[string][]byte{}}
 	for i, fileKey := range fileKeys {
 		loaded.rowsByFileKey[fileKey] = rowsOfFile(files[i])
