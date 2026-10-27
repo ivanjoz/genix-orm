@@ -14,10 +14,11 @@ of a frame. dynamo has no partitions and puts every record in partition 0.
 
 ```text
 dataframe/
-  table.go       Column, Spec → Compile → Table / Frame; file keys, the write check
+  table.go       Column, Line, Spec → Compile → Table / Frame; LinesOf, file keys
+  projection.go  ProjectionOf: a frame declared by a ToFrames method of the record (section 1.1)
   codec.go       the frame file format (section 3)
   versions.go    the versions file: 255 slots, the moment each was last raised (section 3.4)
-  changelog.go   the per-record changelog, History and valuesAt (section 4)
+  changelog.go   the per-record changelog of lines, History and linesAt (section 4)
   run.go         Materialize: build, rebuild and incremental runs; RebuildPartition (sections 5–6)
   read.go        Read: plain and fresh (section 7)
   changed.go     ReadChanged: the files a client holding raw copies must replace (section 7.1)
@@ -57,6 +58,37 @@ file; one that changes a Rows value moves to another row; one that changes a Sum
 
 A GroupBy counter (dynamo) keeps one item per group. A frame keeps a whole table of rows per file,
 so a report over thousands of employees is one read.
+
+### 1.1 Lines: what a record puts in a frame
+
+The engine never reads a record's columns. A record gives each frame its **lines**: a `Line` is one
+`[]int64` of the frame's Keys, Rows and Sums values, in that order, and a record gives 0..n of
+them. Everything below (the changelog, the runs, the reads) compares and sums lines.
+
+A frame is declared one of two ways:
+
+- **By columns** (`Keys`/`Rows`/`Sums`/`Count`, above): the record gives one line from those
+  columns, none when `Status = 0`.
+- **By a `ToFrames` method** of the record, returning a slice of a frame struct whose fields are
+  tagged `frame:"key"`, `frame:"row"` or `frame:"sum"` (`ProjectionOf`). The method decides
+  everything: a sale gives one line per product it sold, an annulled one none. A list column, a
+  status rule or a currency conversion stay in the method; the engine only sees the lines. The
+  struct's fields are the frame's columns, ids by field position.
+
+```go
+type SaleSummaryFrame struct {
+    Date       int16 `frame:"key"`
+    ProductID  int32 `frame:"row"`
+    SubDivisor int16 `frame:"row"`
+    AmountPEN  int32 `frame:"sum"`
+    SoldUnits  int32 `frame:"sum"`
+}
+func (e *SaleOrder) ToSaleSummaryFrames() []SaleSummaryFrame
+```
+
+Two lines of one record with the same Keys and Rows add up in their row. `Count` adds 1 per line.
+`Spec.Version` is part of the frame's shape: raise it when the method's logic changes and the frame
+is rebuilt.
 
 ## 2. The lifecycle at a glance
 
@@ -122,7 +154,7 @@ its commit on their ETags.
 | Field | Meaning |
 |---|---|
 | `Generation` | the folder of the current files; empty when not built |
-| `Shape` | a hash of the file layout (Keys/Rows/Sums column ids, Count, format version). If the declaration changes, the shape changes and the frame is rebuilt |
+| `Shape` | the file layout and what fills it (Keys/Rows/Sums column ids, Count, the zero sums mask, `Version`, format version). If the declaration changes, the shape changes and the frame is rebuilt |
 | `Snapshot` (w) | a SUnixTime: every file holds the records as of w or later |
 | lock holder + expiry | so only one run or build works on the frame at a time |
 
@@ -133,14 +165,24 @@ column per Sum (in declaration order), then the record count when the frame has 
 stored as integers, `round(v × 10⁶)`, so adding and subtracting the same value is exact.
 
 ```text
-u8       format version (3)
+u8       format version (4), bit 7 set when the file carries the zero sums mask
 u8       slot: the file's versions slot, 1..255 (section 3.4)
 uvarint  snapshot: the SUnixTime this file is exact at
 uvarint  row count n                       (nothing follows when n = 0)
 rows     the Rows columns, nested (below)
+[u8      zero sums mask: bit s set when summed column s holds a non-zero value]
 column   Sum 1   minimum, then each value less the minimum
-column   …       one per Sum, then Count
+column   …       one per Sum, then Count (with the mask: only those whose bit is set)
 ```
+
+**The zero sums mask** is opt-in per frame (`UseZeroSumsMask`, at most 8 summed columns Count
+included): a summed column that is zero in the whole file then costs nothing. Declare the Sums
+from the most to the least often non-zero. It pays where most files leave some Sums empty (no
+sub-units sold, no debt left); a frame whose Sums are always set skips the byte.
+
+**A constant column** (all its residuals zero, below) is written as its minimum and a divisor of 0,
+with no blocks: 2 bytes for an all-zero column, and a nested level whose nodes all hold one value
+(a `SubDivisor` that never varies) costs a byte or two per column.
 
 **The Rows, nested.** With one Rows column it is a single ascending column: first value, smallest
 step, then the n − 1 steps less that smallest step. With 2 or 3, the sorted rows form a tree (a
@@ -171,7 +213,8 @@ Each column becomes a list of small **non-negative residuals**, and those are wh
    - Sums, and a nested level's counts and first values, get their **minimum subtracted** (frame
      of reference), which also makes negative sums non-negative.
 2. **Common divisor:** the residuals are divided by the largest of 1000, 100, 10, 8, 5, 2 that
-   divides them all (amounts in multiples of 1000 save 10 bits each).
+   divides them all (amounts in multiples of 1000 save 10 bits each). Divisor 0 marks a constant
+   column: every residual is zero and no blocks follow.
 3. **Bit packing in blocks of 128:** each block stores a head byte with its bit width, then every
    residual packed at that width with no gaps. The width is the cheapest exactly: either the widest
    residual's bit length, or a narrower one where the few larger residuals keep their extra high
@@ -219,30 +262,33 @@ at w** (to take it out) and **what it holds now** (to put it in). Records don't 
 so each one carries two small extra values beside its data:
 
 - **created**: the SUnixTime it was first written (dynamo: the item attribute `crt`).
-- **changelog**: a compact binary list (dynamo: `cgl`) of the values its **tracked columns** held
+- **changelog**: a compact binary list (dynamo: `cgl`) of the **lines** (1.1) each frame held
   before each write that changed them, newest first, covering the last ~36 hours.
 
-The tracked columns are every frame's Keys, Rows and Sums, plus `Status`. With the current values,
-`Updated`, created and the changelog, `valuesAt(X)` rebuilds what the record held at any moment X
-within that window:
+The changelog is a function of the lines, not of the record's columns: a write that changes a
+column no frame's lines depend on logs nothing. With the current lines, `Updated`, created and the
+changelog, `linesAt(frame, X)` rebuilds the lines the record gave a frame at any moment X within
+that window:
 
 - if `X < created`, the record did not exist yet;
-- otherwise, start from the current values and undo every change made after X, newest first.
+- otherwise, start from the current lines and take, for each frame, the lines logged by the oldest
+  change made after X (what it held just before it), if any.
 
-The changelog stays small because an entry lists only the columns that changed, with variable-width
-values (2–5 bytes for small non-negative values), and entries older than `MaxDelta` (65 535 ticks of
-2 s ≈ 36.4 h) are dropped on the next write. An insert has no changelog. The byte layout is
-documented in `changelog.go`. The backend never builds it by hand: it calls `Table.NextChangelog` on
-every write (section 9).
+An entry lists only the frames whose lines changed, each under a 16-bit tag of its shape and its
+payload length, so the entry of a frame whose declaration changed is skipped (that frame is rebuilt
+anyway). Values are zigzag varints. Entries older than `MaxDelta` (65 535 ticks of 2 s ≈ 36.4 h)
+are dropped on the next write. An insert has no changelog. The byte layout is documented in
+`changelog.go`. The backend never builds it by hand: it calls `Table.NextChangelog` on every write
+(section 9).
 
 Because every operation only asks "what did this record hold at X?", runs, builds and fresh reads
 are exact whatever order the writes landed in.
 
-**scylla keeps no changelog on the record.** Each write that inserts a record or changes a tracked
-column appends one row to the table's change log, `<table>__dtf_log`, with the same content as a
-changelog entry: the values the changed columns held before it, or an insert flag. A History is
-then built from the record's values now, read from the table, and its logged changes
-(`Table.NewHistoryOfChanges`); valuesAt undoes them the same way. See section 12.
+**scylla keeps no changelog on the record.** Each write that inserts a record or changes a frame's
+lines appends one row to the table's change log, `<table>__dtf_log`, with the same body as a
+changelog entry (`Table.EncodeChangedLines`): the lines the changed frames held before it, or an
+insert flag. A History is then built from the record's lines now, taken from the stored row, and
+its logged changes (`Table.NewHistoryOfChanges`); linesAt reads them the same way. See section 12.
 
 ## 5. Building and rebuilding a frame
 
@@ -256,7 +302,7 @@ Step by step (`rebuildFrame`):
 1. Take the frame's lock (5 minutes; its writes stop 30 s before it ends).
 2. Pick the target `T = now − 2 minutes` (`TargetLag`) and a new generation name.
 3. `ScanHistories`: read every record of the table, page by page, and add what each one held **at T**
-   (`valuesAt(T)`) to its file and row in memory. Records created after T are left out.
+   (its lines, `linesAt(frame, T)`) to their files and rows in memory. Records created after T are left out.
 4. Give every file a new slot raised to T (3.4), then write the files of the new generation at
    snapshot T. The files are new (`If-None-Match`).
 5. `CommitGeneration`: switch the state to the new generation, with the frame's shape and w = T.
@@ -381,8 +427,17 @@ DataFrames: []db.DataFrame{{
 }},
 ```
 
-The table also needs a GSI on `Updated` for `HistoriesWrittenAfter`. The adapter turns this into
-`dataframe.Compile`, which any backend calls once at schema compile time:
+Or by a method (1.1), in either backend (genix `sales/types/sales.go`):
+
+```go
+DataFrames: []db.DataFrame{{
+    Name: "sale-summary", Version: 1, UseZeroSumsMask: true,
+    ToFrames: db.ToFrames((*SaleOrder).ToSaleSummaryFrames),
+}},
+```
+
+The dynamo table also needs a GSI on `Updated` for `HistoriesWrittenAfter`. The adapter turns either
+into `dataframe.Compile`, which any backend calls once at schema compile time:
 
 ```go
 table, err := dataframe.Compile("Enrollment", 78901377, []dataframe.Spec{{
@@ -390,16 +445,21 @@ table, err := dataframe.Compile("Enrollment", 78901377, []dataframe.Spec{{
     Keys: []dataframe.Column{{FieldName: "Year", ColumnID: 24}, {FieldName: "ProgramID", ColumnID: 25}},
     Rows: []dataframe.Column{{FieldName: "EmployeeID", ColumnID: 2}},
     Sums: []dataframe.Column{{FieldName: "RecordedMinutes", ColumnID: 10}, {FieldName: "Points", ColumnID: 18}},
-}}, &dataframe.Column{FieldName: "Status", ColumnID: 14})
+    LinesOf: linesOfEnrollment, // the record's one line, none when Status = 0
+}})
 ```
 
-- `ColumnID` is the field's stable id (genix-orm's `cb` tag). Files and changelogs name columns by
-  it, so renaming a Go field keeps them.
+A ToFrames frame passes `Projection: dataframe.ProjectionOf(method)` instead of the columns and
+`LinesOf`.
+
+- `ColumnID` is the column's stable id (dynamo: genix-orm's `cb` tag; scylla: the field position;
+  ToFrames: the frame struct's field position). Only the shape names columns by it.
 - Names: `a-z`, `0-9`, `-`. 1–3 Keys and 1–3 Rows are integers (non-negative values), no column
   twice; Sums are integers or floats; a frame needs Sums or `Count`.
-- `Table.Tracked` lists the tracked columns in column id order. **Every tracked-values slice the
-  backend passes in follows that order**, with floats already scaled (`ScaledFloat`).
-- Limits: at most 63 tracked columns, column ids 1..255, values within ±2⁶⁰.
+- `Table.LinesOf(record)` gives every frame's lines, checked: the right length, non-negative Keys
+  and Rows, values within ±2⁶⁰, floats already scaled (`ScaledFloat`).
+- A ToFrames frame's rows read back with an empty `FrameRow.Key` (its columns are not the
+  record's); its Keys are filtered by the record column of the same field name.
 
 ## 9. What a backend provides
 
@@ -424,18 +484,20 @@ is the in-memory one for tests.
 | `ScanHistories(onPage)` | every record of the table, page by page |
 | `ScanPartitionHistories(partition, onPage)` | every record of one partition, page by page (`RebuildPartition`) |
 
-A `History` names its partition and is built with `NewHistory(partition, recordKey, trackedValues,
-created, updated, changelog)` (dynamo), or `Table.NewHistoryOfChanges(partition, recordKey,
-trackedValues, changes)` from logged changes, newest first (scylla). `FileState` implements the five
-state methods over a file of the store.
+A `History` names its partition and is built with `Table.NewHistory(partition, recordKey, lines,
+created, updated, changelog)` (dynamo), or `Table.NewHistoryOfChanges(partition, recordKey, lines,
+changes)` from logged change bodies, newest first (scylla); `lines` are `Table.LinesOf` of the record
+now. `FileState` implements the five state methods over a file of the store.
 
 ### Duties on the write path
 
-1. Before writing over a stored record, compute `Table.NextChangelog(stored changelog, stored
-   Updated, written Updated, stored values, written values)` and store the result with the record
-   (none when nil). This needs the stored record: read it, or prove it with a conditional write.
+1. Before writing over a stored record, take `Table.LinesOf` of the **whole** stored record and of
+   the record as written (a ToFrames method may read any field), then compute
+   `Table.NextChangelog(stored changelog, stored Updated, written Updated, stored lines, written
+   lines)` and store the result with the record (none when nil). This needs the stored record: read
+   it, or prove it with a conditional write. `LinesOf` refuses lines out of range before the write.
 2. Store `created` on insert and keep it on every later write.
-3. Call `Table.CheckValues(tracked)` before the write (negative Keys/Rows, out-of-range values).
+3. Write nothing for the frames when no frame's lines changed.
 4. Never delete a record physically: soft-delete it (`Status = 0`), which takes it out of the frames.
 5. Stamp `Updated` with the write time (SUnixTime).
 
@@ -444,7 +506,7 @@ state methods over a file of the store.
 - Exact for writes that read the record they replace (dynamo: `Modify`, `PutManyIfVersion`,
   `PutMany`). Two unconditional writes racing on one record compute their changelog from the same
   read: the loser's change is lost until a rebuild.
-- A silent rewrite that changes tracked columns without moving `Updated` (dynamo:
+- A silent rewrite that changes a frame's lines without moving `Updated` (dynamo:
   `ReprocessRecords`) is invisible to runs: rebuild after it.
 - A frame whose runs stop for more than ~35 hours is rebuilt on the next run (one table scan).
 - A write stamped by a clock more than 2 minutes behind could land below a T a run already passed.
@@ -457,17 +519,21 @@ state methods over a file of the store.
   store over random histories, and checks them against brute force. The histories include inserts,
   updates of every column, floats, negative sums, soft deletes and restores, and runs that crash
   halfway, forced rebuilds, rebuilds of one partition and a tiny slot cycle (2 slots), over records
-  spread on 3 partitions, every check per partition. A simulated client per partition syncs through
-  `ReadChanged` and the wire at random moments and must always match the brute force.
-- `TestHistoryOfChangesMatchesTheHistory` builds Histories the scylla way (values now plus logged
-  changes after a window's start) and checks `valuesAt` against the recorded history.
+  spread on 3 partitions, every check per partition. Its frames cover columns, a nested masked
+  frame, and a ToFrames frame giving several lines per record (repeated rows included). A simulated
+  client per partition syncs through `ReadChanged` and the wire at random moments and must always
+  match the brute force.
+- `TestHistoryOfChangesMatchesTheHistory` builds Histories the scylla way (lines now plus logged
+  changes after a window's start) and checks `linesAt` against the recorded history.
 - `state_file_test.go` covers `FileState`: a held lock refuses a second taker, and a holder another
   run overtook fails its commit.
 - `changed_test.go` covers the versions file (round-robin, raise-only, no-op writes) and the wire.
-- It also covers the changelog's sizes, its shift/drop rules, and `valuesAt` against the recorded
+- It also covers the changelog's sizes, its shift/drop rules, and `linesAt` against the recorded
   history.
 - `codec_test.go` covers the file format and its compression steps, 1 to 3 nested Rows columns,
-  truncated files and a decode fuzzer. The simulation runs a frame of one Rows column and one of two.
+  truncated files, a decode fuzzer, the zero sums mask and constant columns
+  (`TestZeroSumsMaskAndConstantColumns`). `vectors_test.go` pins the bytes the browser decoder is
+  tested on (`testdata/frame_wire_vectors.json`).
 
 ## 12. The scylla backend
 
@@ -476,8 +542,8 @@ genix-orm's `scylla` (`data_frame.go`, `data_frame_log.go`, `data_frame_backend.
 - **Declaration:** `TableSchema.DataFrames` (`db.DataFrame`). The table needs an int32 partition
   column and one integer key; frame columns are persisted integers or floats, the status column is
   the one named `status`. A column's id is its field position, so moving a field changes the shapes
-  and rebuilds the frames; the change log names columns by a 16-bit hash of their name instead, so
-  its rows keep their meaning across such a deploy.
+  and rebuilds the frames. A filter on a ToFrames frame names the record column of the key's field
+  name (`Between(table.Date, …)` selects the frame struct's `Date` key).
 - **Change log**, one table per table with frames, created by `DeployScylla`:
 
   ```sql
@@ -489,18 +555,22 @@ genix-orm's `scylla` (`data_frame.go`, `data_frame_log.go`, `data_frame_backend.
 
   `half_hour` is unix seconds / 1800 and `ts` the microseconds since it started: a run reads every
   partition's writes of a half hour with one query, a fresh read slices its partition. `changes` is
-  `u8 format, u8 flags (insert), then per changed column: u16 name hash, zigzag varint before`.
-- **Write path:** one select per partition reads the stored tracked columns (shared with the delta
-  log's read), then the write logs every record it inserts or whose tracked columns it changes, in
-  an unlogged batch at LocalQuorum, **before** the record rows. A change the table holds always has
-  its log row; a log row whose write then failed is harmless, because a History starts from the
-  values the table holds and only undoes changes. A write that changes nothing tracked logs nothing.
-- **Histories:** the log after w, then the values of the records it names, then the log again: a
+  `u8 format (2), u8 flags (insert = 1), then the changelog body` (section 4: the lines the changed
+  frames held before the write). A row of another format is skipped: a deploy that changes it
+  changes every frame's shape, so they are rebuilt.
+- **Write path:** one select per partition reads the **whole stored row** of every record written
+  (shared with the delta log's read). The stored row is decoded into a record, the written columns
+  are laid over a copy of it, and both give their lines (`Table.LinesOf`). The write logs every
+  record it inserts or whose lines it changes, in an unlogged batch at LocalQuorum, **before** the
+  record rows. A change the table holds always has its log row; a log row whose write then failed
+  is harmless, because a History starts from what the table holds. A write that changes no frame's
+  lines logs nothing.
+- **Histories:** the log after w, then the stored rows of the records it names, then the log again: a
   write landing between the value read and the second log read is undone back to what the record
   held before it. A record only the second read names changed after the run's target and is left
   to the next run. A rebuild scans the table a page at a time and reads the log after each page.
 - **State and lock:** `dataframe.FileState`, with `scylla.AcquireFrameLock` as the lock (genix
   installs a fareward try-lock). LWT is not used: it does not run on tablet keyspaces.
 - **Concurrent writes:** two writers of one record that both read the stored row before either
-  writes may log a stale before value for an intermediate moment. The frame still ends on what the
-  table holds, because every History starts from the stored values.
+  writes may log stale before lines for an intermediate moment. The frame still ends on what the
+  table holds, because every History starts from the stored row.

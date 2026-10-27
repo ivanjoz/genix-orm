@@ -18,7 +18,7 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // scylla's dataframe.Backend. The state and the lock are dataframe.FileState's: a file
 // per frame in the store, the lock in AcquireFrameLock. The records come as Histories:
-// a record's tracked values now, read from the table, and its changes from the log.
+// a record's lines now, from its whole row read from the table, and its changes from the log.
 //
 // The order of the reads is what keeps a History exact: the log is read AFTER the
 // values. A write landing between the two is then in both, and its change undoes the
@@ -75,7 +75,7 @@ func (backend *frameBackend) loggedHistories(partition int64, isEveryPartition b
 	for recordKey := range loggedFirst {
 		idsOfPartition[recordKey[0]] = append(idsOfPartition[recordKey[0]], recordKey[1])
 	}
-	stored, err := readStoredRows(*backend.scyllaTable, idsOfPartition, backend.scyllaTable.dataFrames.trackedColumns)
+	stored, err := readStoredRows(*backend.scyllaTable, idsOfPartition, backend.scyllaTable.dataFrames.storedColumns)
 	if err != nil {
 		return nil, err
 	}
@@ -104,11 +104,15 @@ func (backend *frameBackend) historyOf(recordKey [2]int64, stored storedRows, ch
 		return dataframe.History{}, false, nil
 	}
 	info := backend.scyllaTable.dataFrames
-	values, err := info.trackedValuesOfRow(storedRow)
+	lines, err := info.linesOfRow(storedRow)
 	if err != nil {
 		return dataframe.History{}, false, fmt.Errorf("table %q: %w", backend.scyllaTable.Name, err)
 	}
-	return info.frames.NewHistoryOfChanges(recordKey[0], strconv.FormatInt(recordKey[1], 10), values, changes), true, nil
+	history, err := info.frames.NewHistoryOfChanges(recordKey[0], strconv.FormatInt(recordKey[1], 10), lines, changes)
+	if err != nil {
+		return dataframe.History{}, false, fmt.Errorf("table %q: %w", backend.scyllaTable.Name, err)
+	}
+	return history, true, nil
 }
 
 func (backend *frameBackend) ScanHistories(onPage func(histories []dataframe.History) error) error {
@@ -125,7 +129,7 @@ func (backend *frameBackend) scanHistories(partition int64, isEveryPartition boo
 	scyllaTable := backend.scyllaTable
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 	columnNames := []string{partitionColumn.GetName(), keyColumn.GetName()}
-	for _, column := range scyllaTable.dataFrames.trackedColumns {
+	for _, column := range scyllaTable.dataFrames.storedColumns {
 		if !slices.Contains(columnNames, column.GetName()) {
 			columnNames = append(columnNames, column.GetName())
 		}

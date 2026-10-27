@@ -56,7 +56,7 @@ func randomFrameFile(rng *rand.Rand, rowCount, rowColumnCount, sumsCount, sumBit
 // cloneFrameFile copies the columns: the encoder transforms its own copies, but a test compares
 // against the original after encoding.
 func cloneFrameFile(file File) File {
-	clone := File{Snapshot: file.Snapshot, Slot: file.Slot, Rows: make([][]int64, len(file.Rows)), Sums: make([][]int64, len(file.Sums))}
+	clone := File{Snapshot: file.Snapshot, Slot: file.Slot, Rows: make([][]int64, len(file.Rows)), Sums: make([][]int64, len(file.Sums)), UsesZeroSumsMask: file.UsesZeroSumsMask}
 	for i := range file.Rows {
 		clone.Rows[i] = slices.Clone(file.Rows[i])
 	}
@@ -66,18 +66,59 @@ func cloneFrameFile(file File) File {
 	return clone
 }
 
+// assertFrameFileRoundTrip encodes the file with every codec option, with and without the zero sums
+// mask (when its sums fit one), and reads it back.
 func assertFrameFileRoundTrip(t *testing.T, name string, file File) {
 	t.Helper()
-	for _, options := range everyFrameCodecOptions {
-		content := appendFile(nil, cloneFrameFile(file), options)
-		decoded, err := DecodeFile(content, len(file.Rows), len(file.Sums))
-		if err != nil {
-			t.Fatalf("%s %+v: decode: %v", name, options, err)
+	for _, usesZeroSumsMask := range []bool{false, true} {
+		if usesZeroSumsMask && len(file.Sums) > MaxMaskedSums {
+			continue
 		}
-		if !reflect.DeepEqual(decoded, file) {
-			t.Fatalf("%s %+v: decoded file differs from the one written", name, options)
+		file.UsesZeroSumsMask = usesZeroSumsMask
+		for _, options := range everyFrameCodecOptions {
+			content := appendFile(nil, cloneFrameFile(file), options)
+			decoded, err := DecodeFile(content, len(file.Rows), len(file.Sums))
+			if err != nil {
+				t.Fatalf("%s %+v mask %v: decode: %v", name, options, usesZeroSumsMask, err)
+			}
+			if !reflect.DeepEqual(decoded, file) {
+				t.Fatalf("%s %+v mask %v: decoded file differs from the one written", name, options, usesZeroSumsMask)
+			}
 		}
 	}
+}
+
+// TestZeroSumsMaskAndConstantColumns: a day of 1,000 products without sub-units (6 sums, the two
+// sub-unit sums and the debt all zero, the divisor row level constant) pays 1 byte for its 3 empty
+// sums with the mask and 2 bytes each without, and its constant SubDivisor level a few bytes.
+func TestZeroSumsMaskAndConstantColumns(t *testing.T) {
+	const rowCount = 1000
+	file := File{Rows: make([][]int64, 2), Sums: make([][]int64, 6)}
+	for row := range rowCount {
+		file.Rows[0] = append(file.Rows[0], int64(100+row))
+		file.Rows[1] = append(file.Rows[1], 1) // SubDivisor 1: no sub-units
+		file.Sums[0] = append(file.Sums[0], int64(1+row%40)*250)
+		file.Sums[3] = append(file.Sums[3], int64(1+row%9))
+	}
+	for _, s := range []int{1, 2, 4, 5} {
+		file.Sums[s] = make([]int64, rowCount)
+	}
+	file.Sums[4][3] = 2 // one product with units pending delivery
+	withoutMask := len(EncodeFile(cloneFrameFile(file)))
+	masked := file
+	masked.UsesZeroSumsMask = true
+	withMask := len(EncodeFile(cloneFrameFile(masked)))
+	// 3 empty columns: 6 bytes as constant columns, 1 mask byte with the mask.
+	if withoutMask-withMask != 5 {
+		t.Fatalf("the mask saves %d bytes, want 5 (%d → %d)", withoutMask-withMask, withoutMask, withMask)
+	}
+	// The SubDivisor level: child counts and first values constant, 2 bytes each, no steps (past the
+	// 2-byte count of distinct products every nested file carries).
+	single := File{Rows: file.Rows[:1], Sums: file.Sums}
+	if nestedCost := withoutMask - len(EncodeFile(cloneFrameFile(single))) - 2; nestedCost != 4 {
+		t.Fatalf("the constant SubDivisor level costs %d bytes, want 4", nestedCost)
+	}
+	assertFrameFileRoundTrip(t, "a day without sub-units", file)
 }
 
 // TestFrameFileRoundTrip covers the shapes the transforms and the blocks special-case: no rows, one

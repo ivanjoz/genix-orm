@@ -139,7 +139,7 @@ func (frame *Frame) rowsOf(generation string, fileKeys []string, rowsByFileKey m
 	var rows []Row
 	rowColumnCount := len(frame.Rows)
 	for _, fileKey := range fileKeys {
-		file := rowsByFileKey[fileKey].fileAt(0, rowColumnCount, frame.SumsCount)
+		file := rowsByFileKey[fileKey].fileAt(0, frame)
 		// One backing array per file for every row's values and sums: two allocations, not two per row.
 		rowWidth := rowColumnCount + frame.SumsCount
 		backing := make([]int64, file.rowCount()*rowWidth)
@@ -176,21 +176,27 @@ func rowsOfFile(file File) frameRows {
 	return rows
 }
 
-// add moves the row of values by sign (+1 joins it, −1 leaves it).
-func (rows frameRows) add(values *frameValues, sign int64) {
-	sums := rows[values.row]
+// add moves the row of a line of the frame by sign (+1 joins it, −1 leaves it): its Sums, and 1 to
+// the count when the frame counts records.
+func (rows frameRows) add(frame *Frame, line Line, sign int64) {
+	row := frame.rowOf(line)
+	sums := rows[row]
 	if sums == nil {
-		sums = make([]int64, len(values.sums))
-		rows[values.row] = sums
+		sums = make([]int64, frame.SumsCount)
+		rows[row] = sums
 	}
-	for i, sum := range values.sums {
+	for i, sum := range frame.sumsOf(line) {
 		sums[i] += sign * sum
+	}
+	if frame.CountsRecords {
+		sums[frame.SumsCount-1] += sign
 	}
 }
 
-// fileAt encodes the rows as a file at snapshot, rows ascending; a row whose sums are all 0 is dropped.
-func (rows frameRows) fileAt(snapshot int64, rowColumnCount, sumsCount int) File {
-	file := File{Snapshot: snapshot, Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
+// fileAt encodes the rows as a file of the frame at snapshot, rows ascending; a row whose sums are all
+// 0 is dropped.
+func (rows frameRows) fileAt(snapshot int64, frame *Frame) File {
+	file := File{Snapshot: snapshot, Rows: make([][]int64, len(frame.Rows)), Sums: make([][]int64, frame.SumsCount), UsesZeroSumsMask: frame.UsesZeroSumsMask}
 	for _, row := range slices.SortedFunc(maps.Keys(rows), compareRowKeys) {
 		sums := rows[row]
 		if !slices.ContainsFunc(sums, func(sum int64) bool { return sum != 0 }) {

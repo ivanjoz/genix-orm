@@ -1,11 +1,12 @@
 package scylla
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
+	"unsafe"
 
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/dataframe"
@@ -20,16 +21,17 @@ import (
 //	  half_hour  unix seconds / 1800: every partition's writes of a half hour together,
 //	             so a run reads all of them with one query per half hour
 //	  ts         microseconds since the half hour started (< 1.8e9, an int)
-//	  changes    what the write changed, the same scheme as dynamo's changelog entry:
-//	               u8 format, u8 flags (bit 0: the record's insert), then, unless an
-//	               insert, per changed tracked column: u16 column hash (big-endian) and
-//	               the column's value before the write (zigzag varint)
+//	  changes    what the write changed: u8 format, u8 flags (bit 0: the record's
+//	             insert), then, unless an insert, the lines every frame it changed held
+//	             before it (dataframe.Table.EncodeChangedLines: the body of dynamo's
+//	             changelog entry)
 //
-// A write logs a record only when it inserts it or changes one of its tracked columns
-// (Keys, Rows, Sums, status), so the log is one small row per real change. The rows go
-// to the log BEFORE the record rows, at LocalQuorum: a change the table holds always
-// has its log row, and a log row whose write then failed is harmless, because a
-// History starts from the values the table holds and only undoes changes.
+// A write logs a record only when it inserts it or changes the lines it puts in a frame
+// (its stored row and the row it leaves, both turned into lines), so the log is one row
+// per real change. The rows go to the log BEFORE the record rows, at LocalQuorum: a
+// change the table holds always has its log row, and a log row whose write then failed
+// is harmless, because a History starts from the lines the table holds and only undoes
+// changes.
 //
 // Rows expire after 48 h (the frames reach back ~36 h, dataframe.MaxDelta), in a
 // TimeWindowCompactionStrategy table that drops whole expired files.
@@ -38,7 +40,7 @@ import (
 const (
 	dataFrameLogBucketSeconds = 1800
 	dataFrameLogTTLSeconds    = 48 * 3600
-	dataFrameLogFormat        = 1
+	dataFrameLogFormat        = 2
 	dataFrameLogInsertFlag    = 1
 )
 
@@ -77,9 +79,9 @@ type dataFrameLogRow struct {
 	changes   []byte
 }
 
-// writeDataFrameLog logs every record the write inserts or whose tracked columns it changes, from the
-// stored rows read before it. A column the write does not set keeps its stored value (0 on a record
-// not stored, which the row then gets as null).
+// writeDataFrameLog logs every record the write inserts or whose lines it changes, from the stored
+// rows read before it. The row the write leaves is the stored row with the written columns over it (a
+// payment writes only its status), so a partial update still yields the record's whole lines.
 func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored storedRows) error {
 	info := scyllaTable.dataFrames
 	if info == nil {
@@ -88,10 +90,6 @@ func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored stor
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 	var logRows []dataFrameLogRow
 	for _, phase := range phases {
-		isWritten := map[string]bool{}
-		for _, column := range phase.writtenColumns {
-			isWritten[column.GetName()] = true
-		}
 		for i := range phase.records.len() {
 			recordPointer := phase.records.at(i)
 			logRow := dataFrameLogRow{partition: convertToInt64(partitionColumn.GetRawValue(recordPointer)), recordID: convertToInt64(keyColumn.GetRawValue(recordPointer))}
@@ -99,22 +97,27 @@ func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored stor
 				return fmt.Errorf("table %q: a table with DataFrames takes no negative partition (%d): it names the frames' folders", scyllaTable.Name, logRow.partition)
 			}
 			storedRow, isStored := stored[[2]int64{logRow.partition, logRow.recordID}]
-			storedValues, err := info.trackedValuesOfRow(storedRow)
+			storedRecord := info.newRecord(storedRow)
+			writtenRecord := info.newRecord(storedRow)
+			for _, column := range phase.writtenColumns {
+				copyColumnField(column, writtenRecord, recordPointer)
+			}
+			// LinesOf also refuses what a frame can't keep, before anything is written.
+			writtenLines, err := info.frames.LinesOf(writtenRecord)
 			if err != nil {
 				return fmt.Errorf("table %q: %w", scyllaTable.Name, err)
 			}
-			writtenValues := slices.Clone(storedValues)
-			for c, column := range info.trackedColumns {
-				if isWritten[column.GetName()] {
-					if writtenValues[c], err = info.trackedValueOf(column, column.GetRawValue(recordPointer)); err != nil {
-						return fmt.Errorf("table %q: %w", scyllaTable.Name, err)
-					}
-				}
+			if !isStored {
+				logRow.changes = []byte{dataFrameLogFormat, dataFrameLogInsertFlag}
+				logRows = append(logRows, logRow)
+				continue
 			}
-			if err := info.frames.CheckValues(writtenValues); err != nil {
-				return err
+			storedLines, err := info.frames.LinesOf(storedRecord)
+			if err != nil {
+				return fmt.Errorf("table %q: %w", scyllaTable.Name, err)
 			}
-			if logRow.changes = info.encodeLogChanges(isStored, storedValues, writtenValues); logRow.changes != nil {
+			if body := info.frames.EncodeChangedLines(storedLines, writtenLines); body != nil {
+				logRow.changes = append([]byte{dataFrameLogFormat, 0}, body...)
 				logRows = append(logRows, logRow)
 			}
 		}
@@ -142,53 +145,29 @@ func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored stor
 	return nil
 }
 
-// encodeLogChanges is the changes blob of one write: the insert of a record not stored, or the stored
-// values of the columns it changes; nil when it changes none.
-func (info *dataFrameInfo) encodeLogChanges(isStored bool, storedValues, writtenValues []int64) []byte {
-	if !isStored {
-		return []byte{dataFrameLogFormat, dataFrameLogInsertFlag}
+// copyColumnField copies one column's field from the record at source to the record at destination.
+func copyColumnField(column IColInfo, destination, source unsafe.Pointer) {
+	field := column.GetInfo().Field
+	if field == nil {
+		return
 	}
-	var changes []byte
-	for c := range info.trackedColumns {
-		if storedValues[c] != writtenValues[c] {
-			if changes == nil {
-				changes = []byte{dataFrameLogFormat, 0}
-			}
-			changes = binary.BigEndian.AppendUint16(changes, info.columnHashes[c])
-			changes = binary.AppendVarint(changes, storedValues[c])
-		}
-	}
-	return changes
+	reflect.NewAt(field.Type, field.Pointer(destination)).Elem().Set(reflect.NewAt(field.Type, field.Pointer(source)).Elem())
 }
 
 var errDataFrameLogCorrupt = errors.New("the DataFrame log row is corrupt")
 
-// decodeLogChange reads a changes blob into the change at moment. A column no longer tracked is
-// skipped: no frame reads it.
-func (info *dataFrameInfo) decodeLogChange(moment int64, changes []byte) (dataframe.HistoryChange, error) {
-	change := dataframe.HistoryChange{Moment: moment}
-	if len(changes) < 2 || changes[0] != dataFrameLogFormat {
-		return change, errDataFrameLogCorrupt
+// decodeLogChange reads a changes blob into the change at moment. A row of another format (written
+// before the frames moved to lines) is skipped: those frames are rebuilt on their new shape anyway.
+func decodeLogChange(moment int64, changes []byte) (change dataframe.HistoryChange, isKept bool, err error) {
+	change = dataframe.HistoryChange{Moment: moment}
+	if len(changes) < 2 {
+		return change, false, errDataFrameLogCorrupt
 	}
-	if change.IsInsert = changes[1]&dataFrameLogInsertFlag != 0; change.IsInsert {
-		return change, nil
+	if changes[0] != dataFrameLogFormat {
+		return change, false, nil
 	}
-	for position := 2; position < len(changes); {
-		if len(changes)-position < 3 {
-			return change, errDataFrameLogCorrupt
-		}
-		columnHash := binary.BigEndian.Uint16(changes[position:])
-		before, size := binary.Varint(changes[position+2:])
-		if size <= 0 {
-			return change, errDataFrameLogCorrupt
-		}
-		position += 2 + size
-		if trackedIndex, isTracked := info.trackedIndexByHash[columnHash]; isTracked {
-			change.TrackedIndexes = append(change.TrackedIndexes, trackedIndex)
-			change.Before = append(change.Before, before)
-		}
-	}
-	return change, nil
+	change.IsInsert, change.Body = changes[1]&dataFrameLogInsertFlag != 0, slices.Clone(changes[2:])
+	return change, true, nil
 }
 
 /* Read */
@@ -220,10 +199,13 @@ func readDataFrameLog(scyllaTable ScyllaTable, partition int64, isEveryPartition
 			if moment <= afterMoment {
 				continue
 			}
-			change, err := info.decodeLogChange(moment, changes)
+			change, isKept, err := decodeLogChange(moment, changes)
 			if err != nil {
 				iterator.Close()
 				return nil, fmt.Errorf("table %q: %w", scyllaTable.Name, err)
+			}
+			if !isKept {
+				continue
 			}
 			recordKey := [2]int64{rowPartition, recordID}
 			changesByRecord[recordKey] = append(changesByRecord[recordKey], change)

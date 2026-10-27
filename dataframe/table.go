@@ -1,7 +1,8 @@
 // Package dataframe keeps group-by aggregates of a table as columnar files in a file store (S3),
-// fed by a changelog each record carries. It holds no database code: a backend (genix-orm's dynamo,
-// later scylla) declares the frames from its schema, reads its records into Histories and keeps the
-// frames' state, through the Backend interface. See DATAFRAMES.md.
+// fed by the lines each record puts in them and a changelog of those lines. It holds no database
+// code: a backend (genix-orm's dynamo and scylla) declares the frames from its schema, turns its
+// records into lines and Histories and keeps the frames' state, through the Backend interface. See
+// DATAFRAMES.md.
 package dataframe
 
 import (
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -23,31 +25,34 @@ const (
 	// FloatScale turns a float into the int64 frames keep it as: 6 decimals, so adding and
 	// subtracting the same value is exact.
 	FloatScale = 1e6
-	// MaxMagnitude bounds every tracked value: the widest changelog field holds 60 magnitude bits
-	// when its entry has a sign.
+	// MaxMagnitude bounds every value of a line, so the sums of a file stay far from overflowing.
 	MaxMagnitude = 1 << 60
-	// maxTrackedColumns: the changelog counts an entry's fields in 6 bits.
-	maxTrackedColumns = 63
-	// maxColumnID: the changelog names a column by one byte.
-	maxColumnID = 255
 	// MaxRowColumns bounds a frame's Rows: a row is named by up to 3 values (rowKey).
 	MaxRowColumns = 3
 )
 
 var frameNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
-// Column is one record field a frame reads, as the backend describes it: its name, for messages,
-// its stable column id (genix-orm's cb tag: renaming the field keeps the files and the changelogs),
-// and whether it is a float.
+// Column is one value of a frame's lines, as the backend describes it: its name, for messages, a
+// stable id (genix-orm's cb tag or field position; a frame struct's field position) that names it in
+// the frame's shape, and whether it is a float.
 type Column struct {
 	FieldName string
 	ColumnID  int
 	IsFloat   bool
 }
 
+// Line is one row a record puts in a frame: its Keys values (the file), its Rows values (the row) and
+// its Sums, in that order (floats × FloatScale). A record puts 0..N lines in a frame; two lines of one
+// file and row add up.
+type Line []int64
+
+// RecordLines are the lines one record puts in every frame of its table, by frame index.
+type RecordLines [][]Line
+
 // Spec declares one frame: one file per value of Keys (1 to 3 integer columns), one row per value of
 // Rows (1 to 3 integer columns, the widest group first: department, program, employee) with the Sums
-// of the records that hold it, and their count with Count. The file nests the rows like folders: each
+// of the lines that hold it, and their count with Count. The file nests the rows like folders: each
 // value of Rows[0] once, with the values of Rows[1] under it, and so on (codec.go).
 type Spec struct {
 	Name  string
@@ -55,55 +60,72 @@ type Spec struct {
 	Rows  []Column
 	Sums  []Column
 	Count bool
-}
-
-// FrameColumn is a column of a compiled frame: TrackedIndex is its position in Table.Tracked, the
-// order of every tracked-values slice.
-type FrameColumn struct {
-	Column
-	TrackedIndex int
+	// Version is part of the shape: bump it when what LinesOf computes changes, which the columns
+	// alone do not show (a ToFrames method's body).
+	Version int
+	// UseZeroSumsMask writes the zero sums mask in every file (codec.go): a summed column empty in a
+	// whole file costs nothing. At most MaxMaskedSums summed columns (the Sums, then the count).
+	UseZeroSumsMask bool
+	// LinesOf is what the record at the pointer puts in the frame: a backend builds it from the
+	// frame's columns (one line, none for a soft-deleted record).
+	LinesOf func(record unsafe.Pointer) ([]Line, error)
+	// Projection declares the frame by a ToFrames method instead (ProjectionOf): Compile takes the
+	// Keys, Rows, Sums and LinesOf from it, and the spec must list none of them.
+	Projection *Projection
 }
 
 // Frame is one compiled frame.
 type Frame struct {
-	Name          string
-	Keys          []FrameColumn
-	Rows          []FrameColumn
-	Sums          []FrameColumn
-	CountsRecords bool
+	Name string
+	// Index is the frame's position in Table.Frames, and in every RecordLines.
+	Index            int
+	Keys             []Column
+	Rows             []Column
+	Sums             []Column
+	CountsRecords    bool
+	UsesZeroSumsMask bool
+	// IsProjected: declared by a ToFrames method, so its columns are a frame struct's, not the record's.
+	IsProjected bool
 	// SumsCount is the number of summed columns in its files: the Sums, then the record count.
 	SumsCount int
-	// Shape names the layout of its files (column ids, Count, format): another one is a rebuild.
-	Shape  string
-	Folder string // dtf/<table id>/<name>/
+	// Shape names the layout of its files and what fills them (column ids, Count, the mask, the
+	// Version, the format): another one is a rebuild.
+	Shape string
+	// shapeTag names the frame in the changelog: 16 bits of its Shape, so a logged line of another
+	// shape is skipped (that frame is rebuilt anyway).
+	shapeTag uint16
+	Folder   string // dtf/<table id>/<name>/
+	linesOf  func(record unsafe.Pointer) ([]Line, error)
 }
 
-// Table is the compiled frames of one table and the columns their changelog tracks: every frame's
-// Keys, Rows and Sums, plus the Status column, in column id order. A backend reads a record into a
-// tracked-values slice in that order (floats × FloatScale).
+// Table is the compiled frames of one table.
 type Table struct {
 	Name string
 	// Folder is the table's store prefix, dtf/<table id>/: its frames' folders and the versions file of
 	// each partition (versionsKeyOf).
-	Folder  string
-	Frames  []Frame
-	Tracked []Column
-	// StatusIndex is the Status column in Tracked, -1 without one: a record with Status 0 is in no file.
-	StatusIndex int
+	Folder string
+	Frames []Frame
 }
 
-// Compile checks the specs and compiles them. tableID names the table's folder (utils.EncodeUintBase64); status
-// is the record's soft-delete column (nil without one).
-func Compile(tableName string, tableID uint64, specs []Spec, status *Column) (*Table, error) {
+// Compile checks the specs and compiles them. tableID names the table's folder (utils.EncodeUintBase64).
+func Compile(tableName string, tableID uint64, specs []Spec) (*Table, error) {
 	tableFolder := Folder + utils.EncodeUintBase64(tableID) + "/"
 	table := &Table{Name: tableName, Folder: tableFolder}
-	var trackedColumns []Column
 	for _, spec := range specs {
+		if spec.Projection != nil {
+			if spec.Keys != nil || spec.Rows != nil || spec.Sums != nil || spec.LinesOf != nil {
+				return nil, fmt.Errorf("dataframe: %s frame %q is declared by ToFrames: it takes no Keys, Rows, Sums or LinesOf", tableName, spec.Name)
+			}
+			spec.Keys, spec.Rows, spec.Sums, spec.LinesOf = spec.Projection.Keys, spec.Projection.Rows, spec.Projection.Sums, spec.Projection.linesOf
+		}
 		if !frameNamePattern.MatchString(spec.Name) || slices.ContainsFunc(table.Frames, func(frame Frame) bool { return frame.Name == spec.Name }) {
 			return nil, fmt.Errorf("dataframe: %s frame name %q must be unique and hold only a-z, 0-9 and '-'", tableName, spec.Name)
 		}
 		if len(spec.Keys) == 0 || len(spec.Keys) > 3 || len(spec.Rows) == 0 || len(spec.Rows) > MaxRowColumns || (len(spec.Sums) == 0 && !spec.Count) {
 			return nil, fmt.Errorf("dataframe: %s frame %q needs 1 to 3 Keys, 1 to %d Rows, and Sums or Count", tableName, spec.Name, MaxRowColumns)
+		}
+		if spec.LinesOf == nil {
+			return nil, fmt.Errorf("dataframe: %s frame %q has no LinesOf", tableName, spec.Name)
 		}
 		frameColumns := slices.Concat(spec.Keys, spec.Rows, spec.Sums)
 		for i, column := range frameColumns {
@@ -114,61 +136,22 @@ func Compile(tableName string, tableID uint64, specs []Spec, status *Column) (*T
 				return nil, fmt.Errorf("dataframe: %s frame %q lists %q twice", tableName, spec.Name, column.FieldName)
 			}
 		}
-		trackedColumns = append(trackedColumns, frameColumns...)
-		frame := Frame{Name: spec.Name, CountsRecords: spec.Count, SumsCount: len(spec.Sums), Folder: tableFolder + spec.Name + "/"}
+		frame := Frame{Name: spec.Name, Index: len(table.Frames), Keys: spec.Keys, Rows: spec.Rows, Sums: spec.Sums, CountsRecords: spec.Count,
+			UsesZeroSumsMask: spec.UseZeroSumsMask, IsProjected: spec.Projection != nil, SumsCount: len(spec.Sums), Folder: tableFolder + spec.Name + "/", linesOf: spec.LinesOf}
 		if spec.Count {
 			frame.SumsCount++
 		}
-		for _, column := range spec.Keys {
-			frame.Keys = append(frame.Keys, FrameColumn{Column: column})
+		if frame.UsesZeroSumsMask && frame.SumsCount > MaxMaskedSums {
+			return nil, fmt.Errorf("dataframe: %s frame %q sums %d columns: UseZeroSumsMask takes at most %d", tableName, spec.Name, frame.SumsCount, MaxMaskedSums)
 		}
-		for _, column := range spec.Rows {
-			frame.Rows = append(frame.Rows, FrameColumn{Column: column})
+		frame.Shape = shapeOf(frame, spec.Version)
+		frame.shapeTag = uint16(crc32.ChecksumIEEE([]byte(frame.Shape)))
+		if slices.ContainsFunc(table.Frames, func(earlier Frame) bool { return earlier.shapeTag == frame.shapeTag }) {
+			return nil, fmt.Errorf("dataframe: %s frame %q has the changelog tag of another frame: bump its Version", tableName, spec.Name)
 		}
-		for _, column := range spec.Sums {
-			frame.Sums = append(frame.Sums, FrameColumn{Column: column})
-		}
-		frame.Shape = shapeOf(frame)
 		table.Frames = append(table.Frames, frame)
 	}
-	// A change of Status moves a record in or out of every file, so it is tracked too.
-	if status != nil {
-		trackedColumns = append(trackedColumns, *status)
-	}
-
-	for _, column := range trackedColumns {
-		if column.ColumnID < 1 || column.ColumnID > maxColumnID {
-			return nil, fmt.Errorf("dataframe: %s column %q needs a column id in 1..%d: the changelog names columns by one byte", tableName, column.FieldName, maxColumnID)
-		}
-		if !slices.ContainsFunc(table.Tracked, func(tracked Column) bool { return tracked.FieldName == column.FieldName }) {
-			table.Tracked = append(table.Tracked, column)
-		}
-	}
-	if len(table.Tracked) > maxTrackedColumns {
-		return nil, fmt.Errorf("dataframe: %s frames track %d columns: the changelog takes at most %d", tableName, len(table.Tracked), maxTrackedColumns)
-	}
-	slices.SortFunc(table.Tracked, func(a, b Column) int { return a.ColumnID - b.ColumnID })
-	table.StatusIndex = -1
-	if status != nil {
-		table.StatusIndex = table.trackedIndexOf(status.FieldName)
-	}
-	for i := range table.Frames {
-		frame := &table.Frames[i]
-		for j := range frame.Keys {
-			frame.Keys[j].TrackedIndex = table.trackedIndexOf(frame.Keys[j].FieldName)
-		}
-		for j := range frame.Rows {
-			frame.Rows[j].TrackedIndex = table.trackedIndexOf(frame.Rows[j].FieldName)
-		}
-		for j := range frame.Sums {
-			frame.Sums[j].TrackedIndex = table.trackedIndexOf(frame.Sums[j].FieldName)
-		}
-	}
 	return table, nil
-}
-
-func (table *Table) trackedIndexOf(fieldName string) int {
-	return slices.IndexFunc(table.Tracked, func(column Column) bool { return column.FieldName == fieldName })
 }
 
 // FrameNamed returns the frame called name, nil when the table has none.
@@ -181,23 +164,26 @@ func (table *Table) FrameNamed(name string) *Frame {
 	return nil
 }
 
-// shapeOf hashes what the files are laid out by: the column ids of the Keys, the Rows and the Sums,
-// the record count, and the layout version (v5: nested Rows columns, the slot byte), so a frame built
-// otherwise is rebuilt.
-func shapeOf(frame Frame) string {
-	columnIDs := func(columns []FrameColumn) string {
+// shapeOf hashes what the files are laid out by and filled with: the column ids of the Keys, the Rows
+// and the Sums (and which are floats), the record count, the zero sums mask, the Version, and the
+// layout version (v6: lines, format 4), so a frame built otherwise is rebuilt.
+func shapeOf(frame Frame, version int) string {
+	columnIDs := func(columns []Column) string {
 		ids := make([]string, len(columns))
 		for i, column := range columns {
 			ids[i] = strconv.Itoa(column.ColumnID)
+			if column.IsFloat {
+				ids[i] += "f"
+			}
 		}
 		return strings.Join(ids, ".")
 	}
-	layout := fmt.Sprintf("v5|%s|%s|%s|%t", columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords)
+	layout := fmt.Sprintf("v6|%d|%s|%s|%s|%t|%t", version, columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords, frame.UsesZeroSumsMask)
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(layout)))
 }
 
-// ScaledFloat is a float tracked value: round(v × FloatScale), false when it is NaN or outside what a
-// frame keeps (±MaxMagnitude).
+// ScaledFloat is a float value of a line: round(v × FloatScale), false when it is NaN or outside what
+// a frame keeps (±MaxMagnitude).
 func ScaledFloat(value float64) (int64, bool) {
 	scaled := math.Round(value * FloatScale)
 	if math.IsNaN(scaled) || math.Abs(scaled) >= MaxMagnitude {
@@ -206,23 +192,38 @@ func ScaledFloat(value float64) (int64, bool) {
 	return int64(scaled), true
 }
 
-// CheckValues refuses, before the record is written, a value its changelog can't keep and a negative
-// frame Keys or Rows value: they name files and ascend in them.
-func (table *Table) CheckValues(tracked []int64) error {
-	for i, value := range tracked {
-		if value >= MaxMagnitude || value <= -MaxMagnitude {
-			return fmt.Errorf("dataframe: %s column %s holds %d, outside what a frame keeps (±2^60)", table.Name, table.Tracked[i].FieldName, value)
-		}
-	}
+// LinesOf is what the record at the pointer puts in every frame. It refuses, before the record is
+// written, a line a frame can't keep: a value past ±MaxMagnitude, a negative Keys or Rows value (they
+// name files and ascend in them), or a line of the wrong length.
+func (table *Table) LinesOf(record unsafe.Pointer) (RecordLines, error) {
+	recordLines := make(RecordLines, len(table.Frames))
 	for i := range table.Frames {
 		frame := &table.Frames[i]
-		values := table.valuesOf(frame, tracked)
-		if values != nil && (slices.ContainsFunc(values.row[:], func(rowValue int64) bool { return rowValue < 0 }) || slices.ContainsFunc(values.keys, func(key int64) bool { return key < 0 })) {
-			return fmt.Errorf("dataframe: %s frame %q takes no negative Keys or Rows value", table.Name, frame.Name)
+		lines, err := frame.linesOf(record)
+		if err != nil {
+			return nil, fmt.Errorf("dataframe: %s frame %q: %w", table.Name, frame.Name, err)
 		}
+		lineLength, keysAndRows := frame.lineLength(), len(frame.Keys)+len(frame.Rows)
+		for _, line := range lines {
+			if len(line) != lineLength {
+				return nil, fmt.Errorf("dataframe: %s frame %q takes lines of %d values, got %d", table.Name, frame.Name, lineLength, len(line))
+			}
+			for v, value := range line {
+				if value >= MaxMagnitude || value <= -MaxMagnitude {
+					return nil, fmt.Errorf("dataframe: %s frame %q holds %d, outside what a frame keeps (±2^60)", table.Name, frame.Name, value)
+				}
+				if value < 0 && v < keysAndRows {
+					return nil, fmt.Errorf("dataframe: %s frame %q takes no negative Keys or Rows value", table.Name, frame.Name)
+				}
+			}
+		}
+		recordLines[i] = lines
 	}
-	return nil
+	return recordLines, nil
 }
+
+// lineLength is how many values a line of the frame holds: its Keys, Rows and Sums.
+func (frame *Frame) lineLength() int { return len(frame.Keys) + len(frame.Rows) + len(frame.Sums) }
 
 // rowKey names a row of a file: its Rows values in order, the positions past len(Frame.Rows) 0. A
 // fixed array, so it keys a map without an allocation.
@@ -230,34 +231,18 @@ type rowKey [MaxRowColumns]int64
 
 func compareRowKeys(a, b rowKey) int { return slices.Compare(a[:], b[:]) }
 
-// frameValues is what one record puts in a frame: the file (keys), the row and the sums.
-type frameValues struct {
-	keys []int64
-	row  rowKey
-	sums []int64 // SumsCount values: the Sums, then 1 when the frame counts records
+// keysOf is the file a line goes to: its Keys values.
+func (frame *Frame) keysOf(line Line) []int64 { return line[:len(frame.Keys)] }
+
+// rowOf is the row of its file a line goes to.
+func (frame *Frame) rowOf(line Line) rowKey {
+	var row rowKey
+	copy(row[:], line[len(frame.Keys):len(frame.Keys)+len(frame.Rows)])
+	return row
 }
 
-// valuesOf reads a frame's values out of a record's tracked values: nil for no record or a deleted
-// one (Status 0).
-func (table *Table) valuesOf(frame *Frame, tracked []int64) *frameValues {
-	if tracked == nil || (table.StatusIndex >= 0 && tracked[table.StatusIndex] == 0) {
-		return nil
-	}
-	values := &frameValues{keys: make([]int64, len(frame.Keys)), sums: make([]int64, frame.SumsCount)}
-	for i, key := range frame.Keys {
-		values.keys[i] = tracked[key.TrackedIndex]
-	}
-	for i, rowColumn := range frame.Rows {
-		values.row[i] = tracked[rowColumn.TrackedIndex]
-	}
-	for i, sum := range frame.Sums {
-		values.sums[i] = tracked[sum.TrackedIndex]
-	}
-	if frame.CountsRecords {
-		values.sums[frame.SumsCount-1] = 1
-	}
-	return values
-}
+// sumsOf is what a line adds to its row: its Sums.
+func (frame *Frame) sumsOf(line Line) []int64 { return line[len(frame.Keys)+len(frame.Rows):] }
 
 // partitionFolderOf is the folder of one partition's files in a generation: <folder><generation>/<partition>/.
 func (frame *Frame) partitionFolderOf(generation string, partition int64) string {

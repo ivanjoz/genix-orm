@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ── DataFrame test entity: enrollments summed per year and program, one row per employee. The
@@ -48,8 +50,23 @@ func (t frameEnrollmentTable) GetSchema() Schema {
 		Indexes: []Index{{Slot: G1, Keys: Cols(t.Updated.Size(32))}},
 		DataFrames: []DataFrame{
 			{Name: "year-program", Keys: Cols(t.Year, t.ProgramID), Rows: Cols(t.EmployeeID), Sums: Cols(t.Minutes, t.Points, t.Hours), Count: true},
+			{Name: "year-activity", ToFrames: ToFrames((*frameEnrollment).toActivityLines), UseZeroSumsMask: true},
 		},
 	}
+}
+
+// frameActivityLine is one line of the "year-activity" frame, declared by ToFrames.
+type frameActivityLine struct {
+	Year       int16 `frame:"key"`
+	ActivityID int32 `frame:"row"`
+	Minutes    int16 `frame:"sum"`
+}
+
+func (e *frameEnrollment) toActivityLines() []frameActivityLine {
+	if e.Status == 0 {
+		return nil
+	}
+	return []frameActivityLine{{Year: e.Year, ActivityID: e.ActivityID, Minutes: e.Minutes}}
 }
 
 var frameEnrollments = NewRepo[frameEnrollmentTable, frameEnrollment]()
@@ -97,16 +114,21 @@ func TestDataFrameDeclarationRules(t *testing.T) {
 	}
 }
 
-func TestFrameTrackedValuesAndTheWriteCheck(t *testing.T) {
+func TestFrameLinesAndTheWriteCheck(t *testing.T) {
 	m := frameEnrollments.meta
-	if !m.readsStoredVersion() || m.frames.Tracked[m.frames.StatusIndex].FieldName != statusFieldName {
+	if !m.readsStoredVersion() || len(m.frames.Frames) != 2 || !m.frames.Frames[1].IsProjected {
 		t.Fatalf("compiled frames: %+v", m.frames)
 	}
 	record := frameEnrollment{ActivityID: 9, EmployeeID: 4, Year: 2026, ProgramID: 3, Minutes: 240, Points: 100, Hours: 1.5, Status: 1}
-	trackedValues, err := m.trackedValuesOf(unsafe.Pointer(&record))
-	if err != nil || !slices.Equal(trackedValues, []int64{4, 2026, 3, 240, 100, 1, 1_500_000}) {
-		t.Fatalf("tracked values %v, err %v", trackedValues, err)
+	lines, err := m.frames.LinesOf(unsafe.Pointer(&record))
+	if err != nil || !slices.Equal(lines[0][0], dataframe.Line{2026, 3, 4, 240, 100, 1_500_000}) || !slices.Equal(lines[1][0], dataframe.Line{2026, 9, 240}) {
+		t.Fatalf("lines %v, err %v", lines, err)
 	}
+	record.Status = 0
+	if lines, _ := m.frames.LinesOf(unsafe.Pointer(&record)); lines[0] != nil || lines[1] != nil {
+		t.Fatalf("a deleted record puts no lines, got %v", lines)
+	}
+	record.Status = 1
 	item, err := m.marshalItem(unsafe.Pointer(&record), &record)
 	if err != nil || item[createdColumn] == nil {
 		t.Fatalf("an item carries crt: %v, err %v", item, err)

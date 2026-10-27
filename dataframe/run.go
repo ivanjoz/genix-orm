@@ -148,7 +148,7 @@ func (table *Table) moveFiles(ctx context.Context, store utils.FileStore, frame 
 		if loaded.snapshotByFileKey[fileKey] >= target {
 			continue // a run that crashed after writing it already brought it here
 		}
-		file := loaded.rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
+		file := loaded.rowsByFileKey[fileKey].fileAt(target, frame)
 		if file.rowCount() == 0 && loaded.etagByFileKey[fileKey] == "" {
 			continue // a file no record is left in is not created
 		}
@@ -196,15 +196,6 @@ func (table *Table) writeFiles(ctx context.Context, store utils.FileStore, frame
 	})
 }
 
-// frameValuesAt is what a record put in a frame at moment: nil when it was in no file.
-func (table *Table) frameValuesAt(frame *Frame, history History, moment int64) *frameValues {
-	tracked, existed := table.valuesAt(history, moment)
-	if !existed {
-		return nil
-	}
-	return table.valuesOf(frame, tracked)
-}
-
 // filesHeldBetween lists the files the records were in at any moment of [from, to]: at from and after
 // each of their changes up to to. A run rewrites them all, so a file a crashed run left ahead of w
 // moves to the target too.
@@ -233,31 +224,32 @@ func (table *Table) filesOfHistory(frame *Frame, generation string, history Hist
 	}
 	var fileKeys []string
 	for _, moment := range moments {
-		if values := table.frameValuesAt(frame, history, moment); values != nil {
-			fileKeys = append(fileKeys, frame.fileKeyOf(generation, history.Partition, values.keys))
+		lines, _ := history.linesAt(frame, moment)
+		for _, line := range lines {
+			fileKeys = append(fileKeys, frame.fileKeyOf(generation, history.Partition, frame.keysOf(line)))
 		}
 	}
 	return fileKeys
 }
 
-// moveRecords brings the loaded files forward to moment: each file takes, of every record, what it
-// held at moment minus what it held at appliedThrough[file] (max(the file's snapshot, w)).
+// moveRecords brings the loaded files forward to moment: each file takes, of every record, the lines
+// it held at moment minus the ones it held at appliedThrough[file] (max(the file's snapshot, w)).
 func (table *Table) moveRecords(frame *Frame, generation string, histories []History, loaded loadedFiles, moment int64) {
 	appliedMoments := slices.Compact(slices.Sorted(maps.Values(loaded.appliedThrough)))
 	for _, history := range histories {
-		if values := table.frameValuesAt(frame, history, moment); values != nil {
-			if rows := loaded.rowsByFileKey[frame.fileKeyOf(generation, history.Partition, values.keys)]; rows != nil {
-				rows.add(values, 1)
+		lines, _ := history.linesAt(frame, moment)
+		for _, line := range lines {
+			if rows := loaded.rowsByFileKey[frame.fileKeyOf(generation, history.Partition, frame.keysOf(line))]; rows != nil {
+				rows.add(frame, line, 1)
 			}
 		}
 		for _, appliedMoment := range appliedMoments {
-			values := table.frameValuesAt(frame, history, appliedMoment)
-			if values == nil {
-				continue
-			}
-			fileKey := frame.fileKeyOf(generation, history.Partition, values.keys)
-			if rows := loaded.rowsByFileKey[fileKey]; rows != nil && loaded.appliedThrough[fileKey] == appliedMoment {
-				rows.add(values, -1)
+			appliedLines, _ := history.linesAt(frame, appliedMoment)
+			for _, line := range appliedLines {
+				fileKey := frame.fileKeyOf(generation, history.Partition, frame.keysOf(line))
+				if rows := loaded.rowsByFileKey[fileKey]; rows != nil && loaded.appliedThrough[fileKey] == appliedMoment {
+					rows.add(frame, line, -1)
+				}
 			}
 		}
 	}
@@ -325,7 +317,7 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 	fileKeys := slices.Collect(maps.Keys(rowsByFileKey))
 	files := make([]File, len(fileKeys))
 	for i, fileKey := range fileKeys {
-		files[i] = rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
+		files[i] = rowsByFileKey[fileKey].fileAt(target, frame)
 	}
 	if err := table.writeFiles(lock.ctx, store, frame, generation, fileKeys, files, nil, target); err != nil {
 		return fmt.Errorf("dataframe: %s frame %q writing its files: %w", table.Name, frame.Name, err)
@@ -347,18 +339,17 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 	return store.DeleteFiles(lock.ctx, staleKeys...)
 }
 
-// sumAt adds what every record held at moment to the files of a generation.
+// sumAt adds the lines every record held at moment to the files of a generation.
 func (table *Table) sumAt(frame *Frame, generation string, histories []History, moment int64, rowsByFileKey map[string]frameRows) {
 	for _, history := range histories {
-		values := table.frameValuesAt(frame, history, moment)
-		if values == nil {
-			continue
+		lines, _ := history.linesAt(frame, moment)
+		for _, line := range lines {
+			fileKey := frame.fileKeyOf(generation, history.Partition, frame.keysOf(line))
+			if rowsByFileKey[fileKey] == nil {
+				rowsByFileKey[fileKey] = frameRows{}
+			}
+			rowsByFileKey[fileKey].add(frame, line, 1)
 		}
-		fileKey := frame.fileKeyOf(generation, history.Partition, values.keys)
-		if rowsByFileKey[fileKey] == nil {
-			rowsByFileKey[fileKey] = frameRows{}
-		}
-		rowsByFileKey[fileKey].add(values, 1)
 	}
 }
 
@@ -418,7 +409,7 @@ func (table *Table) rebuildPartitionFrame(backend Backend, store utils.FileStore
 	}
 	files := make([]File, len(fileKeys))
 	for i, fileKey := range fileKeys {
-		files[i] = rowsByFileKey[fileKey].fileAt(target, len(frame.Rows), frame.SumsCount)
+		files[i] = rowsByFileKey[fileKey].fileAt(target, frame)
 		files[i].Slot = loaded.slotByFileKey[fileKey]
 	}
 	if err := table.writeFiles(lock.ctx, store, frame, state.Generation, fileKeys, files, loaded.etagByFileKey, target); err != nil {

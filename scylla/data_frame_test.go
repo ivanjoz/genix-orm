@@ -1,10 +1,13 @@
 package scylla
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
+	"github.com/ivanjoz/genix-orm/dataframe"
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -19,6 +22,25 @@ type frameSaleRecord struct {
 	Amount    float64 `db:"amount"`
 	Note      string  `db:"note"`
 	Status    int8    `db:"status"`
+	TagIDs    []int32 `db:"tag_ids"`
+}
+
+// frameTagLine is one line of the "sales-by-tag" frame: the sale's quantity once per tag.
+type frameTagLine struct {
+	Year     int16 `frame:"key"`
+	TagID    int32 `frame:"row"`
+	Quantity int32 `frame:"sum"`
+}
+
+func (e *frameSaleRecord) toTagLines() []frameTagLine {
+	if e.Status == 0 {
+		return nil
+	}
+	lines := []frameTagLine{}
+	for _, tagID := range e.TagIDs {
+		lines = append(lines, frameTagLine{Year: e.Year, TagID: tagID, Quantity: e.Quantity})
+	}
+	return lines
 }
 
 type frameSaleSchema struct {
@@ -31,6 +53,7 @@ type frameSaleSchema struct {
 	Amount    Col[*frameSaleSchema, float64]
 	Note      Col[*frameSaleSchema, string]
 	Status    Col[*frameSaleSchema, int8]
+	TagIDs    ColSlice[*frameSaleSchema, int32]
 }
 
 func (e frameSaleSchema) GetSchema() TableSchema {
@@ -41,6 +64,8 @@ func (e frameSaleSchema) GetSchema() TableSchema {
 		Keys:      Cols(e.ID),
 		DataFrames: []DataFrame{{
 			Name: "sales-by-year", Keys: Cols(e.Year), Rows: Cols(e.ProductID), Sums: Cols(e.Quantity, e.Amount), Count: true,
+		}, {
+			Name: "sales-by-tag", ToFrames: db.ToFrames((*frameSaleRecord).toTagLines), Version: 1, UseZeroSumsMask: true,
 		}},
 	}
 }
@@ -54,20 +79,15 @@ func compiledFrameSaleTable(t *testing.T) ScyllaTable {
 func TestDataFramesCompile(t *testing.T) {
 	scyllaTable := compiledFrameSaleTable(t)
 	info := scyllaTable.dataFrames
-	if info == nil || info.logTableName != "frame_sales__dtf_log" || len(info.trackedColumns) != 5 {
+	if info == nil || info.logTableName != "frame_sales__dtf_log" || info.recordType != reflect.TypeFor[frameSaleRecord]() || len(info.storedColumns) != 9 {
 		t.Fatalf("compiled frames: %+v", info)
 	}
-	trackedNames := []string{}
-	for _, column := range info.trackedColumns {
-		trackedNames = append(trackedNames, column.GetName())
-	}
-	// Tracked in column id (field position) order, the status included.
-	if strings.Join(trackedNames, ",") != "year,product_id,quantity,amount,status" || info.frames.StatusIndex != 4 {
-		t.Fatalf("tracked columns: %v (status at %d)", trackedNames, info.frames.StatusIndex)
-	}
 	frame := info.frames.FrameNamed("sales-by-year")
-	if frame == nil || frame.Folder != "dtf/"+utils.EncodeUintBase64(10202)+"/sales-by-year/" || !frame.Sums[1].IsFloat {
+	if frame == nil || frame.Folder != "dtf/"+utils.EncodeUintBase64(10202)+"/sales-by-year/" || !frame.Sums[1].IsFloat || frame.IsProjected {
 		t.Fatalf("frame: %+v", frame)
+	}
+	if tags := info.frames.FrameNamed("sales-by-tag"); tags == nil || !tags.IsProjected || !tags.UsesZeroSumsMask || tags.Rows[0].FieldName != "TagID" {
+		t.Fatalf("projected frame: %+v", tags)
 	}
 	script := dataFrameLogCreateScript(scyllaTable)
 	for _, part := range []string{"frame_sales__dtf_log", "PRIMARY KEY ((half_hour), partition_id, ts, record_id)", "default_time_to_live = 172800", "TimeWindowCompactionStrategy"} {
@@ -89,6 +109,9 @@ func TestQueryFrameResolvesBeforeReading(t *testing.T) {
 		{db.QueryFrame[frameSaleRecord](1, "nope").Equals(columns.Year, 2026), "no DataFrame"},
 		{db.QueryFrame[frameSaleRecord](1, "sales-by-year").Equals(columns.ProductID, 3), "needs an Equals or a Between on year"},
 		{db.QueryFrame[frameSaleRecord](1, "sales-by-year").Between(columns.Year, 2025, 2026), "no file store"},
+		// The record's Year column selects the "Year" key of the ToFrames frame.
+		{db.QueryFrame[frameSaleRecord](1, "sales-by-tag").Between(columns.Year, 2025, 2026), "no file store"},
+		{db.QueryFrame[frameSaleRecord](1, "sales-by-tag").Equals(columns.ProductID, 3), "needs an Equals or a Between on Year"},
 	} {
 		if _, err := testCase.query.Exec(); err == nil || !strings.Contains(err.Error(), testCase.want) {
 			t.Fatalf("want an error with %q, got %v", testCase.want, err)
@@ -106,30 +129,55 @@ func TestDataFramesRefuseABadDeclaration(t *testing.T) {
 	columns := db.InitStructTable[frameSaleSchema, frameSaleRecord](new(frameSaleSchema))
 	schema := columns.GetSchema()
 	schema.DataFrames[0].Sums = Cols(columns.Note)
-	configureDataFrames(&scyllaTable, schema)
+	configureDataFrames(&scyllaTable, schema, reflect.ValueOf(columns).Elem())
 }
 
-// TestDataFrameLogChangesRoundTrip: an insert, a write changing two columns (a float and a negative
-// value among them) and a write changing nothing, through the blob and back.
-func TestDataFrameLogChangesRoundTrip(t *testing.T) {
+// TestDataFrameLinesOfAStoredRow: a stored row, as the write path and the Histories read it, decodes
+// into the record its frames take lines from (the list column included), and a partial write (only
+// the status) merged over it leaves the record's other fields, so its lines go from the stored ones to
+// none.
+func TestDataFrameLinesOfAStoredRow(t *testing.T) {
 	info := compiledFrameSaleTable(t).dataFrames
-	if changes := info.encodeLogChanges(false, make([]int64, 5), []int64{2026, 7, 3, 1_500_000, 1}); len(changes) != 2 {
-		t.Fatalf("an insert logs only its flag, got %x", changes)
+	storedRow := map[string]any{"company_id": int32(1), "id": int32(9), "year": int16(2026), "product_id": int32(7),
+		"quantity": int32(3), "amount": 1.5, "status": int8(1), "tag_ids": []int32{4, 5}}
+	storedLines, err := info.linesOfRow(storedRow)
+	if err != nil {
+		t.Fatal(err)
 	}
-	insert, err := info.decodeLogChange(40, []byte{dataFrameLogFormat, dataFrameLogInsertFlag})
-	if err != nil || !insert.IsInsert || insert.Moment != 40 {
+	if !reflect.DeepEqual(storedLines[0], []dataframe.Line{{2026, 7, 3, 1_500_000}}) || !reflect.DeepEqual(storedLines[1], []dataframe.Line{{2026, 4, 3}, {2026, 5, 3}}) {
+		t.Fatalf("stored lines: %v", storedLines)
+	}
+	scyllaTable := compiledFrameSaleTable(t)
+	annul := frameSaleRecord{Status: 0}
+	writtenRecord := info.newRecord(storedRow)
+	copyColumnField(scyllaTable.ColumnsMap["status"], writtenRecord, unsafe.Pointer(&annul))
+	if merged := (*frameSaleRecord)(writtenRecord); merged.Year != 2026 || merged.Status != 0 || len(merged.TagIDs) != 2 {
+		t.Fatalf("merged record: %+v", merged)
+	}
+	writtenLines, _ := info.frames.LinesOf(writtenRecord)
+	if writtenLines[0] != nil || writtenLines[1] != nil {
+		t.Fatalf("an annulled sale puts no lines, got %v", writtenLines)
+	}
+	if body := info.frames.EncodeChangedLines(storedLines, writtenLines); body == nil {
+		t.Fatal("the annulment must be logged")
+	}
+}
+
+// TestDataFrameLogChangesDecode: an insert, a change with its body, a row of an older format
+// (skipped) and a truncated one.
+func TestDataFrameLogChangesDecode(t *testing.T) {
+	insert, isKept, err := decodeLogChange(40, []byte{dataFrameLogFormat, dataFrameLogInsertFlag})
+	if err != nil || !isKept || !insert.IsInsert || insert.Moment != 40 {
 		t.Fatalf("insert: %+v %v", insert, err)
 	}
-	stored := []int64{2026, 7, 3, 1_500_000, 1}
-	written := []int64{2026, 7, -4, 2_250_000, 1}
-	if info.encodeLogChanges(true, stored, stored) != nil {
-		t.Fatal("a write changing nothing tracked must log nothing")
-	}
-	change, err := info.decodeLogChange(41, info.encodeLogChanges(true, stored, written))
-	if err != nil || change.IsInsert || len(change.TrackedIndexes) != 2 || change.TrackedIndexes[0] != 2 || change.Before[0] != 3 || change.TrackedIndexes[1] != 3 || change.Before[1] != 1_500_000 {
+	change, isKept, err := decodeLogChange(41, []byte{dataFrameLogFormat, 0, 1, 2, 3})
+	if err != nil || !isKept || change.IsInsert || !reflect.DeepEqual(change.Body, []byte{1, 2, 3}) {
 		t.Fatalf("change: %+v %v", change, err)
 	}
-	if _, err := info.decodeLogChange(41, []byte{dataFrameLogFormat, 0, 1}); err == nil {
+	if _, isKept, err := decodeLogChange(41, []byte{1, 0, 1, 2}); err != nil || isKept {
+		t.Fatal("a row of the column format must be skipped")
+	}
+	if _, _, err := decodeLogChange(41, []byte{dataFrameLogFormat}); err == nil {
 		t.Fatal("a truncated log row decoded")
 	}
 }

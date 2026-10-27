@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -24,33 +25,75 @@ var (
 	programColumn  = Column{FieldName: "ProgramID", ColumnID: 4}
 	minutesColumn  = Column{FieldName: "Minutes", ColumnID: 5}
 	pointsColumn   = Column{FieldName: "Points", ColumnID: 6}
-	statusColumn   = Column{FieldName: "Status", ColumnID: 7}
 	hoursColumn    = Column{FieldName: "Hours", ColumnID: 9, IsFloat: true}
 )
 
-// The tracked values of a test record, in column id order.
-const (
-	employeeIndex = iota
-	yearIndex
-	programIndex
-	minutesIndex
-	pointsIndex
-	statusIndex
-	hoursIndex
-)
+// testRecord is an enrollment as a backend stores it. TagIDs is a list column: the "tags" frame turns
+// it into one line per tag (a tag listed twice adds twice).
+type testRecord struct {
+	EmployeeID int64
+	Year       int64
+	ProgramID  int64
+	Minutes    int64
+	Points     int64
+	Status     int64
+	Hours      float64
+	TagIDs     []int64
+}
 
-// compileTestTable compiles two frames of the same sums: year-program, one file per year and program
-// with a row per employee, and year, one file per year with a row per program × employee (nested
-// Rows).
+func (record testRecord) clone() testRecord {
+	record.TagIDs = slices.Clone(record.TagIDs)
+	return record
+}
+
+// testTagFrame is one line of the "tags" frame, declared by a ToFrames method.
+type testTagFrame struct {
+	Year    int64  `frame:"key"`
+	TagID   int32  `frame:"row"`
+	Ignored string // untagged: not part of the frame
+	Minutes int64  `frame:"sum"`
+	Points  int32  `frame:"sum"`
+}
+
+func (record *testRecord) toTagFrames() []testTagFrame {
+	if record.Status == 0 {
+		return nil
+	}
+	frames := []testTagFrame{}
+	for _, tagID := range record.TagIDs {
+		frames = append(frames, testTagFrame{Year: record.Year, TagID: int32(tagID), Minutes: record.Minutes, Points: int32(record.Points)})
+	}
+	return frames
+}
+
+// enrollmentLinesOf is the one line of the two column frames, as a backend builds it from their
+// columns: Year, ProgramID, EmployeeID, then the sums (both frames take that order, the Keys and Rows
+// split differs); none for a soft-deleted record.
+func enrollmentLinesOf(recordPointer unsafe.Pointer) ([]Line, error) {
+	record := (*testRecord)(recordPointer)
+	if record.Status == 0 {
+		return nil, nil
+	}
+	hours, _ := ScaledFloat(record.Hours)
+	return []Line{{record.Year, record.ProgramID, record.EmployeeID, record.Minutes, record.Points, hours}}, nil
+}
+
+var tagProjection = ProjectionOf((*testRecord).toTagFrames)
+
+// compileTestTable compiles three frames: year-program, one file per year and program with a row per
+// employee; year, one file per year with a row per program × employee (nested Rows) and the zero sums
+// mask; and tags, declared by a ToFrames method, 0..N lines per record.
 func compileTestTable(t *testing.T) *Table {
 	t.Helper()
 	table, err := Compile("enrollment", 78901377, []Spec{{
 		Name: "year-program", Keys: []Column{yearColumn, programColumn}, Rows: []Column{employeeColumn},
-		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true,
+		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true, LinesOf: enrollmentLinesOf,
 	}, {
 		Name: "year", Keys: []Column{yearColumn}, Rows: []Column{programColumn, employeeColumn},
-		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true,
-	}}, &statusColumn)
+		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true, UseZeroSumsMask: true, LinesOf: enrollmentLinesOf,
+	}, {
+		Name: "tags", Projection: tagProjection, Count: true, UseZeroSumsMask: true,
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,13 +103,21 @@ func compileTestTable(t *testing.T) *Table {
 func TestCompileRules(t *testing.T) {
 	table := compileTestTable(t)
 	frame := &table.Frames[0]
-	if table.Folder != "dtf/3gz10/" || table.versionsKeyOf(12) != "dtf/3gz10/12.versions" || frame.Folder != "dtf/3gz10/year-program/" || frame.SumsCount != 4 || len(frame.Shape) != 8 || len(table.Tracked) != 7 || table.StatusIndex != statusIndex {
+	if table.Folder != "dtf/3gz10/" || table.versionsKeyOf(12) != "dtf/3gz10/12.versions" || frame.Folder != "dtf/3gz10/year-program/" || frame.SumsCount != 4 || len(frame.Shape) != 8 || frame.Index != 0 {
 		t.Fatalf("compiled: %+v", table)
 	}
-	if nested := &table.Frames[1]; len(nested.Rows) != 2 || nested.Rows[0].TrackedIndex != programIndex || nested.Rows[1].TrackedIndex != employeeIndex || nested.Shape == frame.Shape {
+	if nested := &table.Frames[1]; len(nested.Rows) != 2 || !nested.UsesZeroSumsMask || nested.Shape == frame.Shape || nested.Index != 1 {
 		t.Fatalf("compiled nested Rows: %+v", nested)
 	}
+	if tags := &table.Frames[2]; !tags.IsProjected || len(tags.Keys) != 1 || tags.Keys[0].FieldName != "Year" || tags.Rows[0].FieldName != "TagID" || len(tags.Sums) != 2 || tags.Sums[1].ColumnID != 5 {
+		t.Fatalf("compiled projection: %+v", tags)
+	}
+	if _, err := Compile("bad", 1, []Spec{{Name: "a", Projection: tagProjection, Sums: []Column{minutesColumn}}}); err == nil {
+		t.Fatal("a ToFrames frame that also lists columns compiled")
+	}
 	employeeRows := []Column{employeeColumn}
+	nineSums := []Column{{FieldName: "S1", ColumnID: 11}, {FieldName: "S2", ColumnID: 12}, {FieldName: "S3", ColumnID: 13}, {FieldName: "S4", ColumnID: 14},
+		{FieldName: "S5", ColumnID: 15}, {FieldName: "S6", ColumnID: 16}, {FieldName: "S7", ColumnID: 17}, {FieldName: "S8", ColumnID: 18}}
 	for name, spec := range map[string]Spec{
 		"a name with capitals":   {Name: "Year", Keys: []Column{yearColumn}, Rows: employeeRows, Count: true},
 		"four Keys":              {Name: "a", Keys: []Column{yearColumn, programColumn, minutesColumn, pointsColumn}, Rows: employeeRows, Count: true},
@@ -77,39 +128,69 @@ func TestCompileRules(t *testing.T) {
 		"a float Rows column":    {Name: "a", Keys: []Column{yearColumn}, Rows: []Column{programColumn, hoursColumn}, Count: true},
 		"a column twice":         {Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Sums: []Column{yearColumn}},
 		"a Key in the Rows":      {Name: "a", Keys: []Column{yearColumn}, Rows: []Column{yearColumn, employeeColumn}, Count: true},
-		"a column id over 255":   {Name: "a", Keys: []Column{{FieldName: "Wide", ColumnID: 300}}, Rows: employeeRows, Count: true},
+		"9 masked sums":          {Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Sums: nineSums, Count: true, UseZeroSumsMask: true},
 	} {
-		if _, err := Compile("bad", 1, []Spec{spec}, nil); err == nil {
+		spec.LinesOf = enrollmentLinesOf
+		if _, err := Compile("bad", 1, []Spec{spec}); err == nil {
 			t.Fatalf("%s: compiled", name)
 		}
 	}
-	twice := Spec{Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Count: true}
-	if _, err := Compile("bad", 1, []Spec{twice, twice}, nil); err == nil {
+	if _, err := Compile("ok", 1, []Spec{{Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Sums: nineSums, Count: true, LinesOf: enrollmentLinesOf}}); err != nil {
+		t.Fatalf("9 sums without the mask: %v", err)
+	}
+	if _, err := Compile("bad", 1, []Spec{{Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Count: true}}); err == nil {
+		t.Fatal("a frame without LinesOf compiled")
+	}
+	twice := Spec{Name: "a", Keys: []Column{yearColumn}, Rows: employeeRows, Count: true, LinesOf: enrollmentLinesOf}
+	if _, err := Compile("bad", 1, []Spec{twice, twice}); err == nil {
 		t.Fatal("two frames with one name compiled")
+	}
+	versioned := twice
+	versioned.Version = 2
+	if versionedTable, _ := Compile("ok", 1, []Spec{versioned}); versionedTable.Frames[0].Shape == mustCompile(t, twice).Frames[0].Shape {
+		t.Fatal("a Version bump must change the shape")
 	}
 }
 
-func TestValuesAndTheWriteCheck(t *testing.T) {
+func mustCompile(t *testing.T, specs ...Spec) *Table {
+	t.Helper()
+	table, err := Compile("t", 1, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return table
+}
+
+func TestLinesAndTheWriteCheck(t *testing.T) {
 	table := compileTestTable(t)
+	record := testRecord{EmployeeID: 4, Year: 2026, ProgramID: 3, Minutes: 240, Points: 100, Status: 1, Hours: 1.5, TagIDs: []int64{7, 9, 7}}
+	lines, err := table.LinesOf(unsafe.Pointer(&record))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (Line{2026, 3, 4, 240, 100, 1_500_000}); !slices.Equal(lines[0][0], want) || !slices.Equal(lines[1][0], want) {
+		t.Fatalf("column lines: %v", lines)
+	}
 	frame := &table.Frames[0]
-	tracked := []int64{4, 2026, 3, 240, 100, 1, 1_500_000}
-	values := table.valuesOf(frame, tracked)
-	if !slices.Equal(values.keys, []int64{2026, 3}) || values.row != (rowKey{4}) || !slices.Equal(values.sums, []int64{240, 100, 1_500_000, 1}) {
-		t.Fatalf("frame values: %+v", values)
+	if line := lines[0][0]; !slices.Equal(frame.keysOf(line), []int64{2026, 3}) || frame.rowOf(line) != (rowKey{4}) || !slices.Equal(frame.sumsOf(line), []int64{240, 100, 1_500_000}) {
+		t.Fatalf("line parts: %v", line)
 	}
-	if nestedValues := table.valuesOf(&table.Frames[1], tracked); !slices.Equal(nestedValues.keys, []int64{2026}) || nestedValues.row != (rowKey{3, 4}) {
-		t.Fatalf("nested frame values: %+v", nestedValues)
+	if nested := &table.Frames[1]; nested.rowOf(lines[1][0]) != (rowKey{3, 4}) {
+		t.Fatalf("nested row of %v", lines[1][0])
 	}
-	tracked[statusIndex] = 0
-	if table.valuesOf(frame, tracked) != nil {
-		t.Fatal("a deleted record (Status 0) counts in no file")
+	if len(lines[2]) != 3 || !slices.Equal(lines[2][2], Line{2026, 7, 240, 100}) {
+		t.Fatalf("projected lines: %v", lines[2])
 	}
-	tracked[statusIndex], tracked[yearIndex] = 1, -1
-	if err := table.CheckValues(tracked); err == nil || !strings.Contains(err.Error(), "negative") {
+	record.Status = 0
+	if lines, _ := table.LinesOf(unsafe.Pointer(&record)); lines[0] != nil || lines[2] != nil {
+		t.Fatalf("a deleted record puts no lines, got %v", lines)
+	}
+	record.Status, record.Year = 1, -1
+	if _, err := table.LinesOf(unsafe.Pointer(&record)); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("a negative Keys value must fail the write, got %v", err)
 	}
-	tracked[yearIndex], tracked[programIndex] = 2026, -1
-	if err := table.CheckValues(tracked); err == nil || !strings.Contains(err.Error(), "negative") {
+	record.Year, record.ProgramID = 2026, -1
+	if _, err := table.LinesOf(unsafe.Pointer(&record)); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("a negative Rows value must fail the write, got %v", err)
 	}
 	if _, isKept := ScaledFloat(1e13); isKept {
@@ -135,59 +216,72 @@ func TestFileKeysRoundTrip(t *testing.T) {
 
 // ── Changelog ──
 
-func TestChangelogRoundTripAndSizes(t *testing.T) {
-	for _, testCase := range []struct {
-		values    []int64
-		wantBytes int // 3 header bytes, then per column its id and its value bytes
-	}{
-		{[]int64{0, 63}, 3 + 2 + 2},                                 // reduced uint6
-		{[]int64{64, 1<<14 - 1}, 3 + 3 + 3},                         // reduced uint14
-		{[]int64{1<<30 - 1}, 3 + 5},                                 // reduced uint30
-		{[]int64{1 << 30}, 3 + 1 + 5},                               // normal: 5 + 32 bits
-		{[]int64{-1, 15}, 3 + 2 + 2},                                // normal with negatives: 4 bits in the first byte
-		{[]int64{-16, 1}, 3 + 3 + 2},                                // −16 needs a second byte
-		{[]int64{MaxMagnitude - 1, -(MaxMagnitude - 1)}, 3 + 9 + 9}, // 60 bits each
-		{[]int64{1<<61 - 1}, 3 + 9},                                 // 61 bits without negatives
-	} {
-		entry := changelogEntry{delta: 300}
-		for i, value := range testCase.values {
-			entry.values = append(entry.values, changelogValue{columnID: uint8(i + 1), value: value})
-		}
-		entries := []changelogEntry{entry, {delta: MaxDelta, values: []changelogValue{{columnID: 255, value: 7}}}}
-		content := encodeChangelog(entries)
-		if firstEntryBytes := len(content) - 5; firstEntryBytes != testCase.wantBytes {
-			t.Fatalf("values %v take %d bytes, want %d", testCase.values, firstEntryBytes, testCase.wantBytes)
-		}
-		decoded, err := decodeChangelog(content)
-		if err != nil || !reflect.DeepEqual(decoded, entries) {
-			t.Fatalf("values %v: decoded %+v, err %v", testCase.values, decoded, err)
-		}
-		if _, err := decodeChangelog(content[:len(content)-1]); !errors.Is(err, errChangelogCorrupt) {
-			t.Fatalf("a truncated changelog decoded, err %v", err)
-		}
+func linesOfRecord(t *testing.T, table *Table, record testRecord) RecordLines {
+	t.Helper()
+	lines, err := table.LinesOf(unsafe.Pointer(&record))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lines
+}
+
+func TestChangelogRoundTrip(t *testing.T) {
+	table := compileTestTable(t)
+	stored := testRecord{EmployeeID: 4, Year: 2026, ProgramID: 3, Minutes: 240, Points: -100, Status: 1, Hours: 1.5, TagIDs: []int64{7, 9}}
+	written := stored.clone()
+	written.Minutes, written.TagIDs = 300, nil
+	storedLines, writtenLines := linesOfRecord(t, table, stored), linesOfRecord(t, table, written)
+	content, err := table.NextChangelog(nil, 100, 100, storedLines, writtenLines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := table.decodeChangelog(content)
+	if err != nil || len(entries) != 1 || len(entries[0].frames) != 3 || !reflect.DeepEqual(entries[0].frames[2].lines, storedLines[2]) {
+		t.Fatalf("decoded %+v, err %v", entries, err)
+	}
+	if _, err := table.decodeChangelog(content[:len(content)-1]); !errors.Is(err, errChangelogCorrupt) {
+		t.Fatalf("a truncated changelog decoded, err %v", err)
+	}
+	// A frame of another shape (a frame since redeclared) is skipped by its length.
+	redeclared := mustCompile(t, Spec{Name: "year-program", Keys: []Column{yearColumn, programColumn}, Rows: []Column{employeeColumn},
+		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true, Version: 2, LinesOf: enrollmentLinesOf})
+	if entries, err := redeclared.decodeChangelog(content); err != nil || len(entries) != 1 || len(entries[0].frames) != 0 {
+		t.Fatalf("a changelog of other shapes decoded to %+v, err %v", entries, err)
+	}
+	// Only the changed frames: a write that leaves the tags alone logs the two column frames.
+	untagged := written.clone()
+	untagged.Points = 5
+	if body := table.EncodeChangedLines(writtenLines, linesOfRecord(t, table, untagged)); body == nil {
+		t.Fatal("a changed sum must log its frames")
+	} else if frames, length, err := table.readBody(body); err != nil || length != len(body) || len(frames) != 2 || frames[0].frameIndex != 0 || frames[1].frameIndex != 1 {
+		t.Fatalf("body frames %+v, err %v", frames, err)
+	}
+	if body := table.EncodeChangedLines(writtenLines, writtenLines); body != nil {
+		t.Fatal("an unchanged write logs nothing")
 	}
 }
 
 func TestNextChangelogShiftsAndDrops(t *testing.T) {
 	table := compileTestTable(t)
-	stored := []int64{1, 2, 3, 4, 5, 6, 7}
-	written := slices.Clone(stored)
-	written[yearIndex] = 30
-	first, _ := table.NextChangelog(nil, 100, 100, stored, written)
-	entries, _ := decodeChangelog(first)
-	if len(entries) != 1 || entries[0].delta != 0 || len(entries[0].values) != 1 || entries[0].values[0] != (changelogValue{columnID: uint8(yearColumn.ColumnID), value: 2}) {
-		t.Fatalf("one changed column gives one entry with its stored value, got %+v", entries)
+	stored := testRecord{EmployeeID: 1, Year: 2026, ProgramID: 3, Status: 1}
+	written := stored.clone()
+	written.Year = 2027
+	storedLines, writtenLines := linesOfRecord(t, table, stored), linesOfRecord(t, table, written)
+	first, _ := table.NextChangelog(nil, 100, 100, storedLines, writtenLines)
+	entries, _ := table.decodeChangelog(first)
+	if len(entries) != 1 || entries[0].delta != 0 || len(entries[0].frames) != 2 || !reflect.DeepEqual(entries[0].frames[0].lines, storedLines[0]) {
+		t.Fatalf("one changed record gives one entry with its stored lines, got %+v", entries)
 	}
 	// An unchanged write only shifts the deltas.
-	second, _ := table.NextChangelog(first, 100, 1100, written, written)
-	if entries, _ = decodeChangelog(second); len(entries) != 1 || entries[0].delta != 1000 {
+	second, _ := table.NextChangelog(first, 100, 1100, writtenLines, writtenLines)
+	if entries, _ = table.decodeChangelog(second); len(entries) != 1 || entries[0].delta != 1000 {
 		t.Fatalf("shifted entry: %+v", entries)
 	}
 	// A write past the reach drops it; a lagging clock shifts nothing.
-	if third, _ := table.NextChangelog(second, 1100, 1100+MaxDelta-999, written, written); third != nil {
+	if third, _ := table.NextChangelog(second, 1100, 1100+MaxDelta-999, writtenLines, writtenLines); third != nil {
 		t.Fatalf("an entry past %d ticks must be dropped, got %x", MaxDelta, third)
 	}
-	if third, _ := table.NextChangelog(second, 1100, 1000, written, written); !slices.Equal(third, second) {
+	if third, _ := table.NextChangelog(second, 1100, 1000, writtenLines, writtenLines); !slices.Equal(third, second) {
 		t.Fatal("a write stamped before the stored Updated must not shift the deltas")
 	}
 }
@@ -198,45 +292,52 @@ func TestNextChangelogShiftsAndDrops(t *testing.T) {
 // deadlines a run derives from its simulated now are still ahead.
 var simStart = utils.SUnixTimeOf(time.Now()) + 1000
 
-// simWrite is one landed write of a record, as stored: its tracked values, Updated, created and changelog.
+// simWrite is one landed write of a record, as stored: the record, Updated, created and changelog.
 type simWrite struct {
-	values    []int64
+	record    testRecord
 	updated   int64
 	created   int64
 	changelog []byte
 }
 
 type simHistory struct {
+	t                *testing.T
 	table            *Table
 	writesByEmployee map[int64][]simWrite
 }
 
-// simulateWrites writes records for duration ticks: inserts, updates of any tracked column (floats and
-// negative Points included), soft deletes and restores, and writes that change nothing tracked.
+// simulateWrites writes records for duration ticks: inserts, updates of any field (floats and
+// negative Points included), tags added and dropped, soft deletes and restores, and writes that change
+// nothing the frames read.
 func simulateWrites(t *testing.T, table *Table, rng *rand.Rand, duration int64) simHistory {
-	sim := simHistory{table: table, writesByEmployee: map[int64][]simWrite{}}
+	sim := simHistory{t: t, table: table, writesByEmployee: map[int64][]simWrite{}}
 	for tick := int64(simStart + 1); tick < simStart+duration; tick += 1 + rng.Int64N(30) {
 		employeeID := int64(rng.IntN(60))
 		previousWrites := sim.writesByEmployee[employeeID]
-		write := simWrite{values: []int64{employeeID, 0, 0, 0, 0, 1, 0}, updated: tick, created: tick}
+		write := simWrite{record: testRecord{EmployeeID: employeeID, Status: 1}, updated: tick, created: tick}
 		if len(previousWrites) > 0 {
 			stored := previousWrites[len(previousWrites)-1]
-			write.values, write.created = slices.Clone(stored.values), stored.created
+			write.record, write.created = stored.record.clone(), stored.created
 		}
 		switch roll := rng.IntN(8); {
 		case len(previousWrites) == 0 || roll == 0:
-			write.values[yearIndex], write.values[programIndex] = int64(2025+rng.IntN(3)), int64(rng.IntN(5))
+			write.record.Year, write.record.ProgramID = int64(2025+rng.IntN(3)), int64(rng.IntN(5))
 		case roll == 1:
-			write.values[statusIndex] = 1 - write.values[statusIndex]
+			write.record.Status = 1 - write.record.Status
+		case roll == 2:
+			write.record.TagIDs = nil
+			for range rng.IntN(4) {
+				write.record.TagIDs = append(write.record.TagIDs, int64(rng.IntN(6)))
+			}
 		}
 		if len(previousWrites) == 0 || rng.IntN(3) == 0 {
-			write.values[minutesIndex], write.values[pointsIndex] = int64(rng.IntN(600)), int64(rng.IntN(300)-100)
-			write.values[hoursIndex], _ = ScaledFloat(float64(rng.IntN(1000)) / 8)
+			write.record.Minutes, write.record.Points = int64(rng.IntN(600)), int64(rng.IntN(300)-100)
+			write.record.Hours = float64(rng.IntN(1000)) / 8
 		}
 		if len(previousWrites) > 0 {
 			stored := previousWrites[len(previousWrites)-1]
 			var err error
-			if write.changelog, err = table.NextChangelog(stored.changelog, stored.updated, tick, stored.values, write.values); err != nil {
+			if write.changelog, err = table.NextChangelog(stored.changelog, stored.updated, tick, linesOfRecord(t, table, stored.record), linesOfRecord(t, table, write.record)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -262,14 +363,17 @@ func (sim simHistory) storedAt(moment int64) []simWrite {
 // simPartitions: a record's partition is its employee id modulo it, so the simulated table has several.
 const simPartitions = 3
 
-func simPartitionOf(write simWrite) int64 { return write.values[employeeIndex] % simPartitions }
+func simPartitionOf(write simWrite) int64 { return write.record.EmployeeID % simPartitions }
 
 // historiesAt is what a read at moment returns of the records written after since.
 func (sim simHistory) historiesAt(moment, since int64) []History {
 	var histories []History
 	for _, write := range sim.storedAt(moment) {
 		if write.updated > since {
-			history, _ := NewHistory(simPartitionOf(write), fmt.Sprint(write.values[employeeIndex]), write.values, write.created, write.updated, write.changelog)
+			history, err := sim.table.NewHistory(simPartitionOf(write), fmt.Sprint(write.record.EmployeeID), linesOfRecord(sim.t, sim.table, write.record), write.created, write.updated, write.changelog)
+			if err != nil {
+				sim.t.Fatal(err)
+			}
 			histories = append(histories, history)
 		}
 	}
@@ -286,42 +390,57 @@ func (sim simHistory) bruteForceRows(frame *Frame, partition, moment int64) []Ro
 	rowsByFileKey := map[string]frameRows{}
 	var fileKeys []string
 	for _, write := range sim.storedAt(moment) {
-		values := sim.table.valuesOf(frame, write.values)
-		if values == nil || simPartitionOf(write) != partition {
+		if simPartitionOf(write) != partition {
 			continue
 		}
-		fileKey := frame.fileKeyOf("g", partition, values.keys)
-		if rowsByFileKey[fileKey] == nil {
-			rowsByFileKey[fileKey] = frameRows{}
-			fileKeys = append(fileKeys, fileKey)
+		for _, line := range linesOfRecord(sim.t, sim.table, write.record)[frame.Index] {
+			fileKey := frame.fileKeyOf("g", partition, frame.keysOf(line))
+			if rowsByFileKey[fileKey] == nil {
+				rowsByFileKey[fileKey] = frameRows{}
+				fileKeys = append(fileKeys, fileKey)
+			}
+			rowsByFileKey[fileKey].add(frame, line, 1)
 		}
-		rowsByFileKey[fileKey].add(values, 1)
 	}
 	return frame.rowsOf("g", fileKeys, rowsByFileKey)
 }
 
-func TestValuesAtMatchesTheHistory(t *testing.T) {
-	table := compileTestTable(t)
-	sim := simulateWrites(t, table, rand.New(rand.NewPCG(3, 4)), 30000)
-	histories := sim.historiesAt(simStart+30000, -1)
-	for moment := int64(simStart - 5); moment <= simStart+30000; moment += 37 {
-		storedByEmployee := map[int64]simWrite{}
-		for _, write := range sim.storedAt(moment) {
-			storedByEmployee[write.values[employeeIndex]] = write
+// assertLinesAt checks a History against what the record was stored as at moment (nil: not yet).
+func assertLinesAt(t *testing.T, table *Table, history History, stored *testRecord, moment int64) {
+	t.Helper()
+	for i := range table.Frames {
+		lines, exists := history.linesAt(&table.Frames[i], moment)
+		if exists != (stored != nil) {
+			t.Fatalf("moment %d frame %d: exists %v, want %v", moment, i, exists, stored != nil)
 		}
-		for _, history := range histories {
-			stored, existed := storedByEmployee[history.values[employeeIndex]]
-			values, exists := table.valuesAt(history, moment)
-			if exists != existed || (exists && !slices.Equal(values, stored.values)) {
-				t.Fatalf("moment %d: values %v (%v), want %v (%v)", moment, values, exists, stored.values, existed)
-			}
+		if exists && !isSameLines(lines, linesOfRecord(t, table, *stored)[i]) {
+			t.Fatalf("moment %d frame %d: lines %v, want %v", moment, i, lines, linesOfRecord(t, table, *stored)[i])
 		}
 	}
 }
 
-// TestHistoryOfChangesMatchesTheHistory: a History built from a record's values now and the changes a
-// log keeps after a window's start (scylla: the before values of the changed columns, the insert
-// flagged) says what the record held at every moment from that start on, as the stored record does.
+func TestLinesAtMatchesTheHistory(t *testing.T) {
+	table := compileTestTable(t)
+	sim := simulateWrites(t, table, rand.New(rand.NewPCG(3, 4)), 30000)
+	histories := sim.historiesAt(simStart+30000, -1)
+	for moment := int64(simStart - 5); moment <= simStart+30000; moment += 37 {
+		storedByEmployee := map[string]testRecord{}
+		for _, write := range sim.storedAt(moment) {
+			storedByEmployee[fmt.Sprint(write.record.EmployeeID)] = write.record
+		}
+		for _, history := range histories {
+			var stored *testRecord
+			if record, isStored := storedByEmployee[history.RecordKey]; isStored {
+				stored = &record
+			}
+			assertLinesAt(t, table, history, stored, moment)
+		}
+	}
+}
+
+// TestHistoryOfChangesMatchesTheHistory: a History built from a record's lines now and the changes a
+// log keeps after a window's start (scylla: the body of every write that changed a frame's lines, the
+// insert flagged) says what the record put in its frames at every moment from that start on.
 func TestHistoryOfChangesMatchesTheHistory(t *testing.T) {
 	table := compileTestTable(t)
 	sim := simulateWrites(t, table, rand.New(rand.NewPCG(5, 6)), 30000)
@@ -329,31 +448,30 @@ func TestHistoryOfChangesMatchesTheHistory(t *testing.T) {
 		for _, writes := range sim.writesByEmployee {
 			var changes []HistoryChange // newest first, as the backend hands them
 			for i := len(writes) - 1; i >= 0 && writes[i].updated > windowStart; i-- {
-				change := HistoryChange{Moment: writes[i].updated, IsInsert: i == 0}
-				for c := range table.Tracked {
-					if i > 0 && writes[i-1].values[c] != writes[i].values[c] {
-						change.TrackedIndexes = append(change.TrackedIndexes, c)
-						change.Before = append(change.Before, writes[i-1].values[c])
-					}
+				if i == 0 {
+					changes = append(changes, HistoryChange{Moment: writes[i].updated, IsInsert: true})
+					continue
 				}
-				if change.IsInsert || len(change.TrackedIndexes) > 0 { // only real changes are logged
-					changes = append(changes, change)
+				// Only real changes are logged.
+				if body := table.EncodeChangedLines(linesOfRecord(t, table, writes[i-1].record), linesOfRecord(t, table, writes[i].record)); body != nil {
+					changes = append(changes, HistoryChange{Moment: writes[i].updated, Body: body})
 				}
 			}
 			if len(changes) == 0 {
 				continue
 			}
-			history := table.NewHistoryOfChanges(simPartitionOf(writes[0]), "r", writes[len(writes)-1].values, changes)
+			history, err := table.NewHistoryOfChanges(simPartitionOf(writes[0]), "r", linesOfRecord(t, table, writes[len(writes)-1].record), changes)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for moment := windowStart; moment <= simStart+30000; moment += 13 {
-				var stored []int64
+				var stored *testRecord
 				for _, write := range writes {
 					if write.updated <= moment {
-						stored = write.values
+						stored = &write.record
 					}
 				}
-				if values, exists := table.valuesAt(history, moment); exists != (stored != nil) || (exists && !slices.Equal(values, stored)) {
-					t.Fatalf("window %d moment %d: values %v (%v), want %v", windowStart, moment, values, exists, stored)
-				}
+				assertLinesAt(t, table, history, stored, moment)
 			}
 		}
 	}
@@ -486,6 +604,9 @@ func (client *simClient) rows(t *testing.T, frame *Frame) []Row {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if file.UsesZeroSumsMask != frame.UsesZeroSumsMask {
+			t.Fatalf("frame %s: a file with the zero sums mask %v", frame.Name, file.UsesZeroSumsMask)
+		}
 		for i := range file.rowCount() {
 			row := Row{Keys: changed.Keys, RowValues: make([]int64, len(frame.Rows)), Sums: make([]int64, frame.SumsCount)}
 			for c := range row.RowValues {
@@ -502,7 +623,7 @@ func (client *simClient) rows(t *testing.T, frame *Frame) []Row {
 
 // TestRunsSurviveCrashes: a rebuild, then runs at random moments, some crashing after a random part of
 // their files, leave the files equal to the brute force at their target, and a fresh read equal to it
-// at the read's moment, for both test frames. A client syncing raw files with ReadChanged holds the
+// at the read's moment, for every test frame. A client syncing raw files with ReadChanged holds the
 // brute force at every read too, through occasional rebuilds of the frames and of one partition; half
 // the seeds cycle 2 slots, so every slot is shared. Every check runs per partition.
 func TestRunsSurviveCrashes(t *testing.T) {

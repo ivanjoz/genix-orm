@@ -125,13 +125,17 @@ func (q *frameQueryState) readRows() ([]dataframe.Row, error) {
 	return dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, q.isFresh)
 }
 
-// setRowKey sets the frame's Keys and Rows columns of the key record at keyPtr from a row.
+// setRowKey sets the frame's Keys and Rows columns of the key record at keyPtr from a row. A frame
+// declared by ToFrames names a frame struct's fields, not the record's: its rows leave the key empty.
 func (q *frameQueryState) setRowKey(keyPtr unsafe.Pointer, row dataframe.Row) {
+	if q.frame.IsProjected {
+		return
+	}
 	for k, key := range q.frame.Keys {
-		q.meta.trackedAccessors[key.TrackedIndex].setI64(keyPtr, row.Keys[k])
+		q.meta.accessors[key.FieldName].setI64(keyPtr, row.Keys[k])
 	}
 	for c, rowColumn := range q.frame.Rows {
-		q.meta.trackedAccessors[rowColumn.TrackedIndex].setI64(keyPtr, row.RowValues[c])
+		q.meta.accessors[rowColumn.FieldName].setI64(keyPtr, row.RowValues[c])
 	}
 }
 

@@ -3,6 +3,8 @@ package dynamo
 import (
 	"fmt"
 	"reflect"
+
+	"github.com/ivanjoz/genix-orm/dataframe"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -368,6 +370,22 @@ type DataFrame struct {
 	Sums []Coln
 	// Count adds the number of records per row (FrameRow.Count).
 	Count bool
+	// ToFrames declares the frame by a method of the record instead of Keys, Rows and Sums:
+	// ToFrames((*Enrollment).ToEnrollmentFrames), 0..N rows per record (dataframe/projection.go).
+	ToFrames *dataframe.Projection
+	// Version is part of the frame's shape: bump it when the logic of ToFrames changes, which rebuilds
+	// the frame.
+	Version int
+	// UseZeroSumsMask writes a byte per file saying which summed columns hold anything, so a column
+	// empty in a whole file costs nothing. At most 8 summed columns (the Sums, then the count).
+	UseZeroSumsMask bool
+}
+
+// ToFrames compiles a record's ToFrames method for DataFrame.ToFrames: it returns the record's lines
+// as structs whose fields are tagged frame:"key", frame:"row" or frame:"sum". It must be pure: it is
+// called on the record before and after each write.
+func ToFrames[R any, F any](method func(*R) []F) *dataframe.Projection {
+	return dataframe.ProjectionOf(method)
 }
 
 // holdsSliceColumn reports whether the index is a fan-out index: one of its Keys is a ColSlice.

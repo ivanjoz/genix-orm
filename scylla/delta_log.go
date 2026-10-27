@@ -93,8 +93,9 @@ func deltaTrackedColumns(scyllaTable ScyllaTable) []IColInfo {
 type storedRows map[[2]int64]map[string]any
 
 // readStoredWrittenRows reads, in one select per partition, what the delta indexes and the DataFrames
-// need of the records about to be written: the version and the delta tracked columns, the frames'
-// tracked columns. nil when the table has neither. The keys must be final (after handlePreInsert).
+// need of the records about to be written: the version and the delta tracked columns, and the whole
+// row for the frames (a ToFrames method may read any field). nil when the table has neither. The keys
+// must be final (after handlePreInsert).
 func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (storedRows, error) {
 	var columns []IColInfo
 	if len(scyllaTable.deltaIndexes) > 0 {
@@ -102,7 +103,7 @@ func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (stored
 		columns = append(columns, deltaTrackedColumns(scyllaTable)...)
 	}
 	if scyllaTable.dataFrames != nil {
-		columns = append(columns, scyllaTable.dataFrames.trackedColumns...)
+		columns = append(columns, scyllaTable.dataFrames.storedColumns...)
 	}
 	if len(columns) == 0 {
 		return nil, nil
@@ -199,7 +200,7 @@ func readStoredRows(scyllaTable ScyllaTable, idsOfPartition map[int64][]int64, c
 					break
 				}
 				storedRow := map[string]any{}
-				for _, columnName := range columnNames[1:] {
+				for _, columnName := range columnNames {
 					if storedValue := row[columnName]; storedValue != nil {
 						storedRow[columnName] = storedValue
 					}

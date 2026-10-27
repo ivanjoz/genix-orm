@@ -162,7 +162,7 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 			changed := ChangedFile{Keys: keys, Slot: loaded.slotByFileKey[fileKey]}
 			switch _, isTouched := lastWriteByFileKey[fileKey]; {
 			case isTouched:
-				file := loaded.rowsByFileKey[fileKey].fileAt(now, len(frame.Rows), frame.SumsCount)
+				file := loaded.rowsByFileKey[fileKey].fileAt(now, frame)
 				file.Slot, changed.Snapshot = changed.Slot, now
 				if file.rowCount() > 0 {
 					changed.Content = EncodeFile(file)

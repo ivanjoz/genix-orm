@@ -1,5 +1,7 @@
 package db
 
+import "github.com/ivanjoz/genix-orm/dataframe"
+
 // Coln is the type-erased handle for a column, as referenced from a schema
 // declaration or an index. Both Col and ColSlice satisfy it.
 type Coln interface {
@@ -164,8 +166,9 @@ type TableSchema struct {
 }
 
 // DataFrame is one group-by report of a table: one file per value of Keys, one row per value of Rows
-// in it, holding the Sums of the records with those values and, with Count, how many they are. A
-// soft-deleted record (status 0) is in no file.
+// in it, holding the Sums of the records with those values and, with Count, how many they are. It is
+// declared either by the record's columns (one row per record; a soft-deleted record, status 0, is in
+// no file) or by a ToFrames method (0..N rows per record), never both.
 type DataFrame struct {
 	// Name: a-z, 0-9 and '-'. It names the frame's folder.
 	Name string
@@ -176,6 +179,22 @@ type DataFrame struct {
 	// Sums are the integer or float columns each row adds up.
 	Sums  []Coln
 	Count bool
+	// ToFrames declares the frame by a method of the record instead of its columns:
+	// db.ToFrames((*SaleOrder).ToSaleSummaryFrames). See dataframe/projection.go.
+	ToFrames *dataframe.Projection
+	// Version is part of the frame's shape: bump it when the logic of ToFrames changes, which rebuilds
+	// the frame.
+	Version int
+	// UseZeroSumsMask writes a byte per file saying which summed columns hold anything, so a column
+	// empty in a whole file costs nothing. At most 8 summed columns (the Sums, then the count).
+	UseZeroSumsMask bool
+}
+
+// ToFrames compiles a record's ToFrames method for DataFrame.ToFrames: it returns the record's lines
+// as structs whose fields are tagged frame:"key", frame:"row" or frame:"sum". It must be pure: it is
+// called on the record before and after each write.
+func ToFrames[R any, F any](method func(*R) []F) *dataframe.Projection {
+	return dataframe.ProjectionOf(method)
 }
 
 // GenericRecordSchema declares which columns fill the generic by-IDs shape. Name is required; the

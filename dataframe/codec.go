@@ -10,12 +10,18 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // DataFrame file codec: raw bytes, columnar.
 //
-//	u8        format version
+//	u8        format version, bit 7 set when the file carries the zero sums mask
 //	u8        slot: the file's slot in the versions file (versions.go), 0 = none yet
 //	uvarint   snapshot: the SUnixTime the file holds its frame at
 //	uvarint   row count n (no columns follow when n = 0)
 //	rows      the Rows columns, nested (below)
-//	column    each Sums column: varint min, residuals of the n values
+//	[u8       zero sums mask: bit s set when summed column s holds a non-zero value.
+//	          Only on a frame declared with UseZeroSumsMask (at most 8 summed columns)]
+//	column    each summed column (with the mask: each one whose bit is set): varint min,
+//	          residuals of the n values
+//
+// The mask makes a summed column empty in the whole file (no sub-units sold, no debt
+// left) cost nothing; without it such a column is a constant column, 2 bytes.
 //
 // The rows are sorted by their Rows values, so with several Rows columns (department,
 // program, employee) they nest like folders: a department once, the programs under
@@ -42,7 +48,9 @@ import (
 // by the largest of 1000, 100, 10, 8, 5 and 2 that divides them all (quantities
 // stored as multiples of 1000 lose 10 bits each) and written in blocks of 128:
 //
-//	residuals := uvarint divisor, block*
+//	residuals := uvarint divisor, block*   (divisor 0: every residual is 0, no blocks
+//	                                          follow: a constant column costs its min
+//	                                          and this one byte, whatever its length)
 //	block     := u8 head      bits 0–6 width w (0..64), bit 7 patched
 //	             [u8 patch count, when patched]
 //	             packed       the low w bits of each residual, least significant first,
@@ -57,10 +65,16 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	formatVersion    = 3
-	blockSize        = 128
-	blockPatchedFlag = 0x80
-	blockWidthMask   = 0x7F
+	formatVersion = 4
+	// zeroSumsMaskFlag marks, in the format byte, a file whose summed columns follow a zero sums mask.
+	zeroSumsMaskFlag = 0x80
+	// MaxMaskedSums: the zero sums mask is one byte.
+	MaxMaskedSums = 8
+	// constantColumnDivisor, in the place of the divisor, says every residual of the column is 0.
+	constantColumnDivisor = 0
+	blockSize             = 128
+	blockPatchedFlag      = 0x80
+	blockWidthMask        = 0x7F
 	// decodePadding is how far past a packed run the bit unpack loads: a value is read with
 	// one 8-byte load (a ninth byte for widths above 57), whatever its offset in the run.
 	decodePadding = 8
@@ -71,12 +85,14 @@ var errCorrupt = errors.New("dataframe: frame file is truncated or corrupt")
 // File is a decoded frame file: the frame at Snapshot. Slot is the file's slot in the versions file,
 // kept by every rewrite (0 = no run created the file yet). Rows holds one column per Rows column of
 // the frame, all of one length: row i is (Rows[0][i], Rows[1][i]...), strictly ascending in that
-// order and >= 0. Each column of Sums is parallel to them.
+// order and >= 0. Each column of Sums is parallel to them. UsesZeroSumsMask writes the zero sums
+// mask (the frame's UseZeroSumsMask); a decoded file says whether it had one.
 type File struct {
-	Snapshot int64
-	Slot     uint8
-	Rows     [][]int64
-	Sums     [][]int64
+	Snapshot         int64
+	Slot             uint8
+	Rows             [][]int64
+	Sums             [][]int64
+	UsesZeroSumsMask bool
 }
 
 // rowCount is the number of rows of the file; 0 for the zero File, which a missing file reads as.
@@ -99,17 +115,39 @@ func EncodeFile(file File) []byte { return appendFile(nil, file, codecOptions{})
 
 // appendFile encodes file onto out.
 func appendFile(out []byte, file File, options codecOptions) []byte {
-	out = append(out, formatVersion, file.Slot)
+	formatByte := byte(formatVersion)
+	if file.UsesZeroSumsMask {
+		formatByte |= zeroSumsMaskFlag
+	}
+	out = append(out, formatByte, file.Slot)
 	out = binary.AppendUvarint(out, uint64(file.Snapshot))
 	out = binary.AppendUvarint(out, uint64(file.rowCount()))
 	if file.rowCount() == 0 {
 		return out
 	}
 	out = appendRowColumns(out, file.Rows, options)
-	for _, sumColumn := range file.Sums {
-		out = appendSumsColumn(out, sumColumn, options)
+	var zeroSumsMask byte
+	if file.UsesZeroSumsMask {
+		zeroSumsMask = zeroSumsMaskOf(file.Sums)
+		out = append(out, zeroSumsMask)
+	}
+	for s, sumColumn := range file.Sums {
+		if !file.UsesZeroSumsMask || zeroSumsMask&(1<<s) != 0 {
+			out = appendSumsColumn(out, sumColumn, options)
+		}
 	}
 	return out
+}
+
+// zeroSumsMaskOf sets bit s for each summed column holding a non-zero value.
+func zeroSumsMaskOf(sumColumns [][]int64) byte {
+	var mask byte
+	for s, sumColumn := range sumColumns {
+		if slices.ContainsFunc(sumColumn, func(sum int64) bool { return sum != 0 }) {
+			mask |= 1 << s
+		}
+	}
+	return mask
 }
 
 // appendRowColumns writes the Rows columns as the tree of their values (the file layout above): the
@@ -203,6 +241,9 @@ func appendSumsColumn(out []byte, values []int64, options codecOptions) []byte {
 // appendResiduals writes the residuals' common divisor, then the residuals divided by it in
 // blocks. It divides residuals in place.
 func appendResiduals(out []byte, residuals []uint64, options codecOptions) []byte {
+	if !slices.ContainsFunc(residuals, func(residual uint64) bool { return residual != 0 }) {
+		return binary.AppendUvarint(out, constantColumnDivisor)
+	}
 	divisor := uint64(1)
 	if !options.skipsDivisor {
 		divisor = commonDivisor(residuals)
@@ -394,8 +435,9 @@ type byteDecoder struct {
 // schema.
 func DecodeFile(content []byte, rowColumnCount, sumsCount int) (File, error) {
 	decoder := &byteDecoder{data: append(slices.Clip(content), make([]byte, decodePadding)...), end: len(content)}
-	version, err := decoder.readByte()
-	if err != nil || version != formatVersion {
+	formatByte, err := decoder.readByte()
+	usesZeroSumsMask := formatByte&zeroSumsMaskFlag != 0
+	if err != nil || formatByte&^zeroSumsMaskFlag != formatVersion || (usesZeroSumsMask && sumsCount > MaxMaskedSums) {
 		return File{}, errCorrupt
 	}
 	slot, err := decoder.readByte()
@@ -412,15 +454,25 @@ func DecodeFile(content []byte, rowColumnCount, sumsCount int) (File, error) {
 	if err != nil || rowCount > uint64(decoder.end)*blockSize+1 {
 		return File{}, errCorrupt
 	}
-	file := File{Snapshot: int64(snapshot), Slot: slot, Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount)}
+	file := File{Snapshot: int64(snapshot), Slot: slot, Rows: make([][]int64, rowColumnCount), Sums: make([][]int64, sumsCount), UsesZeroSumsMask: usesZeroSumsMask}
 	if rowCount == 0 {
 		return file, nil
 	}
 	if file.Rows, err = decoder.readRowColumns(int(rowCount), rowColumnCount); err != nil {
 		return File{}, err
 	}
-	for i := range file.Sums {
-		if file.Sums[i], err = decoder.readSumsColumn(int(rowCount)); err != nil {
+	var zeroSumsMask byte
+	if usesZeroSumsMask {
+		if zeroSumsMask, err = decoder.readByte(); err != nil || zeroSumsMask>>sumsCount != 0 {
+			return File{}, errCorrupt
+		}
+	}
+	for s := range file.Sums {
+		if usesZeroSumsMask && zeroSumsMask&(1<<s) == 0 {
+			file.Sums[s] = make([]int64, rowCount)
+			continue
+		}
+		if file.Sums[s], err = decoder.readSumsColumn(int(rowCount)); err != nil {
 			return File{}, err
 		}
 	}
@@ -570,6 +622,9 @@ func (decoder *byteDecoder) readResiduals(count int) ([]uint64, error) {
 		return nil, err
 	}
 	residuals := make([]uint64, count)
+	if divisor == constantColumnDivisor {
+		return residuals, nil
+	}
 	for start := 0; start < count; start += blockSize {
 		block := residuals[start:min(start+blockSize, count)]
 		head, err := decoder.readByte()

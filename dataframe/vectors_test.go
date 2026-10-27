@@ -18,12 +18,13 @@ type frameWireVectors struct {
 }
 
 type frameFileVector struct {
-	Name     string    `json:"name"`
-	Snapshot int64     `json:"snapshot"`
-	Slot     uint8     `json:"slot"`
-	Rows     [][]int64 `json:"rows"`
-	Sums     [][]int64 `json:"sums"`
-	Hex      string    `json:"hex"`
+	Name             string    `json:"name"`
+	Snapshot         int64     `json:"snapshot"`
+	Slot             uint8     `json:"slot"`
+	Rows             [][]int64 `json:"rows"`
+	Sums             [][]int64 `json:"sums"`
+	UsesZeroSumsMask bool      `json:"usesZeroSumsMask"`
+	Hex              string    `json:"hex"`
 }
 
 type frameAnswerVector struct {
@@ -50,8 +51,8 @@ type frameHeldVector struct {
 }
 
 // makeFrameWireVectors covers each step of the codec (one and three nested Rows columns, a block
-// boundary at 128 rows, the divisor, negative sums, patches past 32 bits, a file without rows) and
-// the wire around them.
+// boundary at 128 rows, the divisor, negative sums, patches past 32 bits, constant columns, the zero
+// sums mask, a file without rows) and the wire around them.
 func makeFrameWireVectors() frameWireVectors {
 	single := frameFileVector{Name: "one-rows-column", Snapshot: 396172200, Slot: 7,
 		Rows: [][]int64{{1001, 1002, 1005, 1100}}, Sums: [][]int64{{120, 60, 300, -40}, {10, 5, 20, 0}}}
@@ -70,11 +71,16 @@ func makeFrameWireVectors() frameWireVectors {
 		nested.Sums[2] = append(nested.Sums[2], points)
 	}
 	empty := frameFileVector{Name: "no-rows", Snapshot: 396173000, Slot: 3, Rows: [][]int64{{}, {}}, Sums: [][]int64{{}}}
-	vectors := frameWireVectors{Files: []frameFileVector{single, nested, empty}}
+	// A sale summary day: products × divisor (constant 1 but for one), the sub-unit and debt sums empty
+	// but one sub sum, behind the zero sums mask.
+	masked := frameFileVector{Name: "zero-sums-mask", Snapshot: 396174000, Slot: 9, UsesZeroSumsMask: true,
+		Rows: [][]int64{{101, 102, 103, 107}, {1, 1, 1, 6}},
+		Sums: [][]int64{{2500, 1250, 900, 4000}, {0, 0, 0, 0}, {3, 1, 2, 1}, {0, 0, 0, 4}, {0, 0, 0, 0}, {0, 0, 0, 0}}}
+	vectors := frameWireVectors{Files: []frameFileVector{single, nested, empty, masked}}
 
 	contentByName := map[string][]byte{}
 	for i, vector := range vectors.Files {
-		content := EncodeFile(File{Snapshot: vector.Snapshot, Slot: vector.Slot, Rows: vector.Rows, Sums: vector.Sums})
+		content := EncodeFile(File{Snapshot: vector.Snapshot, Slot: vector.Slot, Rows: vector.Rows, Sums: vector.Sums, UsesZeroSumsMask: vector.UsesZeroSumsMask})
 		vectors.Files[i].Hex, contentByName[vector.Name] = hex.EncodeToString(content), content
 	}
 	vectors.Wire = []frameAnswerVector{
@@ -86,6 +92,8 @@ func makeFrameWireVectors() frameWireVectors {
 				{Keys: []int64{2602, 4}, Snapshot: 396173000},
 			}},
 		{Name: "nothing-changed", Generation: "P4F-6sW", RowColumnCount: 3, SumsCount: 3, Snapshot: 396172100, Files: []frameAnswerFileVector{}},
+		{Name: "masked-file", Generation: "P4F-6sX", RowColumnCount: 2, SumsCount: 6, Snapshot: 396174000,
+			Files: []frameAnswerFileVector{{Keys: []int64{20500}, Snapshot: 396174000, Slot: 9, File: "zero-sums-mask"}}},
 	}
 	for i, vector := range vectors.Wire {
 		answer := ChangedFiles{Generation: vector.Generation, RowColumnCount: vector.RowColumnCount, SumsCount: vector.SumsCount, Snapshot: vector.Snapshot}
@@ -105,7 +113,7 @@ func TestFrameWireVectors(t *testing.T) {
 	for _, vector := range vectors.Files {
 		content, _ := hex.DecodeString(vector.Hex)
 		decoded, err := DecodeFile(content, len(vector.Rows), len(vector.Sums))
-		if err != nil || decoded.Snapshot != vector.Snapshot || decoded.Slot != vector.Slot {
+		if err != nil || decoded.Snapshot != vector.Snapshot || decoded.Slot != vector.Slot || decoded.UsesZeroSumsMask != vector.UsesZeroSumsMask {
 			t.Fatalf("%s: %+v, %v", vector.Name, decoded, err)
 		}
 		if decoded.rowCount() > 0 && (!reflect.DeepEqual(decoded.Rows, vector.Rows) || !reflect.DeepEqual(decoded.Sums, vector.Sums)) {

@@ -74,13 +74,12 @@ type tableMeta struct {
 	deltaIndexes    []deltaIndexMeta // the TypeDelta indexes (delta.go)
 	groupIndexes    []groupIndexMeta // the Indexes declaring GroupBy (group_by.go)
 	// frames are the schema's DataFrames, compiled by the dataframe module (data_frame.go); nil
-	// without any. trackedAccessors read its Tracked columns, in their order.
-	frames           *dataframe.Table
-	trackedAccessors []*colAccessor
-	accessors        map[string]*colAccessor // record field name -> precompiled accessor
-	autoinc          *autoincConfig          // nil unless the schema sets UseAutoincrement
-	cacheByIDs       *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
-	textSearch       *textSearchMeta         // nil unless the schema declares TextSearch
+	// without any.
+	frames     *dataframe.Table
+	accessors  map[string]*colAccessor // record field name -> precompiled accessor
+	autoinc    *autoincConfig          // nil unless the schema sets UseAutoincrement
+	cacheByIDs *cacheByIDsConfig       // nil unless the schema sets CacheByIDs
+	textSearch *textSearchMeta         // nil unless the schema declares TextSearch
 	// The managed fields (delta.go): Version, on every table, and Updated, nil without one.
 	version *colAccessor
 	updated *keyCol

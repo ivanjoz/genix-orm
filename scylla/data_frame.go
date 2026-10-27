@@ -2,7 +2,7 @@ package scylla
 
 import (
 	"fmt"
-	"hash/crc32"
+	"reflect"
 	"slices"
 	"time"
 	"unsafe"
@@ -18,12 +18,13 @@ import (
 // The logic lives in the dataframe module (../dataframe, DATAFRAMES.md); scylla gives it:
 //
 //   - the frames, compiled from TableSchema.DataFrames (configureDataFrames), each
-//     partition of the table with its own files;
+//     partition of the table with its own files, and the lines a record puts in them:
+//     from the frame's columns, or from its ToFrames method;
 //   - a change log table per table, <table>__dtf_log, that every write appends to
 //     before its rows land (data_frame_log.go);
 //   - the frames' state in a file of the store and their lock in AcquireFrameLock,
-//     and the records as Histories: their values now, read from the table, undone by
-//     their logged changes (data_frame_backend.go).
+//     and the records as Histories: their lines now, from the whole stored row, undone
+//     by their logged changes (data_frame_backend.go).
 // ─────────────────────────────────────────────────────────────────────────────
 
 // AcquireFrameLock takes a DataFrame's lock without waiting: release frees it, false when another
@@ -35,18 +36,17 @@ var AcquireFrameLock func(lockName string, lease time.Duration) (release func(),
 // dataFrameInfo is a table's compiled DataFrames.
 type dataFrameInfo struct {
 	frames *dataframe.Table
-	// trackedColumns are the columns of frames.Tracked, in its order.
-	trackedColumns []IColInfo
-	// columnHashes name the tracked columns in the log (data_frame_log.go): 16 bits of each column
-	// name's CRC32, so a log row keeps its meaning when the struct's fields move.
-	columnHashes       []uint16
-	trackedIndexByHash map[uint16]int
-	logTableName       string
+	// recordType is the record struct: a stored row is decoded into one to take its lines.
+	recordType reflect.Type
+	// storedColumns are every persisted column. A ToFrames method may read any field, so the write
+	// path and the Histories read whole rows.
+	storedColumns []IColInfo
+	logTableName  string
 }
 
 // configureDataFrames validates a table's DataFrames and compiles them. Schema mistakes panic when
 // the table compiles.
-func configureDataFrames(scyllaTable *ScyllaTable, schema TableSchema) {
+func configureDataFrames(scyllaTable *ScyllaTable, schema TableSchema, schemaStruct reflect.Value) {
 	if len(schema.DataFrames) == 0 {
 		return
 	}
@@ -65,64 +65,91 @@ func configureDataFrames(scyllaTable *ScyllaTable, schema TableSchema) {
 	if scyllaTable.ID <= 0 {
 		fail("require the table's ID: it names the frames' folder")
 	}
+	recordTyped, isTyped := schemaStruct.Addr().Interface().(interface{ BaseStructType() reflect.Type })
+	if !isTyped || recordTyped.BaseStructType() == nil {
+		fail("need the table's record type")
+	}
 
 	isIntegerType := func(fieldType string) bool {
 		return slices.Contains([]string{"int8", "int16", "int32", "int64", "int"}, fieldType)
 	}
-	frameColumnOf := func(declared Coln, frameName string) dataframe.Column {
-		column := scyllaTable.ColumnsMap[declared.GetName()]
-		if column == nil || column.GetInfo().IsVirtual {
-			fail(`frame %q column "%v" must be a persisted column of the table`, frameName, declared.GetName())
+	var statusColumn IColInfo
+	if column := scyllaTable.ColumnsMap["status"]; column != nil && !column.IsNil() {
+		if !isIntegerType(column.GetType().FieldType) {
+			fail(`status column must be an integer. Found: %v`, column.GetType().FieldType)
 		}
-		fieldType := column.GetType().FieldType
-		isFloat := fieldType == "float32" || fieldType == "float64"
-		if !isFloat && !isIntegerType(fieldType) {
-			fail(`frame %q column "%v" must be an integer or a float. Found: %v`, frameName, column.GetName(), fieldType)
-		}
-		// The column's position names it in the frames' shape: moving the field rebuilds them.
-		return dataframe.Column{FieldName: column.GetName(), ColumnID: int(column.GetInfo().Idx), IsFloat: isFloat}
+		statusColumn = column
 	}
 	specs := make([]dataframe.Spec, len(schema.DataFrames))
 	for i, declared := range schema.DataFrames {
-		specs[i] = dataframe.Spec{Name: declared.Name, Count: declared.Count}
+		specs[i] = dataframe.Spec{Name: declared.Name, Count: declared.Count, Version: declared.Version,
+			UseZeroSumsMask: declared.UseZeroSumsMask, Projection: declared.ToFrames}
+		if declared.ToFrames != nil {
+			continue
+		}
+		var lineColumns []IColInfo
+		frameColumnOf := func(declaredColumn db.Coln) dataframe.Column {
+			column := scyllaTable.ColumnsMap[declaredColumn.GetName()]
+			if column == nil || column.GetInfo().IsVirtual {
+				fail(`frame %q column "%v" must be a persisted column of the table`, declared.Name, declaredColumn.GetName())
+			}
+			fieldType := column.GetType().FieldType
+			isFloat := fieldType == "float32" || fieldType == "float64"
+			if !isFloat && !isIntegerType(fieldType) {
+				fail(`frame %q column "%v" must be an integer or a float. Found: %v`, declared.Name, column.GetName(), fieldType)
+			}
+			lineColumns = append(lineColumns, column)
+			// The column's position names it in the frames' shape: moving the field rebuilds them.
+			return dataframe.Column{FieldName: column.GetName(), ColumnID: int(column.GetInfo().Idx), IsFloat: isFloat}
+		}
 		for _, column := range declared.Keys {
-			specs[i].Keys = append(specs[i].Keys, frameColumnOf(column, declared.Name))
+			specs[i].Keys = append(specs[i].Keys, frameColumnOf(column))
 		}
 		for _, column := range declared.Rows {
-			specs[i].Rows = append(specs[i].Rows, frameColumnOf(column, declared.Name))
+			specs[i].Rows = append(specs[i].Rows, frameColumnOf(column))
 		}
 		for _, column := range declared.Sums {
-			specs[i].Sums = append(specs[i].Sums, frameColumnOf(column, declared.Name))
+			specs[i].Sums = append(specs[i].Sums, frameColumnOf(column))
 		}
+		specs[i].LinesOf = columnLinesOf(lineColumns, statusColumn)
 	}
-	var status *dataframe.Column
-	if statusColumn := scyllaTable.ColumnsMap["status"]; statusColumn != nil && !statusColumn.IsNil() {
-		if !isIntegerType(statusColumn.GetType().FieldType) {
-			fail(`status column must be an integer. Found: %v`, statusColumn.GetType().FieldType)
-		}
-		status = &dataframe.Column{FieldName: statusColumn.GetName(), ColumnID: int(statusColumn.GetInfo().Idx)}
-	}
-	frames, err := dataframe.Compile(scyllaTable.Name, uint64(scyllaTable.ID), specs, status)
+	frames, err := dataframe.Compile(scyllaTable.Name, uint64(scyllaTable.ID), specs)
 	if err != nil {
 		fail("%v", err)
 	}
 
-	info := &dataFrameInfo{frames: frames, trackedIndexByHash: map[uint16]int{}, logTableName: scyllaTable.Name + "__dtf_log"}
-	for trackedIndex, tracked := range frames.Tracked {
-		info.trackedColumns = append(info.trackedColumns, scyllaTable.ColumnsMap[tracked.FieldName])
-		columnHash := uint16(crc32.ChecksumIEEE([]byte(tracked.FieldName)))
-		if _, isTaken := info.trackedIndexByHash[columnHash]; isTaken {
-			fail(`column "%v" has the same log hash as another tracked column: rename one of them`, tracked.FieldName)
+	info := &dataFrameInfo{frames: frames, recordType: recordTyped.BaseStructType(), logTableName: scyllaTable.Name + "__dtf_log"}
+	// ColumnsMap: Columns is filled after the schema's features compile.
+	for _, column := range scyllaTable.ColumnsMap {
+		if !column.GetInfo().IsVirtual && column.GetInfo().Field != nil {
+			info.storedColumns = append(info.storedColumns, column)
 		}
-		info.columnHashes = append(info.columnHashes, columnHash)
-		info.trackedIndexByHash[columnHash] = trackedIndex
 	}
+	slices.SortFunc(info.storedColumns, func(a, b IColInfo) int { return int(a.GetInfo().Idx) - int(b.GetInfo().Idx) })
 	scyllaTable.dataFrames = info
 }
 
-// trackedValueOf is a tracked column's value as frames keep it: integers as they are, floats ×
+// columnLinesOf is the LinesOf of a frame declared by columns: one line of the columns' values
+// (integers as they are, floats × dataframe.FloatScale, null as 0), none when status is 0.
+func columnLinesOf(lineColumns []IColInfo, statusColumn IColInfo) func(record unsafe.Pointer) ([]dataframe.Line, error) {
+	return func(record unsafe.Pointer) ([]dataframe.Line, error) {
+		if statusColumn != nil && convertToInt64(statusColumn.GetRawValue(record)) == 0 {
+			return nil, nil
+		}
+		line := make(dataframe.Line, len(lineColumns))
+		for i, column := range lineColumns {
+			var err error
+			if line[i], err = frameValueOf(column, column.GetRawValue(record)); err != nil {
+				return nil, err
+			}
+		}
+		return []dataframe.Line{line}, nil
+	}
+}
+
+// frameValueOf is a column's value as frames keep it: integers as they are, floats ×
 // dataframe.FloatScale, null as 0.
-func (info *dataFrameInfo) trackedValueOf(column IColInfo, rawValue any) (int64, error) {
+func frameValueOf(column IColInfo, rawValue any) (int64, error) {
 	if plainValue, isNamed := db.NormalizeNamedNumeric(rawValue); isNamed {
 		rawValue = plainValue
 	}
@@ -145,16 +172,20 @@ func (info *dataFrameInfo) trackedValueOf(column IColInfo, rawValue any) (int64,
 	return scaled, nil
 }
 
-// trackedValuesOfRow reads the tracked values of a stored row.
-func (info *dataFrameInfo) trackedValuesOfRow(storedRow map[string]any) ([]int64, error) {
-	values := make([]int64, len(info.trackedColumns))
-	for i, column := range info.trackedColumns {
-		var err error
-		if values[i], err = info.trackedValueOf(column, storedRow[column.GetName()]); err != nil {
-			return nil, err
+// newRecord is a zero record of the table, its fields set from a stored row (nil: none).
+func (info *dataFrameInfo) newRecord(storedRow map[string]any) unsafe.Pointer {
+	record := reflect.New(info.recordType).UnsafePointer()
+	for _, column := range info.storedColumns {
+		if storedValue, isSet := storedRow[column.GetName()]; isSet {
+			column.SetValue(record, storedValue)
 		}
 	}
-	return values, nil
+	return record
+}
+
+// linesOfRow is what a stored row puts in every frame.
+func (info *dataFrameInfo) linesOfRow(storedRow map[string]any) (dataframe.RecordLines, error) {
+	return info.frames.LinesOf(info.newRecord(storedRow))
 }
 
 /* Controller */
@@ -225,7 +256,18 @@ func frameOfRequest(scyllaTable *ScyllaTable, request db.FrameRequest) (*datafra
 		return nil, dataframe.Selection{}, fmt.Errorf("table %q has no DataFrame %q", scyllaTable.Name, request.Frame)
 	}
 	frame := scyllaTable.dataFrames.frames.FrameNamed(request.Frame)
-	selection, err := db.FrameSelection(frame, request.Filters)
+	filters := request.Filters
+	if frame.IsProjected {
+		// A ToFrames frame's Keys are its frame struct's field names: the filter on a record column
+		// selects the key of the same field name (as dynamo names them).
+		filters = slices.Clone(filters)
+		for i, filter := range filters {
+			if column := scyllaTable.ColumnsMap[filter.Column]; column != nil && !column.IsNil() {
+				filters[i].Column = column.GetInfo().FieldName
+			}
+		}
+	}
+	selection, err := db.FrameSelection(frame, filters)
 	return frame, selection, err
 }
 
@@ -262,13 +304,18 @@ func readFrameChanged(scyllaTable *ScyllaTable, request db.FrameRequest, heldGen
 	return dataframe.AppendChangedFiles(nil, answer), nil
 }
 
-// setFrameRowKey sets the frame's Keys and Rows columns of the key record at keyPointer.
+// setFrameRowKey sets the frame's Keys and Rows columns of the key record at keyPointer. A frame
+// declared by ToFrames names a frame struct's fields, not the record's: its rows leave the key empty.
 func setFrameRowKey(scyllaTable *ScyllaTable, frame *dataframe.Frame, keyPointer unsafe.Pointer, row dataframe.Row) {
-	trackedColumns := scyllaTable.dataFrames.trackedColumns
+	if frame.IsProjected {
+		return
+	}
 	for k, key := range frame.Keys {
-		trackedColumns[key.TrackedIndex].SetValue(keyPointer, coerceManagedIntegerValue(trackedColumns[key.TrackedIndex], row.Keys[k]))
+		column := scyllaTable.ColumnsMap[key.FieldName]
+		column.SetValue(keyPointer, coerceManagedIntegerValue(column, row.Keys[k]))
 	}
 	for c, rowColumn := range frame.Rows {
-		trackedColumns[rowColumn.TrackedIndex].SetValue(keyPointer, coerceManagedIntegerValue(trackedColumns[rowColumn.TrackedIndex], row.RowValues[c]))
+		column := scyllaTable.ColumnsMap[rowColumn.FieldName]
+		column.SetValue(keyPointer, coerceManagedIntegerValue(column, row.RowValues[c]))
 	}
 }
