@@ -161,7 +161,8 @@ type TableSchema struct {
 	FixedValues      []FixedValues
 	// DataFrames declares group-by reports of the table kept as columnar files in the file store
 	// (genix-orm/dataframe, DATAFRAMES.md), each partition with its own files. The table needs a
-	// partition column and one integer key; MaterializeDataFrames keeps them current.
+	// partition column and one integer key; the reads compact them (DataFrame.CompactOn), or
+	// CompactDataFrames.
 	DataFrames []DataFrame
 }
 
@@ -188,7 +189,13 @@ type DataFrame struct {
 	// UseZeroSumsMask writes a byte per file saying which summed columns hold anything, so a column
 	// empty in a whole file costs nothing. At most 8 summed columns (the Sums, then the count).
 	UseZeroSumsMask bool
+	// CompactOn makes a read compact the partition it reads, before answering, once Records records
+	// changed since the last compaction or Seconds passed since it. Zero: only CompactDataFrames does.
+	CompactOn CompactOn
 }
+
+// CompactOn is when a read compacts the DataFrame partition it reads (dataframe/compact.go).
+type CompactOn = dataframe.CompactOn
 
 // ToFrames compiles a record's ToFrames method for DataFrame.ToFrames: it returns the record's lines
 // as structs whose fields are tagged frame:"key", frame:"row" or frame:"sum". It must be pure: it is

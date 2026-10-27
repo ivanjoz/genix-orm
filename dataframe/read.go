@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -29,10 +30,10 @@ func (selection Selection) matches(keys []int64) bool {
 	return keys[0] >= selection.FromKey && keys[0] <= selection.ToKey && slices.Equal(keys[1:1+len(selection.PinnedKeys)], selection.PinnedKeys)
 }
 
-// matchesFile says whether a file key of a generation is a file of the partition the selection takes.
+// matchesFile says whether a file key is a file of the partition's generation the selection takes.
 func (selection Selection) matchesFile(frame *Frame, generation string, partition int64, fileKey string) bool {
-	filePartition, keys, isFrameFile := frame.keysOfFile(generation, fileKey)
-	return isFrameFile && filePartition == partition && selection.matches(keys)
+	keys, isFrameFile := frame.keysOfFile(generation, partition, fileKey)
+	return isFrameFile && selection.matches(keys)
 }
 
 // Row is one row of a frame file: the file's Keys, its Rows values (Frame.Rows in order) and the sums
@@ -43,31 +44,48 @@ type Row struct {
 	Sums      []int64
 }
 
-// Read returns the selected rows of one partition, sorted by Keys then by RowValues, as the last run
-// left them; isFresh also moves the partition's records written since the frame's snapshot to their
-// current values.
-func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, selection Selection, isFresh bool) ([]Row, error) {
-	readName := fmt.Sprintf("dataframe: %s frame %q", table.Name, frame.Name)
+// Read returns the selected rows of one partition, sorted by Keys then by RowValues, as the last
+// compaction left them; isFresh also moves the partition's records written since the frame's snapshot
+// to their current values. It compacts the partition first when it must or is due (compact.go): a
+// read that isn't fresh reads no log, so only CompactOn.Seconds makes it due.
+func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, selection Selection, isFresh bool, now time.Time) ([]Row, error) {
+	readName := fmt.Sprintf("dataframe: %s frame %q partition %d", table.Name, frame.Name, partition)
 	if err := frame.checkSelection(readName, selection); err != nil {
 		return nil, err
 	}
+	isCompacted := false
 	for attempt := 1; ; attempt++ {
-		state, err := backend.ReadState(frame)
+		state, err := backend.ReadState(frame, partition)
 		if err != nil {
 			return nil, err
 		}
-		if state.Generation == "" || state.Shape != frame.Shape {
-			return nil, fmt.Errorf("%s: %w", readName, ErrFrameNotBuilt)
-		}
-		fileKeys, err := frame.selectedFileKeys(store, state.Generation, partition, selection)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", readName, err)
+		if frame.needsRebuild(state, now) {
+			if isCompacted {
+				return nil, fmt.Errorf("%s: %w", readName, ErrFrameNotBuilt)
+			}
+			if err := table.rebuildBeforeRead(backend, store, frame, partition, state, now); err != nil {
+				return nil, fmt.Errorf("%s: %w", readName, err)
+			}
+			isCompacted = true
+			continue
 		}
 		var histories []History
 		if isFresh {
 			if histories, err = backend.PartitionHistoriesWrittenAfter(partition, state.Snapshot); err != nil {
 				return nil, err
 			}
+		}
+		if !isCompacted && frame.isCompactDue(state, histories, now) {
+			isCompacted = true
+			if table.compactDueFrame(backend, store, frame, partition, state, now) {
+				continue
+			}
+		}
+		fileKeys, err := frame.selectedFileKeys(store, state.Generation, partition, selection)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", readName, err)
+		}
+		if isFresh {
 			// A file a change creates is not listed yet.
 			for _, fileKey := range table.filesHeldBetween(frame, state.Generation, histories, state.Snapshot, math.MaxInt64) {
 				if selection.matchesFile(frame, state.Generation, partition, fileKey) && !slices.Contains(fileKeys, fileKey) {
@@ -82,7 +100,7 @@ func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, pa
 		if isFresh {
 			table.moveRecords(frame, state.Generation, histories, loaded, math.MaxInt64)
 			// A run that moved w meanwhile wrote files this read took as of the old w.
-			stateAfter, err := backend.ReadState(frame)
+			stateAfter, err := backend.ReadState(frame, partition)
 			if err != nil {
 				return nil, err
 			}
@@ -93,7 +111,7 @@ func Read(table *Table, frame *Frame, backend Backend, store utils.FileStore, pa
 				continue
 			}
 		}
-		return frame.rowsOf(state.Generation, fileKeys, loaded.rowsByFileKey), nil
+		return frame.rowsOf(state.Generation, partition, fileKeys, loaded.rowsByFileKey), nil
 	}
 }
 
@@ -116,8 +134,8 @@ func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, p
 		return fileKeys, nil
 	}
 	listedByFirstKey := make([][]string, firstKeyCount)
-	err := utils.RunParallel(firstKeyCount, func(firstKeyIndex int) error {
-		folder := frame.partitionFolderOf(generation, partition) + strconv.FormatInt(selection.FromKey+int64(firstKeyIndex), 10) + "/"
+	err := utils.RunParallelLimit(maxConcurrentFileTasks, firstKeyCount, func(firstKeyIndex int) error {
+		folder := frame.generationFolderOf(generation, partition) + strconv.FormatInt(selection.FromKey+int64(firstKeyIndex), 10) + "/"
 		listedKeys, err := store.ListFiles(folder)
 		for _, listedKey := range listedKeys {
 			if selection.matchesFile(frame, generation, partition, listedKey) {
@@ -130,10 +148,10 @@ func (frame *Frame) selectedFileKeys(store utils.FileStore, generation string, p
 }
 
 // rowsOf turns the files into rows, by Keys then by RowValues.
-func (frame *Frame) rowsOf(generation string, fileKeys []string, rowsByFileKey map[string]frameRows) []Row {
+func (frame *Frame) rowsOf(generation string, partition int64, fileKeys []string, rowsByFileKey map[string]frameRows) []Row {
 	keysByFileKey := map[string][]int64{}
 	for _, fileKey := range fileKeys {
-		_, keysByFileKey[fileKey], _ = frame.keysOfFile(generation, fileKey)
+		keysByFileKey[fileKey], _ = frame.keysOfFile(generation, partition, fileKey)
 	}
 	slices.SortFunc(fileKeys, func(a, b string) int { return slices.Compare(keysByFileKey[a], keysByFileKey[b]) })
 	var rows []Row

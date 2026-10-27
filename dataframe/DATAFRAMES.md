@@ -8,9 +8,9 @@ This module holds all the logic and no database code. A backend (genix-orm's `dy
 plugs in through the `Backend` interface, a `utils.FileStore`, and a few duties on its write path
 (section 9). It depends only on the standard library and genix-orm's `utils`.
 
-A frame follows the table's **partition** (a company): every partition has its own files and its own
-versions file, and a read names one partition. One state, one lock and one run cover every partition
-of a frame. dynamo has no partitions and puts every record in partition 0.
+A frame follows the table's **partition** (a company): every partition has its own files, versions
+file, state and lock, and a read names one partition. Partitions are compacted and rebuilt apart, so
+one company never waits on another's. dynamo has no partitions and puts every record in partition 0.
 
 ```text
 dataframe/
@@ -19,7 +19,8 @@ dataframe/
   codec.go       the frame file format (section 3)
   versions.go    the versions file: 255 slots, the moment each was last raised (section 3.4)
   changelog.go   the per-record changelog of lines, History and linesAt (section 4)
-  run.go         Materialize: build, rebuild and incremental runs; RebuildPartition (sections 5–6)
+  compact.go     CompactOn, Compact: when a read compacts the partition it reads (section 6)
+  run.go         Rebuild, and the build, rebuild and incremental run of a partition (sections 5–6)
   read.go        Read: plain and fresh (section 7)
   changed.go     ReadChanged: the files a client holding raw copies must replace (section 7.1)
   backend.go     Backend, State, ErrFrameNotBuilt (section 9)
@@ -40,7 +41,7 @@ So every distinct `(Year, ProgramID)` gets one file, and inside it one row per e
 sum of that employee's minutes and points over their enrollments in that year and program:
 
 ```text
-file dtf/3gz10/enrollment-report/P49QA9-/0/2026/3    (partition 0, Year 2026, ProgramID 3)
+file dtf/3gz10/enrollment-report/0/P49QA9-/2026/3    (partition 0, Year 2026, ProgramID 3)
 
   EmployeeID   RecordedMinutes   Points
   1001         120               10
@@ -93,15 +94,15 @@ is rebuilt.
 ## 2. The lifecycle at a glance
 
 ```text
-  write path (backend)                 schedule (every ~10 min)                 read
+  write path (backend)                 compaction, per partition                read
   ─────────────────────                ─────────────────────────                ────
-  every record write also              Materialize, per frame:                  Read(selection):
+  every record write also              the read compacts first when:            Read(selection):
   stores the record's                    not built / shape changed /              the selected files,
-  created and changelog                  too far behind → BUILD a new             as the last run left
-  (what it held in the                   generation from a full scan              them (plain), or plus
-  last ~36 h)                            otherwise → RUN: rewrite only the        the records written
-          │                              files the recently written records       since (fresh)
-          │                              touched, then move the snapshot
+  created and changelog                  too far behind → BUILD a new             as the last compaction
+  (what it held in the                   generation from a partition scan         left them (plain), or
+  last ~36 h)                            CompactOn due → RUN: rewrite only        plus the records
+          │                              the files the recently written           written since (fresh)
+          │                              records touched, move the snapshot
           └────────── records ──────────►        │                                       ▲
                                                  └──────── files in S3 ──────────────────┘
 ```
@@ -123,40 +124,41 @@ Four ideas carry everything:
 ### 3.1 Folders and generations
 
 ```text
-dtf/<table id>/<frame>/<generation>/<partition>/<k1>            file of a 1-key frame
-dtf/<table id>/<frame>/<generation>/<partition>/<k1>/<k2>_<k3>  file of a 2–3-key frame
+dtf/<table id>/<frame>/<partition>/<generation>/<k1>            file of a 1-key frame
+dtf/<table id>/<frame>/<partition>/<generation>/<k1>/<k2>_<k3>  file of a 2–3-key frame
 dtf/<table id>/<partition>.versions                             the partition's versions file (3.4)
-dtf/<table id>/<frame>.state                                    the frame's state (scylla, 3.2)
+dtf/<table id>/<frame>/<partition>.state                        the partition's state (scylla, 3.2)
 ```
 
 - `<table id>` is the backend's numeric table id and `<generation>` the build time in Unix
   milliseconds, both in `utils.EncodeUintBase64` (genix-orm's URL-safe base64 in ASCII order):
   `78901377` → `3gz10`, a 2026 build → 7 characters such as `P49QA9-`. A build writes a whole new
-  generation beside the old one, for every partition, switches the state to it, then deletes the
-  old one, so readers never see a half-built frame.
-- The partition comes after the generation: a generation spans every partition, so the build's
-  "delete every other generation" stays one listing of the frame's folder.
+  generation of one partition beside the old one, switches the partition's state to it, then
+  deletes the old one, so readers never see a half-built partition.
+- The partition comes before the generation: each partition has its own generation, so a build's
+  "delete every other generation" is one listing of the partition's folder.
 - The partition and the Keys are non-negative integers written in decimal. Grouping by `<k1>/`
   lets a read select a range of the first Key and list the files under each value (section 7).
-- The versions and state files sit beside the frames' folders with a suffix (`.versions`,
-  `.state`), never inside one, so no listing of a frame's folder sees them.
+- The versions and state files sit beside the folders they describe with a suffix (`.versions`,
+  `.state`), never inside one, so no listing of a partition's folder sees them.
 - A missing file means "no rows". A file whose rows all sum to 0 is not created.
 
 ### 3.2 The frame state
 
-One record per frame, for every partition, kept by the backend. dynamo: an item `pk = <table base
-pk>‖000`, `sk = "f" + <frame name>`, with conditional updates. scylla: `FileState`, the file
-`dtf/<table id>/<frame>.state` (`{"g", "s", "w"}`), written conditioned on the ETag it had when the
-lock was taken, with the lock itself external (`AcquireLock`: fareward in genix). The lock only
-spares duplicate work: a run whose lock lapsed and that another overtook fails its file writes and
-its commit on their ETags.
+One record per frame partition, kept by the backend. dynamo (one partition): an item `pk = <table
+base pk>‖000`, `sk = "f" + <frame name>`, with conditional updates and a lock that does not wait.
+scylla: `FileState`, the file `dtf/<table id>/<frame>/<partition>.state` (`{"g", "s", "w"}`), written
+conditioned on the ETag it had when the lock was taken, with the lock itself external
+(`AcquireLock`: fareward in genix, one per partition, queuing a waiter up to 40 s). The lock spares
+duplicate work and lets a read wait for the compaction under way: a run whose lock lapsed and that
+another overtook fails its file writes and its commit on their ETags.
 
 | Field | Meaning |
 |---|---|
 | `Generation` | the folder of the current files; empty when not built |
 | `Shape` | the file layout and what fills it (Keys/Rows/Sums column ids, Count, the zero sums mask, `Version`, format version). If the declaration changes, the shape changes and the frame is rebuilt |
 | `Snapshot` (w) | a SUnixTime: every file holds the records as of w or later |
-| lock holder + expiry | so only one run or build works on the frame at a time |
+| lock holder + expiry | so only one run or build works on the partition at a time |
 
 ### 3.3 The file: columnar, compressed
 
@@ -290,46 +292,52 @@ changelog entry (`Table.EncodeChangedLines`): the lines the changed frames held 
 insert flag. A History is then built from the record's lines now, taken from the stored row, and
 its logged changes (`Table.NewHistoryOfChanges`); linesAt reads them the same way. See section 12.
 
-## 5. Building and rebuilding a frame
+## 5. Building and rebuilding a partition
 
-A frame is **built** when it has no generation yet, when its shape changed, or when its snapshot is
-so old that the changelogs no longer reach it (within an hour of the 36-hour window). `Materialize`
-does this on its own; `Rebuild(table, backend, store, frameName, now)` forces it, for example after a
-data fix that bypassed the write path.
+A partition of a frame is **built** when it has no generation yet, when the frame's shape changed, or
+when its snapshot is so old that the changelogs no longer reach it (within an hour of the 36-hour
+window). A read that finds it so builds it before answering (section 6); `Rebuild(table, backend,
+store, partition, frameName, now)` forces it, for example after a data fix or a backup restore that
+bypassed the write path.
 
 Step by step (`rebuildFrame`):
 
-1. Take the frame's lock (5 minutes; its writes stop 30 s before it ends).
+1. Take the partition's lock (40 s; its writes stop 5 s before it ends).
 2. Pick the target `T = now − 2 minutes` (`TargetLag`) and a new generation name.
-3. `ScanHistories`: read every record of the table, page by page, and add what each one held **at T**
-   (its lines, `linesAt(frame, T)`) to their files and rows in memory. Records created after T are left out.
+3. `ScanPartitionHistories`: read every record of the partition, page by page, and add what each one
+   held **at T** (its lines, `linesAt(frame, T)`) to their files and rows in memory. Records created
+   after T are left out.
 4. Give every file a new slot raised to T (3.4), then write the files of the new generation at
-   snapshot T. The files are new (`If-None-Match`).
-5. `CommitGeneration`: switch the state to the new generation, with the frame's shape and w = T.
-   From this moment reads use it.
-6. Delete every other generation in the frame's folder.
+   snapshot T, at most 8 at a time. The files are new (`If-None-Match`).
+5. `CommitGeneration`: switch the partition's state to the new generation, with the frame's shape and
+   w = T. From this moment reads use it.
+6. Delete every other generation in the partition's folder.
 
 Writes that land during the scan don't break it: each record's changelog still says what it held at
 T. The next run picks up everything written after T.
 
-**One partition** (`RebuildPartition(table, backend, store, partition, now)`): after a partition's
-rows changed outside the write path (a backup restore deletes them), its files are computed again
-in the current generation, frame by frame under the lock: scan the partition, write every file of
-it at T conditioned on its ETag, w left as is. A stored file no record is in any more is rewritten
-empty, not deleted, so a later run that moves a record out of it still finds what it held. Each
-file's own snapshot (T, past w) is what the next run subtracts from. A frame not built yet is left
-to Materialize.
+## 6. Keeping it current: compaction
 
-## 6. Keeping it current: the incremental run
+No schedule runs the frames. A read compacts the partition it reads before it answers
+(`compact.go`):
 
-`Materialize(table, backend, store, now)` runs on a schedule (berryapps: every 10 minutes, from
-`core/frames`). For each frame that doesn't need a build (section 5), it runs:
+- **always** when the partition needs a build (section 5): the read could not be exact otherwise,
+  and fails with `ErrFrameNotBuilt` if the build does;
+- **when `CompactOn` says it is due**: `Records` records with a change between w and T, or
+  `Seconds` from w to T. Without it the files and the log still answer the read exactly, so a failed
+  compaction is only logged. A frame without `CompactOn` is compacted only by `Compact(table,
+  backend, store, partition, now)`, the manual one, or by a build.
 
-1. **Lock** the frame. A frame held by another run is skipped.
+A read that finds it due takes the partition's lock, **queuing up to 40 s** behind a compaction under
+way (a holder past its 40 s lease lets it in). Once it holds the lock it reads the state again: one
+other than the state it found means the holder before it compacted, so it releases the lock and
+reads those files. Otherwise it runs, for that one partition:
+
+1. **Lock** the partition (above).
 2. **Target** `T = now − 2 minutes`. Every write stamped before T has landed and is visible to the
    backend's index on `Updated`.
-3. **Find what moved:** `HistoriesWrittenAfter(w)`, the only records whose values can differ from
-   what the files hold.
+3. **Find what moved:** `PartitionHistoriesWrittenAfter(partition, w)`, the only records whose values
+   can differ from what the files hold.
 4. **Find the files to touch:** every file those records were in at any moment of `[w, T]`: at w,
    at their creation, after each of their changes, and at T (`filesOfHistory`). A record that moved
    from Program 3 to Program 4 touches both files. The creation moment counts because an insert
@@ -338,8 +346,8 @@ to Materialize.
 5. **Rewrite each file:** read it (rows, its own snapshot `s`, its slot, its ETag). Then, for every
    moved record, subtract what it held at `max(s, w)` and add what it holds at T. Raise the slots of
    the files to rewrite to T and give the new ones a slot (3.4), then write each at snapshot T,
-   conditioned on the ETag read. A file already at T or later is left as is. A missing file that
-   would stay empty is not created.
+   conditioned on the ETag read, at most 8 at a time. A file already at T or later is left as is. A
+   missing file that would stay empty is not created.
 6. **Commit:** `CommitSnapshot(w → T)`, only if the lock, the generation and w are still the ones
    read.
 
@@ -349,17 +357,17 @@ twice or lost. A run whose lock expired fails its conditional writes and its com
 
 ## 7. Reading a frame
 
-`Read(table, frame, backend, store, partition, selection, isFresh)` (dynamo: `Repo.QueryFrame(name)`;
-scylla: `db.QueryFrame[Record](partition, name)`). Every step below is within the partition.
+`Read(table, frame, backend, store, partition, selection, isFresh, now)` (dynamo:
+`Repo.QueryFrame(name)`; scylla: `db.QueryFrame[Record](partition, name)`). Every step below is within
+the partition.
 
 1. **Select the files.** A `Selection` takes a range of the first Key (at most 400 values) and, for
    the later Keys, the values of a leading run (`PinnedKeys`):
    - every Key pinned: the file keys are built directly, one GET each;
    - otherwise: the folder of each first-Key value is listed, then the matching files are read.
-2. **Read the state.** If the frame is not built in its current shape, the read fails with
-   `ErrFrameNotBuilt`; the next `Materialize` builds it.
-3. **Plain read:** decode the files and return their rows, as the last run left them (2 to 12
-   minutes behind with a 10-minute schedule).
+2. **Read the state**, and compact first when it must or is due (section 6). A plain read reads no
+   log, so only `CompactOn.Seconds` makes it due.
+3. **Plain read:** decode the files and return their rows, as the last compaction left them.
 4. **Fresh read:** also read `PartitionHistoriesWrittenAfter(partition, w)` and bring the selected files up to the
    records' current values, the same subtract/add as a run, including files a change created that
    are not listed yet. If a run moved w while it read, it starts over (3 attempts).
@@ -432,11 +440,14 @@ Or by a method (1.1), in either backend (genix `sales/types/sales.go`):
 ```go
 DataFrames: []db.DataFrame{{
     Name: "sale-summary", Version: 1, UseZeroSumsMask: true,
-    ToFrames: db.ToFrames((*SaleOrder).ToSaleSummaryFrames),
+    CompactOn: db.CompactOn{Records: 100, Seconds: 3600},
+    ToFrames:  db.ToFrames((*SaleOrder).ToSaleSummaryFrames),
 }},
 ```
 
-The dynamo table also needs a GSI on `Updated` for `HistoriesWrittenAfter`. The adapter turns either
+`CompactOn` (optional, section 6) makes a read compact the partition once 100 records changed or an
+hour passed since the last compaction. The dynamo table also needs a GSI on `Updated` for
+`PartitionHistoriesWrittenAfter`. The adapter turns either
 into `dataframe.Compile`, which any backend calls once at schema compile time:
 
 ```go
@@ -474,15 +485,13 @@ is the in-memory one for tests.
 
 | Method | What it does |
 |---|---|
-| `ReadState(frame)` | the frame's `State{Generation, Shape, Snapshot}`, read consistently |
-| `TakeLock(frame, holderID, now, until)` | a conditional write: take the lock if absent or expired; returns the state |
-| `ReleaseLock(frame, holderID)` | free it if still held by holderID (best effort) |
-| `CommitSnapshot(ctx, frame, holderID, state, w)` | move the snapshot, only if the lock, generation and old snapshot still hold |
-| `CommitGeneration(ctx, frame, holderID, generation, w)` | make a built generation current (with `frame.Shape`) |
-| `HistoriesWrittenAfter(moment)` | every record of every partition written after moment, as `History` (dynamo: the GSI on Updated; scylla: the change log) |
-| `PartitionHistoriesWrittenAfter(partition, moment)` | the same for one partition (fresh reads) |
-| `ScanHistories(onPage)` | every record of the table, page by page |
-| `ScanPartitionHistories(partition, onPage)` | every record of one partition, page by page (`RebuildPartition`) |
+| `ReadState(frame, partition)` | the partition's `State{Generation, Shape, Snapshot}`, read consistently |
+| `TakeLock(frame, partition, holderID, now, until, wait)` | take the partition's lock when absent or expired, waiting up to `wait` for it (dynamo does not wait); returns the state |
+| `ReleaseLock(frame, partition, holderID)` | free it if still held by holderID (best effort) |
+| `CommitSnapshot(ctx, frame, partition, holderID, state, w)` | move the snapshot, only if the lock, generation and old snapshot still hold |
+| `CommitGeneration(ctx, frame, partition, holderID, generation, w)` | make a built generation current (with `frame.Shape`) |
+| `PartitionHistoriesWrittenAfter(partition, moment)` | every record of the partition written after moment, as `History` (dynamo: the GSI on Updated; scylla: the change log) |
+| `ScanPartitionHistories(partition, onPage)` | every record of one partition, page by page (a build) |
 
 A `History` names its partition and is built with `Table.NewHistory(partition, recordKey, lines,
 created, updated, changelog)` (dynamo), or `Table.NewHistoryOfChanges(partition, recordKey, lines,
@@ -508,21 +517,26 @@ now. `FileState` implements the five state methods over a file of the store.
   read: the loser's change is lost until a rebuild.
 - A silent rewrite that changes a frame's lines without moving `Updated` (dynamo:
   `ReprocessRecords`) is invisible to runs: rebuild after it.
-- A frame whose runs stop for more than ~35 hours is rebuilt on the next run (one table scan).
+- A partition not compacted for more than ~35 hours (its frame has no `CompactOn` and nobody ran
+  `Compact`, or nobody read it) is rebuilt by its next read (one scan of the partition), inside that
+  request.
 - A write stamped by a clock more than 2 minutes behind could land below a T a run already passed.
 - A row whose sums net to 0 disappears from its file. Declare `Count` if a row must stay visible
   while its records exist.
 
 ## 11. Tests
 
-- `dataframe_test.go` drives the real `Materialize` and `Read` with an in-memory `Backend` and file
+- `dataframe_test.go` drives the real `Compact` and `Read` with an in-memory `Backend` and file
   store over random histories, and checks them against brute force. The histories include inserts,
-  updates of every column, floats, negative sums, soft deletes and restores, and runs that crash
-  halfway, forced rebuilds, rebuilds of one partition and a tiny slot cycle (2 slots), over records
+  updates of every column, floats, negative sums, soft deletes and restores, and compactions that
+  crash halfway, forced rebuilds of one partition and a tiny slot cycle (2 slots), over records
   spread on 3 partitions, every check per partition. Its frames cover columns, a nested masked
   frame, and a ToFrames frame giving several lines per record (repeated rows included). A simulated
   client per partition syncs through `ReadChanged` and the wire at random moments and must always
   match the brute force.
+- `TestReadsCompactWhenDue`: the first read builds a partition, `CompactOn.Records` and
+  `CompactOn.Seconds` each make a read compact once, and a compaction that finds the state moved by
+  the holder before it leaves it.
 - `TestHistoryOfChangesMatchesTheHistory` builds Histories the scylla way (lines now plus logged
   changes after a window's start) and checks `linesAt` against the recorded history.
 - `state_file_test.go` covers `FileState`: a held lock refuses a second taker, and a holder another

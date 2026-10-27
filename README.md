@@ -273,9 +273,11 @@ rows, err := db.QueryFrame[Sale](empresaID, "sales-by-month").Between(q.Month, 2
 quantity := rows[0].Sum(q.Quantity)
 ```
 
-Every write logs what it changed in `<table>__dtf_log` (scylla); `MaterializeDataFrames` on the
-controller, every few minutes, moves the files forward. The frames' lock is
-`scylla.AcquireFrameLock`, installed by the application.
+Every write logs what it changed in `<table>__dtf_log` (scylla). No schedule moves the files
+forward: a read compacts the company's files first when its frame's `CompactOn{Records, Seconds}`
+is due, or when they are not built; `CompactDataFrames(partition)` on the controller is the manual
+compaction. The frames' lock, one per company and frame, is `scylla.AcquireFrameLock`, installed by
+the application; a read queues up to 40 s behind a compaction under way and then reads its files.
 
 ---
 

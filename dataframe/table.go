@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	// Folder is the store prefix of every frame: dtf/<table id>/<frame>/<generation>/<partition>/...,
-	// the table id and the generation in utils.EncodeUintBase64, the partition in decimal.
+	// Folder is the store prefix of every frame: dtf/<table id>/<frame>/<partition>/<generation>/...,
+	// the table id and the generation in utils.EncodeUintBase64, the partition in decimal. Each
+	// partition has its own generation, so it is rebuilt alone.
 	Folder = "dtf/"
 	// FloatScale turns a float into the int64 frames keep it as: 6 decimals, so adding and
 	// subtracting the same value is exact.
@@ -66,6 +67,9 @@ type Spec struct {
 	// UseZeroSumsMask writes the zero sums mask in every file (codec.go): a summed column empty in a
 	// whole file costs nothing. At most MaxMaskedSums summed columns (the Sums, then the count).
 	UseZeroSumsMask bool
+	// CompactOn makes a read compact the partition it reads when it is due (compact.go). Zero: only
+	// Compact compacts it, and a read that finds it out of the log's reach.
+	CompactOn CompactOn
 	// LinesOf is what the record at the pointer puts in the frame: a backend builds it from the
 	// frame's columns (one line, none for a soft-deleted record).
 	LinesOf func(record unsafe.Pointer) ([]Line, error)
@@ -86,6 +90,7 @@ type Frame struct {
 	UsesZeroSumsMask bool
 	// IsProjected: declared by a ToFrames method, so its columns are a frame struct's, not the record's.
 	IsProjected bool
+	CompactOn   CompactOn
 	// SumsCount is the number of summed columns in its files: the Sums, then the record count.
 	SumsCount int
 	// Shape names the layout of its files and what fills them (column ids, Count, the mask, the
@@ -94,7 +99,7 @@ type Frame struct {
 	// shapeTag names the frame in the changelog: 16 bits of its Shape, so a logged line of another
 	// shape is skipped (that frame is rebuilt anyway).
 	shapeTag uint16
-	Folder   string // dtf/<table id>/<name>/
+	Folder   string // dtf/<table id>/<name>/, a folder per partition in it
 	linesOf  func(record unsafe.Pointer) ([]Line, error)
 }
 
@@ -124,6 +129,9 @@ func Compile(tableName string, tableID uint64, specs []Spec) (*Table, error) {
 		if len(spec.Keys) == 0 || len(spec.Keys) > 3 || len(spec.Rows) == 0 || len(spec.Rows) > MaxRowColumns || (len(spec.Sums) == 0 && !spec.Count) {
 			return nil, fmt.Errorf("dataframe: %s frame %q needs 1 to 3 Keys, 1 to %d Rows, and Sums or Count", tableName, spec.Name, MaxRowColumns)
 		}
+		if spec.CompactOn.Records < 0 || spec.CompactOn.Seconds < 0 {
+			return nil, fmt.Errorf("dataframe: %s frame %q CompactOn takes no negative Records or Seconds", tableName, spec.Name)
+		}
 		if spec.LinesOf == nil {
 			return nil, fmt.Errorf("dataframe: %s frame %q has no LinesOf", tableName, spec.Name)
 		}
@@ -137,7 +145,7 @@ func Compile(tableName string, tableID uint64, specs []Spec) (*Table, error) {
 			}
 		}
 		frame := Frame{Name: spec.Name, Index: len(table.Frames), Keys: spec.Keys, Rows: spec.Rows, Sums: spec.Sums, CountsRecords: spec.Count,
-			UsesZeroSumsMask: spec.UseZeroSumsMask, IsProjected: spec.Projection != nil, SumsCount: len(spec.Sums), Folder: tableFolder + spec.Name + "/", linesOf: spec.LinesOf}
+			UsesZeroSumsMask: spec.UseZeroSumsMask, IsProjected: spec.Projection != nil, CompactOn: spec.CompactOn, SumsCount: len(spec.Sums), Folder: tableFolder + spec.Name + "/", linesOf: spec.LinesOf}
 		if spec.Count {
 			frame.SumsCount++
 		}
@@ -166,7 +174,7 @@ func (table *Table) FrameNamed(name string) *Frame {
 
 // shapeOf hashes what the files are laid out by and filled with: the column ids of the Keys, the Rows
 // and the Sums (and which are floats), the record count, the zero sums mask, the Version, and the
-// layout version (v6: lines, format 4), so a frame built otherwise is rebuilt.
+// layout version (v7: a folder and a state per partition), so a frame built otherwise is rebuilt.
 func shapeOf(frame Frame, version int) string {
 	columnIDs := func(columns []Column) string {
 		ids := make([]string, len(columns))
@@ -178,7 +186,7 @@ func shapeOf(frame Frame, version int) string {
 		}
 		return strings.Join(ids, ".")
 	}
-	layout := fmt.Sprintf("v6|%d|%s|%s|%s|%t|%t", version, columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords, frame.UsesZeroSumsMask)
+	layout := fmt.Sprintf("v7|%d|%s|%s|%s|%t|%t", version, columnIDs(frame.Keys), columnIDs(frame.Rows), columnIDs(frame.Sums), frame.CountsRecords, frame.UsesZeroSumsMask)
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(layout)))
 }
 
@@ -244,15 +252,21 @@ func (frame *Frame) rowOf(line Line) rowKey {
 // sumsOf is what a line adds to its row: its Sums.
 func (frame *Frame) sumsOf(line Line) []int64 { return line[len(frame.Keys)+len(frame.Rows):] }
 
-// partitionFolderOf is the folder of one partition's files in a generation: <folder><generation>/<partition>/.
-func (frame *Frame) partitionFolderOf(generation string, partition int64) string {
-	return frame.Folder + generation + "/" + strconv.FormatInt(partition, 10) + "/"
+// partitionFolderOf is the folder of one partition's files: <folder><partition>/. Its generations are
+// folders in it.
+func (frame *Frame) partitionFolderOf(partition int64) string {
+	return frame.Folder + strconv.FormatInt(partition, 10) + "/"
+}
+
+// generationFolderOf is the folder of one partition's files in a generation: <folder><partition>/<generation>/.
+func (frame *Frame) generationFolderOf(generation string, partition int64) string {
+	return frame.partitionFolderOf(partition) + generation + "/"
 }
 
 // fileKeyOf is the store key of the file of keys of a partition in a generation folder:
-// <partition folder><k1> for one key, <partition folder><k1>/<k2>_<k3> for two or three.
+// <generation folder><k1> for one key, <generation folder><k1>/<k2>_<k3> for two or three.
 func (frame *Frame) fileKeyOf(generation string, partition int64, keys []int64) string {
-	fileKey := frame.partitionFolderOf(generation, partition) + strconv.FormatInt(keys[0], 10)
+	fileKey := frame.generationFolderOf(generation, partition) + strconv.FormatInt(keys[0], 10)
 	if len(keys) > 1 {
 		laterKeys := make([]string, len(keys)-1)
 		for i, key := range keys[1:] {
@@ -263,17 +277,12 @@ func (frame *Frame) fileKeyOf(generation string, partition int64, keys []int64) 
 	return fileKey
 }
 
-// keysOfFile parses a file key of a generation folder back into its partition and keys (false: not
-// a frame file).
-func (frame *Frame) keysOfFile(generation, fileKey string) (int64, []int64, bool) {
-	relativeKey, isInFolder := strings.CutPrefix(fileKey, frame.Folder+generation+"/")
+// keysOfFile parses a file key of a partition's generation folder back into its keys (false: not a
+// frame file of it).
+func (frame *Frame) keysOfFile(generation string, partition int64, fileKey string) ([]int64, bool) {
+	relativeKey, isInFolder := strings.CutPrefix(fileKey, frame.generationFolderOf(generation, partition))
 	if !isInFolder {
-		return 0, nil, false
-	}
-	partitionText, relativeKey, hasKeys := strings.Cut(relativeKey, "/")
-	partition, err := strconv.ParseInt(partitionText, 10, 64)
-	if !hasKeys || err != nil || partition < 0 {
-		return 0, nil, false
+		return nil, false
 	}
 	firstKey, laterKeys, hasLaterKeys := strings.Cut(relativeKey, "/")
 	parts := []string{firstKey}
@@ -281,17 +290,17 @@ func (frame *Frame) keysOfFile(generation, fileKey string) (int64, []int64, bool
 		parts = append(parts, strings.Split(laterKeys, "_")...)
 	}
 	if len(parts) != len(frame.Keys) {
-		return 0, nil, false
+		return nil, false
 	}
 	keys := make([]int64, len(parts))
 	for i, part := range parts {
 		key, err := strconv.ParseInt(part, 10, 64)
 		if err != nil || key < 0 {
-			return 0, nil, false
+			return nil, false
 		}
 		keys[i] = key
 	}
-	return partition, keys, true
+	return keys, true
 }
 
 // versionsKeyOf is the store key of a partition's versions file (versions.go): dtf/<table id>/<partition>.versions,

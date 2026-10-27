@@ -113,18 +113,16 @@ type Controller interface {
 	// DropTextSearch empties the partition's index.
 	DropTextSearch(partValue int32) error
 
-	// The three below keep the DataFrames of a table that declares them; on any other table they do
-	// nothing.
+	// The two below keep the DataFrames of a table that declares them; on any other table they do
+	// nothing. Reads compact a frame on their own when its CompactOn says so.
 
-	// MaterializeDataFrames brings every frame up to date, every partition at once: it builds a frame
-	// not built in its current shape and moves the others to the records written since their last
-	// run. Run it every few minutes.
-	MaterializeDataFrames() error
-	// RebuildDataFrames computes the files of the frame frameName ("" every frame) again from the
-	// records, every partition: the fix for drift.
-	RebuildDataFrames(frameName string) error
+	// CompactDataFrames brings one partition's files of every frame up to date: it builds a frame not
+	// built in its current shape and moves the others to the records written since their last
+	// compaction. The manual compaction.
+	CompactDataFrames(partValue int32) error
 	// RebuildDataFramesPartition computes one partition's files of every frame again from its
-	// records: the fix after the partition's rows changed outside the write path (a restore).
+	// records: the fix for drift, or after the partition's rows changed outside the write path (a
+	// restore).
 	RebuildDataFramesPartition(partValue int32) error
 
 	// The four below are the name-addressed data surface (see generic_access.go): the read and

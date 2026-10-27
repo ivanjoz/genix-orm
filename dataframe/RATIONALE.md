@@ -45,21 +45,36 @@ method, which may read the key.
 **Rationale** — A method reading the ID would otherwise see 0 on the stored side and log a false
 change. The map grows by one value per record.
 
-## The partition comes after the generation in the file path
-**Context** — Frames now follow the table's partition. A generation is built for every partition at
-once, and a build deletes every other generation by listing the frame's folder.
-**Decision** — `dtf/<table id>/<frame>/<generation>/<partition>/<keys>`. One state, one lock and
-one run per frame cover every partition. The versions file is per (table, partition),
-`dtf/<table id>/<partition>.versions`, and the state file `dtf/<table id>/<frame>.state`, both
-beside the frames' folders with a suffix, never inside one.
-**Rationale** — The build's cleanup stays one listing, and a run reads one log for all partitions.
-A rebuild of a frame rebuilds every partition; `RebuildPartition` is the per-partition fix.
+## The partition comes before the generation in the file path; the layout version moved to v7
+**Context** — State and lock are now per partition, so each partition has its own generation and a
+build cleans up only its partition. Files already stored follow the old global layout.
+**Decision** — `dtf/<table id>/<frame>/<partition>/<generation>/<keys>`, state at
+`dtf/<table id>/<frame>/<partition>.state`. `shapeOf` says `v7`, so every stored frame reads as
+another shape and is rebuilt on its first read (dynamo too, whose state item still names the old
+generation). A partition rebuild is a full build of the partition in a new generation; the old
+"rewrite in the current generation, keep w" partition rebuild is gone.
+**Rationale** — The cleanup is one listing of the partition's folder. The old files and the old
+`<frame>.state` are left orphaned in the store: nothing reads them, and they must be deleted once by
+hand.
 
-## RebuildPartition rewrites a file left with no rows instead of deleting it
-**Context** — A partition rebuild writes its files at a target past w. A later run that moves a
-record out of a file subtracts what the record held there, and a missing file reads as snapshot 0,
-so it would subtract from w on a file the rebuild already brought past it.
-**Decision** — Stored files of the partition that no record is in any more are written empty at
-the target, keeping their slot. A run creates no empty file either way.
-**Rationale** — The file's own snapshot is what every later subtraction starts from, so it must
-exist. An empty file costs a few bytes.
+## A read compacts by CompactOn only on changes before the target; a needed build is not optional
+**Context** — A compaction moves w to now − 2 min (TargetLag), so the writes of the last two minutes
+stay in the log after it.
+**Decision** — `Records` counts the records with an insert or change in (w, target]; `Seconds` is
+measured from w to the target, so right after a compaction neither is due. A partition that needs a
+build (not built, other shape, w out of the log's reach) is built by the read whatever `CompactOn`
+says, and a failed build fails the read. A failed CompactOn compaction is only `log.Printf`'d and
+the read replays the log. A plain (not fresh) read reads no log, so only `Seconds` triggers it.
+**Rationale** — Counting every history since w would make each read compact again while 100
+records were written in the last two minutes. The log reaches back only ~36 h, so a partition no
+one compacted would otherwise read wrong.
+
+## Locks lease and wait 40 s, timed from the grant
+**Context** — A read that finds a partition due queues behind the compaction under way; fareward
+clamps leases to 60 s.
+**Decision** — `lockLease = lockWait = 40s`, writes stop 5 s before the lease ends, and that
+deadline is counted from when the lock is granted, not from the read's `now` (which can be up to
+40 s earlier). dynamo's conditional-write lock ignores `wait` and refuses at once.
+**Rationale** — A compaction of one partition is expected to take seconds. The cost: a dynamo
+rebuild of a large table (berryapps) that takes longer than 35 s now stops writing and fails, where
+the old 5-minute lock let it finish.

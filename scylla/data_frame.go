@@ -10,7 +10,6 @@ import (
 	"github.com/ivanjoz/genix-orm/dataframe"
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/db/cache"
-	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,11 +26,13 @@ import (
 //     by their logged changes (data_frame_backend.go).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// AcquireFrameLock takes a DataFrame's lock without waiting: release frees it, false when another
-// holder has it. lockName names the frame across tables; lease is how long the run may hold it. The
-// application installs it at boot (genix: fareward) before the first MaterializeDataFrames. The lock
-// only spares duplicate work: the frames' state and files are written conditioned on their ETags.
-var AcquireFrameLock func(lockName string, lease time.Duration) (release func(), isTaken bool, err error)
+// AcquireFrameLock takes the lock of a DataFrame partition, queuing up to wait behind its holder:
+// release frees it, false when the holder kept it past wait. lockName names the frame partition
+// across tables; lease is how long the compaction may hold it. The application installs it at boot
+// (genix: fareward) before the first read of a frame. The lock spares duplicate work and lets a read
+// wait for the compaction under way: the frames' state and files are written conditioned on their
+// ETags.
+var AcquireFrameLock func(lockName string, wait, lease time.Duration) (release func(), isTaken bool, err error)
 
 // dataFrameInfo is a table's compiled DataFrames.
 type dataFrameInfo struct {
@@ -83,7 +84,7 @@ func configureDataFrames(scyllaTable *ScyllaTable, schema TableSchema, schemaStr
 	specs := make([]dataframe.Spec, len(schema.DataFrames))
 	for i, declared := range schema.DataFrames {
 		specs[i] = dataframe.Spec{Name: declared.Name, Count: declared.Count, Version: declared.Version,
-			UseZeroSumsMask: declared.UseZeroSumsMask, Projection: declared.ToFrames}
+			UseZeroSumsMask: declared.UseZeroSumsMask, CompactOn: declared.CompactOn, Projection: declared.ToFrames}
 		if declared.ToFrames != nil {
 			continue
 		}
@@ -190,30 +191,18 @@ func (info *dataFrameInfo) linesOfRow(storedRow map[string]any) (dataframe.Recor
 
 /* Controller */
 
-// MaterializeDataFrames brings every DataFrame of the table up to date, every partition at once.
-// Run it every few minutes (genix: fn-materialize-frames).
-func (e *ScyllaController[T, E]) MaterializeDataFrames() error {
+// CompactDataFrames brings one partition's files of every DataFrame of the table up to date: the
+// manual compaction (the reads compact a frame with CompactOn on their own).
+func (e *ScyllaController[T, E]) CompactDataFrames(partValue int32) error {
 	return withFrameBackend(&e.Table, func(backend *frameBackend) error {
-		return dataframe.Materialize(backend.Table, backend, cache.FileStore(), backend.startedAt)
-	})
-}
-
-// RebuildDataFrames computes the files of the frame frameName ("" every frame) again from the
-// records, every partition.
-func (e *ScyllaController[T, E]) RebuildDataFrames(frameName string) error {
-	return withFrameBackend(&e.Table, func(backend *frameBackend) error {
-		return dataframe.Rebuild(backend.Table, backend, cache.FileStore(), frameName, backend.startedAt)
+		return dataframe.Compact(backend.Table, backend, cache.FileStore(), int64(partValue), backend.startedAt)
 	})
 }
 
 // RebuildDataFramesPartition computes one partition's files of every frame again from its records.
 func (e *ScyllaController[T, E]) RebuildDataFramesPartition(partValue int32) error {
-	return rebuildDataFramesPartition(&e.Table, partValue)
-}
-
-func rebuildDataFramesPartition(scyllaTable *ScyllaTable, partValue int32) error {
-	return withFrameBackend(scyllaTable, func(backend *frameBackend) error {
-		return dataframe.RebuildPartition(backend.Table, backend, cache.FileStore(), int64(partValue), backend.startedAt)
+	return withFrameBackend(&e.Table, func(backend *frameBackend) error {
+		return dataframe.Rebuild(backend.Table, backend, cache.FileStore(), int64(partValue), "", backend.startedAt)
 	})
 }
 
@@ -280,7 +269,7 @@ func readFrameRows(scyllaTable *ScyllaTable, request db.FrameRequest) ([]datafra
 	if err != nil {
 		return nil, nil, err
 	}
-	rows, err := dataframe.Read(backend.Table, frame, backend, cache.FileStore(), int64(request.Partition), selection, request.IsFresh)
+	rows, err := dataframe.Read(backend.Table, frame, backend, cache.FileStore(), int64(request.Partition), selection, request.IsFresh, backend.startedAt)
 	return rows, frame, err
 }
 
@@ -297,7 +286,7 @@ func readFrameChanged(scyllaTable *ScyllaTable, request db.FrameRequest, heldGen
 	if err != nil {
 		return nil, err
 	}
-	answer, err := dataframe.ReadChanged(backend.Table, frame, backend, cache.FileStore(), int64(request.Partition), selection, heldGeneration, held, utils.SUnixTimeOf(backend.startedAt))
+	answer, err := dataframe.ReadChanged(backend.Table, frame, backend, cache.FileStore(), int64(request.Partition), selection, heldGeneration, held, backend.startedAt)
 	if err != nil {
 		return nil, err
 	}

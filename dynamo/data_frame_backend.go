@@ -16,7 +16,8 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// dynamo's dataframe.Backend. Each frame has one state item:
+// dynamo's dataframe.Backend. Every record is in framePartition, so each frame has one
+// state item, and the partition the Backend methods take is always that one:
 //
 //	pk  = base pk ‖ 000          beside the GroupBy counters (sk g…)
 //	sk  = "f" + frame name
@@ -26,12 +27,13 @@ import (
 //	lk    the lock's expiry (unix ms), lid its holder
 //
 // The records come as Histories: through the GSI on Updated for the ones written
-// after a moment, through a scan of the base rows for a rebuild.
+// after a moment, through a scan of the base rows for a rebuild. The lock is a
+// conditional write that does not wait: a compaction finding it held is refused.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const frameStateSKPrefix = "f"
 
-// ErrFrameNotBuilt: the frame has no files in its current shape yet. The next MaterializeDataFrames builds it.
+// ErrFrameNotBuilt: the frame has no files in its current shape, and the read could not build them.
 var ErrFrameNotBuilt = dataframe.ErrFrameNotBuilt
 
 type frameBackend struct {
@@ -50,8 +52,8 @@ func frameBackendOf(meta *tableMeta) (*frameBackend, error) {
 	return &frameBackend{meta: meta, client: client}, nil
 }
 
-// MaterializeDataFrames brings every DataFrame of the table up to date (dataframe.Materialize).
-// berryapps runs it every 10 minutes.
+// MaterializeDataFrames brings every DataFrame of the table up to date (dataframe.Compact of its only
+// partition). berryapps runs it every 10 minutes.
 func (r *repoCore) MaterializeDataFrames() error {
 	if r.meta.frames == nil {
 		return nil
@@ -60,7 +62,7 @@ func (r *repoCore) MaterializeDataFrames() error {
 	if err != nil {
 		return err
 	}
-	return dataframe.Materialize(r.meta.frames, backend, cache.FileStore(), Now())
+	return dataframe.Compact(r.meta.frames, backend, cache.FileStore(), framePartition, Now())
 }
 
 // RebuildDataFrames computes the files of the frame frameName ("" every frame) again from the
@@ -73,7 +75,7 @@ func (r *repoCore) RebuildDataFrames(frameName string) error {
 	if err != nil {
 		return err
 	}
-	return dataframe.Rebuild(r.meta.frames, backend, cache.FileStore(), frameName, Now())
+	return dataframe.Rebuild(r.meta.frames, backend, cache.FileStore(), framePartition, frameName, Now())
 }
 
 // DropDataFrame deletes what a frame the schema no longer declares left behind: its state item and
@@ -119,7 +121,7 @@ func frameStateOf(item map[string]types.AttributeValue) dataframe.State {
 	return state
 }
 
-func (backend *frameBackend) ReadState(frame *dataframe.Frame) (dataframe.State, error) {
+func (backend *frameBackend) ReadState(frame *dataframe.Frame, _ int64) (dataframe.State, error) {
 	out, err := backend.client.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName: aws.String(tableName()), Key: backend.stateKey(frame), ConsistentRead: aws.Bool(true),
 	})
@@ -129,7 +131,7 @@ func (backend *frameBackend) ReadState(frame *dataframe.Frame) (dataframe.State,
 	return frameStateOf(out.Item), nil
 }
 
-func (backend *frameBackend) TakeLock(frame *dataframe.Frame, holderID string, now, lockedUntil time.Time) (dataframe.State, bool, error) {
+func (backend *frameBackend) TakeLock(frame *dataframe.Frame, _ int64, holderID string, now, lockedUntil time.Time, _ time.Duration) (dataframe.State, bool, error) {
 	out, err := backend.client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -149,7 +151,7 @@ func (backend *frameBackend) TakeLock(frame *dataframe.Frame, holderID string, n
 	return frameStateOf(out.Attributes), true, nil
 }
 
-func (backend *frameBackend) ReleaseLock(frame *dataframe.Frame, holderID string) {
+func (backend *frameBackend) ReleaseLock(frame *dataframe.Frame, _ int64, holderID string) {
 	backend.client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -160,7 +162,7 @@ func (backend *frameBackend) ReleaseLock(frame *dataframe.Frame, holderID string
 	})
 }
 
-func (backend *frameBackend) CommitSnapshot(ctx context.Context, frame *dataframe.Frame, holderID string, state dataframe.State, snapshot int64) error {
+func (backend *frameBackend) CommitSnapshot(ctx context.Context, frame *dataframe.Frame, _ int64, holderID string, state dataframe.State, snapshot int64) error {
 	_, err := backend.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -172,7 +174,7 @@ func (backend *frameBackend) CommitSnapshot(ctx context.Context, frame *datafram
 	return err
 }
 
-func (backend *frameBackend) CommitGeneration(ctx context.Context, frame *dataframe.Frame, holderID string, generation string, snapshot int64) error {
+func (backend *frameBackend) CommitGeneration(ctx context.Context, frame *dataframe.Frame, _ int64, holderID string, generation string, snapshot int64) error {
 	_, err := backend.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(tableName()),
 		Key:                       backend.stateKey(frame),
@@ -184,8 +186,8 @@ func (backend *frameBackend) CommitGeneration(ctx context.Context, frame *datafr
 	return err
 }
 
-// HistoriesWrittenAfter reads, through the GSI on Updated, every record written after moment.
-func (backend *frameBackend) HistoriesWrittenAfter(moment int64) ([]dataframe.History, error) {
+// historiesWrittenAfter reads, through the GSI on Updated, every record written after moment.
+func (backend *frameBackend) historiesWrittenAfter(moment int64) ([]dataframe.History, error) {
 	query := &queryState{meta: backend.meta, preds: []predicate{{field: updatedFieldName, op: opGt, v1: moment}}}
 	plans, err := query.plans()
 	if err != nil {
@@ -211,24 +213,24 @@ func (backend *frameBackend) HistoriesWrittenAfter(moment int64) ([]dataframe.Hi
 	}
 }
 
-// PartitionHistoriesWrittenAfter is HistoriesWrittenAfter: every record is in framePartition.
+// PartitionHistoriesWrittenAfter is historiesWrittenAfter: every record is in framePartition.
 func (backend *frameBackend) PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]dataframe.History, error) {
 	if partition != framePartition {
 		return nil, fmt.Errorf("db: %s DataFrames have only partition %d", backend.meta.recordType.Name(), framePartition)
 	}
-	return backend.HistoriesWrittenAfter(moment)
+	return backend.historiesWrittenAfter(moment)
 }
 
-// ScanPartitionHistories is ScanHistories: every record is in framePartition.
+// ScanPartitionHistories is scanHistories: every record is in framePartition.
 func (backend *frameBackend) ScanPartitionHistories(partition int64, onPage func(histories []dataframe.History) error) error {
 	if partition != framePartition {
 		return fmt.Errorf("db: %s DataFrames have only partition %d", backend.meta.recordType.Name(), framePartition)
 	}
-	return backend.ScanHistories(onPage)
+	return backend.scanHistories(onPage)
 }
 
-// ScanHistories reads every record of the table, page by page.
-func (backend *frameBackend) ScanHistories(onPage func(histories []dataframe.History) error) error {
+// scanHistories reads every record of the table, page by page.
+func (backend *frameBackend) scanHistories(onPage func(histories []dataframe.History) error) error {
 	return scanItems(backend.client, tableName(), []pkRange{backend.meta.baseRowsRange()}, nil, func(items []map[string]types.AttributeValue) error {
 		histories, err := backend.appendHistories(nil, items)
 		if err != nil {

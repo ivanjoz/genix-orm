@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -73,20 +74,29 @@ type ChangedFiles struct {
 }
 
 // ReadChanged answers the selected files of one partition the client must replace (above).
-// heldGeneration and held describe the client's copies; now is the read's SUnixTime, the snapshot of
-// the files it moves.
-func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, selection Selection, heldGeneration string, held []HeldFile, now int64) (ChangedFiles, error) {
-	readName := fmt.Sprintf("dataframe: %s frame %q", table.Name, frame.Name)
+// heldGeneration and held describe the client's copies; now is the read's moment, the snapshot of the
+// files it moves. It compacts the partition first when it must or is due (compact.go).
+func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, selection Selection, heldGeneration string, held []HeldFile, now time.Time) (ChangedFiles, error) {
+	readName := fmt.Sprintf("dataframe: %s frame %q partition %d", table.Name, frame.Name, partition)
 	if err := frame.checkSelection(readName, selection); err != nil {
 		return ChangedFiles{}, err
 	}
+	readMoment := utils.SUnixTimeOf(now)
+	isCompacted := false
 	for attempt := 1; ; attempt++ {
-		state, err := backend.ReadState(frame)
+		state, err := backend.ReadState(frame, partition)
 		if err != nil {
 			return ChangedFiles{}, err
 		}
-		if state.Generation == "" || state.Shape != frame.Shape {
-			return ChangedFiles{}, fmt.Errorf("%s: %w", readName, ErrFrameNotBuilt)
+		if frame.needsRebuild(state, now) {
+			if isCompacted {
+				return ChangedFiles{}, fmt.Errorf("%s: %w", readName, ErrFrameNotBuilt)
+			}
+			if err := table.rebuildBeforeRead(backend, store, frame, partition, state, now); err != nil {
+				return ChangedFiles{}, fmt.Errorf("%s: %w", readName, err)
+			}
+			isCompacted = true
+			continue
 		}
 		versions, _, err := readVersions(store, table.versionsKeyOf(partition))
 		if err != nil {
@@ -95,6 +105,12 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 		histories, err := backend.PartitionHistoriesWrittenAfter(partition, state.Snapshot)
 		if err != nil {
 			return ChangedFiles{}, err
+		}
+		if !isCompacted && frame.isCompactDue(state, histories, now) {
+			isCompacted = true
+			if table.compactDueFrame(backend, store, frame, partition, state, now) {
+				continue
+			}
 		}
 		fileKeys, err := frame.selectedFileKeys(store, state.Generation, partition, selection)
 		if err != nil {
@@ -144,7 +160,7 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 		}
 		table.moveRecords(frame, state.Generation, histories, loaded, math.MaxInt64)
 		// A run that moved w meanwhile wrote files this read took as of the old w.
-		stateAfter, err := backend.ReadState(frame)
+		stateAfter, err := backend.ReadState(frame, partition)
 		if err != nil {
 			return ChangedFiles{}, err
 		}
@@ -158,17 +174,17 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 		answer := ChangedFiles{Generation: state.Generation, RowColumnCount: uint8(len(frame.Rows)), SumsCount: uint8(frame.SumsCount),
 			Snapshot: state.Snapshot, Files: make([]ChangedFile, len(sentKeys))}
 		for i, fileKey := range sentKeys {
-			_, keys, _ := frame.keysOfFile(state.Generation, fileKey)
+			keys, _ := frame.keysOfFile(state.Generation, partition, fileKey)
 			changed := ChangedFile{Keys: keys, Slot: loaded.slotByFileKey[fileKey]}
 			switch _, isTouched := lastWriteByFileKey[fileKey]; {
 			case isTouched:
-				file := loaded.rowsByFileKey[fileKey].fileAt(now, frame)
-				file.Slot, changed.Snapshot = changed.Slot, now
+				file := loaded.rowsByFileKey[fileKey].fileAt(readMoment, frame)
+				file.Slot, changed.Snapshot = changed.Slot, readMoment
 				if file.rowCount() > 0 {
 					changed.Content = EncodeFile(file)
 				}
 			case loaded.contentByFileKey[fileKey] == nil:
-				changed.Snapshot = now // no file: no rows as of now, re-asked until a run creates it
+				changed.Snapshot = readMoment // no file: no rows as of now, re-asked until a run creates it
 			default:
 				changed.Snapshot, changed.Content = loaded.snapshotByFileKey[fileKey], loaded.contentByFileKey[fileKey]
 			}

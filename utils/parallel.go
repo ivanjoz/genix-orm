@@ -17,11 +17,16 @@ const maxConcurrentTasks = 10
 // RunParallel runs task(0)..task(count-1), at most maxConcurrentTasks at a time, and returns their errors
 // joined. The calls of one step are independent, so their order does not matter.
 func RunParallel(count int, task func(index int) error) error {
+	return RunParallelLimit(maxConcurrentTasks, count, task)
+}
+
+// RunParallelLimit is RunParallel with at most limit tasks at a time.
+func RunParallelLimit(limit int, count int, task func(index int) error) error {
 	if count == 1 {
 		return task(0)
 	}
 	taskErrors := make([]error, count)
-	parallelSlots := make(chan struct{}, maxConcurrentTasks)
+	parallelSlots := make(chan struct{}, limit)
 	var pendingTasks sync.WaitGroup
 	for index := 0; index < count; index++ {
 		pendingTasks.Add(1)

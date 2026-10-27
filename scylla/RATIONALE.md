@@ -1,3 +1,11 @@
+## The DataFrame log keeps its (half_hour) partition key now that every read is per partition
+**Context** — Compactions and reads are per company now; nothing reads every partition's log at
+once. A `((partition_id, half_hour))` key would spread the load better.
+**Decision** — The `<table>__dtf_log` schema is unchanged: a read selects `half_hour = ? AND
+partition_id = ?`, a clustering-prefix slice of each half hour.
+**Rationale** — No table migration. Every company's writes of a half hour still land on one
+Scylla partition, which is fine at genix's write rate; revisit if a half hour gets hot.
+
 ## DataFrame log rows hold before values only; Histories start from the table
 **Context** — The agreed plan logged each write's after values with the same explicit
 `USING TIMESTAMP` as its rows, so the log replayed Scylla's last-write-wins exactly. Logging
@@ -6,7 +14,7 @@ plus timestamps cost bytes on every row and a timestamp on every write of the ta
 **Decision** — A log row is the `cgl` entry: the before values of the changed columns, or an
 insert flag. A History is the record's values read from the table, undone by its logged changes.
 No explicit write timestamps. The log is read after the values, and again after them for
-`HistoriesWrittenAfter`; a rebuild reads the log after each page of 5000 records. The column is
+`PartitionHistoriesWrittenAfter`; a rebuild reads the log after each page of 5000 records. The column is
 `partition_id`, not `empresa_id`: the ORM names no tenant.
 **Rationale** — A frame always ends on what the table holds, whatever the writers raced, because
 every History starts from the stored row. It costs a read of the changed records' values per

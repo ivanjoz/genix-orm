@@ -18,8 +18,9 @@ import (
 // The DataFrame change log: one table per table with frames, <table>__dtf_log.
 //
 //	PRIMARY KEY ((half_hour), partition_id, ts, record_id)
-//	  half_hour  unix seconds / 1800: every partition's writes of a half hour together,
-//	             so a run reads all of them with one query per half hour
+//	  half_hour  unix seconds / 1800: every partition's writes of a half hour together;
+//	             a compaction reads one partition's slice of it (partition_id leads the
+//	             clustering key) with one query per half hour
 //	  ts         microseconds since the half hour started (< 1.8e9, an int)
 //	  changes    what the write changed: u8 format, u8 flags (bit 0: the record's
 //	             insert), then, unless an insert, the lines every frame it changed held
@@ -172,25 +173,19 @@ func decodeLogChange(moment int64, changes []byte) (change dataframe.HistoryChan
 
 /* Read */
 
-// readDataFrameLog reads the changes logged after the SUnixTime afterMoment, of one partition or,
-// with isEveryPartition, of all, by (partition, record ID), newest first per record.
-func readDataFrameLog(scyllaTable ScyllaTable, partition int64, isEveryPartition bool, afterMoment int64, now time.Time) (map[[2]int64][]dataframe.HistoryChange, error) {
+// readDataFrameLog reads the changes of one partition logged after the SUnixTime afterMoment, by
+// (partition, record ID), newest first per record.
+func readDataFrameLog(scyllaTable ScyllaTable, partition int64, afterMoment int64, now time.Time) (map[[2]int64][]dataframe.HistoryChange, error) {
 	info := scyllaTable.dataFrames
 	firstHalfHour, _ := dataFrameLogPosition(time.Unix(afterMoment*2+1e9, 0))
 	lastHalfHour, _ := dataFrameLogPosition(now)
-	queryString := fmt.Sprintf("SELECT partition_id, ts, record_id, changes FROM %v.%v WHERE half_hour = ?",
+	queryString := fmt.Sprintf("SELECT partition_id, ts, record_id, changes FROM %v.%v WHERE half_hour = ? AND partition_id = ?",
 		resolveKeyspace(scyllaTable), info.logTableName)
-	if !isEveryPartition {
-		queryString += " AND partition_id = ?"
-	}
+	partitionValue := coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition)
 
 	changesByRecord := map[[2]int64][]dataframe.HistoryChange{}
 	for halfHour := firstHalfHour; halfHour <= lastHalfHour; halfHour++ {
-		queryValues := []any{halfHour}
-		if !isEveryPartition {
-			queryValues = append(queryValues, coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition))
-		}
-		iterator := getScyllaConnection().Query(queryString, queryValues...).Consistency(gocql.LocalQuorum).Iter()
+		iterator := getScyllaConnection().Query(queryString, halfHour, partitionValue).Consistency(gocql.LocalQuorum).Iter()
 		var rowPartition, recordID int64
 		var offsetMicros int32
 		var changes []byte

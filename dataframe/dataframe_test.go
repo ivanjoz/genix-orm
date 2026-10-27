@@ -201,15 +201,15 @@ func TestLinesAndTheWriteCheck(t *testing.T) {
 func TestFileKeysRoundTrip(t *testing.T) {
 	frame := &compileTestTable(t).Frames[0]
 	fileKey := frame.fileKeyOf("g1", 12, []int64{2026, 3})
-	if fileKey != "dtf/3gz10/year-program/g1/12/2026/3" {
+	if fileKey != "dtf/3gz10/year-program/12/g1/2026/3" {
 		t.Fatalf("file key %q", fileKey)
 	}
-	if partition, keys, isFrameFile := frame.keysOfFile("g1", fileKey); !isFrameFile || partition != 12 || !slices.Equal(keys, []int64{2026, 3}) {
-		t.Fatalf("keys of %q: %d %v %v", fileKey, partition, keys, isFrameFile)
+	if keys, isFrameFile := frame.keysOfFile("g1", 12, fileKey); !isFrameFile || !slices.Equal(keys, []int64{2026, 3}) {
+		t.Fatalf("keys of %q: %v %v", fileKey, keys, isFrameFile)
 	}
-	for _, otherKey := range []string{frame.Folder + "g2/12/2026/3", frame.Folder + "g1/12/2026", frame.Folder + "g1/2026/3", frame.Folder + "g1/-1/2026/3"} {
-		if _, _, isFrameFile := frame.keysOfFile("g1", otherKey); isFrameFile {
-			t.Fatalf("%q read as a file of generation g1", otherKey)
+	for _, otherKey := range []string{frame.Folder + "12/g2/2026/3", frame.Folder + "12/g1/2026", frame.Folder + "13/g1/2026/3", frame.Folder + "12/g1/-1/3"} {
+		if _, isFrameFile := frame.keysOfFile("g1", 12, otherKey); isFrameFile {
+			t.Fatalf("%q read as a file of partition 12 generation g1", otherKey)
 		}
 	}
 }
@@ -402,7 +402,7 @@ func (sim simHistory) bruteForceRows(frame *Frame, partition, moment int64) []Ro
 			rowsByFileKey[fileKey].add(frame, line, 1)
 		}
 	}
-	return frame.rowsOf("g", fileKeys, rowsByFileKey)
+	return frame.rowsOf("g", partition, fileKeys, rowsByFileKey)
 }
 
 // assertLinesAt checks a History against what the record was stored as at moment (nil: not yet).
@@ -477,49 +477,50 @@ func TestHistoryOfChangesMatchesTheHistory(t *testing.T) {
 	}
 }
 
-// memoryBackend keeps each frame's state in memory and answers the records as the simulation stored
-// them at readAt.
+// memoryBackend keeps the state of each frame partition in memory and answers the records as the
+// simulation stored them at readAt. compactions counts the locks taken, one per compaction.
 type memoryBackend struct {
-	sim           simHistory
-	readAt        int64
-	stateByFrame  map[string]State
-	holderByFrame map[string]string
+	sim                    simHistory
+	readAt                 int64
+	stateByFramePartition  map[string]State
+	holderByFramePartition map[string]string
+	compactions            int
 }
 
 func newMemoryBackend(sim simHistory) *memoryBackend {
-	return &memoryBackend{sim: sim, stateByFrame: map[string]State{}, holderByFrame: map[string]string{}}
+	return &memoryBackend{sim: sim, stateByFramePartition: map[string]State{}, holderByFramePartition: map[string]string{}}
 }
 
-func (backend *memoryBackend) ReadState(frame *Frame) (State, error) {
-	return backend.stateByFrame[frame.Name], nil
+func framePartitionKey(frame *Frame, partition int64) string {
+	return fmt.Sprint(frame.Name, "/", partition)
 }
-func (backend *memoryBackend) TakeLock(frame *Frame, holderID string, now, lockedUntil time.Time) (State, bool, error) {
-	backend.holderByFrame[frame.Name] = holderID
-	return backend.stateByFrame[frame.Name], true, nil
+
+func (backend *memoryBackend) ReadState(frame *Frame, partition int64) (State, error) {
+	return backend.stateByFramePartition[framePartitionKey(frame, partition)], nil
 }
-func (backend *memoryBackend) ReleaseLock(frame *Frame, holderID string) {
-	delete(backend.holderByFrame, frame.Name)
+func (backend *memoryBackend) TakeLock(frame *Frame, partition int64, holderID string, now, lockedUntil time.Time, wait time.Duration) (State, bool, error) {
+	backend.compactions++
+	backend.holderByFramePartition[framePartitionKey(frame, partition)] = holderID
+	return backend.stateByFramePartition[framePartitionKey(frame, partition)], true, nil
 }
-func (backend *memoryBackend) CommitSnapshot(ctx context.Context, frame *Frame, holderID string, state State, snapshot int64) error {
-	if holderID != backend.holderByFrame[frame.Name] || state != backend.stateByFrame[frame.Name] {
+func (backend *memoryBackend) ReleaseLock(frame *Frame, partition int64, holderID string) {
+	delete(backend.holderByFramePartition, framePartitionKey(frame, partition))
+}
+func (backend *memoryBackend) CommitSnapshot(ctx context.Context, frame *Frame, partition int64, holderID string, state State, snapshot int64) error {
+	key := framePartitionKey(frame, partition)
+	if holderID != backend.holderByFramePartition[key] || state != backend.stateByFramePartition[key] {
 		return errors.New("lock or state moved")
 	}
 	state.Snapshot = snapshot
-	backend.stateByFrame[frame.Name] = state
+	backend.stateByFramePartition[key] = state
 	return nil
 }
-func (backend *memoryBackend) CommitGeneration(ctx context.Context, frame *Frame, holderID string, generation string, snapshot int64) error {
-	backend.stateByFrame[frame.Name] = State{Generation: generation, Shape: frame.Shape, Snapshot: snapshot}
+func (backend *memoryBackend) CommitGeneration(ctx context.Context, frame *Frame, partition int64, holderID string, generation string, snapshot int64) error {
+	backend.stateByFramePartition[framePartitionKey(frame, partition)] = State{Generation: generation, Shape: frame.Shape, Snapshot: snapshot}
 	return nil
-}
-func (backend *memoryBackend) HistoriesWrittenAfter(moment int64) ([]History, error) {
-	return backend.sim.historiesAt(backend.readAt, moment), nil
 }
 func (backend *memoryBackend) PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]History, error) {
 	return partitionHistories(backend.sim.historiesAt(backend.readAt, moment), partition), nil
-}
-func (backend *memoryBackend) ScanHistories(onPage func([]History) error) error {
-	return onPage(backend.sim.historiesAt(backend.readAt, -1))
 }
 func (backend *memoryBackend) ScanPartitionHistories(partition int64, onPage func([]History) error) error {
 	return onPage(partitionHistories(backend.sim.historiesAt(backend.readAt, -1), partition))
@@ -546,10 +547,10 @@ func (store *crashingFileStore) PutFileIfMatch(ctx context.Context, key string, 
 
 func timeOfSUnix(moment int64) time.Time { return time.Unix(moment*2+1e9, 0) }
 
-// readAll is every row of a test frame in a partition (its Years are 2025..2027).
-func readAll(t *testing.T, table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, isFresh bool) []Row {
+// readAll is every row of a test frame in a partition (its Years are 2025..2027), read at now.
+func readAll(t *testing.T, table *Table, frame *Frame, backend Backend, store utils.FileStore, partition int64, isFresh bool, now int64) []Row {
 	t.Helper()
-	rows, err := Read(table, frame, backend, store, partition, Selection{FromKey: 2025, ToKey: 2027}, isFresh)
+	rows, err := Read(table, frame, backend, store, partition, Selection{FromKey: 2025, ToKey: 2027}, isFresh, timeOfSUnix(now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +576,7 @@ func (client *simClient) sync(t *testing.T, table *Table, frame *Frame, backend 
 	if err != nil {
 		t.Fatal(err)
 	}
-	answer, err := ReadChanged(table, frame, backend, store, client.partition, Selection{FromKey: 2025, ToKey: 2027}, client.generation, parsedHeld, now)
+	answer, err := ReadChanged(table, frame, backend, store, client.partition, Selection{FromKey: 2025, ToKey: 2027}, client.generation, parsedHeld, timeOfSUnix(now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,11 +622,70 @@ func (client *simClient) rows(t *testing.T, frame *Frame) []Row {
 	return rows
 }
 
-// TestRunsSurviveCrashes: a rebuild, then runs at random moments, some crashing after a random part of
-// their files, leave the files equal to the brute force at their target, and a fresh read equal to it
-// at the read's moment, for every test frame. A client syncing raw files with ReadChanged holds the
-// brute force at every read too, through occasional rebuilds of the frames and of one partition; half
-// the seeds cycle 2 slots, so every slot is shared. Every check runs per partition.
+// TestReadsCompactWhenDue: the first read of a partition builds it; a fresh read compacts it once
+// CompactOn.Records records changed before the target, and moves w to the target, and the next read
+// doesn't compact again; CompactOn.Seconds compacts a partition with no change; a compaction that finds
+// the state moved by the holder before it does nothing. Every read equals the brute force.
+func TestReadsCompactWhenDue(t *testing.T) {
+	table := mustCompile(t, Spec{Name: "year", Keys: []Column{yearColumn}, Rows: []Column{programColumn, employeeColumn},
+		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true, LinesOf: enrollmentLinesOf,
+		CompactOn: CompactOn{Records: 5, Seconds: 7200}})
+	frame := &table.Frames[0]
+	sim := simulateWrites(t, table, rand.New(rand.NewPCG(7, 8)), 20000)
+	backend, store := newMemoryBackend(sim), utils.NewMemoryFileStore()
+	const partition = 1
+	readAt := func(now int64) {
+		t.Helper()
+		backend.readAt = now
+		if got, want := readAll(t, table, frame, backend, store, partition, true, now), sim.bruteForceRows(frame, partition, now); !reflect.DeepEqual(got, want) {
+			t.Fatalf("the read at %d differs from the brute force", now)
+		}
+	}
+
+	now := simStart + 2000
+	readAt(now)
+	if state, _ := backend.ReadState(frame, partition); backend.compactions != 1 || state.Snapshot != now-TargetLag {
+		t.Fatalf("the first read must build the partition: %d compactions, state %+v", backend.compactions, state)
+	}
+	now += 3000 // ~190 writes: most change nothing the frame reads, but over 5 records of the partition do
+	readAt(now)
+	if state, _ := backend.ReadState(frame, partition); backend.compactions != 2 || state.Snapshot != now-TargetLag {
+		t.Fatalf("a read past CompactOn.Records must compact: %d compactions, state %+v", backend.compactions, state)
+	}
+	readAt(now + 1)
+	if backend.compactions != 2 {
+		t.Fatal("a read right after a compaction must not compact again")
+	}
+
+	// Past the simulated writes nothing changes: only Seconds (3600 ticks) makes the partition due.
+	now = simStart + 20000 + 3*TargetLag
+	readAt(now)
+	compactionsAfterWrites := backend.compactions
+	readAt(now + 3599)
+	if backend.compactions != compactionsAfterWrites {
+		t.Fatal("a read before CompactOn.Seconds must not compact")
+	}
+	readAt(now + 3600)
+	if backend.compactions != compactionsAfterWrites+1 {
+		t.Fatal("a read past CompactOn.Seconds must compact")
+	}
+
+	stateBefore, _ := backend.ReadState(frame, partition)
+	staleState := stateBefore
+	staleState.Snapshot--
+	if err := table.compactFrame(backend, store, frame, partition, staleState, timeOfSUnix(now+5000)); err != nil {
+		t.Fatal(err)
+	}
+	if stateAfter, _ := backend.ReadState(frame, partition); stateAfter != stateBefore {
+		t.Fatal("a compaction that finds the state moved by the holder before it must leave it")
+	}
+}
+
+// TestRunsSurviveCrashes: a rebuild, then compactions at random moments, some crashing after a random
+// part of their files, leave the files equal to the brute force at their target, and a fresh read
+// equal to it at the read's moment, for every test frame. A client syncing raw files with ReadChanged
+// holds the brute force at every read too, through occasional rebuilds of one partition; half the
+// seeds cycle 2 slots, so every slot is shared. Every check runs per partition.
 func TestRunsSurviveCrashes(t *testing.T) {
 	table := compileTestTable(t)
 	defer func() { slotCycle = slotCount }()
@@ -646,16 +706,24 @@ func TestRunsSurviveCrashes(t *testing.T) {
 			}
 		}
 
-		// The first Materialize builds the frame; each record is read a little after the target.
+		compactEveryPartition := func(now int64) error {
+			var partitionErrors []error
+			for partition := range int64(simPartitions) {
+				partitionErrors = append(partitionErrors, Compact(table, backend, store, partition, timeOfSUnix(now)))
+			}
+			return errors.Join(partitionErrors...)
+		}
+
+		// The first compaction builds every partition; each record is read a little after the target.
 		now := simStart + 2000 + rng.Int64N(3000)
 		backend.readAt = now + rng.Int64N(30)
-		if err := Materialize(table, backend, store, timeOfSUnix(now)); err != nil {
+		if err := compactEveryPartition(now); err != nil {
 			t.Fatal(err)
 		}
 		for i := range table.Frames {
 			frame := &table.Frames[i]
 			for partition := range int64(simPartitions) {
-				if got, want := readAll(t, table, frame, backend, store, partition, false), sim.bruteForceRows(frame, partition, now-TargetLag); !reflect.DeepEqual(got, want) {
+				if got, want := readAll(t, table, frame, backend, store, partition, false, now), sim.bruteForceRows(frame, partition, now-TargetLag); !reflect.DeepEqual(got, want) {
 					t.Fatalf("seed %d frame %s partition %d: the rebuild at %d differs from the brute force", seed, frame.Name, partition, now-TargetLag)
 				}
 			}
@@ -664,15 +732,10 @@ func TestRunsSurviveCrashes(t *testing.T) {
 		for now += 300; now < simStart+40000; now += 300 + rng.Int64N(1500) {
 			backend.readAt = now + rng.Int64N(30)
 			store.isCrashing = rng.IntN(3) == 0
-			err := Materialize(table, backend, store, timeOfSUnix(now))
+			err := compactEveryPartition(now)
 			store.isCrashing = false
-			switch rng.IntN(12) {
-			case 0:
-				if err := Rebuild(table, backend, store, "", timeOfSUnix(now)); err != nil {
-					t.Fatal(err)
-				}
-			case 1:
-				if err := RebuildPartition(table, backend, store, rng.Int64N(simPartitions), timeOfSUnix(now)); err != nil {
+			if rng.IntN(6) == 0 {
+				if err := Rebuild(table, backend, store, rng.Int64N(simPartitions), "", timeOfSUnix(now)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -680,12 +743,12 @@ func TestRunsSurviveCrashes(t *testing.T) {
 				frame := &table.Frames[i]
 				for partition := range int64(simPartitions) {
 					if err == nil {
-						if got, want := readAll(t, table, frame, backend, store, partition, false), sim.bruteForceRows(frame, partition, now-TargetLag); !reflect.DeepEqual(got, want) {
+						if got, want := readAll(t, table, frame, backend, store, partition, false, now), sim.bruteForceRows(frame, partition, now-TargetLag); !reflect.DeepEqual(got, want) {
 							t.Fatalf("seed %d frame %s partition %d: the files after the run at %d differ from the brute force", seed, frame.Name, partition, now)
 						}
 					}
 					want := sim.bruteForceRows(frame, partition, backend.readAt)
-					if got := readAll(t, table, frame, backend, store, partition, true); !reflect.DeepEqual(got, want) {
+					if got := readAll(t, table, frame, backend, store, partition, true, backend.readAt); !reflect.DeepEqual(got, want) {
 						t.Fatalf("seed %d frame %s partition %d: the fresh read at %d differs from the brute force", seed, frame.Name, partition, backend.readAt)
 					}
 					if rng.IntN(3) > 0 { // the client doesn't look at every moment

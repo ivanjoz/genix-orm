@@ -6,7 +6,6 @@ import (
 	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/dataframe"
-	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // FrameRow is one row of a DataFrame file, as Group is one GroupBy counter.
@@ -122,7 +121,7 @@ func (q *frameQueryState) readRows() ([]dataframe.Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, q.isFresh)
+	return dataframe.Read(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, q.isFresh, Now())
 }
 
 // setRowKey sets the frame's Keys and Rows columns of the key record at keyPtr from a row. A frame
@@ -158,7 +157,7 @@ func (q *frameQueryState) ExecChanged(heldGeneration string, heldFiles string) (
 	if err != nil {
 		return nil, err
 	}
-	answer, err := dataframe.ReadChanged(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, heldGeneration, held, utils.SUnixTimeOf(Now()))
+	answer, err := dataframe.ReadChanged(q.meta.frames, q.frame, backend, cache.FileStore(), framePartition, selection, heldGeneration, held, Now())
 	if err != nil {
 		return nil, err
 	}

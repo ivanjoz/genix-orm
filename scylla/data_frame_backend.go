@@ -17,8 +17,9 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // scylla's dataframe.Backend. The state and the lock are dataframe.FileState's: a file
-// per frame in the store, the lock in AcquireFrameLock. The records come as Histories:
-// a record's lines now, from its whole row read from the table, and its changes from the log.
+// per frame partition in the store, the lock in AcquireFrameLock. The records come as
+// Histories: a record's lines now, from its whole row read from the table, and its
+// changes from the log.
 //
 // The order of the reads is what keeps a History exact: the log is read AFTER the
 // values. A write landing between the two is then in both, and its change undoes the
@@ -36,8 +37,8 @@ const frameRebuildLogMargin = 150
 type frameBackend struct {
 	*dataframe.FileState
 	scyllaTable *ScyllaTable
-	// startedAt is the call's now: Materialize and Rebuild take it as theirs, and the rebuild scans
-	// read the log from before the target it gives them.
+	// startedAt is the call's now: the reads, Compact and Rebuild take it as theirs, and the rebuild
+	// scans read the log from before the target it gives them.
 	startedAt time.Time
 }
 
@@ -55,19 +56,12 @@ func newFrameBackend(scyllaTable *ScyllaTable) (*frameBackend, error) {
 	}, nil
 }
 
-func (backend *frameBackend) HistoriesWrittenAfter(moment int64) ([]dataframe.History, error) {
-	return backend.loggedHistories(0, true, moment)
-}
-
+// PartitionHistoriesWrittenAfter is the History of every record of the partition with a change logged
+// after moment. The log is read once to know the records, then again after their values. A record only
+// the second read logs changed after the first read began, past any target a run has: it is left to
+// the next run.
 func (backend *frameBackend) PartitionHistoriesWrittenAfter(partition int64, moment int64) ([]dataframe.History, error) {
-	return backend.loggedHistories(partition, false, moment)
-}
-
-// loggedHistories is the History of every record with a change logged after moment. The log is read
-// once to know the records, then again after their values. A record only the second read logs changed
-// after the first read began, past any target a run has: it is left to the next run.
-func (backend *frameBackend) loggedHistories(partition int64, isEveryPartition bool, moment int64) ([]dataframe.History, error) {
-	loggedFirst, err := readDataFrameLog(*backend.scyllaTable, partition, isEveryPartition, moment, db.Now())
+	loggedFirst, err := readDataFrameLog(*backend.scyllaTable, partition, moment, db.Now())
 	if err != nil || len(loggedFirst) == 0 {
 		return nil, err
 	}
@@ -79,7 +73,7 @@ func (backend *frameBackend) loggedHistories(partition int64, isEveryPartition b
 	if err != nil {
 		return nil, err
 	}
-	logged, err := readDataFrameLog(*backend.scyllaTable, partition, isEveryPartition, moment, db.Now())
+	logged, err := readDataFrameLog(*backend.scyllaTable, partition, moment, db.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -115,17 +109,9 @@ func (backend *frameBackend) historyOf(recordKey [2]int64, stored storedRows, ch
 	return history, true, nil
 }
 
-func (backend *frameBackend) ScanHistories(onPage func(histories []dataframe.History) error) error {
-	return backend.scanHistories(0, true, onPage)
-}
-
+// ScanPartitionHistories reads every record of one partition, a page at a time, and the log after each
+// page: the changes since a little before the rebuild's target.
 func (backend *frameBackend) ScanPartitionHistories(partition int64, onPage func(histories []dataframe.History) error) error {
-	return backend.scanHistories(partition, false, onPage)
-}
-
-// scanHistories reads every record of the table or of one partition, a page at a time, and the log
-// after each page: the changes since a little before the rebuild's target.
-func (backend *frameBackend) scanHistories(partition int64, isEveryPartition bool, onPage func(histories []dataframe.History) error) error {
 	scyllaTable := backend.scyllaTable
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 	columnNames := []string{partitionColumn.GetName(), keyColumn.GetName()}
@@ -134,16 +120,12 @@ func (backend *frameBackend) scanHistories(partition int64, isEveryPartition boo
 			columnNames = append(columnNames, column.GetName())
 		}
 	}
-	queryString := fmt.Sprintf("SELECT %v FROM %v.%v", strings.Join(columnNames, ", "), resolveKeyspace(*scyllaTable), scyllaTable.Name)
-	var queryValues []any
-	if !isEveryPartition {
-		queryString += fmt.Sprintf(" WHERE %v = ?", partitionColumn.GetName())
-		queryValues = append(queryValues, coerceManagedIntegerValue(partitionColumn, partition))
-	}
+	queryString := fmt.Sprintf("SELECT %v FROM %v.%v WHERE %v = ?", strings.Join(columnNames, ", "), resolveKeyspace(*scyllaTable), scyllaTable.Name, partitionColumn.GetName())
+	queryValues := []any{coerceManagedIntegerValue(partitionColumn, partition)}
 	logSince := utils.SUnixTimeOf(backend.startedAt) - dataframe.TargetLag - frameRebuildLogMargin
 
 	flushPage := func(page storedRows) error {
-		logged, err := readDataFrameLog(*scyllaTable, partition, isEveryPartition, logSince, db.Now())
+		logged, err := readDataFrameLog(*scyllaTable, partition, logSince, db.Now())
 		if err != nil {
 			return err
 		}
