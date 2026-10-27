@@ -93,3 +93,13 @@ ascending by Keys, so a rebuild hands slots out in that order instead of map ord
 **Rationale** — Bytes identical (golden hashes). A/B at GOMAXPROCS=1, 100k records: Rebuild
 sales 326 → 89 ms, enrollment 58 → 15 ms, movements 559 → 185 ms; allocations −98%, bytes −40%. The
 arena holds every line until the files are built (sales: 37 MB), about what the maps held.
+
+## The encoder reuses one residuals buffer per file and scores widths up to the widest
+**Context** — After the rebuild's sorting, encoding was a quarter of a rebuild: every column
+allocated its residuals, the Rows levels grew by append, and `blockCost` walked all 64 bit lengths
+for each candidate width (~2,000 steps per block of 128 values).
+**Decision** — `codecOptions.scratch` holds one column's residuals at a time, set once by
+`appendFile`; the levels of `appendRowColumns` are sized once; `blockCost` and the patch count stop
+at the block's widest residual (no residual is longer, so the costs are the same).
+**Rationale** — Bytes identical. Rebuild of 100k records: movements 185 → 135 ms, sales 89 → 77 ms;
+allocations of a rebuild halved.
