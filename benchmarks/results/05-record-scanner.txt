@@ -1,0 +1,33 @@
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkLinesOf/sales  	       3	  58118917 ns/op	       111.1 ns/line	54531930 B/op	  289969 allocs/op
+BenchmarkLinesOf/sales  	       3	  41467325 ns/op	        79.25 ns/line	54531930 B/op	  289969 allocs/op
+BenchmarkLinesOf/sales  	       3	  41106851 ns/op	        78.56 ns/line	54531930 B/op	  289969 allocs/op
+BenchmarkLinesOf/enrollment         	       3	   4080036 ns/op	        42.07 ns/line	10933712 B/op	  293948 allocs/op
+BenchmarkLinesOf/enrollment         	       3	   4215565 ns/op	        43.47 ns/line	10933712 B/op	  293948 allocs/op
+BenchmarkLinesOf/enrollment         	       3	   4412875 ns/op	        45.51 ns/line	10933712 B/op	  293948 allocs/op
+BenchmarkLinesOf/movements          	       3	  46806854 ns/op	        73.56 ns/line	58850901 B/op	  296170 allocs/op
+BenchmarkLinesOf/movements          	       3	  37082595 ns/op	        58.28 ns/line	58850901 B/op	  296170 allocs/op
+BenchmarkLinesOf/movements          	       3	  36096268 ns/op	        56.73 ns/line	58850901 B/op	  296170 allocs/op
+BenchmarkBuild/sales                	       3	 111899361 ns/op	       213.9 ns/line	100381717 B/op	   51117 allocs/op
+BenchmarkBuild/sales                	       3	 100232157 ns/op	       191.6 ns/line	100379474 B/op	   51106 allocs/op
+BenchmarkBuild/sales                	       3	 100835146 ns/op	       192.7 ns/line	100379464 B/op	   51106 allocs/op
+BenchmarkBuild/enrollment           	       3	  17184678 ns/op	       177.2 ns/line	32869656 B/op	  226454 allocs/op
+BenchmarkBuild/enrollment           	       3	  17238866 ns/op	       177.8 ns/line	32869645 B/op	  226453 allocs/op
+BenchmarkBuild/enrollment           	       3	  16875966 ns/op	       174.0 ns/line	32869645 B/op	  226453 allocs/op
+BenchmarkBuild/movements            	       3	 178460365 ns/op	       280.5 ns/line	175638344 B/op	   72608 allocs/op
+BenchmarkBuild/movements            	       3	 161414314 ns/op	       253.7 ns/line	175637829 B/op	   72606 allocs/op
+BenchmarkBuild/movements            	       3	 162138061 ns/op	       254.8 ns/line	175637834 B/op	   72606 allocs/op
+BenchmarkBuildHistories/sales       	       3	 119579964 ns/op	       228.5 ns/line	158767821 B/op	  320590 allocs/op
+BenchmarkBuildHistories/sales       	       3	 116818058 ns/op	       223.3 ns/line	158767333 B/op	  320586 allocs/op
+BenchmarkBuildHistories/sales       	       3	 121583389 ns/op	       232.4 ns/line	158767333 B/op	  320586 allocs/op
+BenchmarkBuildHistories/enrollment  	       3	  20075964 ns/op	       207.0 ns/line	41855605 B/op	  316069 allocs/op
+BenchmarkBuildHistories/enrollment  	       3	  20441442 ns/op	       210.8 ns/line	41855605 B/op	  316069 allocs/op
+BenchmarkBuildHistories/enrollment  	       3	  19975057 ns/op	       206.0 ns/line	41855605 B/op	  316069 allocs/op
+BenchmarkBuildHistories/movements   	       3	 220922052 ns/op	       347.2 ns/line	238190256 B/op	  348514 allocs/op
+BenchmarkBuildHistories/movements   	       3	 202664339 ns/op	       318.5 ns/line	238189752 B/op	  348512 allocs/op
+BenchmarkBuildHistories/movements   	       3	 210505373 ns/op	       330.8 ns/line	238189757 B/op	  348512 allocs/op
+PASS
+ok  	github.com/ivanjoz/genix-orm/benchmarks	9.191s
