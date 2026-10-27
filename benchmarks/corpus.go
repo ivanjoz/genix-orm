@@ -25,7 +25,9 @@ import (
 //	~0.2% inserted between T0 and T1: absent from the build, added by the compaction
 //
 // A changed record's previous version differs the way that shape's records change
-// (a sale paid and delivered, an enrollment's minutes, a movement's quantities).
+// (a sale paid and delivered, an enrollment's minutes, a movement's quantities). The
+// sales written between T0 and T1 are of the last two days, as a store's are; the
+// other shapes spread theirs over every file, the worst case for a compaction.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // RecordCount is the records of every case.
@@ -237,6 +239,11 @@ func generateSale(rng *rand.Rand, index int) recordVersions {
 	versions := recordVersions{current: unsafe.Pointer(sale)}
 	isChanged, changeMoment, insertMoment := eventOf(rng, index)
 	versions.insertMoment = insertMoment
+	if changeMoment > target0 || insertMoment > 0 {
+		// What a store writes in the minutes before a compaction is today's sales: paid, delivered,
+		// rung up. The compaction touches a couple of days' files, not the year's.
+		sale.Date = int16(saleFirstDay + saleDays - 1 - rng.IntN(2))
+	}
 	if isChanged {
 		previous := *sale
 		previous.DetailQuantities = slices.Clone(sale.DetailQuantities)
