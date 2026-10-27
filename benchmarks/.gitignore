@@ -1,0 +1,6 @@
+# The checkout under test: a local symlink, set by link.sh.
+/orm
+# Build products of bench.sh and ab.sh.
+/bin/
+*.test
+*.prof
