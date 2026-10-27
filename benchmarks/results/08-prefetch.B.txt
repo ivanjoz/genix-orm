@@ -1,0 +1,66 @@
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	  82496146 ns/op	       157.6 ns/line	101060570 B/op	   10016 allocs/op
+BenchmarkRebuild/enrollment    	       3	  14138669 ns/op	       145.8 ns/line	30264320 B/op	    4244 allocs/op
+BenchmarkRebuild/movements     	       3	 145146076 ns/op	       228.1 ns/line	176940224 B/op	   33153 allocs/op
+BenchmarkBuild/sales           	       3	  95379378 ns/op	       182.2 ns/line	100250576 B/op	   50255 allocs/op
+BenchmarkBuild/enrollment      	       3	  18125089 ns/op	       186.9 ns/line	32863400 B/op	  226093 allocs/op
+BenchmarkBuild/movements       	       3	 173745723 ns/op	       273.0 ns/line	175649992 B/op	   70528 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	  81194649 ns/op	       155.1 ns/line	101060570 B/op	   10016 allocs/op
+BenchmarkRebuild/enrollment    	       3	  15066926 ns/op	       155.4 ns/line	30264320 B/op	    4244 allocs/op
+BenchmarkRebuild/movements     	       3	 155444002 ns/op	       244.3 ns/line	176939968 B/op	   33151 allocs/op
+BenchmarkBuild/sales           	       3	 105295977 ns/op	       201.2 ns/line	100250576 B/op	   50255 allocs/op
+BenchmarkBuild/enrollment      	       3	  18882030 ns/op	       194.7 ns/line	32863400 B/op	  226093 allocs/op
+BenchmarkBuild/movements       	       3	 188084864 ns/op	       295.6 ns/line	175649992 B/op	   70528 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	  83647357 ns/op	       159.8 ns/line	101060570 B/op	   10016 allocs/op
+BenchmarkRebuild/enrollment    	       3	  13244324 ns/op	       136.6 ns/line	30264320 B/op	    4244 allocs/op
+BenchmarkRebuild/movements     	       3	 144660827 ns/op	       227.3 ns/line	176939968 B/op	   33151 allocs/op
+BenchmarkBuild/sales           	       3	  97311070 ns/op	       185.9 ns/line	100250576 B/op	   50255 allocs/op
+BenchmarkBuild/enrollment      	       3	  16709883 ns/op	       172.3 ns/line	32863405 B/op	  226093 allocs/op
+BenchmarkBuild/movements       	       3	 167287974 ns/op	       262.9 ns/line	175649992 B/op	   70528 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	  92838722 ns/op	       177.4 ns/line	101060816 B/op	   10018 allocs/op
+BenchmarkRebuild/enrollment    	       3	  14562001 ns/op	       150.2 ns/line	30264336 B/op	    4244 allocs/op
+BenchmarkRebuild/movements     	       3	 164491341 ns/op	       258.5 ns/line	176939968 B/op	   33151 allocs/op
+BenchmarkBuild/sales           	       3	  99698227 ns/op	       190.5 ns/line	100250576 B/op	   50255 allocs/op
+BenchmarkBuild/enrollment      	       3	  16731600 ns/op	       172.5 ns/line	32863405 B/op	  226093 allocs/op
+BenchmarkBuild/movements       	       3	 169975807 ns/op	       267.1 ns/line	175649992 B/op	   70528 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	  81803746 ns/op	       156.3 ns/line	101060602 B/op	   10016 allocs/op
+BenchmarkRebuild/enrollment    	       3	  13850220 ns/op	       142.8 ns/line	30264320 B/op	    4244 allocs/op
+BenchmarkRebuild/movements     	       3	 149135828 ns/op	       234.4 ns/line	176939968 B/op	   33151 allocs/op
+BenchmarkBuild/sales           	       3	 102806502 ns/op	       196.4 ns/line	100250576 B/op	   50255 allocs/op
+BenchmarkBuild/enrollment      	       3	  17155155 ns/op	       176.9 ns/line	32863400 B/op	  226093 allocs/op
+BenchmarkBuild/movements       	       3	 171186056 ns/op	       269.0 ns/line	175649992 B/op	   70528 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/ivanjoz/genix-orm/benchmarks
+cpu: 13th Gen Intel(R) Core(TM) i7-1355U
+BenchmarkRebuild/sales         	       3	  88730958 ns/op	       169.5 ns/line	101060570 B/op	   10016 allocs/op
+BenchmarkRebuild/enrollment    	       3	  14440544 ns/op	       148.9 ns/line	30264320 B/op	    4244 allocs/op
+BenchmarkRebuild/movements     	       3	 148039126 ns/op	       232.6 ns/line	176939968 B/op	   33151 allocs/op
+BenchmarkBuild/sales           	       3	 105550642 ns/op	       201.6 ns/line	100250581 B/op	   50255 allocs/op
+BenchmarkBuild/enrollment      	       3	  16682277 ns/op	       172.0 ns/line	32863405 B/op	  226093 allocs/op
+BenchmarkBuild/movements       	       3	 170544416 ns/op	       268.0 ns/line	175649992 B/op	   70528 allocs/op
+PASS
