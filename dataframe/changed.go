@@ -118,8 +118,9 @@ func ReadChanged(table *Table, frame *Frame, backend Backend, store utils.FileSt
 		}
 		// The last write since w each file was touched by; a file a write creates is not listed yet.
 		lastWriteByFileKey := map[string]int64{}
+		fileKeyOf := frame.newFileKeyCache(state.Generation)
 		for _, history := range histories {
-			for _, fileKey := range table.filesOfHistory(frame, state.Generation, history, state.Snapshot, math.MaxInt64) {
+			for _, fileKey := range fileKeyOf.filesOfHistory(history, state.Snapshot, math.MaxInt64) {
 				lastWriteByFileKey[fileKey] = max(lastWriteByFileKey[fileKey], history.updated)
 			}
 		}

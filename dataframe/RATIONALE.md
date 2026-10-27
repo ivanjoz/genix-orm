@@ -125,3 +125,12 @@ path's `LinesOf` reuses its `[]F` through a `sync.Pool`.
 100k records from records (scylla): sales 119 → 101 ms, movements 209 → 162 ms; sales allocations
 416k → 51k. The write path's LinesOf: sales 52 → 41 ms. Not an A/B: the benchmarks can't compile
 against the old signature; compared with the recorded results.
+
+## A run builds each file's key once
+**Context** — With a run's files merged instead of mapped, naming files was most of a realistic
+compaction's allocations: `fileKeyOf` built the key string of every line of every moved record, at
+every moment, with several concatenations each.
+**Decision** — `fileKeyOf` builds the key in one buffer the string shares; `fileKeyCache` keeps the
+keys of one generation by partition and Keys for the length of a run or a read.
+**Rationale** — Compact of 100k sales with today's ~1,200 written (A/B): 6.7 → 4.6 ms, allocations
+73k → 15k; movements (changes over every file) −4%, allocations −56%.

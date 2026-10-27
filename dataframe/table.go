@@ -305,14 +305,41 @@ func (frame *Frame) generationFolderOf(generation string, partition int64) strin
 
 // fileKeyOf is the store key of the file of keys of a partition in a generation folder:
 // <generation folder><k1> for one key, <generation folder><k1>/<k2>_<k3> for two or three.
+// It is built in one buffer, which the string then shares.
 func (frame *Frame) fileKeyOf(generation string, partition int64, keys []int64) string {
-	fileKey := frame.generationFolderOf(generation, partition) + strconv.FormatInt(keys[0], 10)
-	if len(keys) > 1 {
-		laterKeys := make([]string, len(keys)-1)
-		for i, key := range keys[1:] {
-			laterKeys[i] = strconv.FormatInt(key, 10)
+	fileKey := make([]byte, 0, len(frame.Folder)+len(generation)+24+20*len(keys))
+	fileKey = strconv.AppendInt(append(fileKey, frame.Folder...), partition, 10)
+	fileKey = strconv.AppendInt(append(append(append(fileKey, '/'), generation...), '/'), keys[0], 10)
+	for i, key := range keys[1:] {
+		separator := byte('_')
+		if i == 0 {
+			separator = '/'
 		}
-		fileKey += "/" + strings.Join(laterKeys, "_")
+		fileKey = strconv.AppendInt(append(fileKey, separator), key, 10)
+	}
+	return unsafe.String(unsafe.SliceData(fileKey), len(fileKey))
+}
+
+// fileKeyCache names the files of one generation by partition and Keys, building each key once: a run
+// names the file of every line of every record it moves, at several moments.
+type fileKeyCache struct {
+	frame      *Frame
+	generation string
+	keys       map[[1 + 3]int64]string
+}
+
+func (frame *Frame) newFileKeyCache(generation string) *fileKeyCache {
+	return &fileKeyCache{frame: frame, generation: generation, keys: map[[1 + 3]int64]string{}}
+}
+
+// of is the store key of the file of a line's Keys in a partition (Frame.fileKeyOf).
+func (cache *fileKeyCache) of(partition int64, keys []int64) string {
+	cacheKey := [1 + 3]int64{partition}
+	copy(cacheKey[1:], keys)
+	fileKey, isCached := cache.keys[cacheKey]
+	if !isCached {
+		fileKey = cache.frame.fileKeyOf(cache.generation, partition, keys)
+		cache.keys[cacheKey] = fileKey
 	}
 	return fileKey
 }
