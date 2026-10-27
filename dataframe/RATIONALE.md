@@ -111,3 +111,17 @@ row, then sorted the map's keys to write it back, though a run moves a few rows 
 and a map of only the rows its lines moved; `fileAt` sorts the moved rows and merges the two once.
 **Rationale** — Bytes identical. Compact of 100k records with ~1,200 written since the build (A/B):
 sales 161 → 74 ms, enrollment 37 → 12 ms, movements 261 → 147 ms; bytes −45%.
+
+## ToFrames appends to a slice it is given; a rebuild can take records instead of Histories
+**Context** — Turning a partition into lines was ~40% of a rebuild: per record a ToFrames slice, a
+line backing, a `[]Line`, a `RecordLines` and a `History`, garbage the GC then scanned.
+**Decision** — The ToFrames method is `func(*R, []F) []F`: it appends to the slice and returns it
+(an API change of every ToFrames method). A backend may implement `PartitionRecordScanner`, handing
+a rebuild `ScannedRecord{Record, History}` with a History only for a record written within the log's
+reach; the rebuild reads every other record's lines straight into its arena through one reused
+`[]F` and `Line` (`Frame.lineReader`). scylla implements it; dynamo still hands Histories. The write
+path's `LinesOf` reuses its `[]F` through a `sync.Pool`.
+**Rationale** — Bytes identical (golden, and a test that both scans write the same files). Build of
+100k records from records (scylla): sales 119 → 101 ms, movements 209 → 162 ms; sales allocations
+416k → 51k. The write path's LinesOf: sales 52 → 41 ms. Not an A/B: the benchmarks can't compile
+against the old signature; compared with the recorded results.

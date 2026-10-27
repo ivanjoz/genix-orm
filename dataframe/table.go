@@ -6,6 +6,7 @@
 package dataframe
 
 import (
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math"
@@ -101,6 +102,9 @@ type Frame struct {
 	shapeTag uint16
 	Folder   string // dtf/<table id>/<name>/, a folder per partition in it
 	linesOf  func(record unsafe.Pointer) ([]Line, error)
+	// newLineReader is a projected frame's (Projection.newLineReader); nil for a frame declared by
+	// columns, read through linesOf.
+	newLineReader func() lineReader
 }
 
 // Table is the compiled frames of one table.
@@ -146,6 +150,9 @@ func Compile(tableName string, tableID uint64, specs []Spec) (*Table, error) {
 		}
 		frame := Frame{Name: spec.Name, Index: len(table.Frames), Keys: spec.Keys, Rows: spec.Rows, Sums: spec.Sums, CountsRecords: spec.Count,
 			UsesZeroSumsMask: spec.UseZeroSumsMask, IsProjected: spec.Projection != nil, CompactOn: spec.CompactOn, SumsCount: len(spec.Sums), Folder: tableFolder + spec.Name + "/", linesOf: spec.LinesOf}
+		if spec.Projection != nil {
+			frame.newLineReader = spec.Projection.newLineReader
+		}
 		if spec.Count {
 			frame.SumsCount++
 		}
@@ -211,23 +218,56 @@ func (table *Table) LinesOf(record unsafe.Pointer) (RecordLines, error) {
 		if err != nil {
 			return nil, fmt.Errorf("dataframe: %s frame %q: %w", table.Name, frame.Name, err)
 		}
-		lineLength, keysAndRows := frame.lineLength(), len(frame.Keys)+len(frame.Rows)
 		for _, line := range lines {
-			if len(line) != lineLength {
-				return nil, fmt.Errorf("dataframe: %s frame %q takes lines of %d values, got %d", table.Name, frame.Name, lineLength, len(line))
-			}
-			for v, value := range line {
-				if value >= MaxMagnitude || value <= -MaxMagnitude {
-					return nil, fmt.Errorf("dataframe: %s frame %q holds %d, outside what a frame keeps (±2^60)", table.Name, frame.Name, value)
-				}
-				if value < 0 && v < keysAndRows {
-					return nil, fmt.Errorf("dataframe: %s frame %q takes no negative Keys or Rows value", table.Name, frame.Name)
-				}
+			if err := frame.checkLine(line); err != nil {
+				return nil, fmt.Errorf("dataframe: %s frame %q %w", table.Name, frame.Name, err)
 			}
 		}
 		recordLines[i] = lines
 	}
 	return recordLines, nil
+}
+
+// checkLine refuses a line the frame can't keep (LinesOf).
+func (frame *Frame) checkLine(line Line) error {
+	if len(line) != frame.lineLength() {
+		return fmt.Errorf("takes lines of %d values, got %d", frame.lineLength(), len(line))
+	}
+	keysAndRows := len(frame.Keys) + len(frame.Rows)
+	for v, value := range line {
+		if value >= MaxMagnitude || value <= -MaxMagnitude {
+			return fmt.Errorf("holds %d, outside what a frame keeps (±2^60)", value)
+		}
+		if value < 0 && v < keysAndRows {
+			return errors.New("takes no negative Keys or Rows value")
+		}
+	}
+	return nil
+}
+
+// lineReader makes the frame's lineReader, its errors naming the table and the frame.
+func (frame *Frame) lineReader(tableName string) lineReader {
+	read := func(record unsafe.Pointer, sums *lineSums) error {
+		lines, err := frame.linesOf(record)
+		for _, line := range lines {
+			if err != nil {
+				break
+			}
+			if err = frame.checkLine(line); err == nil {
+				sums.add(line)
+			}
+		}
+		return err
+	}
+	if frame.newLineReader != nil {
+		read = frame.newLineReader()
+	}
+	return func(record unsafe.Pointer, sums *lineSums) error {
+		if err := read(record, sums); err != nil {
+			return fmt.Errorf("dataframe: %s frame %q: %w", tableName, frame.Name, err)
+		}
+		return nil
+	}
 }
 
 // lineLength is how many values a line of the frame holds: its Keys, Rows and Sums.

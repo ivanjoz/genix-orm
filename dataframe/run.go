@@ -281,15 +281,33 @@ func (table *Table) rebuildFrame(backend Backend, store utils.FileStore, frame *
 	target := utils.SUnixTimeOf(now) - TargetLag
 	generation := utils.EncodeUintBase64(uint64(now.UnixMilli()))
 	sums := newLineSums(frame)
-	err := backend.ScanPartitionHistories(partition, func(histories []History) error {
-		for _, history := range histories {
-			lines, _ := history.linesAt(frame, target)
-			for _, line := range lines {
-				sums.add(line)
-			}
+	addLinesAt := func(history *History) {
+		lines, _ := history.linesAt(frame, target)
+		for _, line := range lines {
+			sums.add(line)
 		}
-		return nil
-	})
+	}
+	var err error
+	if scanner, isRecordScanner := backend.(PartitionRecordScanner); isRecordScanner {
+		readLines := frame.lineReader(table.Name)
+		err = scanner.ScanPartitionRecords(partition, func(records []ScannedRecord) error {
+			for _, scanned := range records {
+				if scanned.History != nil {
+					addLinesAt(scanned.History)
+				} else if err := readLines(scanned.Record, sums); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	} else {
+		err = backend.ScanPartitionHistories(partition, func(histories []History) error {
+			for i := range histories {
+				addLinesAt(&histories[i])
+			}
+			return nil
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("dataframe: %s frame %q partition %d reading the records: %w", table.Name, frame.Name, partition, err)
 	}

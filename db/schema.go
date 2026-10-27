@@ -197,10 +197,11 @@ type DataFrame struct {
 // CompactOn is when a read compacts the DataFrame partition it reads (dataframe/compact.go).
 type CompactOn = dataframe.CompactOn
 
-// ToFrames compiles a record's ToFrames method for DataFrame.ToFrames: it returns the record's lines
-// as structs whose fields are tagged frame:"key", frame:"row" or frame:"sum". It must be pure: it is
-// called on the record before and after each write.
-func ToFrames[R any, F any](method func(*R) []F) *dataframe.Projection {
+// ToFrames compiles a record's ToFrames method for DataFrame.ToFrames: it appends the record's lines
+// to the slice it is given and returns it, as structs whose fields are tagged frame:"key",
+// frame:"row" or frame:"sum". It must be pure: it is called on the record before and after each
+// write. A rebuild hands it one reused buffer, so it must not keep the slice.
+func ToFrames[R any, F any](method func(*R, []F) []F) *dataframe.Projection {
 	return dataframe.ProjectionOf(method)
 }
 
