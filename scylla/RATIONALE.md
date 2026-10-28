@@ -1,3 +1,36 @@
+## A blob column is decoded without the colbin.IsColbin gate
+**Context** — `AssignValue` skipped any blob not starting with a colbin root byte. colbin documents
+that a typed narrow message usually has none, and a top-level `[]Struct` column (`SaleOrder.Lines`)
+is one: every such column was written and then read back empty, silently.
+**Decision** — Every non-empty blob goes to `colbin.Unmarshal`, and a failure is logged with its
+first byte.
+**Rationale** — A blob that is not colbin still fails, now in the decoder. It costs one noisier log
+line: `companies.invoice_series` holds blobs that are not readable colbin, and it now reports "the
+message ends inside a field" where it used to report "not a colbin message".
+
+## A computed column is any table field with no record field; the driver validates it
+**Context** — `bindStructTable` runs per query on the *unbound* schema, where `Computed[i].Col` has no
+name yet, so it cannot tell a computed column from a typo in the table struct.
+**Decision** — Binding names any table field with no record field and marks it `IsComputed`. The
+driver's `makeTable` panics on one that `TableSchema.Computed` does not declare. The panic that used to
+fire at bind time ("No se encontró el field") now fires when the table compiles, which happens at
+boot.
+**Rationale** — The check stays, one step later, and the schema needs no second declaration (a tag)
+to say what `Computed` already says.
+
+## A computed column lives in ColumnsMap but not in Columns, and needs From
+**Context** — Index groups and the query planner resolve source columns by name in `ColumnsMap`.
+Every write, select, deploy, backup and by-IDs read walks `Columns`. An update only rehashes an
+index group when one of its source columns is in the update.
+**Decision** — The computed column goes into `ColumnsMap`, with `IsVirtual` set so the view
+projections skip it, and never into `Columns`. Deploy now adds missing columns from `Columns`.
+`ComputedCol.From` names the stored columns it derives from, and an update that writes one of them
+counts the computed column as written (`includeComputedColumns`). A predicate on a computed column
+that no index group consumed fails in `Compute` instead of reaching CQL.
+**Rationale** — It touches 4 places, not one guard per column walk. The cost is that `From` must be
+declared by hand: if it is missing, an update of `Lines` alone would leave the hashes stale, so it is
+required at compile time.
+
 ## The DataFrame log keeps its (half_hour) partition key now that every read is per partition
 **Context** — Compactions and reads are per company now; nothing reads every partition's log at
 once. A `((partition_id, half_hour))` key would spread the load better.

@@ -341,8 +341,16 @@ func bindStructTable(schemaStruct any, schema TableSchema, structRefType reflect
 				}
 			}
 		} else if fieldType.Name != "TableStruct" {
-			err := fmt.Sprintf(`No se encontró el field "%v" en el struct "%v"`, fieldType.Name, structRefType.Name())
-			panic(err)
+			// No record field: only a TableSchema.Computed column may do that. The schema here is
+			// unbound, so it cannot be checked yet; the driver rejects an undeclared one when the
+			// table compiles, which happens at boot.
+			if columnName == "" {
+				columnName = ToSnakeCase(fieldType.Name)
+			}
+			colInfo := column.GetInfoPointer()
+			colInfo.Name = columnName
+			colInfo.FieldName = fieldType.Name
+			colInfo.IsComputed = true
 		}
 
 		// Set the column name using the interface method

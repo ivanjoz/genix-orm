@@ -331,7 +331,10 @@ func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.
 	}
 	for _, indexGroup := range scyllaTable.indexGroups {
 		for _, sourceColumn := range indexGroup.sourceColumns {
-			appendSelectedColumn(sourceColumn.column)
+			// A computed source has no storage: its From columns are read and it is computed from them.
+			for _, storedColumn := range storedColumnsOf(&scyllaTable, sourceColumn.column) {
+				appendSelectedColumn(storedColumn)
+			}
 		}
 	}
 	if len(selectedColumns) == 0 {
@@ -1047,8 +1050,9 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 		}
 
 		columnsSchemaMap := map[string]IColInfo{}
-		for name, col := range table.ColumnsMap {
-			columnsSchemaMap[name] = col
+		// Columns, not ColumnsMap: a computed column has no storage to create.
+		for _, col := range table.Columns {
+			columnsSchemaMap[col.GetName()] = col
 		}
 		columnsNoMapeadas := map[string]string{}
 

@@ -144,24 +144,19 @@ func (scyllaValueCodec) AssignValue(c *columnInfo, ptr unsafe.Pointer, v any) {
 		return
 	}
 
-	// IsColbin is the dispatch check the format is built for: a message always
-	// starts in the reserved root range, and no other byte can. It replaces a
-	// `len(vl) > 3` guess, which both dropped a valid short message — an all-zero
-	// record encodes to a single root byte — and fed non-colbin blobs to the
-	// decoder to fail further in.
-	if !colbin.IsColbin(vl) {
-		if len(vl) > 0 {
-			fmt.Printf("Blob for Col %s is not a colbin message (first byte %#x)\n", c.Name, vl[0])
-		} else if ShouldLogFull() {
+	if len(vl) == 0 {
+		if ShouldLogFull() {
 			fmt.Printf("Complex Type is empty: %s\n", c.Name)
 		}
 		return
 	}
 
-	// Direct unmarshal into the field memory using the xunsafe pointer.
+	// No colbin.IsColbin gate: a typed narrow message (a top-level []Struct column) does not start
+	// with a root byte, so the gate dropped every slice column. A blob that is not colbin at all
+	// fails in the decoder and is logged the same way.
 	dest := reflect.NewAt(c.RefType, c.Field.Pointer(ptr)).Interface()
 	if err := colbin.Unmarshal(vl, dest); err != nil {
-		fmt.Printf("Error decoding colbin ComplexType for Col %s: %v\n", c.Name, err)
+		fmt.Printf("Error decoding colbin ComplexType for Col %s (first byte %#x): %v\n", c.Name, vl[0], err)
 	}
 }
 

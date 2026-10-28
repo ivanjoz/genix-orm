@@ -1,6 +1,11 @@
 package db
 
-import "github.com/ivanjoz/genix-orm/dataframe"
+import (
+	"reflect"
+	"unsafe"
+
+	"github.com/ivanjoz/genix-orm/dataframe"
+)
 
 // Coln is the type-erased handle for a column, as referenced from a schema
 // declaration or an index. Both Col and ColSlice satisfy it.
@@ -164,6 +169,42 @@ type TableSchema struct {
 	// partition column and one integer key; the reads compact them (DataFrame.CompactOn), or
 	// CompactDataFrames.
 	DataFrames []DataFrame
+	// Computed declares the table-struct columns that have no record field: their value is a method of
+	// the record, so a value derived from another column (the product IDs of the sale lines) can feed
+	// an index without being stored twice. See ComputedCol.
+	Computed []ComputedCol
+}
+
+// ComputedCol binds a table-struct column with no record field to a record method:
+//
+//	{Col: e.DetailProductIDs, From: db.Cols(e.Lines), Value: db.Compute((*SaleOrder).DetailProductIDs)}
+//
+// The column is never written, read or deployed. Only a multi-column UseIndexGroup can name it, since
+// that index stores hashes computed from the record in memory; every other use is rejected when the
+// table compiles. A query on it must be served by one of those index groups.
+type ComputedCol struct {
+	Col Coln
+	// From are the stored columns the value is derived from: an update that writes any of them
+	// recomputes the index groups of the computed column.
+	From  []Coln
+	Value *ComputedValue
+}
+
+// ComputedValue is a record method compiled for ComputedCol.Value.
+type ComputedValue struct {
+	RecordType reflect.Type
+	ValueType  reflect.Type
+	Read       func(recordPointer unsafe.Pointer) any
+}
+
+// Compute compiles a record method for ComputedCol.Value: db.Compute((*SaleOrder).DetailProductIDs).
+// It must be pure, it is called on every write of the record.
+func Compute[RecordT any, ValueT any](method func(*RecordT) ValueT) *ComputedValue {
+	return &ComputedValue{
+		RecordType: reflect.TypeFor[RecordT](),
+		ValueType:  reflect.TypeFor[ValueT](),
+		Read:       func(recordPointer unsafe.Pointer) any { return method((*RecordT)(recordPointer)) },
+	}
 }
 
 // DataFrame is one group-by report of a table: one file per value of Keys, one row per value of Rows

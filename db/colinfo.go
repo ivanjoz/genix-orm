@@ -17,7 +17,10 @@ type ColInfo struct {
 	IsPrimaryKey int8
 	FieldIdx     int
 	IsVirtual    bool
-	HasView      bool
+	// IsComputed marks a column read from a record method (TableSchema.Computed): it has no
+	// record field and no storage, it only feeds the index groups that name it.
+	IsComputed bool
+	HasView    bool
 	ViewIdx      int8
 	Idx          int16
 	RefType      reflect.Type

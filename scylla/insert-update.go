@@ -1088,6 +1088,7 @@ func resolveUpdateColumnsForWrite(
 	if pk != nil && !pk.IsNil() {
 		columnsIncluded = append(columnsIncluded, pk.GetInfo().Idx)
 	}
+	columnsIncluded = includeComputedColumns(&scyllaTable, columnsIncluded)
 
 	// Revisa si hay columnas que deben actualizarse juntas para los índices calculados.
 	for _, indexViews := range scyllaTable.indexViews {

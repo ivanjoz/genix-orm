@@ -1029,6 +1029,9 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 			orderColumnName = groupByPlan.OrderColumn.GetName()
 		}
 	}
+	if err := rejectComputedStatements(scyllaTable, remainingStatements); err != nil {
+		return nil, err
+	}
 
 	return buildBoundSelectPlan(
 		queryTemplate,

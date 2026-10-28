@@ -39,6 +39,8 @@ type ScyllaTable struct {
 	// Composite bucket metadata is used to materialize virtual hash sets and plan range+contains reads.
 	compositeBucketIndexes []compositeBucketIndex
 	indexGroups            []indexGroupInfo
+	// computedColumns are the TableSchema.Computed columns (computed_columns.go).
+	computedColumns []computedColumnInfo
 	// indexGroupIDs prevents per-table collisions when logical IndexGroup names hash to the same int16.
 	indexGroupIDs     map[int16]string
 	indexUpdatedTable *indexUpdatedTableInfo

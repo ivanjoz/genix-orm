@@ -238,6 +238,8 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		sequenceColumn = schema.SequenceColumn.GetName()
 	}
 
+	computedPendingColumns := map[string]columnInfo{}
+
 	// New implementation: iterate over struct fields and process Col[T,E] fields
 	for i := 0; i < structRefValue.NumField(); i++ {
 		field := structRefValue.Field(i)
@@ -275,6 +277,12 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 			fmt.Printf("Mapped Table Column: %-20s | Field: %-20s | Type: %-10s | Offset: %d\n", column.GetName(), column.GetInfo().FieldName, column.FieldType, offset)
 		}
 
+		// No record field: configureComputedColumns binds it to its TableSchema.Computed declaration.
+		if column.IsComputed {
+			computedPendingColumns[column.GetName()] = column
+			continue
+		}
+
 		if sequenceColumn == column.GetName() {
 			column.DBType = "counter"
 		} /* else if column.DBType == "" {
@@ -301,6 +309,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 
 	// Default audit columns are added unless the schema explicitly opts out.
 	bindManagedAuditColumns(&dbTable, schema)
+	configureComputedColumns(&dbTable, schema, structRefValue, computedPendingColumns)
 
 	// Resolve declared value ranges before any index compiles, since TypeDelta sizes its bit
 	// slots from them.
@@ -587,8 +596,11 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 	}
 
 	for _, col := range dbTable.ColumnsMap {
-		dbTable.Columns = append(dbTable.Columns, col)
 		dbTable.ColumnsIdxMap[col.GetInfo().Idx] = col
+		// Columns is what every write, read and deploy walks: a computed column has no storage.
+		if !col.GetInfo().IsComputed {
+			dbTable.Columns = append(dbTable.Columns, col)
+		}
 	}
 
 	for _, e := range dbTable.indexes {

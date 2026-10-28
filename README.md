@@ -175,6 +175,44 @@ func (e ProductTable) GetSchema() db.TableSchema {
 `SelfParse()` on the record, if defined, runs before every insert and update — use
 it for derived fields.
 
+### Computed columns
+
+A table column with no record field can be declared in `Computed`. Its value comes from a record
+method and is never stored, so a value derived from another column can feed an index without being
+stored twice:
+
+```go
+type SaleOrder struct {
+    db.TableStruct[SaleOrderTable, SaleOrder]
+    Date  int16
+    Lines []SaleOrderLine   // one colbin blob
+}
+
+func (e *SaleOrder) DetailProductIDs() []int32 { /* the ProductID of every line */ }
+
+type SaleOrderTable struct {
+    db.TableStruct[SaleOrderTable, SaleOrder]
+    Date             db.Col[*SaleOrderTable, int16]
+    Lines            db.Col[*SaleOrderTable, []SaleOrderLine]
+    DetailProductIDs db.Col[*SaleOrderTable, []int32]   // no field in SaleOrder
+}
+
+// in GetSchema:
+Computed: []db.ComputedCol{
+    {Col: e.DetailProductIDs, From: db.Cols(e.Lines), Value: db.Compute((*SaleOrder).DetailProductIDs)},
+},
+Indexes: []db.Index{{Keys: db.Cols(e.Date, e.DetailProductIDs), UseIndexGroup: true}},
+```
+
+- Only a `UseIndexGroup` index with two or more Keys can name it. That index stores hashes computed
+  from the record in memory. Any other use is rejected when the table compiles: a key, a partition,
+  another index kind, a single-key group or a DataFrame.
+- `From` lists the stored columns the value is derived from. An update that writes any of them
+  recomputes the hashes.
+- A query on it (`DetailProductIDs.Contains(x)`) must be served by one of those index groups. Any
+  other query on it returns an error.
+- Scylla driver only.
+
 For the full schema reference (key patterns, `KeyIntPacking`, `KeyConcatenated`,
 index kinds, column modifiers) see the `create-database-tables` skill.
 
