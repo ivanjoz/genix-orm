@@ -1,6 +1,9 @@
 package db
 
-import "github.com/ivanjoz/genix-orm/db/cache"
+import (
+	"github.com/ivanjoz/genix-orm/dataframe"
+	"github.com/ivanjoz/genix-orm/db/cache"
+)
 
 // Executor is one storage engine's implementation of the operations that need a
 // live connection. It is deliberately *generic*: an Executor[ProductTable, Product]
@@ -45,6 +48,8 @@ type Executor[TableT any, RecordT any] interface {
 	SearchText(refSlice *[]RecordT, partition int32, query string, limit, offset int) ([]TextHit, error)
 	// QueryFrame reads the rows of one partition of a DataFrame (FrameQuery.Exec).
 	QueryFrame(request FrameRequest) ([]FrameRow[RecordT], error)
+	// QueryFrameRows reads the same rows as dataframe rows, with the frame (FrameQuery.ExecRows).
+	QueryFrameRows(request FrameRequest) ([]dataframe.Row, *dataframe.Frame, error)
 	// QueryFrameChanged answers a client keeping a DataFrame's raw files (FrameQuery.ExecChanged).
 	QueryFrameChanged(request FrameRequest, heldGeneration, heldFiles string) ([]byte, error)
 	// CompileTable turns the declared schema into this driver's compiled form.

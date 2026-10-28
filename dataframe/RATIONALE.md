@@ -2,6 +2,43 @@
 
 Design decisions, newest first.
 
+## FrameSQL restored over the materialized read: Source is a function, no file cap
+**Context** — FrameSQL (`framesql/`) was lost with the first DataFrames module. Its `Source.Scan`
+streamed files one at a time, with a `selectFiles` hook before any GET to drop filtered files and
+cap the read at `MaxFiles`. The current module reads through `dataframe.Read`, which returns the
+sorted rows of a selection at once. It has no per-file hook, and a fresh read retries when a run
+commits mid-read.
+**Decision** — `framesql.Source` is `func(dataframe.Selection) ([]dataframe.Row, error)`.
+- The key and row filters drop rows inside the fold (`keepsRow`).
+- `Options.MaxFiles`, `selectFiles`, `Result.Snapshot` and `Result.FilesRead` are gone;
+  `Result.RowsRead` reports the size of the read.
+- Rows are 1–3 columns, with one filter per column.
+**Rationale** — No second read path through the ORM: FrameSQL reads exactly what a page's fresh read
+reads. The cost is the file cap. A frame whose later Keys a statement leaves unpinned lists every
+file of each `Keys[0]` value, with no refusal before the GETs. The sale frames have one Key, so a
+read is at most 400 files.
+
+## FrameSQL's ORM read is a typed FrameSource over a raw-rows ExecRows
+**Context** — FrameSQL needs a frame's rows as `dataframe.Row`. `FrameQuery.Exec` leaves
+`FrameRow.Key` empty on a ToFrames frame, which every sale frame is. FrameSQL also already holds
+the selection, so mapping it back to named filters would be a round trip.
+**Decision** — `FrameQuery.ExecRows()` (executor `QueryFrameRows`) returns the rows and the frame.
+`FrameRequest.Selection` passes a selection as is, and `dataframe.Read` checks it.
+`db.FrameSource[RecordT](partition, frameName)` is the Source: always `Fresh()`.
+**Rationale** — This was planned as a non-generic `db.ReadFrameRows(tableName, …)`. That needs a
+table registry by name, which the ORM doesn't have. A generic constructor reuses `QueryFrame`'s
+executor lookup, and the caller names its record type once, where it declares the frames.
+
+## FrameSQL: Hidden columns and KindQuantity
+**Context** — The sale frames keep `SubDivisor` as a Rows column, and sub-unit sums only add up within
+one divisor. The agent must never handle them.
+**Decision** — `Column.Hidden` keeps a column out of statements: no filter, group or sum, absent from
+errors. A hidden Rows column folds into the group of the others. `KindQuantity` reads a float Sums
+column unscaled (`/ FloatScale`).
+**Rationale** — The frame keeps what the page's chart reads, and the agent gets one quantity in whole
+units. `COUNT(*)` still counts a product's rows per divisor separately; a dataset's description must
+not present `COUNT(*)` as "days sold".
+
 ## A ToFrames frame is filtered by the record column of the key's name; its rows come back without a key
 **Context** — A ToFrames frame's columns are the frame struct's fields, not the record's. scylla
 filters name the record column (`date`), while the frame's key is the struct field `Date`, and a

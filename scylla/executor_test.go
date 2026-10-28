@@ -3,6 +3,7 @@ package scylla
 import (
 	"testing"
 
+	"github.com/ivanjoz/genix-orm/dataframe"
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/db/cache"
 )
@@ -67,6 +68,9 @@ func (f *fakeExec[TableT, RecordT]) SearchText(
 }
 func (f *fakeExec[TableT, RecordT]) QueryFrame(_ db.FrameRequest) ([]db.FrameRow[RecordT], error) {
 	return nil, nil
+}
+func (f *fakeExec[TableT, RecordT]) QueryFrameRows(_ db.FrameRequest) ([]dataframe.Row, *dataframe.Frame, error) {
+	return nil, nil, nil
 }
 func (f *fakeExec[TableT, RecordT]) QueryFrameChanged(_ db.FrameRequest, _, _ string) ([]byte, error) {
 	return nil, nil

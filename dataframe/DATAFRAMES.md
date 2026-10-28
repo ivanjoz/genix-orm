@@ -362,7 +362,8 @@ twice or lost. A run whose lock expired fails its conditional writes and its com
 
 `Read(table, frame, backend, store, partition, selection, isFresh, now)` (dynamo:
 `Repo.QueryFrame(name)`; scylla: `db.QueryFrame[Record](partition, name)`). Every step below is within
-the partition.
+the partition. `.ExecRows()` returns the raw `dataframe.Row`s with the frame: what FrameSQL
+(`framesql/FRAMESQL.md`) folds, through `db.FrameSource`.
 
 1. **Select the files.** A `Selection` takes a range of the first Key (at most 400 values) and, for
    the later Keys, the values of a leading run (`PinnedKeys`):

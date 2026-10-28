@@ -234,6 +234,11 @@ func (Exec[TableT, RecordT]) QueryFrame(request db.FrameRequest) ([]db.FrameRow[
 	return frameRows, nil
 }
 
+func (Exec[TableT, RecordT]) QueryFrameRows(request db.FrameRequest) ([]dataframe.Row, *dataframe.Frame, error) {
+	scyllaTable := MakeScyllaTable[RecordT, TableT]()
+	return readFrameRows(&scyllaTable, request)
+}
+
 func (Exec[TableT, RecordT]) QueryFrameChanged(request db.FrameRequest, heldGeneration, heldFiles string) ([]byte, error) {
 	scyllaTable := MakeScyllaTable[RecordT, TableT]()
 	return readFrameChanged(&scyllaTable, request, heldGeneration, heldFiles)
@@ -245,6 +250,10 @@ func frameOfRequest(scyllaTable *ScyllaTable, request db.FrameRequest) (*datafra
 		return nil, dataframe.Selection{}, fmt.Errorf("table %q has no DataFrame %q", scyllaTable.Name, request.Frame)
 	}
 	frame := scyllaTable.dataFrames.frames.FrameNamed(request.Frame)
+	// dataframe.Read checks a selection given as is.
+	if request.Selection != nil {
+		return frame, *request.Selection, nil
+	}
 	filters := request.Filters
 	if frame.IsProjected {
 		// A ToFrames frame's Keys are its frame struct's field names: the filter on a record column

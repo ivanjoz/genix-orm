@@ -19,6 +19,8 @@ type FrameRequest struct {
 	Partition int32
 	Frame     string
 	Filters   []FrameFilter
+	// Selection replaces Filters for a caller that already holds the frame's selection (FrameSQL).
+	Selection *dataframe.Selection
 	IsFresh   bool
 }
 
@@ -94,6 +96,13 @@ func (query *FrameQuery[TableT, RecordT]) Fresh() *FrameQuery[TableT, RecordT] {
 // Exec returns the rows sorted by the frame's Keys, then by its Rows. A missing file has no rows.
 func (query *FrameQuery[TableT, RecordT]) Exec() ([]FrameRow[RecordT], error) {
 	return query.executor.QueryFrame(query.request)
+}
+
+// ExecRows returns the same rows as Exec, as dataframe rows with the frame: Keys and RowValues in the
+// frame's column order. A ToFrames frame's rows can only be read this way, since Exec leaves their
+// Key empty.
+func (query *FrameQuery[TableT, RecordT]) ExecRows() ([]dataframe.Row, *dataframe.Frame, error) {
+	return query.executor.QueryFrameRows(query.request)
 }
 
 // ExecChanged answers a client (the browser) that keeps the raw files of the selection:
