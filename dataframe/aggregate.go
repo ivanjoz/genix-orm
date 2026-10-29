@@ -179,8 +179,10 @@ func (sums *lineSums) files(generation string, partition int64, snapshot int64) 
 			clear(groupSums)
 			end := start
 			for ; end < len(order) && (end == start || isSameGroup(end, start)); end++ {
+				// The line's last group value, beside its Sums: a frame with only Count has no Sums
+				// in its lines, so the line ends there.
 				if ahead := end + prefetchDistance; ahead < len(order) {
-					prefetch(unsafe.Pointer(&sums.lineAt(int(order[ahead]))[width]))
+					prefetch(unsafe.Pointer(&sums.lineAt(int(order[ahead]))[width-1]))
 				}
 				for s, value := range sums.lineAt(int(order[end]))[width:] {
 					groupSums[s] += value

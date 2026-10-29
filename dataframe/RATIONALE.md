@@ -2,6 +2,18 @@
 
 Design decisions, newest first.
 
+## FrameSQL views: a constructor, hidden base Rows dropped, a panic on a bad declaration
+**Context** — A view had to be declarative so the star rule (base frame names the files, a
+dictionary only adds a Rows column) can't be broken. `sale-client-product` already has 3 Rows
+(client, product, hidden divisor), the `dataframe.MaxRowColumns` cap, so a category column didn't fit.
+**Decision** — `framesql.View(name, base, dictionary)` builds a plain `Frame`: Keys and Sums are the
+base's, its `Source` wraps the base's read. Prepare, the planner and the engine are unchanged. The
+base's hidden Rows are left out of the view. A declaration that can't be a view panics in `View`.
+**Rationale** — A constructor is less code than a `Base` field resolved inside `Prepare`, and keeps
+the engine single-frame. Hidden Rows can't be filtered or grouped, so dropping them changes no
+statement's result; the cost is that a view can't hand them to another reader. The panic is a
+caller's typo in a declaration, which every test that builds the frames trips.
+
 ## FrameSQL restored over the materialized read: Source is a function, no file cap
 **Context** — FrameSQL (`framesql/`) was lost with the first DataFrames module. Its `Source.Scan`
 streamed files one at a time, with a `selectFiles` hook before any GET to drop filtered files and

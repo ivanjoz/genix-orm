@@ -77,11 +77,21 @@ func enrollmentLinesOf(recordPointer unsafe.Pointer) ([]Line, error) {
 	return []Line{{record.Year, record.ProgramID, record.EmployeeID, record.Minutes, record.Points, hours}}, nil
 }
 
+// memberLinesOf is the record's line of a frame with no Sums: its Keys and Rows only.
+func memberLinesOf(recordPointer unsafe.Pointer) ([]Line, error) {
+	record := (*testRecord)(recordPointer)
+	if record.Status == 0 {
+		return nil, nil
+	}
+	return []Line{{record.Year, record.ProgramID, record.EmployeeID}}, nil
+}
+
 var tagProjection = ProjectionOf((*testRecord).toTagFrames)
 
-// compileTestTable compiles three frames: year-program, one file per year and program with a row per
+// compileTestTable compiles four frames: year-program, one file per year and program with a row per
 // employee; year, one file per year with a row per program × employee (nested Rows) and the zero sums
-// mask; and tags, declared by a ToFrames method, 0..N lines per record.
+// mask; tags, declared by a ToFrames method, 0..N lines per record; and year-members, year's rows with
+// no Sums, only the Count.
 func compileTestTable(t *testing.T) *Table {
 	t.Helper()
 	table, err := Compile("enrollment", 78901377, []Spec{{
@@ -92,6 +102,10 @@ func compileTestTable(t *testing.T) *Table {
 		Sums: []Column{minutesColumn, pointsColumn, hoursColumn}, Count: true, UseZeroSumsMask: true, LinesOf: enrollmentLinesOf,
 	}, {
 		Name: "tags", Projection: tagProjection, Count: true, UseZeroSumsMask: true,
+	}, {
+		// Only groups: no Sums, the Count keeps a row while a record holds it.
+		Name: "year-members", Keys: []Column{yearColumn}, Rows: []Column{programColumn, employeeColumn},
+		Count: true, LinesOf: memberLinesOf,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +282,7 @@ func TestNextChangelogShiftsAndDrops(t *testing.T) {
 	storedLines, writtenLines := linesOfRecord(t, table, stored), linesOfRecord(t, table, written)
 	first, _ := table.NextChangelog(nil, 100, 100, storedLines, writtenLines)
 	entries, _ := table.decodeChangelog(first)
-	if len(entries) != 1 || entries[0].delta != 0 || len(entries[0].frames) != 2 || !reflect.DeepEqual(entries[0].frames[0].lines, storedLines[0]) {
+	if len(entries) != 1 || entries[0].delta != 0 || len(entries[0].frames) != 3 || !reflect.DeepEqual(entries[0].frames[0].lines, storedLines[0]) {
 		t.Fatalf("one changed record gives one entry with its stored lines, got %+v", entries)
 	}
 	// An unchanged write only shifts the deltas.

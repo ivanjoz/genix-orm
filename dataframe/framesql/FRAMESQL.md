@@ -48,6 +48,7 @@ currency units, each row underlined by a bar as long as its share of the largest
 | `dataframe/framesql/parse.go` | The tokenizer, the recursive-descent parser, the words it refuses with a rewrite, `formatExpr` (the canonical text of an expression) |
 | `dataframe/framesql/plan.go` | The statement bound to a frame: groups, items and their names, types, ORDER BY, then WHERE split into the read's selection, the key filters and the row filters; `keepsRow` |
 | `dataframe/framesql/engine.go` | The fold of each row into one accumulator; items, ORDER BY, LIMIT; `PeriodStarts` |
+| `dataframe/framesql/view.go` | `View` and `Dictionary`: a frame over a base frame's read with one more Rows column (§3, Views) |
 | `db/frame_sql.go` | `db.FrameSource[RecordT](partition, frameName)`: the `Source` over `QueryFrame(...).Fresh().ExecRows()` |
 | `db/dataframe.go` | `FrameRequest.Selection` and `FrameQuery.ExecRows`, the raw-rows read `FrameSource` uses |
 
@@ -131,6 +132,36 @@ type Source func(selection dataframe.Selection) ([]dataframe.Row, error)
   `dataframe.ErrFrameNotBuilt`.
 - `ExecRows`, not `Exec`, because a ToFrames frame's `FrameRow.Key` is empty: its columns are a frame
   struct's, not the record's.
+
+### Views: a base frame and a dictionary
+
+A statement reads one frame, so a join is declared, not written: `View(name, base, dictionary)`
+returns a `Frame` like any other. It is a star:
+- **The base frame is the facts and alone names the files.** The view has the base's Keys and Sums as
+  they are, and the statement's selection goes to the base's `Source` untouched.
+- **The dictionary only adds one Rows column.** It is joined on a visible base Rows column (`On`),
+  never on a Key, and read whole with the `Selection` the view fixes: a statement never bounds it.
+  A frame whose files a statement would have to choose can't be a dictionary.
+- **Many to many unnests.** A base row is repeated under each dictionary value of its `On` value, and
+  goes under 0 when it has none. Grouped by the added column each group is exact; the groups add up
+  to more than the base's total, which the caller's dataset description must say.
+- **Hidden base Rows are left out** of the view: a statement can't name them anyway, and it keeps the
+  view within `dataframe.MaxRowColumns`.
+- Star only: a view's base may be a view, but a dictionary is never joined to another.
+- The dictionary is read only when a statement runs on the view.
+
+```go
+db.SQLView("sale-category", saleSummary, db.SQLDictionary{
+	Rows:      []string{"category_id", "product_id"}, // the dictionary's RowValues, in order
+	On:        "product_id",
+	Column:    db.SQLColumn{Name: "category_id", Label: "Category|Categoría", Kind: db.SQLRef, Collection: "categories"},
+	Selection: db.SQLSelection{FromKey: 0, ToKey: 0},
+	Source:    db.FrameSource[production.Product](companyID, "product-categories"),
+})
+```
+
+`View` panics on a declaration that can't be a view (`On` or `Column.Name` not among the dictionary's
+Rows, `On` not a visible base Rows column, no `Source`).
 
 ### Prepare, check, run
 
@@ -706,7 +737,8 @@ the choice card's questions.
 
 ## 8. Limits
 
-- One frame and one statement per call; no joins, `OR`, `HAVING`, `MIN` / `MAX` or `DISTINCT`.
+- One frame and one statement per call; no joins, `OR`, `HAVING`, `MIN` / `MAX` or `DISTINCT`. A
+  join is a declared view (§3).
 - **Frame rows, not records.** `COUNT(*)` counts frame rows, and `AVG` averages over the rows that
   exist: an average over every day of the range, days without sales included, is not expressible.
 - **No filters on values.** WHERE takes Keys and Rows only, never a Sums column or an aggregate.
@@ -741,6 +773,9 @@ the choice card's questions.
   - several Rows columns, a hidden one folded into its product, and quantities that add sixths and
     twelfths as whole units;
   - `WEEK` / `MONTH` and `PeriodStarts`.
+- **`view_test.go`**: a product in two categories counted in both, one without under 0, the base's
+  selection passed through, the dictionary read whole, hidden base Rows left out, a dictionary off the
+  base's Rows refused.
   - **`TestEngineMatchesBruteForce`, the spec**: 400 random frames (1–3 Keys) and statements,
     rows fed in shuffled order, compared with a naive aggregation row by row. At least half the
     rounds must return several rows, so the comparison proves something.
