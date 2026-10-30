@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -37,6 +38,11 @@ import (
 // It is measured in read units, not pages, because a keys-only Contains also
 // reads its base records in a BatchGetItem.
 const queryScanMaxReadUnits = 5 * 1024 / 4 * 0.5
+
+// ErrQueryScanBudget wraps the error of a QueryScan that read queryScanMaxReadUnits and still had
+// more to read. The records it matched until then are kept: Exec already appended them, and
+// QueryScanRecords returns them together with the error, so a caller may use them as a partial result.
+var ErrQueryScanBudget = errors.New("QueryScan read its 5 MB budget without finishing")
 
 type op int8
 
@@ -79,7 +85,7 @@ type predicate struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // queryRecordsMaxLimit caps how many records a dynamic query returns.
-const queryRecordsMaxLimit = 400
+const queryRecordsMaxLimit = 1000
 
 // QueryPredicate is one field/operator/value constraint for QueryRecords. Values
 // arrive as decoded JSON (string, number, bool) and are coerced to the column's
@@ -92,7 +98,7 @@ type QueryPredicate struct {
 }
 
 // QueryRecords runs a dynamic query for this entity and returns up to limit
-// records (capped at 400) as JSON-serializable values, in descending sort-key
+// records (capped at 1000) as JSON-serializable values, in descending sort-key
 // order when desc is set (newest first on an autoincrement ID). See the package
 // comment above for the strict key rules it enforces.
 func (r *Repo[T, E]) QueryRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
@@ -101,7 +107,8 @@ func (r *Repo[T, E]) QueryRecords(preds []QueryPredicate, limit int32, desc bool
 
 // QueryScanRecords is QueryRecords over QueryScan: a partition or full GSI key
 // must still serve the read, and the predicates no key serves are filtered in
-// memory after it, within QueryScan's 5 MB read budget.
+// memory after it, within QueryScan's 5 MB read budget. Past it, the records matched so far come
+// back with an error wrapping ErrQueryScanBudget.
 func (r *Repo[T, E]) QueryScanRecords(preds []QueryPredicate, limit int32, desc bool) ([]any, error) {
 	return r.QueryScan().queryRecords(preds, limit, desc)
 }
@@ -142,10 +149,11 @@ func (q *queryState) queryRecords(preds []QueryPredicate, limit int32, desc bool
 		records = append(records, reflect.NewAt(q.meta.recordType, recordPtr).Elem().Interface())
 		return len(records)
 	})
-	if err != nil {
+	// Past the QueryScan budget, the records matched so far go out with the error.
+	if err != nil && !errors.Is(err, ErrQueryScanBudget) {
 		return nil, err
 	}
-	return records, nil
+	return records, err
 }
 
 // parseOp maps a wire operator token to an internal op. Both symbol ("=", ">=")
@@ -360,8 +368,8 @@ func (q *queryState) execPlans(client *dynamodb.Client, appendRecord recordSink)
 			// only a read that would go on past the budget fails; one that finished
 			// within a page of it returns what it found.
 			if q.allowsMemoryFilter && readUnits > queryScanMaxReadUnits {
-				return fmt.Errorf("db: %s QueryScan read more than 5 MB (%.1f RCU) without finishing: narrow its index predicates",
-					q.meta.recordType.Name(), readUnits)
+				return fmt.Errorf("db: %s %w (%.1f RCU): narrow its index predicates",
+					q.meta.recordType.Name(), ErrQueryScanBudget, readUnits)
 			}
 			out, err := client.Query(context.Background(), input)
 			if err != nil {

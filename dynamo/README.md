@@ -771,7 +771,9 @@ pays for every row the index returns, matched or not. To keep that bounded it
 stops with an error once it has read more than **5 MB** (640 RCU, eventually
 consistent: 4 KB per 0.5 RCU) without finishing. The budget is counted in read
 units, not pages, because a keys-only `Contains` also spends BatchGetItem reads
-that are not Query pages. Predicate order never matters: the planner picks the
+that are not Query pages. The error wraps `ErrQueryScanBudget`, and the records
+matched until then are kept (`Exec` already appended them; `QueryScanRecords`
+returns them with the error), so a caller may use them as a partial result. Predicate order never matters: the planner picks the
 index, not the call order.
 
 ### How a query is planned (`query.go`)
