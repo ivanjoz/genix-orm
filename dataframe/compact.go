@@ -36,8 +36,20 @@ type CompactOn struct {
 // needsRebuild says the partition can only be read after a rebuild: it has no files in the frame's
 // shape, or its w is so far back the changelogs may no longer reach it.
 func (frame *Frame) needsRebuild(state State, now time.Time) bool {
-	isOutOfReach := state.Snapshot < utils.SUnixTimeOf(now)-MaxDelta+rebuildMargin
-	return state.Generation == "" || state.Shape != frame.Shape || isOutOfReach
+	return frame.rebuildReason(state, now) != ""
+}
+
+// rebuildReason names why needsRebuild holds, for the compaction log; "" when it doesn't.
+func (frame *Frame) rebuildReason(state State, now time.Time) string {
+	switch {
+	case state.Generation == "":
+		return "no files yet"
+	case state.Shape != frame.Shape:
+		return "the frame's shape changed"
+	case state.Snapshot < utils.SUnixTimeOf(now)-MaxDelta+rebuildMargin:
+		return "w is out of the changelogs' reach"
+	}
+	return ""
 }
 
 // isCompactDue applies the frame's CompactOn to a partition at state, whose records written since w
@@ -81,21 +93,31 @@ func Compact(table *Table, backend Backend, store utils.FileStore, partition int
 // holder before it moved the state away from seenState (it did this compaction already), rebuilds the
 // partition when it needs it or moves its files to now − TargetLag.
 func (table *Table) compactFrame(backend Backend, store utils.FileStore, frame *Frame, partition int64, seenState State, now time.Time) error {
+	// A rebuild or compaction runs inside a read and is most of its latency: each one is logged with
+	// its cause and duration, so a slow read is explained by the log.
+	startedAt := time.Now()
+	logName := fmt.Sprintf("dataframe: %s frame %q partition %d", table.Name, frame.Name, partition)
 	lock, state, err := takeLock(backend, frame, partition, now)
 	if err != nil {
 		return err
 	}
 	if lock == nil {
-		return fmt.Errorf("dataframe: %s frame %q partition %d: another compaction kept it past %v", table.Name, frame.Name, partition, lockWait)
+		return fmt.Errorf("%s: another compaction kept it past %v", logName, lockWait)
 	}
 	defer releaseLock(backend, frame, partition, lock)
 	if state != seenState {
+		log.Printf("%s: waited %v for a compaction another read ran", logName, time.Since(startedAt))
 		return nil
 	}
-	if frame.needsRebuild(state, now) {
-		return table.rebuildFrame(backend, store, frame, partition, lock, now)
+	if rebuildReason := frame.rebuildReason(state, now); rebuildReason != "" {
+		err := table.rebuildFrame(backend, store, frame, partition, lock, now)
+		log.Printf("%s: rebuilt from its records (%s) in %v, err: %v", logName, rebuildReason, time.Since(startedAt), err)
+		return err
 	}
-	return table.runFrame(backend, store, frame, partition, lock, state, now)
+	err = table.runFrame(backend, store, frame, partition, lock, state, now)
+	snapshotAge := time.Duration(utils.SUnixTimeOf(now)-state.Snapshot) * 2 * time.Second
+	log.Printf("%s: compacted %v of changes in %v, err: %v", logName, snapshotAge, time.Since(startedAt), err)
+	return err
 }
 
 // compactDueFrame is the compaction a read does when CompactOn says it is due; true when it compacted,

@@ -2,6 +2,11 @@
 
 Design decisions, newest first.
 
+## Every rebuild and compaction is logged, unconditionally
+**Context** — A read that rebuilds or compacts first can take seconds (a 13 s `sale-summary` read after a 59 h gap), and nothing in the log said so: only a failed compaction was logged.
+**Decision** — `compactFrame`, the one funnel for read-time and manual compactions, logs each run with `log.Printf`: rebuilt (with the `rebuildReason`), compacted (with the span of changes it took), or only waited behind another holder, each with its duration and error.
+**Rationale** — One line per compaction is rare (at most hourly per partition under `CompactOn`) and needs no flag. Logging at the funnel instead of in `Read`/`ReadChanged` also covers `Compact`. The cost is a line in production logs for every compaction.
+
 ## FrameSQL views: a constructor, hidden base Rows dropped, a panic on a bad declaration
 **Context** — A view had to be declarative so the star rule (base frame names the files, a
 dictionary only adds a Rows column) can't be broken. `sale-client-product` already has 3 Rows
