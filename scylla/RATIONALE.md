@@ -1,3 +1,12 @@
+## MaxColIdx starts past the highest record-field Idx
+**Context** — A column's Idx is its record field index + 1, but MaxColIdx started at the table
+struct's field count + 1. A record with more fields than its table struct (SaleOrder: 31 vs 28)
+handed generated columns (computed, packed, index groups) an Idx a real column already had:
+writing `period` looked like writing the computed `detail_product_ids`, and a partial update
+panicked on an index group.
+**Decision** — `makeTable` raises MaxColIdx past every mapped column's Idx.
+**Rationale** — Idx is in-memory only, so the renumbering needs no migration.
+
 ## A blob column is decoded without the colbin.IsColbin gate
 **Context** — `AssignValue` skipped any blob not starting with a colbin root byte. colbin documents
 that a typed narrow message usually has none, and a top-level `[]Struct` column (`SaleOrder.Lines`)

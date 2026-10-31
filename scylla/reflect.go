@@ -300,6 +300,9 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 			panic("The following column name is repeated:" + column.GetName())
 		} else {
 			column.GetInfo().Idx = int16(column.GetInfo().FieldIdx) + 1
+			// Idx follows the record's field order, which can hold more fields than the table
+			// struct: the generated columns numbered from MaxColIdx must start past every one.
+			dbTable.MaxColIdx = max(dbTable.MaxColIdx, column.GetInfo().Idx+1)
 			dbTable.ColumnsMap[column.GetName()] = &column
 			if DebugFull {
 				// fmt.Printf("Mapped Col: %s, Field: %s, Offset: %d\n", column.GetName(), column.GetInfo().FieldName, column.GetInfo().Field.Offset)
