@@ -874,7 +874,7 @@ func selectExec(
 		return errors.New("no se ha especificado un keyspace")
 	}
 	if tableInfo.Delta != nil {
-		return execDelta(sink, tableInfo, scyllaTable, selectStartTime)
+		return execDelta(sink, tableInfo, scyllaTable)
 	}
 
 	compiledSelect, err := tryGetOrCompileSelectStatement(tableInfo, scyllaTable)

@@ -255,10 +255,10 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	dbTable.views[view.name] = view
 }
 
-// compileSchemaView builds the materialized view backing one TypeView declaration. slotPlan is nil
-// for a plain TypeView, whose packed bit layout is derived from .Size() hints here; a
-// TypeDelta declaration resolves its layout from FixedValues up front and passes it in.
-func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotPlan) {
+// compileSchemaView builds the materialized view backing one TypeView declaration. A packed view
+// takes its bit layout from .Size() hints, or from FixedValues when no key has a hint
+// (planFixedValueViewSlots).
+func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	appendUniqueColumn := func(target []IColInfo, column IColInfo) []IColInfo {
 		if column == nil || column.IsNil() {
 			return target
@@ -294,8 +294,8 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 		}
 	}
 
-	// A resolved slot plan already establishes the view as packed, so no per-column hint is needed.
-	isRangeView := len(viewCfg.Keys) > 1 && (packedViewHintFound || slotPlan != nil)
+	fixedValueSlots := planFixedValueViewSlots(dbTable, viewCfg)
+	isRangeView := len(viewCfg.Keys) > 1 && (packedViewHintFound || fixedValueSlots != nil)
 
 	// Views keep the base table partition unless the schema declares another column.
 	basePartCol := dbTable.GetPartKey()
@@ -393,15 +393,11 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index, slotPlan *deltaSlotP
 		isInt32PackedView := false
 		slotBitsPerColumn := make([]int64, 0, len(viewColumnsConfig))
 
-		if slotPlan != nil {
-			// TypeDelta resolved every slot from FixedValues, so the Size() rules below do not
-			// apply: the leading column carries a real width instead of absorbing the bit remainder.
-			if len(slotPlan.slotBitsPerColumn) != len(columns) {
-				panic(fmt.Sprintf(`The view "%v" in "%v" got %v slot widths for %v columns`,
-					view.name, dbTable.Name, len(slotPlan.slotBitsPerColumn), len(columns)))
-			}
-			isInt32PackedView = slotPlan.useInt32
-			slotBitsPerColumn = append(slotBitsPerColumn, slotPlan.slotBitsPerColumn...)
+		if fixedValueSlots != nil {
+			// Every slot comes from FixedValues: the leading column carries a real width instead of
+			// absorbing the bit remainder.
+			isInt32PackedView = fixedValueSlots.useInt32
+			slotBitsPerColumn = append(slotBitsPerColumn, fixedValueSlots.slotBitsPerColumn...)
 		} else {
 			if viewColumnsConfig[0].SlotBits > 0 {
 				panic(fmt.Sprintf(`The view "%v" in "%v" cannot set Size() on the first column; it takes the bits the remaining columns leave`, view.name, dbTable.Name))

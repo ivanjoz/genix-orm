@@ -157,7 +157,7 @@ func TestViewExpectedColumnsMatchCreateScript(t *testing.T) {
 	assertViewExpectedColumnsMatchCreateScript(t, MakeScyllaTable[hashIndexedFullViewRecord, hashIndexedFullViewSchema]())
 
 	resetORMTableCachesForTesting()
-	assertViewExpectedColumnsMatchCreateScript(t, MakeScyllaTable[deltaViewRecord, deltaViewSchema]())
+	assertViewExpectedColumnsMatchCreateScript(t, MakeScyllaTable[fixedViewViewRecord, fixedViewViewSchema]())
 
 	resetORMTableCachesForTesting()
 	assertViewExpectedColumnsMatchCreateScript(t, MakeScyllaTable[relocatedPartitionViewRecord, relocatedPartitionViewSchema]())

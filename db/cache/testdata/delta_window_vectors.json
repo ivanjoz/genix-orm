@@ -1,0 +1,155 @@
+{
+ "records": [
+  {
+   "id": 1,
+   "version": 1,
+   "hash": 2980047484
+  },
+  {
+   "id": 2,
+   "version": 1,
+   "hash": 2117216093
+  },
+  {
+   "id": 1,
+   "version": 2,
+   "hash": 232174035
+  },
+  {
+   "id": 87,
+   "version": 5,
+   "hash": 1142326658
+  },
+  {
+   "id": 412,
+   "version": 32767,
+   "hash": 1156860886
+  },
+  {
+   "id": 1234567890123,
+   "version": 3,
+   "hash": 2768639810
+  },
+  {
+   "id": 4398046511103,
+   "version": 1,
+   "hash": 949399778
+  },
+  {
+   "id": 9007199254740991,
+   "version": 12,
+   "hash": 297253237
+  }
+ ],
+ "windows": [
+  {
+   "records": [],
+   "hash": 0
+  },
+  {
+   "records": [
+    [
+     1,
+     1
+    ]
+   ],
+   "hash": 2980047484
+  },
+  {
+   "records": [
+    [
+     1,
+     1
+    ],
+    [
+     87,
+     5
+    ],
+    [
+     412,
+     32767
+    ]
+   ],
+   "hash": 984267732
+  },
+  {
+   "records": [
+    [
+     412,
+     32767
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     87,
+     5
+    ]
+   ],
+   "hash": 984267732
+  },
+  {
+   "records": [
+    [
+     1234567890123,
+     3
+    ],
+    [
+     9007199254740991,
+     12
+    ],
+    [
+     2,
+     1
+    ]
+   ],
+   "hash": 888141844
+  }
+ ],
+ "metadata": [
+  {
+   "isReplace": false,
+   "nextCursor": 400000000,
+   "windowFrom": 399999550,
+   "windowTo": 399999995,
+   "windowHash": 123456789,
+   "filterField": "ss",
+   "filterValues": [
+    1
+   ],
+   "removedIDs": [
+    412,
+    12,
+    87
+   ],
+   "hex": "088088debe01be84debe01fb87debe0115cd5b070273730102030c4bc502"
+  },
+  {
+   "isReplace": true,
+   "nextCursor": 400000123,
+   "windowFrom": 0,
+   "windowTo": 0,
+   "windowHash": 0,
+   "filterField": "State",
+   "filterValues": [
+    0,
+    2,
+    -3
+   ],
+   "removedIDs": [],
+   "hex": "0afb88debe010000000000000553746174650300040500"
+  },
+  {
+   "isReplace": false,
+   "nextCursor": 5,
+   "windowFrom": 0,
+   "windowTo": 0,
+   "windowHash": 4294967295,
+   "filterField": "",
+   "filterValues": [],
+   "removedIDs": [],
+   "hex": "08050000ffffffff000000"
+  }
+ ]
+}

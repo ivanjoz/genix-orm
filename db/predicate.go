@@ -3,8 +3,6 @@ package db
 import (
 	"fmt"
 	"strings"
-
-	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // ColumnStatement is one predicate against a column. It is a plain description
@@ -40,10 +38,11 @@ func (q ColumnStatement) GetValue() any {
 	}
 }
 
-// DeltaRead is what a Delta() call asked for: the client's cursor of the log, and the values a first
-// sync (or a replace) filters the index's sync filter column with.
+// DeltaRead is what a Delta() call asked for (db/cache delta_window.go): the highest Updated the client
+// holds (0 on a first sync), and the values of the index's sync filter column a replace lists and the
+// window hash covers.
 type DeltaRead struct {
-	Cursor           cache.DeltaCursor
+	CursorUpdated    int32
 	SyncFilterValues []any
 }
 

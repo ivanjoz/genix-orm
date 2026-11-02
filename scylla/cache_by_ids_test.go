@@ -29,7 +29,7 @@ func TestTableIDCollisionIsRejected(t *testing.T) {
 		}
 	}()
 
-	MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
+	MakeScyllaTable[fixedViewViewRecord, fixedViewViewSchema]()
 	MakeScyllaTable[tableIDCollisionRecord, tableIDCollisionSchema]()
 }
 
@@ -43,7 +43,7 @@ func toString(value any) string {
 	return ""
 }
 
-// Declares the same ID as deltaViewSchema, which must be refused at compile time.
+// Declares the same ID as fixedViewViewSchema, which must be refused at compile time.
 type tableIDCollisionRecord struct {
 	TableStruct[tableIDCollisionSchema, tableIDCollisionRecord]
 	CompanyID int32 `db:"company_id"`
@@ -81,66 +81,5 @@ func TestRaiseWrittenSlotsRaisesThePartitionFile(t *testing.T) {
 	slotFile, _, err := cache.ReadSlotFile(cache.SlotFileKey(2026, "genix_test/10000/7"))
 	if err != nil || cache.SlotTickOf(slotFile, cache.SlotOfRecordID(300)) != cache.WrittenYearTick(cycleStart+10_000, cycleStart) {
 		t.Fatalf("slot 44 = %d, err %v", cache.SlotTickOf(slotFile, 44), err)
-	}
-}
-
-// A written record appends its version to the folder of its pinned values; one whose pinned value
-// changed also appends a deleted entry to the folder it left, and a soft delete logs deleted.
-func TestAppendDeltaLogsWritesEntriesAndLeftFolders(t *testing.T) {
-	resetORMTableCachesForTesting()
-	store := withMemoryFileStore(t)
-
-	scyllaTable := MakeScyllaTable[deltaMultiShapeRecord, deltaMultiShapeSchema]()
-	scyllaTable.Namespace = "genix_test"
-	err := appendDeltaLogs(scyllaTable, []deltaWrittenRecord{
-		{partition: 7, logID: 1, version: 3, writtenValues: map[string]int64{"warehouse_id": 42, "status": 1},
-			storedValues: map[string]int64{"warehouse_id": 41, "status": 1}},
-		{partition: 7, logID: 2, version: 1, isDeleted: true, writtenValues: map[string]int64{"warehouse_id": 42, "status": 0}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	readEntries := func(folder string) []cache.DeltaLogEntry {
-		t.Helper()
-		files, _ := store.ListFiles(folder)
-		if len(files) != 1 {
-			t.Fatalf("%s: expected one bucket file, got %v", folder, files)
-		}
-		content, _, _ := store.GetFile(files[0])
-		entries, err := cache.DecodeDeltaLogEntries(content, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return entries
-	}
-	base := "delta-log/genix_test/10028/7/"
-	if entries := readEntries(base + "warehouse_id-status/42/"); len(entries) != 2 ||
-		entries[0] != (cache.DeltaLogEntry{LogID: 1, Version: 3}) || !entries[1].IsDeleted {
-		t.Fatalf("warehouse 42 entries = %+v", entries)
-	}
-	if entries := readEntries(base + "warehouse_id-status/41/"); len(entries) != 1 || !entries[0].IsDeleted {
-		t.Fatalf("warehouse 41 must log the record that left it: %+v", entries)
-	}
-	if entries := readEntries(base + "status/"); len(entries) != 2 {
-		t.Fatalf("the status index logs both records: %+v", entries)
-	}
-}
-
-// The Metadata record carries −bucket as its key and the Metadata text.
-func TestDeltaMetadataRecord(t *testing.T) {
-	resetORMTableCachesForTesting()
-
-	scyllaTable := MakeScyllaTable[deltaViewRecord, deltaViewSchema]()
-	recordPointer, err := deltaMetadataRecord(makeRecordSink(&[]deltaViewRecord{}), scyllaTable, cache.DeltaMetadataFile{Bucket: 5000, Text: "abc"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record := (*deltaViewRecord)(recordPointer); record.ID != -5000 || record.Metadata == nil || *record.Metadata != "abc" {
-		t.Fatalf("metadata record = %+v", record)
-	}
-	// A record without the Metadata field cannot carry the cursor.
-	if _, err := deltaMetadataRecord(makeRecordSink(&[]deltaMultiShapeRecord{}), scyllaTable, cache.DeltaMetadataFile{Bucket: 1}); err == nil {
-		t.Fatal("expected an error for a record without Metadata")
 	}
 }

@@ -1092,6 +1092,26 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 			}
 		}
 
+		// The moves table is written after every write that moves a record out of a pinned prefix.
+		if hasDeltaMoves(table) {
+			if err := QueryExec(deltaMovesCreateScript(table)); err != nil {
+				panic(fmt.Sprintf(`Error creando la tabla de moves delta "%v" | %v`, deltaMovesTableName(table), err))
+			}
+		}
+
+		// The TypeDelta views stay out of table.views: the query planner never reads them, only Delta().
+		for _, deltaIndex := range table.deltaIndexes {
+			if _, exists := tableColumnsMap[table.Namespace+"."+deltaIndex.viewName]; exists {
+				continue
+			}
+			createScript := deltaViewCreateScript(table, deltaIndex)
+			fmt.Println(createScript)
+			if err := QueryExec(createScript); err != nil {
+				panic(fmt.Sprintf(`Error creando la view delta "%v" en %v | %v`, deltaIndex.viewName, tableName, err))
+			}
+			Logx(2, fmt.Sprintf(`Delta view created "%v"`+"\n", deltaIndex.viewName))
+		}
+
 		// Revisa si posee índices, en su defecto los crea
 		tableIndexes := tableIndexesMap[tableName]
 

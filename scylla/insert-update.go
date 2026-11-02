@@ -21,6 +21,9 @@ var getManagedUnixTime = currentManagedUnixTime
 type managedWriteValues struct {
 	createdValues []any
 	updatedValues []any
+	// deltaPackedValues are the TypeDelta packed column values, by column name, one per record: an
+	// update that leaves a pinned column out still binds the value it keeps (stampDeltaWrites).
+	deltaPackedValues map[string][]any
 }
 
 func currentManagedUnixTime() int32 {
@@ -38,10 +41,19 @@ func (e managedWriteValues) slice(start int, end int) managedWriteValues {
 	if len(e.updatedValues) > 0 {
 		slicedValues.updatedValues = e.updatedValues[start:end]
 	}
+	if len(e.deltaPackedValues) > 0 {
+		slicedValues.deltaPackedValues = map[string][]any{}
+		for columnName, packedValues := range e.deltaPackedValues {
+			slicedValues.deltaPackedValues[columnName] = packedValues[start:end]
+		}
+	}
 	return slicedValues
 }
 
 func (e managedWriteValues) getValueForColumn(recordIndex int, column IColInfo, isInsert bool) (any, bool) {
+	if packedValues, isDeltaPacked := e.deltaPackedValues[column.GetName()]; isDeltaPacked && recordIndex < len(packedValues) {
+		return packedValues[recordIndex], true
+	}
 	switch column.GetName() {
 	case managedCreatedColumnName:
 		if isInsert && recordIndex < len(e.createdValues) && e.createdValues[recordIndex] != nil {
@@ -827,7 +839,9 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	if err != nil {
 		return err
 	}
-	deltaWrittenRecords := stampDeltaVersions(scyllaTable, writePhases, storedWrittenRows)
+	deltaPackedValuesByPhase, deltaMoves := stampDeltaWrites(scyllaTable, writePhases, storedWrittenRows)
+	managedInsertValues.deltaPackedValues = deltaPackedValuesByPhase[0]
+	managedUpdateValues.deltaPackedValues = deltaPackedValuesByPhase[1]
 	// Before the rows: a change in the table always has its log row (data_frame_log.go).
 	if err := writeDataFrameLog(scyllaTable, writePhases, storedWrittenRows); err != nil {
 		return err
@@ -898,7 +912,7 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	//
 	// Phase 1 writes the derived DATA (view tables, search index). Phase 2 writes the FRESHNESS
 	// MARKERS the caches read to decide whether to refetch (__index_updated counters, the by-IDs
-	// slot files and the delta logs). The barrier is what makes the protocol safe: publishing a
+	// slot files and the delta moves). The barrier is what makes the protocol safe: publishing a
 	// marker before the data it gates lets a client refetch a stale row and then record the new
 	// version, permanently missing the update.
 	//
@@ -966,8 +980,8 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	})
 
 	markerSyncGroup.Go(func() error {
-		if err := appendDeltaLogs(scyllaTable, deltaWrittenRecords); err != nil {
-			return fmt.Errorf("appending delta logs: %w", err)
+		if err := writeDeltaMoves(scyllaTable, deltaMoves); err != nil {
+			return fmt.Errorf("writing delta moves: %w", err)
 		}
 		return nil
 	})
@@ -1211,6 +1225,14 @@ func resolveUpdateColumnsForWrite(
 				columnsToUpdate = append(columnsToUpdate, indexGroup.virtualColumn)
 				columnsToUpdateByName[indexGroup.virtualColumn.GetName()] = indexGroup.virtualColumn
 			}
+		}
+	}
+
+	// A TypeDelta packed column holds updated, which every update writes, so it is always rewritten,
+	// from the pinned values the record keeps (managedWriteValues.deltaPackedValues).
+	for _, deltaIndex := range scyllaTable.deltaIndexes {
+		if deltaIndex.packedColumn != nil {
+			columnsToUpdate = append(columnsToUpdate, deltaIndex.packedColumn)
 		}
 	}
 

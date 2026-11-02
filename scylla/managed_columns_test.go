@@ -207,10 +207,9 @@ func TestMakeUpdateStatementsAlwaysPersistsManagedUpdatedColumns(t *testing.T) {
 func TestMakeUpdateStatementsPersistsTheVersionOfADeltaTable(t *testing.T) {
 	resetORMTableCachesForTesting()
 
-	records := []deltaViewRecord{{CompanyID: 7, ID: 1, Status: 1, Type: 2, RegistryNumber: "x", Version: 4}}
-	table := TableOf[deltaViewRecord, deltaViewSchema]()
-	// The packed listing view needs its keys written together.
-	preparedStatements := MakeUpdateStatements(&records, table.Status, table.Type)
+	records := []deltaStockRecord{{CompanyID: 7, ID: 1, WarehouseID: 5, Name: "x", Version: 4}}
+	table := TableOf[deltaStockRecord, deltaStockSchema]()
+	preparedStatements := MakeUpdateStatements(&records, table.Name)
 	if !strings.Contains(preparedStatements[0].Stmt, "version = ?") || !containsAny(preparedStatements[0].Args, int16(4)) {
 		t.Fatalf("expected the version SET clause and value, got %s %v", preparedStatements[0].Stmt, preparedStatements[0].Args)
 	}

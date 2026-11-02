@@ -226,7 +226,8 @@ Inference rules:
 - `Type: TypeGlobalIndex`: global secondary index
 - `Cols != nil`: materialized view payload declaration
 - `Type: TypeViewTable`: derived table with write-side maintenance
-- `Type: TypeDelta`: a change log in the file store (§11), listed through a view on its keys
+- `Type: TypeDelta`: a slim materialized view `(ID, updated, version, filter)` that serves `Delta()`
+  only (§11); it is not in the query planner, so plain reads on its keys need their own `TypeView`
 - `UseIndexGroup: true`: write-maintained hash group metadata
 
 An index group compiles to exactly one virtual hash column per declaration (`zz_ig_` for scalars,
@@ -272,11 +273,10 @@ tier, while a partial prefix sits above the bare-partition plan (100) and below 
 equality (120) — a narrow index beats a broad prefix scan, and picking the view instead would leave
 the narrow predicate as an unservable leftover filter.
 
-A `TypeDelta` with several keys lists its first sync through a range view whose bit layout is
-resolved from `TableSchema.FixedValues` instead of per-column `Size()` hints. Each declared key takes
-`bits.Len64(max)` bits (one key without a range takes the remainder); `compileSchemaDeltaView` picks
-`int` when the keys fit 32 bits, and `bigint` otherwise. One key compiles to a plain view on it, and
-no key to no view: the first sync reads the partition.
+A `TypeView` with several keys and no `Size()` hint sizes its range layout from
+`TableSchema.FixedValues` (`planFixedValueViewSlots`, `fixed_values.go`). Each declared key takes
+`bits.Len64(max)` bits; one key without a range takes the remainder in a `bigint`, otherwise the view
+picks `int` when the slots fit 32 bits. Two keys without a range compile to a hash view.
 
 ### 8.4 Composite Bucketing
 
@@ -328,9 +328,10 @@ Update path enforces dependency integrity:
 
 ## 11. The cache protocols (`db/cache`)
 
-Both client caches keep their state in the ORM's file store (`db.SetFileStore`), not in Scylla. The
-files, their formats and the rules over them live in `genix-orm/db/cache`, shared with the dynamo
-driver; this driver brings the keys, the record reads and the write hooks. A partition is named
+The protocols, their wire formats and their rules live in `genix-orm/db/cache`; this driver brings
+the keys, the record reads and the write hooks. The by-IDs cache keeps its slot files in the ORM's
+file store (`db.SetFileStore`), shared with the dynamo driver; the delta sync keeps nothing outside
+Scylla. A partition is named
 `<keyspace>/<table ID>/<partition>` in every file key.
 
 **By-IDs** (`CacheByIDs`, `cache_by_ids.go`). Records are bucketed into 256 slots by `uint8(ID)`;
@@ -340,18 +341,33 @@ only the IDs whose slot moved (`part = ? AND key IN (…)`, at LocalQuorum), and
 returned record's `Updated` with the tick the client now holds. The table needs one integer key, an
 integer partition, and an `Updated int32` field.
 
-**Delta** (`TypeDelta`, `delta_log.go`). The last Key is the sync filter, the others are pinned (each
-pinned value has its own log), and the table's single integer key is the log ID. Before the CQL, a
-write reads the stored `version`, status and pinned values of its keys and stamps `version + 1`
-(`cache.NextVersion`); after it, every record appends `(ID, version)` to its folder of each index —
-a deleted entry when its status is 0, and one in the folder it left when a pinned value changed.
-`Delta(cursor, filter…)` reads the log past the client's cursor and selects the logged IDs, or lists
-the view on a first sync or a replace; the result ends with one Metadata record (key = −bucket) per
-log file read. Two concurrent writers of one record can store the same version: one write is then
-not re-applied until the record's next change.
+**Delta** (`TypeDelta`, `delta_view.go`): the window protocol of `db/cache/delta_window.go`, no file
+store. The last Key is the sync filter, the others are pinned, and the table needs one integer key
+and an integer partition. Each index compiles to `<table>__dlt_<keys>_view`:
+`PRIMARY KEY ((part), zz_dlt_<pinned>, id)` ordered `DESC`, where the virtual bigint `zz_dlt_…` packs
+the pinned values over `updated` (31 bits) — Scylla allows one non-key base column in a view's key,
+so pinned and `updated` share it. Without pinned keys the view orders by `updated` itself.
 
-Both run in the marker phase, after the derived data, so a client never holds a marker newer than the
-row it read.
+Writes: before the CQL a write reads the stored `version` and pinned values of its keys
+(`readStoredWrittenRows`), stamps `version + 1`, and computes each packed value from the final
+pinned values — the stored one when a partial update does not write the column, which is why the
+packed column is always rewritten. A record whose pinned values changed gets a row in
+`<table>__delta_moves` (`(partition, index tag, old prefix)`, never expires), written in the
+marker phase after the rows. The delta views stay out of `table.views`, so the generic
+"columns updated together" check does not apply to them.
+
+`Delta(cursor, filter…)` first reads the changed rows (`updated ≥ C − 10 s`) and the moves since
+`C − 15 min`, each with `LIMIT threshold + 1`: the view lists newest first, so deciding costs at most
+that many rows whatever the cursor's age. Not a replace: the changed records are read by ID
+(honouring a `Select` projection), the window `[C − 15 min, C − 10 s)` is read and hashed with the
+filter values, and moved IDs not back in the prefix are sent as removed. A cursor of 0, or more
+changed or moved records than `Index.DeltaReplaceThreshold` (default 100), answers a replace: the whole prefix filtered by the values, capped at `Limit` newest
+`updated` first. The result ends with one Metadata record (key = −1). Two concurrent writers of one
+record can store the same version: one write is then not re-applied until the record's next change
+(the hash compares versions, not content).
+
+The by-IDs raise runs in the marker phase, after the derived data, so a client never holds a marker
+newer than the row it read.
 
 ---
 

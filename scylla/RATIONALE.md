@@ -108,39 +108,75 @@ lists avoid the copy a `MakeSlice` would add.
 Not erased: the small `Col` methods (interface-retained, see BINARY_SIZE_FINDINGS.md) and the
 generic shims themselves, which are now under ~800 bytes per table.
 
+## TypeDelta is a slim view, not a change log
+**Context** — The delta log in the file store cost an S3 append per write and a per-sync file read,
+and still needed a view on the keys for the first sync. Scylla can list what changed by itself.
+**Decision** — A TypeDelta index is a materialized view of `(ID, updated, version, filter)` ordered
+by updated, and a sync reads it past the client's cursor, then the changed records by ID. The client
+checks the 15 minutes behind its cursor with a hash of `(ID, version)` and asks for a replace on a
+mismatch. Pinned-value changes go to a small moves table. The view stays out of the planner;
+tables that also filter on its keys declare a `TypeView`.
+**Rationale** — No S3 on the write path, and missed writes (late landings, view lag) heal on the next
+sync instead of never. Cost: a second view per listing table, and a replace when more than the
+threshold changed.
+
+## The view's key packs the pinned values with updated
+**Context** — Scylla refuses more than one non-primary-key base column in a view's primary key
+("Cannot include more than one non-primary key column 'updated'"), and a sync must range over
+`updated` inside one pinned prefix.
+**Decision** — One virtual bigint packs the pinned values (their `Size`, else `FixedValues`, else the
+remaining bits) over 31 bits of `updated`. Every write computes it, partial updates included, from
+the stored pinned values it does not write.
+**Rationale** — One contiguous `DESC` range per prefix, read by one query.
+
 ## TypeDelta needs one integer key and an integer partition
-**Context** — A log entry names its record by one integer (the log ID), and each partition has its
-own log. dynamo packs several key columns into the log ID; scylla tables have clustering keys of any
-type.
-**Decision** — `compileSchemaDeltaView` panics unless the table has exactly one integer key (the log
-ID; int64 logs at the 64-bit scale) and an integer partition. A `Partition` override on a TypeDelta
-is refused. A table keyed otherwise answers its route with `db.DeltaReplaceMetadata()`.
+**Context** — The window hash and the moves table name a record by one integer, and the view's
+partition is the table's.
+**Decision** — `compileSchemaDeltaView` panics unless the table has exactly one integer key and an
+integer partition. A `Partition` override on a TypeDelta is refused. A table keyed otherwise answers
+its route with `db.DeltaReplaceMetadata()`.
 **Rationale** — The stored-version read is then one `key IN (…)` per partition, and no packing of
 string or composite keys is needed. Cost: such tables resend their whole list on every sync.
 
-## Soft delete reads the column named "status"
-**Context** — dynamo logs a deleted entry when Status is 0. Two genix tables filter their delta sync
-on `State`, not `Status`.
-**Decision** — A written record logs a deleted entry when its `status` column (if the table has one)
-is 0, whatever the sync filter column is. A table without `status` never logs a delete.
-**Rationale** — The soft delete is the app's one delete; the sync filter only decides what a first
-sync lists.
+## A full sync depends on how much changed, never on the cursor's age
+**Context** — A first version expired the moves after 7 days and answered a replace to any older
+cursor, so a cache 40 days old with 4 changes was resent whole.
+**Decision** — The moves table has no TTL. A replace comes only from an empty cursor, or more than
+`DeltaReplaceThreshold` changed or moved records; both are read with `LIMIT threshold + 1`.
+**Rationale** — The view and the moves never expire, so any cursor can be answered incrementally,
+and the limit keeps the decision as cheap for an old cursor as for a recent one. Cost: one moves row
+per pinned-value change kept forever; such changes are rare and each row is a few bytes.
 
-## What a partial update logs
-**Context** — An Update with an include list writes some columns; the log needs the record's status
-and pinned values after the write, and the folder it left.
-**Decision** — The pre-write read fetches `version`, `status` and every pinned column. A column the
-write does not include keeps its stored value for the log; a record that was not stored takes the
-values on the struct.
-**Rationale** — One read serves the version, the soft delete and the folder move. LocalQuorum on it,
-so a write right after another sees its version.
+## A record leaves the view by its filter value
+**Context** — No hard deletes on TypeDelta tables; the delta log turned a status-0 write into a
+deleted entry.
+**Decision** — Changed records come back in every status. genix-ui removes a returned record whose
+sync-filter value is not in the call's values; a replace lists only matching records. Moving out of
+a pinned prefix is a moves-table row instead.
+**Rationale** — One rule covers soft deletes, annulments and filters on `State`, and the server never
+has to know which column means "deleted". Cost: a table filtered on `State` keeps a soft-deleted
+(`status` 0) record whose `State` still matches.
 
-## The sync filter applies on a first sync only
-**Context** — A replace is a first sync (empty cursor) or a cursor older than the log.
-**Decision** — `Delta()`'s filter values are applied only when the cursor is empty; a replace from an
-old cursor lists every status.
-**Rationale** — Same as dynamo. A replace makes the client drop what the response does not bring, so
-listing inactive records too is harmless.
+## What a partial update writes to the view
+**Context** — An Update with an include list writes some columns; the view's packed column needs the
+pinned values after the write, and the moves table the prefix the record left.
+**Decision** — The pre-write read fetches `version` and every pinned column. A column the write does
+not include keeps its stored value; a record that was not stored takes the values on the struct.
+**Rationale** — One read serves the version, the packed value and the move. LocalQuorum on it, so a
+write right after another sees its version.
+
+## The sync filter applies on every sync
+**Context** — The window hash must cover the same rows on both sides.
+**Decision** — The server hashes and replaces only rows whose filter value is in `Delta()`'s values,
+and sends the field name and the values; the client hashes its held records with the same rule.
+**Rationale** — A client that holds only active records would otherwise mismatch on every inactive
+row in the window.
+
+## A replace honours Limit
+**Context** — Routes such as the sale orders cap their list (`Limit(5000)`).
+**Decision** — A replace keeps the newest `updated` first, up to `Limit`.
+**Rationale** — The cap keeps its meaning. Cost: more than `Limit` writes in one window would answer
+a replace on every sync.
 
 ## CacheByIDs keeps created/updated even with DisableDefaultColumns
 **Context** — The by-IDs slot raise reads each record's `updated`.

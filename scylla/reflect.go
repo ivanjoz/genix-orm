@@ -583,7 +583,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 			dbTable.hasTableBackedViews = true
 			compileSchemaViewTable(&dbTable, indexCfg)
 		case TypeView:
-			compileSchemaView(&dbTable, indexCfg, nil)
+			compileSchemaView(&dbTable, indexCfg)
 		case TypeDelta:
 			compileSchemaDeltaView(&dbTable, indexCfg)
 		default:

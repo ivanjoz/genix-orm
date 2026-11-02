@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-
-	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // TableStruct is embedded in both the record struct and the table struct of every
@@ -122,17 +120,17 @@ func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
 	e.tableInfo.SetBetween(colname, from, to)
 }
 
-// Delta turns the query into a delta-cache read (db/cache). An empty cursor is a first sync: it lists
-// the TypeDelta index's view, syncFilterValues filtering its sync filter column (its last Key). A
-// cursor reads the log past it and returns the records written since, in every status, so records
-// that left the filter (soft-deleted) reach the clients still caching them; a cursor older than the
-// log answers like a first sync. Either way the result ends with one Metadata record per log file
-// read, which the client keeps as its next cursor.
+// Delta turns the query into a delta-cache read (db/cache delta_window.go). cursorUpdated is the
+// highest Updated the client holds; 0 is a first sync, which lists every record of the TypeDelta
+// index's prefix whose sync filter column (its last Key) is in syncFilterValues. A later sync returns
+// the records written since, in every status, so records that left the filter (soft-deleted) reach
+// the clients still caching them. Either way the result ends with one Metadata record (negative ID)
+// carrying the next cursor and the window hash the client checks.
 //
 // The driver picks the TypeDelta index from the predicates already set: the one whose pinned Keys
 // (every Key but the last) all have an equality, the most specific when several fit. Call it last.
-func (e *TableStruct[D, T, E]) Delta(cursor cache.DeltaCursor, syncFilterValues ...any) *T {
-	e.tableInfo.Delta = &DeltaRead{Cursor: cursor, SyncFilterValues: syncFilterValues}
+func (e *TableStruct[D, T, E]) Delta(cursorUpdated int32, syncFilterValues ...any) *T {
+	e.tableInfo.Delta = &DeltaRead{CursorUpdated: cursorUpdated, SyncFilterValues: syncFilterValues}
 	return e.schemaStruct
 }
 

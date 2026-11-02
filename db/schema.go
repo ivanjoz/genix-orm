@@ -42,11 +42,13 @@ const (
 	TypeInheritFromKey int8 = 4
 	TypeView           int8 = 6
 	TypeViewTable      int8 = 9
-	// TypeDelta is a change log (db/cache): every write appends (log ID, Version, deleted) to the
-	// file of the record's partition, pinned values and 10-minute bucket, and Delta() reads it past
-	// the client's cursor. The last Key is the sync filter column, which a first sync filters on;
-	// the other Keys are pinned, each value with its own log. The Keys that are not pinned make the
-	// log ID. A keyless TypeDelta logs the whole partition with no sync filter.
+	// TypeDelta is a delta-cache index (Scylla: db/cache delta_window.go). The last Key is the sync
+	// filter column, which a replace lists by and the window hash covers; the other Keys are pinned:
+	// Delta() needs an equality on each, and each pinned prefix syncs on its own. The Scylla driver
+	// compiles it to a slim materialized view (ID, updated, version, sync filter) keyed by the
+	// partition, the pinned values and updated; a record whose pinned value changes is recorded as
+	// removed from its old prefix. Records of a TypeDelta table are never hard-deleted: a soft delete
+	// (Status 0) is a write like any other. A keyless TypeDelta syncs the whole partition.
 	TypeDelta int8 = 10
 )
 
@@ -66,8 +68,9 @@ var IndexTypeNames = map[int8]string{
 const ColumnNameUpdated = "updated"
 
 // ColumnNameVersion is the column the ORM maintains as every record's write count on a table with a
-// TypeDelta index: 1 on insert, one more on every write, 1 again after cache.MaxVersion. The delta
-// log carries it, and the client skips a logged write whose version it already holds. The record
+// TypeDelta index: 1 on insert, one more on every write, 1 again after cache.MaxVersion. Dynamo's
+// delta log carries it and the client skips a logged write whose version it already holds; Scylla's
+// delta window hashes (ID, version), so two writes in one Updated tick still differ. The record
 // declares it as `Version int16 json:"ver,omitempty"`.
 const ColumnNameVersion = "version"
 
@@ -87,6 +90,9 @@ type Index struct {
 	// Create a hash for use with IN operators
 	UseHash       bool
 	UseIndexGroup bool
+	// DeltaReplaceThreshold (TypeDelta) is how many changed records a sync reads by ID before it
+	// answers a replace instead; 0 is cache.DefaultDeltaReplaceThreshold.
+	DeltaReplaceThreshold int
 }
 
 // FixedValues pins down the set of values a column can hold. Declaring it lets the schema

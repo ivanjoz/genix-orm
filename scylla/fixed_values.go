@@ -4,8 +4,65 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
-	"strings"
 )
+
+// fixedValueSlotPlan is the bit layout of a packed TypeView sized from FixedValues instead of Size().
+type fixedValueSlotPlan struct {
+	slotBitsPerColumn []int64
+	useInt32          bool
+}
+
+// planFixedValueViewSlots sizes a multi-key TypeView from FixedValues: each key takes the bits of
+// its declared maximum, and at most one key with no declared range takes what a bigint leaves. It
+// packs into an int when the slots fit 32 bits. nil when the view isn't eligible: a single key, a
+// Size() hint on any key (the Size() rules apply), or no declared range at all.
+func planFixedValueViewSlots(dbTable *ScyllaTable, viewCfg Index) *fixedValueSlotPlan {
+	if len(viewCfg.Keys) < 2 {
+		return nil
+	}
+	slotBits := make([]int64, len(viewCfg.Keys))
+	elasticIndex, forcesInt32 := -1, false
+	for i, declaredKey := range viewCfg.Keys {
+		keyConfig := declaredKey.GetInfo()
+		if keyConfig.SlotBits > 0 {
+			return nil
+		}
+		forcesInt32 = forcesInt32 || keyConfig.UseInt32Packing
+		if valueRange, isDeclared := dbTable.fixedValueRanges[keyConfig.Name]; isDeclared {
+			slotBits[i] = max(1, int64(bits.Len64(uint64(valueRange.maxValue))))
+		} else if elasticIndex >= 0 {
+			return nil // two keys without a range: no unambiguous split, the view stays a hash view
+		} else {
+			elasticIndex = i
+		}
+	}
+	if elasticIndex >= 0 {
+		if forcesInt32 {
+			panic(fmt.Sprintf(`Table "%v": a FixedValues packed view cannot use .Int32() while key "%v" has no declared range`,
+				dbTable.Name, viewCfg.Keys[elasticIndex].GetInfo().Name))
+		}
+		remainingBits := packedVirtualInt64Bits - sumSlotBits(slotBits, 0)
+		if remainingBits < 1 {
+			panic(fmt.Sprintf(`Table "%v": the FixedValues keys fill the %v bits of a bigint, leaving none for "%v"`,
+				dbTable.Name, packedVirtualInt64Bits, viewCfg.Keys[elasticIndex].GetInfo().Name))
+		}
+		slotBits[elasticIndex] = remainingBits
+		return &fixedValueSlotPlan{slotBitsPerColumn: slotBits}
+	}
+
+	declaredBits := sumSlotBits(slotBits, 0)
+	if declaredBits <= packedVirtualInt32Bits {
+		return &fixedValueSlotPlan{slotBitsPerColumn: slotBits, useInt32: true}
+	}
+	if forcesInt32 {
+		panic(fmt.Sprintf(`Table "%v": a FixedValues packed view cannot pack into an int32: its keys take %v bits`, dbTable.Name, declaredBits))
+	}
+	if declaredBits > packedVirtualInt64Bits {
+		panic(fmt.Sprintf(`Table "%v": a FixedValues packed view's keys take %v bits, past the %v of a bigint`,
+			dbTable.Name, declaredBits, packedVirtualInt64Bits))
+	}
+	return &fixedValueSlotPlan{slotBitsPerColumn: slotBits}
+}
 
 // columnValueRange is the inclusive range a column was declared to hold via FixedValues.
 type columnValueRange struct {
@@ -82,141 +139,4 @@ func resolveFixedValueRanges(dbTable *ScyllaTable, declaredFixedValues []FixedVa
 		}
 	}
 	return valueRanges
-}
-
-// compileSchemaDeltaView registers a TypeDelta index: its change log (delta_log.go) and the view a
-// first sync lists. The last Key is the sync filter column, the others are pinned (each pinned value
-// has its own log), and the table's single integer key is the log ID. The view is keyed on the
-// declared Keys, packed into one column when there are several; a keyless index has no view, since
-// its first sync lists the whole partition.
-func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
-	if dbTable.VersionCol == nil || dbTable.VersionCol.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires the managed "%v" column; declare Version in the record and table structs`,
-			dbTable.Name, managedVersionColumnName))
-	}
-	if partitionColumn := dbTable.GetPartKey(); partitionColumn == nil || partitionColumn.IsNil() ||
-		!isIntegerFieldType(partitionColumn.GetType().FieldType) {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires an integer partition column: each partition has its own log`, dbTable.Name))
-	}
-	if len(dbTable.Keys) != 1 || !isIntegerFieldType(dbTable.Keys[0].GetType().FieldType) {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires exactly one integer key column, the record's log ID. A table keyed otherwise answers its route with db.DeltaReplaceMetadata() instead`,
-			dbTable.Name))
-	}
-
-	deltaIndex := deltaIndexInfo{tag: "all", is64BitScale: dbTable.Keys[0].GetType().FieldType == "int64"}
-	if len(indexCfg.Keys) == 0 {
-		dbTable.deltaIndexes = append(dbTable.deltaIndexes, deltaIndex)
-		fmt.Printf("Delta index registered: table=%s keys=[] (lists the partition)\n", dbTable.Name)
-		return
-	}
-
-	declaredKeyNames := make([]string, 0, len(indexCfg.Keys))
-	declaredKeyBits := make([]int64, 0, len(indexCfg.Keys))
-	declaredColumns := make([]IColInfo, 0, len(indexCfg.Keys))
-	forcesInt32 := false
-	// elasticKeyIndex is the one key, if any, whose width is left for planDeltaSlots to derive.
-	elasticKeyIndex := -1
-
-	for _, declaredKey := range indexCfg.Keys {
-		keyConfig := declaredKey.GetInfo()
-		column := dbTable.ColumnsMap[keyConfig.Name]
-		if column == nil || column.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta column "%v" was not found`, dbTable.Name, keyConfig.Name))
-		}
-		if column.GetType().IsComplexType || column.GetType().IsSlice ||
-			!isSupportedPackedIndexNumericFieldType(column.GetType().FieldType) {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta key "%v" must be a scalar integer. Found: %v`,
-				dbTable.Name, column.GetName(), column.GetType().FieldType))
-		}
-		if column.GetName() == dbTable.Keys[0].GetName() {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta key "%v" is the table's key, which is the log ID`, dbTable.Name, column.GetName()))
-		}
-
-		if keyConfig.UseInt32Packing {
-			forcesInt32 = true
-		}
-
-		// An explicit Size() stays available as the escape hatch; otherwise the slot width comes from
-		// the declared value range. A key with neither is elastic: it absorbs whatever bits the rest
-		// of the layout leaves over.
-		keyBits := int64(keyConfig.SlotBits)
-		if keyBits <= 0 {
-			if valueRange, isDeclared := dbTable.fixedValueRanges[column.GetName()]; isDeclared {
-				keyBits = max(1, int64(bits.Len64(uint64(valueRange.maxValue))))
-			} else {
-				// Two elastic keys would have no unambiguous split of the remainder.
-				if elasticKeyIndex >= 0 {
-					panic(fmt.Sprintf(`Table "%v": TypeDelta keys "%v" and "%v" both lack a FixedValues entry and a Size; only one key can absorb the bit remainder`,
-						dbTable.Name, declaredKeyNames[elasticKeyIndex], column.GetName()))
-				}
-				elasticKeyIndex = len(declaredKeyNames)
-				keyBits = 0
-			}
-		}
-
-		declaredKeyNames = append(declaredKeyNames, column.GetName())
-		declaredKeyBits = append(declaredKeyBits, keyBits)
-		declaredColumns = append(declaredColumns, column)
-	}
-
-	deltaIndex.tag = strings.Join(declaredKeyNames, "-")
-	deltaIndex.pinned = declaredColumns[:len(declaredColumns)-1]
-	deltaIndex.syncFilter = declaredColumns[len(declaredColumns)-1]
-	dbTable.deltaIndexes = append(dbTable.deltaIndexes, deltaIndex)
-
-	listingCfg := indexCfg
-	listingCfg.Type = TypeView
-	if len(declaredColumns) == 1 {
-		fmt.Printf("Delta index registered: table=%s keys=[%s]\n", dbTable.Name, declaredKeyNames[0])
-		compileSchemaView(dbTable, listingCfg, nil)
-		return
-	}
-
-	plan := planDeltaSlots(dbTable.Name, declaredKeyNames, declaredKeyBits, forcesInt32, elasticKeyIndex)
-	fmt.Printf("Delta index registered: table=%s keys=[%s] slotBits=%v int32=%v\n",
-		dbTable.Name, strings.Join(declaredKeyNames, ","), plan.slotBitsPerColumn, plan.useInt32)
-	compileSchemaView(dbTable, listingCfg, &plan)
-}
-
-// deltaSlotPlan is the resolved bit layout of a TypeDelta packed listing view. It is handed to
-// compileSchemaView so the generic view compiler skips its own Size-based derivation.
-type deltaSlotPlan struct {
-	slotBitsPerColumn []int64
-	useInt32          bool
-}
-
-// planDeltaSlots settles the bit layout and storage width of a delta listing view: an int32 when the
-// keys fit its 32 bits, a bigint otherwise. An elastic key (elasticKeyIndex >= 0) takes every bit the
-// others leave of a bigint.
-func planDeltaSlots(tableName string, declaredKeyNames []string, declaredKeyBits []int64,
-	forcesInt32 bool, elasticKeyIndex int) deltaSlotPlan {
-
-	if elasticKeyIndex >= 0 {
-		if forcesInt32 {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta cannot pack into an int32 while key "%v" has no declared range. Drop .Int32(), or give "%v" a FixedValues entry or a Size.`,
-				tableName, declaredKeyNames[elasticKeyIndex], declaredKeyNames[elasticKeyIndex]))
-		}
-		// The elastic slot is still 0 here, so the sum covers only the other keys.
-		remainingBits := packedVirtualInt64Bits - sumSlotBits(declaredKeyBits, 0)
-		if remainingBits < 1 {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta leaves no bits for key "%v": the other keys already fill the %v an int64 packed key holds. Narrow a FixedValues range.`,
-				tableName, declaredKeyNames[elasticKeyIndex], packedVirtualInt64Bits))
-		}
-		declaredKeyBits[elasticKeyIndex] = remainingBits
-		return deltaSlotPlan{slotBitsPerColumn: slices.Clone(declaredKeyBits)}
-	}
-
-	declaredBits := sumSlotBits(declaredKeyBits, 0)
-	if declaredBits <= packedVirtualInt32Bits {
-		return deltaSlotPlan{slotBitsPerColumn: slices.Clone(declaredKeyBits), useInt32: true}
-	}
-	if forcesInt32 {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta cannot pack into an int32: the keys take %v bits, past the %v an int holds. Drop .Int32() or narrow a FixedValues range.`,
-			tableName, declaredBits, packedVirtualInt32Bits))
-	}
-	if declaredBits > packedVirtualInt64Bits {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta keys take %v bits, past the %v an int64 packed key holds. Narrow a FixedValues range.`,
-			tableName, declaredBits, packedVirtualInt64Bits))
-	}
-	return deltaSlotPlan{slotBitsPerColumn: slices.Clone(declaredKeyBits)}
 }
