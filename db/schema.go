@@ -42,13 +42,15 @@ const (
 	TypeInheritFromKey int8 = 4
 	TypeView           int8 = 6
 	TypeViewTable      int8 = 9
-	// TypeDelta is a delta-cache index (Scylla: db/cache delta_window.go). The last Key is the sync
-	// filter column, which a replace lists by and the window hash covers; the other Keys are pinned:
-	// Delta() needs an equality on each, and each pinned prefix syncs on its own. The Scylla driver
-	// compiles it to a slim materialized view (ID, updated, version, sync filter) keyed by the
-	// partition, the pinned values and updated; a record whose pinned value changes is recorded as
-	// removed from its old prefix. Records of a TypeDelta table are never hard-deleted: a soft delete
-	// (Status 0) is a write like any other. A keyless TypeDelta syncs the whole partition.
+	// TypeDelta is a delta-cache index (Scylla: db/cache delta_window.go). Every Key is pinned: a
+	// read covers one prefix per combination of key values, the last Key's from Delta()'s values, the
+	// others from equalities, and a key with neither fans out over its FixedValues. The Scylla driver
+	// compiles it to a materialized view holding every stored column, keyed by the partition, the
+	// key values and updated ([keys…][updated]): Delta() reads whole records from it, and the query
+	// planner serves plain reads on the keys with it. A record whose key value changes (a status
+	// included) is recorded as removed from its old prefix. Records of a TypeDelta table are never
+	// hard-deleted: a soft delete (Status 0) is a write like any other. A keyless TypeDelta syncs the
+	// whole partition.
 	TypeDelta int8 = 10
 )
 
@@ -90,8 +92,8 @@ type Index struct {
 	// Create a hash for use with IN operators
 	UseHash       bool
 	UseIndexGroup bool
-	// DeltaReplaceThreshold (TypeDelta) is how many changed records a sync reads by ID before it
-	// answers a replace instead; 0 is cache.DefaultDeltaReplaceThreshold.
+	// DeltaReplaceThreshold (TypeDelta) is how many changed or moved records a sync answers before
+	// it answers a replace instead; 0 is cache.DefaultDeltaReplaceThreshold.
 	DeltaReplaceThreshold int
 }
 

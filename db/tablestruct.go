@@ -122,15 +122,17 @@ func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
 
 // Delta turns the query into a delta-cache read (db/cache delta_window.go). cursorUpdated is the
 // highest Updated the client holds; 0 is a first sync, which lists every record of the TypeDelta
-// index's prefix whose sync filter column (its last Key) is in syncFilterValues. A later sync returns
-// the records written since, in every status, so records that left the filter (soft-deleted) reach
-// the clients still caching them. Either way the result ends with one Metadata record (negative ID)
-// carrying the next cursor and the window hash the client checks.
+// index's prefixes. Every Key of the index is pinned: each takes the query's equality on it, or —
+// the last Key — lastKeyValues, or else every value its FixedValues enumerates, one prefix per
+// combination, read in parallel. A later sync returns the records written since in those prefixes,
+// and as removed the ones that left them (a pinned value changed, a soft delete). Either way the
+// result ends with one Metadata record (negative ID) carrying the next cursor and the window hash
+// the client checks.
 //
-// The driver picks the TypeDelta index from the predicates already set: the one whose pinned Keys
-// (every Key but the last) all have an equality, the most specific when several fit. Call it last.
-func (e *TableStruct[D, T, E]) Delta(cursorUpdated int32, syncFilterValues ...any) *T {
-	e.tableInfo.Delta = &DeltaRead{CursorUpdated: cursorUpdated, SyncFilterValues: syncFilterValues}
+// The driver picks the TypeDelta index whose Keys all resolve, the one the query's equalities fix
+// most, then the one with fewest prefixes. Call it last.
+func (e *TableStruct[D, T, E]) Delta(cursorUpdated int32, lastKeyValues ...any) *T {
+	e.tableInfo.Delta = &DeltaRead{CursorUpdated: cursorUpdated, LastKeyValues: lastKeyValues}
 	return e.schemaStruct
 }
 

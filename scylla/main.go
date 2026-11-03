@@ -30,7 +30,7 @@ type ScyllaTable struct {
 	// fixedValueRanges holds the schema's FixedValues per column name, which is what lets a
 	// TypeDelta view size each key's bit slot without a .Size() decorator.
 	fixedValueRanges map[string]columnValueRange
-	// deltaIndexes are the compiled TypeDelta indexes, each with its own change log (delta_log.go).
+	// deltaIndexes are the compiled TypeDelta indexes (delta_view.go); their views are also in views.
 	deltaIndexes []deltaIndexInfo
 	// readConsistency overrides the cluster's LocalOne on the copy of the table one read runs with:
 	// the cache reads use LocalQuorum. Zero keeps the session default.
@@ -113,7 +113,10 @@ type viewInfo struct {
 	Operators     []string
 	// RequiresPostFilter indicates the index/view can overfetch and should be exact-filtered in memory.
 	// Keep this for hash-style plans that intentionally trade exact routing for bounded overfetch.
-	RequiresPostFilter    bool
+	RequiresPostFilter bool
+	// isDeltaView marks a TypeDelta view: its packed column is always rewritten by the write path
+	// (stampDeltaWrites), so the "columns updated together" check skips it.
+	isDeltaView           bool
 	getStatementPrepared  func(statements ...ColumnStatement) []boundWhereClause
 	decomposeVirtualValue func(rawValue any) []any
 	getCreateScript       func() string

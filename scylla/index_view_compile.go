@@ -438,25 +438,6 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			}
 		}
 
-		// Query bounds are packed in the unsigned layout and stored-encoded like any written value.
-		// Upper bounds are inclusive (every trailing slot at its max), so none can overflow the layout.
-		makeValue := func(values []int64) any {
-			return storeVirtualPacked(db.PackSlotValues(values, slotBitsPerColumn), isInt32PackedView)
-		}
-		makePrefixUpperBound := func(prefixValues []int64) any {
-			return storeVirtualPacked(db.PackSlotPrefixBound(prefixValues, slotBitsPerColumn, true), isInt32PackedView)
-		}
-
-		viewColsCopy := append([]IColInfo{}, columns...)
-		view.decomposeVirtualValue = func(rawValue any) []any {
-			packed := loadVirtualPacked(convertToInt64(rawValue), isInt32PackedView)
-			values := make([]any, 0, len(viewColsCopy))
-			for _, slotValue := range db.UnpackSlotValues(packed, slotBitsPerColumn) {
-				values = append(values, slotValue)
-			}
-			return values
-		}
-
 		viewCols := columns
 		viewNameForGuard, tableNameForGuard := view.name, dbTable.Name
 		view.column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
@@ -468,167 +449,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			return storeVirtualPacked(packed, isInt32PackedView)
 		}
 
-		viewPtr := view
-		viewPartColPtr := viewPartCol
-		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
-			statementsMap := map[string]statementRangeGroup{}
-			useBeetween := false
-
-			for i := range statements {
-				st := &statements[i]
-				if st.Operator == "BETWEEN" {
-					useBeetween = true
-					for i := range st.From {
-						statementsMap[st.From[i].Col] = statementRangeGroup{
-							from:      &st.From[i],
-							betweenTo: &st.To[i],
-						}
-					}
-				} else {
-					statementsMap[st.Col] = statementRangeGroup{from: st}
-				}
-			}
-
-			var partStatement *ColumnStatement
-			if viewPartColPtr != nil {
-				partStatement = statementsMap[viewPartColPtr.GetName()].from
-			}
-
-			// A packed key is prefix-searchable: the leading columns pinned by equality/IN select a
-			// contiguous block, and everything from the first unconstrained or range-filtered column
-			// onwards spans that block's full width. Absent columns therefore count as range columns,
-			// not as an equality on zero — that distinction is what lets one packed view answer
-			// "Status = 1" as well as the full key.
-			getValuesGroups := func() ([][]int64, []IColInfo) {
-				valuesGroups := [][]int64{}
-				rangeColumns := []IColInfo{}
-				for _, col := range viewCols {
-					if viewPartColPtr != nil && col.GetName() == viewPartColPtr.GetName() {
-						continue
-					}
-					stRange, hasStatement := statementsMap[col.GetName()]
-					isUnconstrained := !hasStatement || stRange.from == nil
-					if len(rangeColumns) > 0 || isUnconstrained || slices.Contains(rangeOperators, stRange.from.Operator) {
-						rangeColumns = append(rangeColumns, col)
-						continue
-					}
-					st := stRange.from
-
-					valuesToAdd := []int64{}
-					if len(st.Values) > 0 {
-						for _, value := range st.Values {
-							valuesToAdd = append(valuesToAdd, convertToInt64(value))
-						}
-					} else {
-						valuesToAdd = append(valuesToAdd, convertToInt64(st.Value))
-					}
-
-					if len(valuesGroups) > 0 {
-						valuesGroupsCurrent := valuesGroups
-						valuesGroups = [][]int64{}
-						for _, vg := range valuesGroupsCurrent {
-							for _, value := range valuesToAdd {
-								valuesGroups = append(valuesGroups, append(append([]int64{}, vg...), value))
-							}
-						}
-					} else {
-						for _, value := range valuesToAdd {
-							valuesGroups = append(valuesGroups, []int64{value})
-						}
-					}
-				}
-				return valuesGroups, rangeColumns
-			}
-
-			// Only the first range column can carry a bound; a filter on anything after it cannot be
-			// expressed as one packed range and must not be silently dropped. Returning nil tells the
-			// planner this view cannot serve the query.
-			hasUnservableGap := func(rangeColumns []IColInfo) bool {
-				for _, col := range rangeColumns[1:] {
-					if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
-						fmt.Printf("Packed view rejected: view=%s cannot bind a filter on \"%s\" behind an unconstrained column\n",
-							viewPtr.name, col.GetName())
-						return true
-					}
-				}
-				return false
-			}
-
-			whereStatements := []boundWhereClause{}
-			valuesGroups, rangeColumns := getValuesGroups()
-			if len(rangeColumns) > 1 && hasUnservableGap(rangeColumns) {
-				return nil
-			}
-
-			if useBeetween {
-				valuesFrom, valuesTo := []int64{}, []int64{}
-				for _, col := range viewCols {
-					srg, hasStatement := statementsMap[col.GetName()]
-					// An unconstrained column spans its whole slot, so it floors on the low bound and
-					// tops out on the high one.
-					if !hasStatement || srg.from == nil {
-						valuesFrom = append(valuesFrom, 0)
-						valuesTo = append(valuesTo, int64(db.SlotMaxValue(slotBitsPerColumn[len(valuesTo)])))
-						continue
-					}
-					valuesFrom = append(valuesFrom, convertToInt64(srg.from.Value))
-					if srg.betweenTo != nil {
-						valuesTo = append(valuesTo, convertToInt64(srg.betweenTo.Value))
-					} else {
-						valuesTo = append(valuesTo, convertToInt64(srg.from.Value))
-					}
-				}
-				whereStatement := boundWhereClause{
-					Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
-					Values: []any{makeValue(valuesFrom), makeValue(valuesTo)},
-				}
-				if partStatement != nil {
-					whereStatement = boundWhereClause{
-						Clause: fmt.Sprintf("%v = ? AND %v", viewPartColPtr.GetName(), whereStatement.Clause),
-						Values: append([]any{convertToInt64(partStatement.Value)}, whereStatement.Values...),
-					}
-				}
-				return []boundWhereClause{whereStatement}
-			} else if len(rangeColumns) > 0 {
-				if len(valuesGroups) == 0 {
-					// Nothing is pinned by equality, so the scan starts at the packed column's floor.
-					valuesGroups = [][]int64{{}}
-				}
-				for _, prefixValues := range valuesGroups {
-					valuesFrom := slices.Clone(prefixValues)
-					for _, col := range rangeColumns {
-						// Only the first range column can carry a lower bound; the rest span their slot.
-						rangeFrom := int64(0)
-						if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
-							rangeFrom = convertToInt64(stRange.from.Value)
-						}
-						valuesFrom = append(valuesFrom, rangeFrom)
-					}
-
-					whereStatements = append(whereStatements, boundWhereClause{
-						Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
-						Values: []any{makeValue(valuesFrom), makePrefixUpperBound(prefixValues)},
-					})
-				}
-			} else {
-				hashValues := make([]any, 0, len(valuesGroups))
-				for _, values := range valuesGroups {
-					hashValues = append(hashValues, makeValue(values))
-				}
-				whereStatements = append(whereStatements,
-					buildChunkedInWhereClauses(viewPtr.column.GetName(), hashValues)...)
-			}
-
-			if partStatement != nil {
-				for i, ws := range whereStatements {
-					whereStatements[i] = boundWhereClause{
-						Clause: fmt.Sprintf("%v = ? AND %v", viewPartColPtr.GetName(), ws.Clause),
-						Values: append([]any{convertToInt64(partStatement.Value)}, ws.Values...),
-					}
-				}
-			}
-			return whereStatements
-		}
+		compilePackedRangeAccessors(view, columns, slotBitsPerColumn, isInt32PackedView, viewPartCol)
 	} else {
 		viewPtr := view
 		viewPartColPtr := viewPartCol
@@ -850,4 +671,189 @@ func makeViewExpectedColumns(columns []IColInfo) []viewExpectedColumn {
 		})
 	}
 	return expectedColumns
+}
+
+// compilePackedRangeAccessors gives a packed range view (Type 8) its query binding and the decoding of
+// its packed column: the planner reads a TypeView and a TypeDelta view through the same code.
+func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPerColumn []int64, isInt32PackedView bool, viewPartCol IColInfo) {
+	// Query bounds are packed in the unsigned layout and stored-encoded like any written value.
+	// Upper bounds are inclusive (every trailing slot at its max), so none can overflow the layout.
+	makeValue := func(values []int64) any {
+		return storeVirtualPacked(db.PackSlotValues(values, slotBitsPerColumn), isInt32PackedView)
+	}
+	makePrefixUpperBound := func(prefixValues []int64) any {
+		return storeVirtualPacked(db.PackSlotPrefixBound(prefixValues, slotBitsPerColumn, true), isInt32PackedView)
+	}
+
+	viewColsCopy := append([]IColInfo{}, viewCols...)
+	view.decomposeVirtualValue = func(rawValue any) []any {
+		packed := loadVirtualPacked(convertToInt64(rawValue), isInt32PackedView)
+		values := make([]any, 0, len(viewColsCopy))
+		for _, slotValue := range db.UnpackSlotValues(packed, slotBitsPerColumn) {
+			values = append(values, slotValue)
+		}
+		return values
+	}
+
+	viewPtr := view
+	viewPartColPtr := viewPartCol
+	view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
+		statementsMap := map[string]statementRangeGroup{}
+		useBeetween := false
+
+		for i := range statements {
+			st := &statements[i]
+			if st.Operator == "BETWEEN" {
+				useBeetween = true
+				for i := range st.From {
+					statementsMap[st.From[i].Col] = statementRangeGroup{
+						from:      &st.From[i],
+						betweenTo: &st.To[i],
+					}
+				}
+			} else {
+				statementsMap[st.Col] = statementRangeGroup{from: st}
+			}
+		}
+
+		var partStatement *ColumnStatement
+		if viewPartColPtr != nil {
+			partStatement = statementsMap[viewPartColPtr.GetName()].from
+		}
+
+		// A packed key is prefix-searchable: the leading columns pinned by equality/IN select a
+		// contiguous block, and everything from the first unconstrained or range-filtered column
+		// onwards spans that block's full width. Absent columns therefore count as range columns,
+		// not as an equality on zero — that distinction is what lets one packed view answer
+		// "Status = 1" as well as the full key.
+		getValuesGroups := func() ([][]int64, []IColInfo) {
+			valuesGroups := [][]int64{}
+			rangeColumns := []IColInfo{}
+			for _, col := range viewCols {
+				if viewPartColPtr != nil && col.GetName() == viewPartColPtr.GetName() {
+					continue
+				}
+				stRange, hasStatement := statementsMap[col.GetName()]
+				isUnconstrained := !hasStatement || stRange.from == nil
+				if len(rangeColumns) > 0 || isUnconstrained || slices.Contains(rangeOperators, stRange.from.Operator) {
+					rangeColumns = append(rangeColumns, col)
+					continue
+				}
+				st := stRange.from
+
+				valuesToAdd := []int64{}
+				if len(st.Values) > 0 {
+					for _, value := range st.Values {
+						valuesToAdd = append(valuesToAdd, convertToInt64(value))
+					}
+				} else {
+					valuesToAdd = append(valuesToAdd, convertToInt64(st.Value))
+				}
+
+				if len(valuesGroups) > 0 {
+					valuesGroupsCurrent := valuesGroups
+					valuesGroups = [][]int64{}
+					for _, vg := range valuesGroupsCurrent {
+						for _, value := range valuesToAdd {
+							valuesGroups = append(valuesGroups, append(append([]int64{}, vg...), value))
+						}
+					}
+				} else {
+					for _, value := range valuesToAdd {
+						valuesGroups = append(valuesGroups, []int64{value})
+					}
+				}
+			}
+			return valuesGroups, rangeColumns
+		}
+
+		// Only the first range column can carry a bound; a filter on anything after it cannot be
+		// expressed as one packed range and must not be silently dropped. Returning nil tells the
+		// planner this view cannot serve the query.
+		hasUnservableGap := func(rangeColumns []IColInfo) bool {
+			for _, col := range rangeColumns[1:] {
+				if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
+					fmt.Printf("Packed view rejected: view=%s cannot bind a filter on \"%s\" behind an unconstrained column\n",
+						viewPtr.name, col.GetName())
+					return true
+				}
+			}
+			return false
+		}
+
+		whereStatements := []boundWhereClause{}
+		valuesGroups, rangeColumns := getValuesGroups()
+		if len(rangeColumns) > 1 && hasUnservableGap(rangeColumns) {
+			return nil
+		}
+
+		if useBeetween {
+			valuesFrom, valuesTo := []int64{}, []int64{}
+			for _, col := range viewCols {
+				srg, hasStatement := statementsMap[col.GetName()]
+				// An unconstrained column spans its whole slot, so it floors on the low bound and
+				// tops out on the high one.
+				if !hasStatement || srg.from == nil {
+					valuesFrom = append(valuesFrom, 0)
+					valuesTo = append(valuesTo, int64(db.SlotMaxValue(slotBitsPerColumn[len(valuesTo)])))
+					continue
+				}
+				valuesFrom = append(valuesFrom, convertToInt64(srg.from.Value))
+				if srg.betweenTo != nil {
+					valuesTo = append(valuesTo, convertToInt64(srg.betweenTo.Value))
+				} else {
+					valuesTo = append(valuesTo, convertToInt64(srg.from.Value))
+				}
+			}
+			whereStatement := boundWhereClause{
+				Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
+				Values: []any{makeValue(valuesFrom), makeValue(valuesTo)},
+			}
+			if partStatement != nil {
+				whereStatement = boundWhereClause{
+					Clause: fmt.Sprintf("%v = ? AND %v", viewPartColPtr.GetName(), whereStatement.Clause),
+					Values: append([]any{convertToInt64(partStatement.Value)}, whereStatement.Values...),
+				}
+			}
+			return []boundWhereClause{whereStatement}
+		} else if len(rangeColumns) > 0 {
+			if len(valuesGroups) == 0 {
+				// Nothing is pinned by equality, so the scan starts at the packed column's floor.
+				valuesGroups = [][]int64{{}}
+			}
+			for _, prefixValues := range valuesGroups {
+				valuesFrom := slices.Clone(prefixValues)
+				for _, col := range rangeColumns {
+					// Only the first range column can carry a lower bound; the rest span their slot.
+					rangeFrom := int64(0)
+					if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
+						rangeFrom = convertToInt64(stRange.from.Value)
+					}
+					valuesFrom = append(valuesFrom, rangeFrom)
+				}
+
+				whereStatements = append(whereStatements, boundWhereClause{
+					Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
+					Values: []any{makeValue(valuesFrom), makePrefixUpperBound(prefixValues)},
+				})
+			}
+		} else {
+			hashValues := make([]any, 0, len(valuesGroups))
+			for _, values := range valuesGroups {
+				hashValues = append(hashValues, makeValue(values))
+			}
+			whereStatements = append(whereStatements,
+				buildChunkedInWhereClauses(viewPtr.column.GetName(), hashValues)...)
+		}
+
+		if partStatement != nil {
+			for i, ws := range whereStatements {
+				whereStatements[i] = boundWhereClause{
+					Clause: fmt.Sprintf("%v = ? AND %v", viewPartColPtr.GetName(), ws.Clause),
+					Values: append([]any{convertToInt64(partStatement.Value)}, ws.Values...),
+				}
+			}
+		}
+		return whereStatements
+	}
 }

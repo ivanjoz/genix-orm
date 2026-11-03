@@ -226,8 +226,8 @@ Inference rules:
 - `Type: TypeGlobalIndex`: global secondary index
 - `Cols != nil`: materialized view payload declaration
 - `Type: TypeViewTable`: derived table with write-side maintenance
-- `Type: TypeDelta`: a slim materialized view `(ID, updated, version, filter)` that serves `Delta()`
-  only (§11); it is not in the query planner, so plain reads on its keys need their own `TypeView`
+- `Type: TypeDelta`: a materialized view of the whole record ordered by updated (§11). It serves
+  `Delta()` and, as a range view on `[part, pinned…, updated]`, plain reads on its pinned keys
 - `UseIndexGroup: true`: write-maintained hash group metadata
 
 An index group compiles to exactly one virtual hash column per declaration (`zz_ig_` for scalars,
@@ -342,27 +342,36 @@ returned record's `Updated` with the tick the client now holds. The table needs 
 integer partition, and an `Updated int32` field.
 
 **Delta** (`TypeDelta`, `delta_view.go`): the window protocol of `db/cache/delta_window.go`, no file
-store. The last Key is the sync filter, the others are pinned, and the table needs one integer key
-and an integer partition. Each index compiles to `<table>__dlt_<keys>_view`:
-`PRIMARY KEY ((part), zz_dlt_<pinned>, id)` ordered `DESC`, where the virtual bigint `zz_dlt_…` packs
-the pinned values over `updated` (31 bits) — Scylla allows one non-key base column in a view's key,
-so pinned and `updated` share it. Without pinned keys the view orders by `updated` itself.
+store. The table needs one integer key and an integer partition. Every declared Key is pinned: each
+index compiles to `<table>__dlt_<keys>_view`, holding every stored column, with
+`PRIMARY KEY ((part), zz_dlt_<keys>, id)` ordered `DESC`, where the virtual bigint `zz_dlt_…` packs
+the key values over `updated` (31 bits) — Scylla allows one non-key base column in a view's key, so
+the keys and `updated` share it. A keyless index packs `updated` alone (`zz_dlt_updated`). A slot is
+sized by the key's `Size`, else its `FixedValues` range, else (one key at most) the bits left. The
+view is a planner range view (Type 8) on `[part, keys…, updated]` (`makeDeltaViewInfo`, sharing
+`compilePackedRangeAccessors` with `TypeView`), so a plain read on its keys is served by it, a key
+without an equality fanning out over its FixedValues (`applyFixedValueFanout`).
 
 Writes: before the CQL a write reads the stored `version` and pinned values of its keys
 (`readStoredWrittenRows`), stamps `version + 1`, and computes each packed value from the final
 pinned values — the stored one when a partial update does not write the column, which is why the
 packed column is always rewritten. A record whose pinned values changed gets a row in
 `<table>__delta_moves` (`(partition, index tag, old prefix)`, never expires), written in the
-marker phase after the rows. The delta views stay out of `table.views`, so the generic
-"columns updated together" check does not apply to them.
+marker phase after the rows. The generic "columns updated together" check skips delta views
+(`viewInfo.isDeltaView`): their packed column is always written.
 
-`Delta(cursor, filter…)` first reads the changed rows (`updated ≥ C − 10 s`) and the moves since
-`C − 15 min`, each with `LIMIT threshold + 1`: the view lists newest first, so deciding costs at most
-that many rows whatever the cursor's age. Not a replace: the changed records are read by ID
-(honouring a `Select` projection), the window `[C − 15 min, C − 10 s)` is read and hashed with the
-filter values, and moved IDs not back in the prefix are sent as removed. A cursor of 0, or more
-changed or moved records than `Index.DeltaReplaceThreshold` (default 100), answers a replace: the whole prefix filtered by the values, capped at `Limit` newest
-`updated` first. The result ends with one Metadata record (key = −1). Two concurrent writers of one
+`Delta(cursor, lastKeyValues…)` reads whole records from the view, honouring a `Select` projection.
+`resolveDeltaPrefixes` turns the read into prefixes: each key takes its equality, the last one
+`Delta()`'s values, and a key with neither fans out over its `FixedValues` (at most
+`maxFixedValueFanoutQueries` prefixes); `selectDeltaIndex` picks the index with the most equalities,
+then the fewest prefixes. Each prefix is read in parallel. It first reads the changed records
+(`updated ≥ C − 10 s`) and the moves since `C − 15 min`, each with `LIMIT threshold + 1`: the view
+lists newest first, so deciding costs at most that many rows whatever the cursor's age, and the
+threshold counts across every prefix. Not a replace: those records are the answer, the window
+`[C − 15 min, C − 10 s)` is read slim (ID, updated, version) and hashed, and moved IDs not back in a
+prefix are sent as removed. A cursor of 0, or more changed or moved records than
+`Index.DeltaReplaceThreshold` (default 100), answers a replace: each prefix read with `LIMIT <Limit>`,
+merged newest `updated` first and cut at `Limit`. The result ends with one Metadata record (key = −1). Two concurrent writers of one
 record can store the same version: one write is then not re-applied until the record's next change
 (the hash compares versions, not content).
 

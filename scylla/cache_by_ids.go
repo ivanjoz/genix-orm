@@ -154,13 +154,11 @@ func forEachIDsBatch(
 
 // readRecordsByIDs reads whole records by ID at LocalQuorum: a read that follows a slot or log
 // write must not hit a replica the row write has not reached yet.
-// columnNames projects the read; nil reads every stored column.
-func readRecordsByIDs(sink recordSink, scyllaTable ScyllaTable, idsOfPartition map[int64][]int64, columnNames []string) error {
-	if columnNames == nil {
-		for _, column := range scyllaTable.Columns {
-			if !column.GetInfo().IsVirtual {
-				columnNames = append(columnNames, column.GetName())
-			}
+func readRecordsByIDs(sink recordSink, scyllaTable ScyllaTable, idsOfPartition map[int64][]int64) error {
+	columnNames := make([]string, 0, len(scyllaTable.Columns))
+	for _, column := range scyllaTable.Columns {
+		if !column.GetInfo().IsVirtual {
+			columnNames = append(columnNames, column.GetName())
 		}
 	}
 	scyllaTable.readConsistency = gocql.LocalQuorum
@@ -208,7 +206,7 @@ func queryCachedIDs(scyllaTable ScyllaTable, request cache.CachedIDsRequest, sin
 		return nil, err
 	}
 	var records []unsafe.Pointer
-	if err := readRecordsByIDs(sink.collectInto(&records), scyllaTable, idsByPartition(plan.IDsToRead), nil); err != nil {
+	if err := readRecordsByIDs(sink.collectInto(&records), scyllaTable, idsByPartition(plan.IDsToRead)); err != nil {
 		return nil, err
 	}
 

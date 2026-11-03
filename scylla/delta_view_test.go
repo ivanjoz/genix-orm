@@ -47,38 +47,60 @@ func (e deltaStockSchema) GetSchema() TableSchema {
 	}
 }
 
-func TestDeltaIndexCompilesASlimViewOutsideThePlanner(t *testing.T) {
+func TestDeltaIndexCompilesAFullViewInThePlanner(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[deltaStockRecord, deltaStockSchema]()
 	scyllaTable.Namespace = "genix_test"
-	if len(scyllaTable.views) != 0 {
-		t.Fatalf("expected the delta views out of the planner, got %d views", len(scyllaTable.views))
-	}
-
 	warehouseIndex, statusIndex := scyllaTable.deltaIndexes[0], scyllaTable.deltaIndexes[1]
-	if warehouseIndex.tag != "warehouse_id_status" || warehouseIndex.pinned[0].GetName() != "warehouse_id" ||
-		warehouseIndex.syncFilter.GetName() != "status" || !slices.Equal(warehouseIndex.pinnedSlotBits, []int64{17}) ||
-		warehouseIndex.packedColumn.GetName() != "zz_dlt_warehouse_id" || warehouseIndex.replaceThreshold != 3 {
+	// Every Key is a pinned slot: Status (FixedValues 0..1) takes 1 bit after the warehouse's 17.
+	if warehouseIndex.tag != "warehouse_id_status" ||
+		!slices.EqualFunc(warehouseIndex.pinned, []string{"warehouse_id", "status"}, func(column IColInfo, name string) bool { return column.GetName() == name }) ||
+		!slices.Equal(warehouseIndex.pinnedSlotBits, []int64{17, 1}) ||
+		warehouseIndex.packedColumn.GetName() != "zz_dlt_warehouse_id_status" || warehouseIndex.replaceThreshold != 3 {
 		t.Fatalf("unexpected warehouse index %+v", warehouseIndex)
 	}
-	if statusIndex.packedColumn != nil || statusIndex.replaceThreshold != cache.DefaultDeltaReplaceThreshold {
-		t.Fatalf("expected the status index to key on updated itself, got %+v", statusIndex)
+	if statusIndex.packedColumn.GetName() != "zz_dlt_status" || !slices.Equal(statusIndex.pinnedSlotBits, []int64{1}) ||
+		statusIndex.replaceThreshold != cache.DefaultDeltaReplaceThreshold {
+		t.Fatalf("unexpected status index %+v", statusIndex)
 	}
 
-	warehouseScript := deltaViewCreateScript(scyllaTable, warehouseIndex)
+	// Both views are planner range views on [partition, pinned…, updated] holding every stored column.
+	warehouseView := scyllaTable.views[warehouseIndex.viewName]
+	if warehouseView == nil || warehouseView.Type != 8 || !warehouseView.isDeltaView ||
+		!slices.Equal(warehouseView.columns, []string{"company_id", "warehouse_id", "status", "updated"}) ||
+		!slices.Contains(warehouseView.availableColumns, "name") {
+		t.Fatalf("unexpected warehouse view %+v", warehouseView)
+	}
+	statusView := scyllaTable.views[statusIndex.viewName]
+	if statusView == nil || !slices.Equal(statusView.columns, []string{"company_id", "status", "updated"}) {
+		t.Fatalf("unexpected status view %+v", statusView)
+	}
+	// A plain read on Status is one span of the status view; one on the warehouse, a prefix of its view.
+	for _, served := range []struct {
+		view      *viewInfo
+		signature string
+	}{{statusView, "company_id|=|status|="}, {warehouseView, "company_id|=|warehouse_id|="}, {warehouseView, "company_id|=|warehouse_id|=|status|="}} {
+		if !slices.ContainsFunc(scyllaTable.capabilities, func(capability QueryCapability) bool {
+			return capability.Source == served.view && capability.Signature == served.signature
+		}) {
+			t.Fatalf("expected %s served by %s", served.signature, served.view.name)
+		}
+	}
+
+	warehouseScript := warehouseView.getCreateScript()
 	for _, expected := range []string{
-		"genix_test.delta_stock_records__dlt_warehouse_id_status_view",
-		"SELECT company_id, id, updated, version, zz_dlt_warehouse_id, status FROM",
-		"PRIMARY KEY ((company_id), zz_dlt_warehouse_id, id)",
-		"CLUSTERING ORDER BY (zz_dlt_warehouse_id DESC, id ASC)",
+		"delta_stock_records__dlt_warehouse_id_status_view AS",
+		"SELECT zz_dlt_warehouse_id_status, company_id, id, warehouse_id, status, name, updated, version, created FROM",
+		"PRIMARY KEY ((company_id), zz_dlt_warehouse_id_status, id)",
+		"CLUSTERING ORDER BY (zz_dlt_warehouse_id_status DESC, id ASC)",
 	} {
 		if !strings.Contains(warehouseScript, expected) {
 			t.Fatalf("expected %q in:\n%s", expected, warehouseScript)
 		}
 	}
-	if statusScript := deltaViewCreateScript(scyllaTable, statusIndex); !strings.Contains(statusScript, "PRIMARY KEY ((company_id), updated, id)") {
-		t.Fatalf("expected the status view keyed on updated:\n%s", statusScript)
+	if statusScript := statusView.getCreateScript(); !strings.Contains(statusScript, "PRIMARY KEY ((company_id), zz_dlt_status, id)") {
+		t.Fatalf("expected the status view keyed on the packed status:\n%s", statusScript)
 	}
 	if !hasDeltaMoves(scyllaTable) || !strings.Contains(deltaMovesCreateScript(scyllaTable), "genix_test.delta_stock_records__delta_moves") {
 		t.Fatal("expected a moves table for a table pinning a column")
@@ -90,11 +112,12 @@ func TestDeltaPackedKeyOrdersAPrefixByUpdated(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	warehouseIndex := MakeScyllaTable[deltaStockRecord, deltaStockSchema]().deltaIndexes[0]
-	packed := func(warehouseID, updated int64) int64 {
-		return warehouseIndex.packedKeyValue("delta_stock_records", []int64{warehouseID}, updated)
+	packed := func(warehouseID, status, updated int64) int64 {
+		return warehouseIndex.packedKeyValue("delta_stock_records", []int64{warehouseID, status}, updated)
 	}
-	if !(packed(42, 0) < packed(42, 100) && packed(42, 100) < packed(42, 1<<31-1) && packed(42, 1<<31-1) < packed(43, 0)) {
-		t.Fatal("expected packed keys ordered by warehouse, then updated")
+	if !(packed(42, 0, 0) < packed(42, 0, 100) && packed(42, 0, 1<<31-1) < packed(42, 1, 0) &&
+		packed(42, 1, 1<<31-1) < packed(43, 0, 0)) {
+		t.Fatal("expected packed keys ordered by warehouse, then status, then updated")
 	}
 }
 
@@ -106,8 +129,8 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 	scyllaTable := MakeScyllaTable[deltaStockRecord, deltaStockSchema]()
 	warehouseIndex := scyllaTable.deltaIndexes[0]
 	stored := storedRows{
-		{7, 1}: {"version": int16(3), "warehouse_id": int32(41)},
-		{7, 2}: {"version": int16(9), "warehouse_id": int32(41)},
+		{7, 1}: {"version": int16(3), "warehouse_id": int32(41), "status": int8(1)},
+		{7, 2}: {"version": int16(9), "warehouse_id": int32(41), "status": int8(1)},
 	}
 	records := []deltaStockRecord{
 		{CompanyID: 7, ID: 1, Name: "renamed", Updated: 500}, // WarehouseID not written: zero on the struct
@@ -120,9 +143,9 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
 		{records: makeRecordSlice(&records), writtenColumns: nameOnly},
 	}, stored)
-	packedValues := packedByPhase[1]["zz_dlt_warehouse_id"]
-	if packedValues[0] != warehouseIndex.packedKeyValue(scyllaTable.Name, []int64{41}, 500) {
-		t.Fatal("expected the unwritten pinned column to keep its stored warehouse 41")
+	packedValues := packedByPhase[1]["zz_dlt_warehouse_id_status"]
+	if packedValues[0] != warehouseIndex.packedKeyValue(scyllaTable.Name, []int64{41, 1}, 500) {
+		t.Fatal("expected the unwritten pinned columns to keep their stored warehouse 41 and status 1")
 	}
 	if records[0].Version != 4 || records[1].Version != 10 || len(moves) != 0 {
 		t.Fatalf("expected versions 4 and 10 and no move, got %d %d %+v", records[0].Version, records[1].Version, moves)
@@ -132,10 +155,22 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
 		{records: makeRecordSlice(&records), writtenColumns: nameAndWarehouse},
 	}, stored)
-	// Record 1 writes warehouse 0 and record 2 warehouse 42: both leave 41.
+	// Record 1 writes warehouse 0 and record 2 warehouse 42: both leave [41, 1]. Status is not written,
+	// so the status index moves nothing.
 	if len(moves) != 2 || moves[1].recordID != 2 || moves[1].indexTag != "warehouse_id_status" ||
-		moves[1].pinnedPrefix != warehouseIndex.packedKeyValue(scyllaTable.Name, []int64{41}, 0) || moves[1].updated != 500 {
+		moves[1].pinnedPrefix != warehouseIndex.packedKeyValue(scyllaTable.Name, []int64{41, 1}, 0) || moves[1].updated != 500 {
 		t.Fatalf("expected both records to leave warehouse 41, got %+v", moves)
+	}
+
+	// A status change is a move like any other pinned change: record 1 leaves the [1] prefix.
+	records = []deltaStockRecord{{CompanyID: 7, ID: 1, Status: 0, Updated: 600}}
+	_, moves = stampDeltaWrites(scyllaTable, []writePhase{
+		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
+		{records: makeRecordSlice(&records), writtenColumns: []IColInfo{scyllaTable.ColumnsMap["status"], scyllaTable.UpdatedCol}},
+	}, stored)
+	statusIndex := scyllaTable.deltaIndexes[1]
+	if len(moves) != 2 || moves[1].indexTag != "status" || moves[1].pinnedPrefix != statusIndex.packedKeyValue(scyllaTable.Name, []int64{1}, 0) {
+		t.Fatalf("expected the soft delete to leave [41, 1] and [1], got %+v", moves)
 	}
 }
 
@@ -147,7 +182,7 @@ func TestUpdateAlwaysRewritesTheDeltaPackedColumn(t *testing.T) {
 	records := []deltaStockRecord{{CompanyID: 7, ID: 1, Name: "renamed"}}
 	_, columnsToUpdate := resolveUpdateColumnsForWrite(scyllaTable, 1, makeRecordSlice(&records).at,
 		[]Coln{TableOf[deltaStockRecord, deltaStockSchema]().Name}, nil, false)
-	if !slices.ContainsFunc(columnsToUpdate, func(column IColInfo) bool { return column.GetName() == "zz_dlt_warehouse_id" }) {
+	if !slices.ContainsFunc(columnsToUpdate, func(column IColInfo) bool { return column.GetName() == "zz_dlt_warehouse_id_status" }) {
 		t.Fatalf("expected the packed column in the SET, got %v", columnsToUpdate)
 	}
 }
@@ -173,11 +208,12 @@ type deltaElasticPinSchema struct {
 
 func (e deltaElasticPinSchema) GetSchema() TableSchema {
 	return TableSchema{
-		ID:        10013,
-		Name:      "delta_elastic_pin_records",
-		Partition: e.CompanyID,
-		Keys:      Cols(e.ID),
-		Indexes:   []Index{{Type: TypeDelta, Keys: Cols(e.ListID, e.Status)}},
+		ID:          10013,
+		Name:        "delta_elastic_pin_records",
+		Partition:   e.CompanyID,
+		Keys:        Cols(e.ID),
+		FixedValues: []FixedValues{{Col: e.Status, Values: []int64{0, 1}}},
+		Indexes:     []Index{{Type: TypeDelta, Keys: Cols(e.ListID, e.Status)}},
 	}
 }
 
@@ -185,8 +221,8 @@ func TestDeltaElasticPinnedKeyTakesTheBitsUpdatedLeaves(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	deltaIndex := MakeScyllaTable[deltaElasticPinRecord, deltaElasticPinSchema]().deltaIndexes[0]
-	if !slices.Equal(deltaIndex.pinnedSlotBits, []int64{64 - deltaUpdatedSlotBits}) {
-		t.Fatalf("expected %d bits for list_id, got %v", 64-deltaUpdatedSlotBits, deltaIndex.pinnedSlotBits)
+	if expectedListBits := int64(64 - deltaUpdatedSlotBits - 1); !slices.Equal(deltaIndex.pinnedSlotBits, []int64{expectedListBits, 1}) {
+		t.Fatalf("expected %d bits for list_id and 1 for status, got %v", expectedListBits, deltaIndex.pinnedSlotBits)
 	}
 }
 
@@ -194,13 +230,25 @@ func TestSelectDeltaIndexPicksTheMostSpecificFit(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[deltaStockRecord, deltaStockSchema]()
-	deltaIndex, err := selectDeltaIndex(scyllaTable, map[string]any{"company_id": int32(7), "warehouse_id": int32(42)}, true)
-	if err != nil || deltaIndex.tag != "warehouse_id_status" {
-		t.Fatalf("expected the warehouse index, got %+v err %v", deltaIndex, err)
-	}
-	deltaIndex, err = selectDeltaIndex(scyllaTable, map[string]any{"company_id": int32(7)}, true)
-	if err != nil || deltaIndex.tag != "status" {
-		t.Fatalf("expected the status index, got %+v err %v", deltaIndex, err)
+	for _, selection := range []struct {
+		equalities       map[string]any
+		deltaValues      []int64
+		expectedTag      string
+		expectedPrefixes [][]int64
+	}{
+		// The warehouse equality fixes more of the warehouse index; the Delta() values name its Status.
+		{map[string]any{"company_id": int32(7), "warehouse_id": int32(42)}, []int64{1}, "warehouse_id_status", [][]int64{{42, 1}}},
+		// No warehouse: the warehouse index cannot resolve (no FixedValues), the status index can.
+		{map[string]any{"company_id": int32(7)}, []int64{0, 1}, "status", [][]int64{{0}, {1}}},
+		// No Delta() values: Status fans out over its FixedValues.
+		{map[string]any{"company_id": int32(7)}, nil, "status", [][]int64{{0}, {1}}},
+	} {
+		deltaIndex, prefixes, err := selectDeltaIndex(scyllaTable, selection.equalities, selection.deltaValues)
+		if err != nil || deltaIndex.tag != selection.expectedTag ||
+			!slices.EqualFunc(prefixes, selection.expectedPrefixes, slices.Equal[[]int64]) {
+			t.Fatalf("%v %v: expected %s %v, got %s %v err %v", selection.equalities, selection.deltaValues,
+				selection.expectedTag, selection.expectedPrefixes, deltaIndex.tag, prefixes, err)
+		}
 	}
 }
 
@@ -214,7 +262,7 @@ func TestDeltaRecordsTheCursorOnTheQuery(t *testing.T) {
 	query.Delta(400000000, int8(1))
 
 	tableInfo := query.GetTableInfo()
-	if tableInfo.Delta == nil || tableInfo.Delta.CursorUpdated != 400000000 || len(tableInfo.Delta.SyncFilterValues) != 1 {
+	if tableInfo.Delta == nil || tableInfo.Delta.CursorUpdated != 400000000 || len(tableInfo.Delta.LastKeyValues) != 1 {
 		t.Fatalf("expected the cursor and the filter values on the query, got %+v", tableInfo.Delta)
 	}
 	if len(tableInfo.Statements) != 1 {

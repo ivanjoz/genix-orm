@@ -163,8 +163,9 @@ func (e ProductTable) GetSchema() db.TableSchema {
             {Col: e.Status, Values: []int64{0, 1}},
         },
         Indexes: []db.Index{
-            // TypeDelta is a slim view (ID, updated, version, Status) that serves query.Delta()
-            // only. Its last key is the column Delta() filters on; the others are pinned.
+            // TypeDelta is a view of the whole record ordered by updated: it serves query.Delta()
+            // and plain reads on its keys. Every key is pinned: query.Delta(cursor, 1) reads the
+            // Status 1 prefix, and a read without Status fans out over its FixedValues.
             {Type: db.TypeDelta, Keys: db.Cols(e.Status)},
             {Type: db.TypeLocalIndex, Keys: db.Cols(e.Nombre)},
         },

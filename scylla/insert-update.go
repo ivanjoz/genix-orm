@@ -1107,7 +1107,9 @@ func resolveUpdateColumnsForWrite(
 	// Revisa si hay columnas que deben actualizarse juntas para los índices calculados.
 	for _, indexViews := range scyllaTable.indexViews {
 		if indexViews.column.GetInfo().IsVirtual {
-			if indexViews.Type == 3 {
+			// A delta view's packed column is always written, from the stored pinned values a partial
+			// update leaves out (stampDeltaWrites): nothing has to be updated together.
+			if indexViews.Type == 3 || indexViews.isDeltaView {
 				// Index groups own their own validation and virtual-column recomputation below.
 				continue
 			}
@@ -1231,9 +1233,7 @@ func resolveUpdateColumnsForWrite(
 	// A TypeDelta packed column holds updated, which every update writes, so it is always rewritten,
 	// from the pinned values the record keeps (managedWriteValues.deltaPackedValues).
 	for _, deltaIndex := range scyllaTable.deltaIndexes {
-		if deltaIndex.packedColumn != nil {
-			columnsToUpdate = append(columnsToUpdate, deltaIndex.packedColumn)
-		}
+		columnsToUpdate = append(columnsToUpdate, deltaIndex.packedColumn)
 	}
 
 	if onlyVirtual {

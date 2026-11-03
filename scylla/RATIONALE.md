@@ -108,17 +108,29 @@ lists avoid the copy a `MakeSlice` would add.
 Not erased: the small `Col` methods (interface-retained, see BINARY_SIZE_FINDINGS.md) and the
 generic shims themselves, which are now under ~800 bytes per table.
 
-## TypeDelta is a slim view, not a change log
+## TypeDelta is a full view, not a change log
 **Context** — The delta log in the file store cost an S3 append per write and a per-sync file read,
-and still needed a view on the keys for the first sync. Scylla can list what changed by itself.
-**Decision** — A TypeDelta index is a materialized view of `(ID, updated, version, filter)` ordered
-by updated, and a sync reads it past the client's cursor, then the changed records by ID. The client
-checks the 15 minutes behind its cursor with a hash of `(ID, version)` and asks for a replace on a
-mismatch. Pinned-value changes go to a small moves table. The view stays out of the planner;
-tables that also filter on its keys declare a `TypeView`.
-**Rationale** — No S3 on the write path, and missed writes (late landings, view lag) heal on the next
-sync instead of never. Cost: a second view per listing table, and a replace when more than the
-threshold changed.
+and still needed a view on the keys for the first sync. Scylla can list what changed by itself. A
+first version kept the view slim (ID, updated, version, filter) and read the records by ID: a full
+sync of 5,000 records cost 1 + 50 queries.
+**Decision** — A TypeDelta index is a materialized view of every stored column, ordered by updated.
+A sync reads the changed records straight from it, and a full sync is one paged range read. The
+client checks the 15 minutes behind its cursor with a hash of `(ID, version)` and asks for a replace
+on a mismatch. Pinned-value changes go to a small moves table.
+**Rationale** — No S3 on the write path, a sync is 2 or 3 queries whatever it returns, and missed
+writes (late landings, view lag) heal on the next sync instead of never. Cost: each TypeDelta index
+is a full copy of the table, and every write moves its view row (updated is in the key), leaving a
+wide tombstone. A record read from the view can lag the base table by one version, as the listing
+itself already did; the next sync or the hash catches it.
+
+## The delta view serves plain reads too
+**Context** — Out of the planner, tables that read by their delta keys needed a second view with
+the same keys (seven `TypeView(Status)` indexes, the projects' views on `ProjectID`).
+**Decision** — The delta view is a planner range view (Type 8) on `[partition, keys…, updated]`. An
+equality on the keys is one span of the packed column; a key without one fans out over its
+`FixedValues`, one read per value. No `ALLOW FILTERING`.
+**Rationale** — Those views are gone. Cost: a read leaving out a key with no enumerable
+`FixedValues` (such as `Period`) cannot use the view.
 
 ## The view's key packs the pinned values with updated
 **Context** — Scylla refuses more than one non-primary-key base column in a view's primary key
@@ -147,15 +159,17 @@ cursor, so a cache 40 days old with 4 changes was resent whole.
 and the limit keeps the decision as cheap for an old cursor as for a recent one. Cost: one moves row
 per pinned-value change kept forever; such changes are rare and each row is a few bytes.
 
-## A record leaves the view by its filter value
-**Context** — No hard deletes on TypeDelta tables; the delta log turned a status-0 write into a
-deleted entry.
-**Decision** — Changed records come back in every status. genix-ui removes a returned record whose
-sync-filter value is not in the call's values; a replace lists only matching records. Moving out of
-a pinned prefix is a moves-table row instead.
-**Rationale** — One rule covers soft deletes, annulments and filters on `State`, and the server never
-has to know which column means "deleted". Cost: a table filtered on `State` keeps a soft-deleted
-(`status` 0) record whose `State` still matches.
+## Every delta key is pinned, status included
+**Context** — A first version pinned every key but the last, which it treated as a filter: changed
+records came back in every status and genix-ui dropped those whose value was not in the call's. It
+read the whole prefix to filter it, and the Anuladas tab needed a replace on every sync.
+**Decision** — Every Key is a slot of the packed column (`[status][updated]`, sorted by updated
+within a status). `Delta()`'s values name the last key's prefixes, read in parallel; a key with no
+equality and no value fans out over its `FixedValues`. A change of any key value, status included, is
+a moves row, so a soft delete or an annulment reaches the client as a removed ID.
+**Rationale** — A read touches only the rows it returns, the threshold and `LIMIT` stay exact, and
+the client keeps every returned record. Cost: one query per value, and a key no read names must
+declare `FixedValues` (at most 8 prefixes per read).
 
 ## What a partial update writes to the view
 **Context** — An Update with an include list writes some columns; the view's packed column needs the
@@ -165,12 +179,13 @@ not include keeps its stored value; a record that was not stored takes the value
 **Rationale** — One read serves the version, the packed value and the move. LocalQuorum on it, so a
 write right after another sees its version.
 
-## The sync filter applies on every sync
-**Context** — The window hash must cover the same rows on both sides.
-**Decision** — The server hashes and replaces only rows whose filter value is in `Delta()`'s values,
-and sends the field name and the values; the client hashes its held records with the same rule.
-**Rationale** — A client that holds only active records would otherwise mismatch on every inactive
-row in the window.
+## The hash covers the call's prefixes only
+**Context** — The window hash must cover the same rows on both sides, and a client key holds only
+the records of its own prefixes.
+**Decision** — The server hashes the window rows of the prefixes it read, and sends the last key's
+field name and values; the client hashes its held records whose field holds one of them.
+**Rationale** — A client holding one status tab would otherwise mismatch on every other status in
+the window.
 
 ## A replace honours Limit
 **Context** — Routes such as the sale orders cap their list (`Limit(5000)`).

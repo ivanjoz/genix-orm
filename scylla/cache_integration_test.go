@@ -1,6 +1,7 @@
 package scylla
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/ivanjoz/genix-orm/db"
@@ -197,14 +198,38 @@ func TestCacheProtocolsOnScylla(t *testing.T) {
 		t.Fatalf("warehouse 6: %+v", records)
 	}
 
-	// A cache 40 days old with 3 changes since gets those 3 by ID, in every status: age is no replace.
+	// A plain query on warehouse + Status is served by the delta view's [warehouse_id, status] prefix.
+	// Record 2 is annulled first so the status-1 prefix has something to leave out.
+	setClock(900)
+	if err := Update(&[]cacheITRecord{{CompanyID: 7, ID: 2, Status: 0}}, table.Status); err != nil {
+		t.Fatal(err)
+	}
+	for _, warehouseCase := range []struct {
+		warehouseID int32
+		expectedIDs []int32
+	}{{5, []int32{}}, {6, []int32{1}}} {
+		plainRecords := []cacheITRecord{}
+		query := Query(&plainRecords)
+		query.CompanyID.Equals(7).WarehouseID.Equals(warehouseCase.warehouseID).Status.Equals(1)
+		if err := query.Exec(); err != nil {
+			t.Fatal(err)
+		}
+		if ids := recordIDs(plainRecords); !slices.Equal(ids, warehouseCase.expectedIDs) {
+			t.Fatalf("plain query on warehouse %d: got %v", warehouseCase.warehouseID, ids)
+		}
+	}
+
+	// A cache 40 days old syncs by ID, since age is no replace: status is a pinned key, so the [1]
+	// prefix returns record 1, record 2 (annulled) comes back as a move, and record 3 (status 0) is
+	// outside the prefix.
 	oldCursor := clockStart - 40*24*1800
 	records, metadataText = deltaSync(t, 0, oldCursor)
 	expected = cache.EncodeDeltaWindowMetadata(cache.DeltaWindowMetadata{
 		NextCursor: clockStart + 800, WindowFrom: oldCursor - cache.DeltaWindowTicks,
 		WindowTo: oldCursor - cache.DeltaWindowMarginTicks, FilterField: "ss", FilterValues: []int64{1},
+		RemovedIDs: []int64{2},
 	})
-	if ids := recordIDs(records); len(ids) != 3 || metadataText != expected {
+	if ids := recordIDs(records); !slices.Equal(ids, []int32{1}) || metadataText != expected {
 		t.Fatalf("40-day-old cursor: %+v", records)
 	}
 }

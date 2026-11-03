@@ -39,11 +39,10 @@ func (q ColumnStatement) GetValue() any {
 }
 
 // DeltaRead is what a Delta() call asked for (db/cache delta_window.go): the highest Updated the client
-// holds (0 on a first sync), and the values of the index's sync filter column a replace lists and the
-// window hash covers.
+// holds (0 on a first sync), and the values of the index's last Key whose prefixes the read covers.
 type DeltaRead struct {
-	CursorUpdated    int32
-	SyncFilterValues []any
+	CursorUpdated int32
+	LastKeyValues []any
 }
 
 // TableInfo is the mutable per-query state collected by the fluent builder

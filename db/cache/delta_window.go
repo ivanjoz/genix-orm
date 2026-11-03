@@ -11,30 +11,30 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Delta window protocol (the Scylla driver's Delta()): no change log. A TypeDelta
-// index is a slim materialized view (ID, updated, version, sync filter) keyed by
-// the partition, the pinned values and updated, and a sync reads it past the
-// client's cursor.
+// index is a materialized view of the whole record keyed by the partition, the
+// index's Keys (all pinned) and updated, and a sync reads it past the client's
+// cursor. A call covers one prefix per combination of key values: its last Key's
+// values are Delta()'s (a status tab, say), the others come from equalities or fan
+// out over FixedValues.
 //
 // The cursor C is the highest Updated (SUnixTime) the client holds. A sync:
 //
-//   - returns the records the view lists with updated ≥ C − DeltaWindowMarginTicks,
-//     read from the table by ID, in every status;
-//   - returns the hash of (ID, version) over the view rows with updated in
-//     [C − DeltaWindowTicks, C − DeltaWindowMarginTicks) whose sync filter value is
-//     in the call's values;
-//   - returns as removed the IDs that left the pinned prefix (a pinned value
-//     changed) in the window, read from the moves table.
+//   - returns the records of the prefixes with updated ≥ C − DeltaWindowMarginTicks;
+//   - returns the hash of (ID, version) over the prefixes' rows with updated in
+//     [C − DeltaWindowTicks, C − DeltaWindowMarginTicks);
+//   - returns as removed the IDs that left a prefix (a key value changed: a move, a
+//     soft delete, an annulment) in the window, read from the moves table.
 //
-// The client compares: it hashes the records it holds in the same window with a
-// matching filter value, leaving out every ID the response brought or removed (a
+// The client compares: it hashes the records it holds in the same window whose last
+// Key holds one of the call's values, leaving out every ID the response brought or removed (a
 // record edited again after C moved out of the server's window but not out of the
 // client's). A mismatch means a write the client missed (one that landed late, a
 // view lag, a lost move): it asks again without a cursor, which replaces its
 // records with the view's.
 //
 // A first sync, or more than the index's threshold of changed or moved records,
-// answers a replace: every record of the prefix whose filter value is in the
-// call's values. The cursor's age never does: the view and the moves never expire.
+// answers a replace: every record of the prefixes, newest first up to the read's
+// Limit. The cursor's age never does: the view and the moves never expire.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
@@ -43,8 +43,8 @@ const (
 	DeltaWindowMarginTicks = 5
 	// DeltaWindowTicks (15 min) is how far behind C the hash checks.
 	DeltaWindowTicks = 450
-	// DefaultDeltaReplaceThreshold is how many changed (or moved) records a sync answers by ID before
-	// it answers a replace instead.
+	// DefaultDeltaReplaceThreshold is how many changed (or moved) records a sync answers before it
+	// answers a replace instead.
 	DefaultDeltaReplaceThreshold = 100
 
 	DeltaWindowFlagReplace = 2
@@ -85,11 +85,11 @@ type DeltaWindowMetadata struct {
 	WindowFrom int32
 	WindowTo   int32
 	WindowHash uint32
-	// FilterField is the JSON name of the sync filter field, "" when the index has none;
-	// FilterValues are the values the hash (and a replace) kept.
+	// FilterField is the JSON name of the index's last Key, "" when the index has none;
+	// FilterValues are the values the call read, which the client's hash must match.
 	FilterField  string
 	FilterValues []int64
-	// RemovedIDs left the pinned prefix inside the window.
+	// RemovedIDs left the call's prefixes since the window began.
 	RemovedIDs []int64
 }
 
