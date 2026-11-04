@@ -28,6 +28,9 @@ func TestIsRecordSnapshotExpired(t *testing.T) {
 	if !IsRecordSnapshotExpired(snapshot, 1002+RecordSnapshotMaxAgeTicks) {
 		t.Fatal("a snapshot past 2 h must be read from the database again")
 	}
+	if !IsRecordSnapshotExpired(snapshot, 1000) {
+		t.Fatal("a snapshot read after the current clock must be read from the database again")
+	}
 }
 
 func TestCacheGroupSnapshotKey(t *testing.T) {

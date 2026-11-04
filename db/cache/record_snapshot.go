@@ -23,8 +23,11 @@ const RecordSnapshotMaxAgeTicks = 3600
 
 // IsRecordSnapshotExpired: the snapshot is older than RecordSnapshotMaxAgeTicks at readTime, the
 // current read's server clock, so the database answers and rewrites it.
+// A snapshot read after readTime is expired too: the clock went back (a backdated seed rewinding
+// core.SetHistoricalUnix, or a skewed instance), so writes stamped before its cursor can still
+// land and its "changed since the cursor" read would never see them.
 func IsRecordSnapshotExpired(snapshot RecordSnapshot, readTime int32) bool {
-	return readTime-snapshot.ReadTime > RecordSnapshotMaxAgeTicks
+	return snapshot.ReadTime > readTime || readTime-snapshot.ReadTime > RecordSnapshotMaxAgeTicks
 }
 
 // RecordSnapshot is one decoded snapshot file.
