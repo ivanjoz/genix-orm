@@ -194,6 +194,7 @@ type deltaElasticPinRecord struct {
 	ID        int32 `db:"id"`
 	ListID    int32 `db:"list_id"`
 	Status    int8  `db:"status"`
+	Updated   int32 `json:"upd,omitempty"`
 	Version   int16 `json:"ver,omitempty"`
 }
 
@@ -203,6 +204,7 @@ type deltaElasticPinSchema struct {
 	ID        Col[*deltaElasticPinSchema, int32]
 	ListID    Col[*deltaElasticPinSchema, int32]
 	Status    Col[*deltaElasticPinSchema, int8]
+	Updated   Col[*deltaElasticPinSchema, int32]
 	Version   Col[*deltaElasticPinSchema, int16]
 }
 

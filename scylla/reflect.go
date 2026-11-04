@@ -108,6 +108,13 @@ func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
 			`Declare the field "Updated int32" with the json tag "upd,omitempty" in the record struct, `+
 			`and "Updated db.Col[...]" in the table struct.`, dbTable.Name))
 	}
+	// The delta key packs the record's Updated and a Delta() read hands it to the client as the cursor:
+	// a DB-only column reads nil from the record, so every key would pack updated = 0.
+	if _, isDeclared := dbTable.ColumnsMap[managedUpdatedColumnName]; hasDeltaIndex(schema) && !isDeclared {
+		panic(fmt.Sprintf(`Table "%v": TypeDelta packs each record's Updated into its key and returns it as the cursor. `+
+			`Declare the field "Updated int32" with the json tag "upd" in the record struct, `+
+			`and "Updated db.Col[...]" in the table struct.`, dbTable.Name))
+	}
 	if _, isDeclared := dbTable.ColumnsMap[managedVersionColumnName]; hasDeltaIndex(schema) && !isDeclared {
 		panic(fmt.Sprintf(`Table "%v": TypeDelta logs each write's Version and the client compares it. `+
 			`Declare the field "Version int16" with the json tag "ver,omitempty" in the record struct, `+
