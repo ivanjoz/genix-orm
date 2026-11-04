@@ -321,9 +321,10 @@ func deltaPinnedColumns(scyllaTable ScyllaTable) []IColInfo {
 // key) and column name; a record not stored is absent and a null column has no entry.
 type storedRows map[[2]int64]map[string]any
 
-// readStoredWrittenRows reads, in one select per partition, what the delta indexes and the DataFrames
-// need of the records about to be written: the version and the pinned columns, and the whole row for
-// the frames (a ToFrames method may read any field). nil when the table has neither. The keys must be
+// readStoredWrittenRows reads, in one select per partition, what the delta indexes, the DataFrames
+// and the index groups need of the records about to be written: the version and the pinned columns,
+// the whole row for the frames (a ToFrames method may read any field), and the group columns (the
+// groups a record leaves are marked too). nil when the table has none of them. The keys must be
 // final (after handlePreInsert).
 func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (storedRows, error) {
 	var columns []IColInfo
@@ -333,6 +334,9 @@ func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (stored
 	}
 	if scyllaTable.dataFrames != nil {
 		columns = append(columns, scyllaTable.dataFrames.storedColumns...)
+	}
+	if len(scyllaTable.indexGroups) > 0 && scyllaTable.indexUpdatedTable != nil {
+		columns = append(columns, indexGroupStoredColumns(&scyllaTable)...)
 	}
 	if len(columns) == 0 {
 		return nil, nil
@@ -709,10 +713,13 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 		}
 	}
 
-	cursor := int64(deltaRead.CursorUpdated)
-	windowFrom, windowTo := cursor-cache.DeltaWindowTicks, cursor-cache.DeltaWindowMarginTicks
+	// V for the client's next sync, on the clock that stamps updated: taken before any read, so
+	// every write stamped before V − DeltaWriteLagTicks was visible to the reads below.
+	metadata.ReadTime = getManagedUnixTime()
+	cursor := deltaRead.Cursor
+	plan := cache.PlanDeltaSync(cursor)
 	// A first sync is a replace; any other cursor, however old, is decided by how much changed.
-	metadata.IsReplace = cursor == 0
+	metadata.IsReplace = cursor.Updated == 0
 	projection := deltaProjection(tableInfo, scyllaTable, deltaIndex)
 	recordIDOf := func(recordPointer unsafe.Pointer) int64 {
 		return convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
@@ -729,12 +736,12 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 	if !metadata.IsReplace {
 		err := readDeltaPrefixes(prefixes, reads, func(prefix []int64, read *deltaPrefixRead) error {
 			if err := readDeltaViewRecords(sink.collectInto(&read.records), scyllaTable, deltaIndex, partition, prefix,
-				max(windowTo, 0), deltaViewUpdatedMax, decisionLimit, projection); err != nil {
+				int64(plan.ChangedFrom), deltaViewUpdatedMax, decisionLimit, projection); err != nil {
 				return err
 			}
 			var err error
 			if len(deltaIndex.pinned) > 0 {
-				read.movedIDs, err = readDeltaMovedIDs(scyllaTable, deltaIndex, partition, prefix, max(windowFrom, 0), decisionLimit)
+				read.movedIDs, err = readDeltaMovedIDs(scyllaTable, deltaIndex, partition, prefix, int64(plan.MovesFrom), decisionLimit)
 			}
 			return err
 		})
@@ -751,11 +758,11 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 
 	if metadata.IsReplace {
 		// Every record of the prefixes, newest first across them, so a Limit keeps the most recently
-		// written ones.
+		// written ones. Each prefix comes from its snapshot when that one still holds (delta_snapshot.go).
 		reads = make([]deltaPrefixRead, len(prefixes))
 		err := readDeltaPrefixes(prefixes, reads, func(prefix []int64, read *deltaPrefixRead) error {
-			return readDeltaViewRecords(sink.collectInto(&read.records), scyllaTable, deltaIndex, partition, prefix,
-				0, deltaViewUpdatedMax, int(tableInfo.Limit), projection)
+			return readDeltaPrefixReplace(sink, scyllaTable, deltaIndex, partition, prefix, tableInfo.Limit, projection,
+				metadata.ReadTime, read)
 		})
 		if err != nil {
 			return err
@@ -775,17 +782,18 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 			sink.appendRecord(recordPointer)
 		}
 	} else {
-		// The hashed window [windowFrom, windowTo) of every prefix: its rows are not resent, only hashed.
+		// The unsettled slice of every prefix: its rows are not resent, only hashed.
 		err := readDeltaPrefixes(prefixes, reads, func(prefix []int64, read *deltaPrefixRead) error {
 			var err error
-			read.windowRows, err = readDeltaViewRows(scyllaTable, deltaIndex, partition, prefix, max(windowFrom, 0), windowTo-1)
+			read.windowRows, err = readDeltaViewRows(scyllaTable, deltaIndex, partition, prefix,
+				int64(plan.WindowFrom), int64(plan.WindowTo)-1)
 			return err
 		})
 		if err != nil {
 			return err
 		}
-		metadata.WindowFrom, metadata.WindowTo = int32(windowFrom), int32(windowTo)
-		metadata.NextCursor = int32(cursor)
+		metadata.WindowFrom, metadata.WindowTo = plan.WindowFrom, plan.WindowTo
+		metadata.NextCursor = cursor.Updated
 		isInView := map[int64]bool{}
 		for _, read := range reads {
 			for _, viewRow := range read.windowRows {

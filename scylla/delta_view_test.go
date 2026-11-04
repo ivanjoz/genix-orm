@@ -259,10 +259,11 @@ func TestDeltaRecordsTheCursorOnTheQuery(t *testing.T) {
 	records := []deltaStockRecord{}
 	query := Query[deltaStockRecord, deltaStockSchema](&records)
 	query.CompanyID.Equals(7)
-	query.Delta(400000000, int8(1))
+	cursor := cache.DeltaWindowCursor{Updated: 400000000, ReadTime: 400000005}
+	query.Delta(cursor, int8(1))
 
 	tableInfo := query.GetTableInfo()
-	if tableInfo.Delta == nil || tableInfo.Delta.CursorUpdated != 400000000 || len(tableInfo.Delta.LastKeyValues) != 1 {
+	if tableInfo.Delta == nil || tableInfo.Delta.Cursor != cursor || len(tableInfo.Delta.LastKeyValues) != 1 {
 		t.Fatalf("expected the cursor and the filter values on the query, got %+v", tableInfo.Delta)
 	}
 	if len(tableInfo.Statements) != 1 {

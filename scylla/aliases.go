@@ -50,12 +50,14 @@ type RecordOf[TableT TableSchemaInterface[TableT], RecordT TableBaseInterface[Ta
 const (
 	MaxTableID = db.MaxTableID
 
-	TypeGlobalIndex    = db.TypeGlobalIndex
-	TypeLocalIndex     = db.TypeLocalIndex
-	TypeInheritFromKey = db.TypeInheritFromKey
-	TypeView           = db.TypeView
-	TypeViewTable      = db.TypeViewTable
-	TypeDelta          = db.TypeDelta
+	TypeGlobalIndex       = db.TypeGlobalIndex
+	TypeLocalIndex        = db.TypeLocalIndex
+	TypeCacheGroupFromKey = db.TypeCacheGroupFromKey
+	TypeView              = db.TypeView
+	TypeViewTable         = db.TypeViewTable
+	TypeDelta             = db.TypeDelta
+	TypeCacheGroup        = db.TypeCacheGroup
+	TypeCacheGroupS3      = db.TypeCacheGroupS3
 )
 
 // Cols returns columns as the slice required by schema declarations.

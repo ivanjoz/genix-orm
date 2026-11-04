@@ -59,9 +59,9 @@ type Executor[TableT any, RecordT any] interface {
 // GroupIndexCache is a client's freshness claim for one index group, so a grouped
 // read can skip groups the caller already holds.
 type GroupIndexCache struct {
-	IndexID       int16
-	GroupHash     int32
-	UpdateCounter int32
+	IndexID   int16
+	GroupHash int32
+	LastWrite int32
 }
 
 // RecordWithExecutor is the constraint on a record type. It extends

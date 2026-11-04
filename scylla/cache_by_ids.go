@@ -11,13 +11,22 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/db/cache"
+	"github.com/ivanjoz/genix-orm/utils"
 )
 
 // The by-IDs cache lets a client ask "give me these records" and get back only the ones that moved.
-// The protocol lives in db/cache: every record belongs to the slot uint8(ID), each partition keeps a
-// year-cycle slot file of 256 ticks in the ORM's file store, and a write raises its record's slot to
-// the tick of the Updated it was stamped with. This file is scylla's side: the partition's base pk,
-// the post-write raise, and the reads of the IDs whose slot moved.
+// The protocol lives in db/cache: every record belongs to the slot uint8(ID), and a write raises its
+// record's slot to the Updated it was stamped with. Other drivers keep the slots in year-cycle files
+// of the file store; scylla keeps them in its own table, in the same keyspace as the records:
+//
+//	cache_by_ids_slots: PRIMARY KEY ((table_id, partition_id)), slots map<tinyint, int>
+//	                    one row per table partition, slot int8(uint8(ID)) → the full Updated (SUnixTime)
+//
+// Slots and rows then share one system and one consistency level (LocalQuorum both ways). A map cell
+// is last-write-wins, so every slot write carries USING TIMESTAMP = its Updated: the cell with the
+// latest stamp wins, a max() with no read and no LWT. On read the full Updated is converted to the
+// current cycle's year tick (cache.YearTickOfUpdated), so the client sees what the file-store drivers
+// send, yearly reset included.
 //
 // On the by-IDs path only, a returned record's Updated is overwritten with its slot tick as the
 // client holds it, not its own write time: that is the value the client compares next time.
@@ -41,12 +50,6 @@ func isIntegerFieldType(fieldType string) bool {
 	return fieldType == "int16" || fieldType == "int32" || fieldType == "int64"
 }
 
-// cacheBasePK names one partition of the table in the cache files: its keyspace, table ID and
-// partition value, so tables and keyspaces sharing a file store never collide.
-func cacheBasePK(scyllaTable ScyllaTable, partitionValue int64) string {
-	return fmt.Sprintf("%s/%d/%d", resolveKeyspace(scyllaTable), scyllaTable.ID, partitionValue)
-}
-
 func resolveKeyspace(scyllaTable ScyllaTable) string {
 	if scyllaTable.Namespace != "" {
 		return scyllaTable.Namespace
@@ -54,27 +57,56 @@ func resolveKeyspace(scyllaTable ScyllaTable) string {
 	return connParams.Keyspace
 }
 
-// raiseWrittenSlots raises the slot of every written record to the tick of its stamped Updated. It
-// runs after the rows are written: a slot raised first would let a client read the old row, hold the
-// new tick, and never read the record again.
+const cacheSlotsTableName = "cache_by_ids_slots"
+
+// cacheSlotsCreateScript is the CREATE of a keyspace's slots table, shared by its CacheByIDs tables.
+func cacheSlotsCreateScript(keyspace string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %v.%v (
+			table_id smallint, partition_id bigint, slots map<tinyint, int>,
+			PRIMARY KEY ((table_id, partition_id))
+		);`, keyspace, cacheSlotsTableName)
+}
+
+// raiseWrittenSlots raises the slot of every written record to its stamped Updated. It runs after
+// the rows are written: a slot raised first would let a client read the old row, hold the new tick,
+// and never read the record again.
 func raiseWrittenSlots(records recordSliceGroup, scyllaTable ScyllaTable) error {
 	if !scyllaTable.CacheByIDs || records.len() == 0 {
 		return nil
 	}
-	if cache.FileStore() == nil {
-		return fmt.Errorf(`table %q uses CacheByIDs and no file store holds its slot files: call db.SetFileStore at boot`, scyllaTable.Name)
+	// USING TIMESTAMP applies to a whole statement, so there is one per partition and stamp. A write
+	// call stamps its records with one Updated, so that is normally one per partition.
+	type partitionStamp struct {
+		partition int64
+		updated   int32
 	}
-	slotWrites := make([]cache.SlotWrite, records.len())
+	slotsByStamp := map[partitionStamp]map[int8]int32{}
 	for i := range records.len() {
 		recordPointer := records.at(i)
-		slotWrites[i] = cache.SlotWrite{
-			BasePK:  cacheBasePK(scyllaTable, convertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer))),
-			ID:      convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer)),
-			Updated: convertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer)),
+		stamp := partitionStamp{
+			partition: convertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer)),
+			updated:   int32(convertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))),
 		}
+		if slotsByStamp[stamp] == nil {
+			slotsByStamp[stamp] = map[int8]int32{}
+		}
+		recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+		slotsByStamp[stamp][int8(cache.SlotOfRecordID(recordID))] = stamp.updated
 	}
-	if err := cache.RaiseWrittenSlots(slotWrites); err != nil {
-		return fmt.Errorf("table %q: %w", scyllaTable.Name, err)
+
+	// "slots = slots + {…}" sets the listed cells without the tombstone a whole-map assignment writes.
+	statement := fmt.Sprintf("UPDATE %v.%v USING TIMESTAMP ? SET slots = slots + ? WHERE table_id = ? AND partition_id = ?",
+		resolveKeyspace(scyllaTable), cacheSlotsTableName)
+	session := getScyllaConnection()
+	batch := session.NewBatch(gocql.UnloggedBatch)
+	batch.SetConsistency(gocql.LocalQuorum)
+	for stamp, slots := range slotsByStamp {
+		// The cell timestamp is the stamp's real time: the latest Updated wins, whatever the arrival order.
+		cellTimestamp := cache.SUnixTimeToTime(int64(stamp.updated)).UnixMicro()
+		batch.Query(statement, cellTimestamp, slots, scyllaTable.ID, stamp.partition)
+	}
+	if err := session.ExecuteBatch(batch); err != nil {
+		return fmt.Errorf("table %q: raising %d by-IDs slot stamp(s): %w", scyllaTable.Name, len(slotsByStamp), err)
 	}
 	return nil
 }
@@ -100,19 +132,42 @@ func splitIDsIntoBatches(ids []int64, batchSize int) [][]int64 {
 	return idBatches
 }
 
-// planCachedIDsRead checks a by-IDs request against the slot files of its partitions.
+// planCachedIDsRead checks a by-IDs request against the slots of its partitions, read at LocalQuorum
+// like the slot writes, each slot's Updated converted to the current cycle's year tick.
 func planCachedIDsRead(scyllaTable ScyllaTable, request cache.CachedIDsRequest, callerName string) (*cache.CachedIDsPlan, error) {
 	if !scyllaTable.CacheByIDs {
 		return nil, fmt.Errorf(`table %q: %v requires CacheByIDs`, scyllaTable.Name, callerName)
 	}
-	if cache.FileStore() == nil {
-		return nil, fmt.Errorf(`table %q: %v reads slot files and no file store holds them: call db.SetFileStore at boot`, scyllaTable.Name, callerName)
-	}
-	basePKByPartition := map[int64]string{}
+	now := db.Now()
+	cycleStart := utils.SUnixTimeOf(cache.CycleStartTime(cache.YearCycleOf(now)))
+
+	var partitions []int64
 	for _, cachedID := range request.IDs {
-		basePKByPartition[cachedID.Partition] = cacheBasePK(scyllaTable, cachedID.Partition)
+		if !slices.Contains(partitions, cachedID.Partition) {
+			partitions = append(partitions, cachedID.Partition)
+		}
 	}
-	return cache.ReadCachedIDsPlan(request, basePKByPartition, db.Now())
+	queryString := fmt.Sprintf("SELECT partition_id, slots FROM %v.%v WHERE table_id = ? AND partition_id IN ?",
+		resolveKeyspace(scyllaTable), cacheSlotsTableName)
+	// A partition with no row has had no write: PlanCachedIDs reads it as all slots unwritten.
+	slotTicksByPartition := map[int64]*cache.SlotTicks{}
+	for _, partitionBatch := range splitIDsIntoBatches(partitions, queryCachedIDsMaxBatchSize) {
+		iterator := getScyllaConnection().Query(queryString, scyllaTable.ID, partitionBatch).Consistency(gocql.LocalQuorum).Iter()
+		var partition int64
+		var updatedBySlot map[int8]int32
+		for iterator.Scan(&partition, &updatedBySlot) {
+			slotTicks := &cache.SlotTicks{}
+			for slot, updated := range updatedBySlot {
+				slotTicks[uint8(slot)] = cache.YearTickOfUpdated(int64(updated), cycleStart)
+			}
+			slotTicksByPartition[partition] = slotTicks
+			updatedBySlot = nil
+		}
+		if err := iterator.Close(); err != nil {
+			return nil, fmt.Errorf("table %q: reading by-IDs slots: %w", scyllaTable.Name, err)
+		}
+	}
+	return cache.PlanCachedIDs(request, slotTicksByPartition, now), nil
 }
 
 // idsByPartition groups the IDs to read by partition, each list ascending so the batches are stable.

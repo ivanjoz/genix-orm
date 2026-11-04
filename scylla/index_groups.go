@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"unsafe"
@@ -11,11 +12,18 @@ import (
 )
 
 type indexUpdatedRow struct {
-	partitionID   int32
-	indexID       int16
-	indexHash     int32
-	updateCounter int64
+	partitionID int32
+	indexID     int16
+	indexHash   int32
+	// lastWrite (SUnixTime) is when the group's latest write landed: the label clients compare.
+	lastWrite int64
 }
+
+// indexGroupSettleTicks (16 s) is how long a group stays unsettled after its last write. An
+// unsettled group is always sent whole and labelled 0, which no stored last_write matches, so a
+// client that read it while writes of the same 2 s tick, or a write still landing, were in flight
+// refetches it once it settles.
+const indexGroupSettleTicks = 8
 
 func makeIndexGroupCacheKey(indexID int16, indexHash int32) int64 {
 	return (int64(indexID) << 32) | int64(uint32(indexHash))
@@ -50,7 +58,7 @@ func appendIndexUpdatedRowsForRecord(
 	recordPointer unsafe.Pointer,
 	scyllaTable *ScyllaTable,
 	partitionValue int32,
-	updateCounterValue int64,
+	lastWriteValue int64,
 	rowsByPartitionAndHash map[string]indexUpdatedRow,
 	rowsToPersist *[]indexUpdatedRow,
 ) {
@@ -59,15 +67,15 @@ func appendIndexUpdatedRowsForRecord(
 		for _, hashValue := range hashValues {
 			dedupKey := fmt.Sprintf("%d|%d|%d", partitionValue, indexGroup.indexID, hashValue)
 			currentRow, exists := rowsByPartitionAndHash[dedupKey]
-			if exists && currentRow.updateCounter >= updateCounterValue {
+			if exists && currentRow.lastWrite >= lastWriteValue {
 				continue
 			}
 
 			nextRow := indexUpdatedRow{
-				partitionID:   partitionValue,
-				indexID:       indexGroup.indexID,
-				indexHash:     hashValue,
-				updateCounter: updateCounterValue,
+				partitionID: partitionValue,
+				indexID:     indexGroup.indexID,
+				indexHash:   hashValue,
+				lastWrite:   lastWriteValue,
 			}
 			rowsByPartitionAndHash[dedupKey] = nextRow
 			if exists {
@@ -92,7 +100,7 @@ func getIndexUpdatedTableCreateScript(keyspace string, tableInfo *indexUpdatedTa
 		partition_id int,
 		index_id smallint,
 		index_hash int,
-		update_counter int,
+		last_write int,
 		PRIMARY KEY ((partition_id), index_id, index_hash)
 	)
 	%v;`,
@@ -111,11 +119,11 @@ func persistIndexUpdatedRowsBatch(keyspace string, tableName string, rows []inde
 
 	session := getScyllaConnection()
 	batch := session.NewBatch(gocql.UnloggedBatch)
-	insertQuery := fmt.Sprintf(`INSERT INTO %v.%v (partition_id, index_id, index_hash, update_counter) VALUES (?, ?, ?, ?)`,
+	insertQuery := fmt.Sprintf(`INSERT INTO %v.%v (partition_id, index_id, index_hash, last_write) VALUES (?, ?, ?, ?)`,
 		keyspace, tableName)
 
 	for _, row := range rows {
-		batch.Query(insertQuery, row.partitionID, row.indexID, row.indexHash, row.updateCounter)
+		batch.Query(insertQuery, row.partitionID, row.indexID, row.indexHash, int32(row.lastWrite))
 	}
 
 	return session.ExecuteBatch(batch)
@@ -211,8 +219,11 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 		sourceColumnNames = append(sourceColumnNames, key.GetName())
 	}
 	indexID := allocateIndexGroupID(dbTable, sourceColumnNames)
+	if len(indexCfg.Cols) > 0 || indexCfg.UseHash {
+		panic(fmt.Sprintf(`Table "%v": a cache group on %v takes Keys only (no Cols, no UseHash)`, dbTable.Name, sourceColumnNames))
+	}
 
-	if indexCfg.Type == TypeInheritFromKey {
+	if indexCfg.Type == TypeCacheGroupFromKey {
 		registerInheritFromKeyIndexGroup(dbTable, indexCfg, indexID, sourceColumnNames)
 		return
 	}
@@ -226,6 +237,7 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 			sourceColumns: []indexGroupSourceColumn{{
 				column: dbTable.ColumnsMap[indexCfg.Keys[0].GetName()],
 			}},
+			snapshotInS3: indexCfg.Type == TypeCacheGroupS3,
 		})
 		if dbTable.indexUpdatedTable == nil {
 			dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
@@ -304,9 +316,16 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 	dbTable.MaxColIdx++
 	dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
 
+	// Every grouped read pins the partition, so the hash is indexed locally: one partition's index
+	// answers it. Scylla has no local index on a collection ("not implemented yet"), so a set<int>
+	// hash (a slice Key) keeps a global index. The suffix names the kind, so a change recreates it.
+	indexName := fmt.Sprintf(`%v__%v_index_1`, dbTable.Name, virtualColumnName)
+	if usesCollectionValues {
+		indexName = fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumnName)
+	}
 	index := &viewInfo{
 		Type:               3,
-		name:               fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumnName),
+		name:               indexName,
 		idx:                *idxCount,
 		column:             virtualColumn,
 		columns:            slices.Clone(sourceColumnNames),
@@ -316,7 +335,7 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 		if usesCollectionValues {
 			return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, index.name, dbTable.GetFullName(), virtualColumnName)
 		}
-		return fmt.Sprintf(`CREATE INDEX %v ON %v (%v)`, index.name, dbTable.GetFullName(), virtualColumnName)
+		return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`, index.name, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), virtualColumnName)
 	}
 
 	virtualColumnNameLocal := virtualColumnName
@@ -372,6 +391,7 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 		sourceColumns:        sourceColumns,
 		virtualColumn:        virtualColumn,
 		usesCollectionValues: usesCollectionValues,
+		snapshotInS3:         indexCfg.Type == TypeCacheGroupS3,
 	})
 
 	if dbTable.indexUpdatedTable == nil {
@@ -381,24 +401,24 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 
 func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, indexID int16, sourceColumnNames []string) {
 	if len(dbTable.keyIntPacking) == 0 {
-		panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey requires KeyIntPacking on the table`, dbTable.Name))
+		panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey requires KeyIntPacking on the table`, dbTable.Name))
 	}
 	if len(indexCfg.Keys) > len(dbTable.keyIntPacking) {
-		panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey index has %d keys but KeyIntPacking only declares %d columns`,
+		panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey index has %d keys but KeyIntPacking only declares %d columns`,
 			dbTable.Name, len(indexCfg.Keys), len(dbTable.keyIntPacking)))
 	}
 	for columnIndex, key := range indexCfg.Keys {
 		packedColumnName := dbTable.keyIntPacking[columnIndex].GetName()
 		if key.GetName() != packedColumnName {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey keys must be a prefix of KeyIntPacking. Position %d expected "%v" but got "%v"`,
+			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey keys must be a prefix of KeyIntPacking. Position %d expected "%v" but got "%v"`,
 				dbTable.Name, columnIndex, packedColumnName, key.GetName()))
 		}
 		baseColumn := dbTable.ColumnsMap[key.GetName()]
 		if baseColumn == nil || baseColumn.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey column "%v" was not found`, dbTable.Name, key.GetName()))
+			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey column "%v" was not found`, dbTable.Name, key.GetName()))
 		}
 		if baseColumn.GetType().IsSlice {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey does not support slice column "%v"`, dbTable.Name, key.GetName()))
+			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey does not support slice column "%v"`, dbTable.Name, key.GetName()))
 		}
 	}
 
@@ -421,35 +441,88 @@ func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, inde
 	}
 }
 
-func syncIndexGroupsAfterWrite(
-	records recordSliceGroup, scyllaTable *ScyllaTable, managedValues managedWriteValues,
-) error {
-	if records.len() == 0 || len(scyllaTable.indexGroups) == 0 || scyllaTable.indexUpdatedTable == nil {
+// indexGroupStoredColumns are the stored columns the index groups hash: a computed source
+// contributes its From columns.
+func indexGroupStoredColumns(scyllaTable *ScyllaTable) []IColInfo {
+	var storedColumns []IColInfo
+	for _, indexGroup := range scyllaTable.indexGroups {
+		for _, sourceColumn := range indexGroup.sourceColumns {
+			for _, storedColumn := range storedColumnsOf(scyllaTable, sourceColumn.column) {
+				if !slices.ContainsFunc(storedColumns, func(column IColInfo) bool { return column.GetName() == storedColumn.GetName() }) {
+					storedColumns = append(storedColumns, storedColumn)
+				}
+			}
+		}
+	}
+	return storedColumns
+}
+
+// collectIndexGroupMarks lists the groups a write touches, read before it lands (stored holds the
+// rows as they were). Each record marks the groups it ends in — a group column the write leaves out
+// keeps its stored value, so a partial update marks the record's real group, not the zero value's —
+// and, when it was stored, the groups it was in: a record that leaves a group changes it too.
+// lastWrite is left 0: markIndexGroupsBeforeWrite stamps it.
+func collectIndexGroupMarks(scyllaTable *ScyllaTable, phases []writePhase, stored storedRows) []indexUpdatedRow {
+	if len(scyllaTable.indexGroups) == 0 || scyllaTable.indexUpdatedTable == nil {
 		return nil
 	}
-	// A group's update_counter is the updated (SUnixTime) of its latest write.
-	if len(managedValues.updatedValues) == 0 {
-		return nil
-	}
+	groupColumns := indexGroupStoredColumns(scyllaTable)
+	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 
 	rowsByPartitionAndHash := map[string]indexUpdatedRow{}
-	rowsToPersist := []indexUpdatedRow{}
-	for recordIndex := range records.len() {
-		recordPointer := records.at(recordIndex)
-		partitionValue := int32(scyllaTable.GetPartValue(recordPointer))
-		updateCounterValue := convertToInt64(managedValues.updatedValues[recordIndex])
-		appendIndexUpdatedRowsForRecord(recordPointer, scyllaTable, partitionValue, updateCounterValue, rowsByPartitionAndHash, &rowsToPersist)
-	}
+	var marks []indexUpdatedRow
+	for _, phase := range phases {
+		isWritten := map[string]bool{}
+		for _, column := range phase.writtenColumns {
+			isWritten[column.GetName()] = true
+		}
+		for i := range phase.records.len() {
+			recordPointer := phase.records.at(i)
+			partition := convertToInt64(partitionColumn.GetRawValue(recordPointer))
+			storedRow, isStored := stored[[2]int64{partition, convertToInt64(keyColumn.GetRawValue(recordPointer))}]
 
-	if len(rowsToPersist) == 0 {
+			finalRecord := reflect.New(phase.records.recordType).UnsafePointer()
+			phase.records.copyRecord(finalRecord, recordPointer)
+			if isStored {
+				leftRecord := reflect.New(phase.records.recordType).UnsafePointer()
+				for _, column := range groupColumns {
+					storedValue, hasValue := storedRow[column.GetName()]
+					if !hasValue {
+						continue
+					}
+					column.SetValue(leftRecord, storedValue)
+					if !isWritten[column.GetName()] {
+						column.SetValue(finalRecord, storedValue)
+					}
+				}
+				appendIndexUpdatedRowsForRecord(leftRecord, scyllaTable, int32(partition), 0, rowsByPartitionAndHash, &marks)
+			}
+			appendIndexUpdatedRowsForRecord(finalRecord, scyllaTable, int32(partition), 0, rowsByPartitionAndHash, &marks)
+		}
+	}
+	return marks
+}
+
+// markIndexGroupsBeforeWrite publishes the marks before the rows are written, with last_write = now.
+// Marking first fails safe: if this fails the write stops with nothing written, and if the write dies
+// after it the cost is one needless refetch. A group stays unsettled for indexGroupSettleTicks (16 s)
+// from its mark, which covers the data landing after it. A data phase slower than that can be cached
+// without its rows until the group's next write: the accepted gap (ORM_INTERNALS.md, Group freshness).
+func markIndexGroupsBeforeWrite(scyllaTable *ScyllaTable, marks []indexUpdatedRow) error {
+	if len(marks) == 0 {
 		return nil
 	}
+	rowsToPersist := slices.Clone(marks)
+	markerTime := int64(getManagedUnixTime())
+	for rowIndex := range rowsToPersist {
+		rowsToPersist[rowIndex].lastWrite = markerTime
+	}
 
-	// Persisted synchronously. These counters are the freshness marker the frontend delta cache
-	// reads (cc-gh / cc-upc), so losing one silently strands every client on stale data. A
+	// Persisted synchronously. These rows are the freshness marker the frontend group cache
+	// reads (cc-gh / cc-lw), so losing one silently strands every client on stale data. A
 	// fire-and-forget goroutine cannot guarantee delivery: AWS Lambda freezes the execution
 	// environment the moment the handler returns, suspending the write until the environment is
-	// reused — or discarding it outright when the environment is recycled. The caller recovers the
-	// lost concurrency by running this alongside the other post-write syncs.
+	// reused — or discarding it outright when the environment is recycled. The
+	// cost is one round trip before the rows.
 	return persistIndexUpdatedRows(scyllaTable.Namespace, scyllaTable.indexUpdatedTable.name, rowsToPersist)
 }

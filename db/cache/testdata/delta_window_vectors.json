@@ -111,6 +111,7 @@
   {
    "isReplace": false,
    "nextCursor": 400000000,
+   "readTime": 400000010,
    "windowFrom": 399999550,
    "windowTo": 399999995,
    "windowHash": 123456789,
@@ -123,11 +124,12 @@
     12,
     87
    ],
-   "hex": "088088debe01be84debe01fb87debe0115cd5b070273730102030c4bc502"
+   "hex": "088088debe018a88debe01be84debe01fb87debe0115cd5b070273730102030c4bc502"
   },
   {
    "isReplace": true,
    "nextCursor": 400000123,
+   "readTime": 400000130,
    "windowFrom": 0,
    "windowTo": 0,
    "windowHash": 0,
@@ -138,18 +140,19 @@
     -3
    ],
    "removedIDs": [],
-   "hex": "0afb88debe010000000000000553746174650300040500"
+   "hex": "0afb88debe018289debe010000000000000553746174650300040500"
   },
   {
    "isReplace": false,
    "nextCursor": 5,
+   "readTime": 7,
    "windowFrom": 0,
    "windowTo": 0,
    "windowHash": 4294967295,
    "filterField": "",
    "filterValues": [],
    "removedIDs": [],
-   "hex": "08050000ffffffff000000"
+   "hex": "0805070000ffffffff000000"
   }
  ]
 }

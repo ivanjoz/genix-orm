@@ -32,6 +32,11 @@ func registerSchemaLocalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Ind
 		if column == nil {
 			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.Name, colInfo.Name))
 		}
+		// Scylla rejects a local index on a collection ("not implemented yet"): fail here, not on deploy.
+		if column.GetType().IsSlice {
+			panic(fmt.Sprintf(`Table "%v": column "%v" is a slice and Scylla has no local index on a collection; use TypeGlobalIndex, or a TypeCacheGroup of two or more Keys`,
+				dbTable.Name, column.GetName()))
+		}
 
 		indexName := fmt.Sprintf(`%v__%v_index_1`, dbTable.Name, column.GetName())
 		if _, exists := dbTable.indexes[indexName]; exists {
@@ -46,12 +51,8 @@ func registerSchemaLocalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Ind
 			columns: []string{dbTable.GetPartKey().GetName(), column.GetName()},
 		}
 		index.getCreateScript = func() string {
-			colName := column.GetName()
-			if column.GetType().IsSlice {
-				colName = fmt.Sprintf("VALUES(%v)", colName)
-			}
 			return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`,
-				indexName, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), colName)
+				indexName, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), column.GetName())
 		}
 
 		*idxCount = *idxCount + 1

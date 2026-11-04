@@ -188,3 +188,31 @@ func TestReadCachedIDsPlan(t *testing.T) {
 		t.Fatalf("another cycle: IDs to read = %v", plan.IDsToRead)
 	}
 }
+
+// A driver storing the full Updated (scylla) converts it to the same ticks the slot files hold.
+func TestPlanCachedIDsFromFullUpdated(t *testing.T) {
+	cycleStart := utils.SUnixTimeOf(CycleStartTime(2026))
+	if YearTickOfUpdated(cycleStart+100, cycleStart) != WrittenYearTick(cycleStart+100, cycleStart) {
+		t.Fatal("a write of this cycle must convert to its written tick")
+	}
+	if YearTickOfUpdated(cycleStart-1, cycleStart) != 0 {
+		t.Fatal("a write of the previous cycle must convert to 0: no write this cycle")
+	}
+
+	slotTicks := &SlotTicks{}
+	slotTicks[44] = YearTickOfUpdated(cycleStart+100, cycleStart) // ID 300, written this cycle
+	slotTicks[1] = YearTickOfUpdated(cycleStart-50, cycleStart)   // ID 1, last written in 2025
+	request := CachedIDsRequest{CycleYear: 2026, IDs: []CachedID{
+		{Partition: 7, ID: 300, YearTick: 102}, // held the slot's tick: not read
+		{Partition: 7, ID: 1, YearTick: 1},     // no write this cycle, held as such: not read
+		{Partition: 8, ID: 5, YearTick: 1},     // a partition without slots row: no write, not read
+		{Partition: 8, ID: 6},                  // nothing held: read
+	}}
+	plan := PlanCachedIDs(request, map[int64]*SlotTicks{7: slotTicks}, SUnixTimeToTime(cycleStart+10_000))
+	if fmt.Sprint(plan.IDsToRead) != fmt.Sprint([]CachedID{{8, 6, 0}}) {
+		t.Fatalf("IDs to read = %v", plan.IDsToRead)
+	}
+	if plan.HeldUpdated(8, 6) != cycleStart {
+		t.Fatalf("held Updated of an unwritten slot = %d, want the cycle start %d", plan.HeldUpdated(8, 6), cycleStart)
+	}
+}

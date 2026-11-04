@@ -202,10 +202,10 @@ type SaleOrderTable struct {
 Computed: []db.ComputedCol{
     {Col: e.DetailProductIDs, From: db.Cols(e.Lines), Value: db.Compute((*SaleOrder).DetailProductIDs)},
 },
-Indexes: []db.Index{{Keys: db.Cols(e.Date, e.DetailProductIDs), UseIndexGroup: true}},
+Indexes: []db.Index{{Type: db.TypeCacheGroup, Keys: db.Cols(e.Date, e.DetailProductIDs)}},
 ```
 
-- Only a `UseIndexGroup` index with two or more Keys can name it. That index stores hashes computed
+- Only a `TypeCacheGroup` index with two or more Keys can name it. That index stores hashes computed
   from the record in memory. Any other use is rejected when the table compiles: a key, a partition,
   another index kind, a single-key group or a DataFrame.
 - `From` lists the stored columns the value is derived from. An update that writes any of them
@@ -355,7 +355,7 @@ and you would need a duplicate record struct per database.
 ## 7. What is portable, and what is not
 
 The shared layer covers table declaration, predicates, record access and the
-managed columns (`Created`, `Updated`, `UpdateCounter`, sequences, cache
+managed columns (`Created`, `Updated`, sequences, cache
 versions). Beyond that, drivers differ. The contract is that a driver **fails at
 table-compile time with a named error** rather than silently dropping a feature it
 cannot express — a table quietly losing an index is worse than a table that refuses
@@ -368,7 +368,7 @@ to compile.
 | Whole-record insert / update / merge | yes |
 | Column projection, `Limit`, `OrderDesc` | yes |
 | `KeyIntPacking`, `KeyConcatenated` | Scylla-specific |
-| `TypeInheritFromKey`, `UseIndexGroup`, `CompositeBucketing` | Scylla-specific |
+| `TypeCacheGroupFromKey`, `CacheGroup`, `CompositeBucketing` | Scylla-specific |
 | Text search (`db.TextSearchBackend`: genix-s3 or the daemon) | both drivers |
 | DataFrames (`dataframe/DATAFRAMES.md`), per partition on scylla | both drivers |
 | `GenericRecord` by-IDs reads | Scylla-specific |

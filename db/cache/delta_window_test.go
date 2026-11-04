@@ -25,6 +25,7 @@ type deltaWindowVectors struct {
 	Metadata []struct {
 		IsReplace    bool    `json:"isReplace"`
 		NextCursor   int32   `json:"nextCursor"`
+		ReadTime     int32   `json:"readTime"`
 		WindowFrom   int32   `json:"windowFrom"`
 		WindowTo     int32   `json:"windowTo"`
 		WindowHash   uint32  `json:"windowHash"`
@@ -72,7 +73,7 @@ func TestDeltaWindowHashMatchesTheSharedVectors(t *testing.T) {
 func TestDeltaWindowMetadataMatchesTheSharedVectors(t *testing.T) {
 	for _, vector := range readDeltaWindowVectors(t).Metadata {
 		encoded := EncodeDeltaWindowMetadata(DeltaWindowMetadata{
-			IsReplace: vector.IsReplace, NextCursor: vector.NextCursor,
+			IsReplace: vector.IsReplace, NextCursor: vector.NextCursor, ReadTime: vector.ReadTime,
 			WindowFrom: vector.WindowFrom, WindowTo: vector.WindowTo, WindowHash: vector.WindowHash,
 			FilterField: vector.FilterField, FilterValues: vector.FilterValues, RemovedIDs: vector.RemovedIDs,
 		})
@@ -87,10 +88,64 @@ func TestDeltaWindowMetadataMatchesTheSharedVectors(t *testing.T) {
 }
 
 func TestParseDeltaWindowCursor(t *testing.T) {
-	cases := map[string]int32{"": 0, "400000000": 400000000, "-5": 0, "12.40": 0, "abc": 0, "99999999999": 0}
+	cases := map[string]DeltaWindowCursor{
+		"":                    {},
+		"400000000.400000005": {Updated: 400000000, ReadTime: 400000005},
+		"12.40.r":             {Updated: 12, ReadTime: 40, ResendUnsettled: true},
+		// A bare C, a third part other than "r", a non-positive or overflowing value: a first sync.
+		"400000000":      {},
+		"12.40.x":        {},
+		"12.40.r.1":      {},
+		"-5.40":          {},
+		"12.0":           {},
+		"abc.40":         {},
+		"99999999999.40": {},
+	}
 	for encodedCursor, want := range cases {
 		if got := ParseDeltaWindowCursor(encodedCursor); got != want {
-			t.Errorf("ParseDeltaWindowCursor(%q) = %d, want %d", encodedCursor, got, want)
+			t.Errorf("ParseDeltaWindowCursor(%q) = %+v, want %+v", encodedCursor, got, want)
+		}
+	}
+}
+
+func TestPlanDeltaSync(t *testing.T) {
+	cases := []struct {
+		name   string
+		cursor DeltaWindowCursor
+		want   DeltaSyncPlan
+	}{
+		{
+			// A reload 2 s after a bulk write stamped at C: the write is hashed, not resent.
+			name:   "unsettled slice is hashed",
+			cursor: DeltaWindowCursor{Updated: 1000, ReadTime: 1001},
+			want:   DeltaSyncPlan{ChangedFrom: 1001, MovesFrom: 993, WindowFrom: 993, WindowTo: 1001},
+		},
+		{
+			name:   "mismatched slice is resent",
+			cursor: DeltaWindowCursor{Updated: 1000, ReadTime: 1001, ResendUnsettled: true},
+			want:   DeltaSyncPlan{ChangedFrom: 993, MovesFrom: 993},
+		},
+		{
+			// V − lag = C: the write at C is still unsettled.
+			name:   "slice edge",
+			cursor: DeltaWindowCursor{Updated: 1000, ReadTime: 1008},
+			want:   DeltaSyncPlan{ChangedFrom: 1001, MovesFrom: 1000, WindowFrom: 1000, WindowTo: 1001},
+		},
+		{
+			name:   "settled cursor reads past C only",
+			cursor: DeltaWindowCursor{Updated: 1000, ReadTime: 1009},
+			want:   DeltaSyncPlan{ChangedFrom: 1001, MovesFrom: 1001},
+		},
+		{
+			// Settled, the resend flag has no slice left to resend.
+			name:   "settled resend",
+			cursor: DeltaWindowCursor{Updated: 1000, ReadTime: 5000, ResendUnsettled: true},
+			want:   DeltaSyncPlan{ChangedFrom: 1001, MovesFrom: 1001},
+		},
+	}
+	for _, testCase := range cases {
+		if got := PlanDeltaSync(testCase.cursor); got != testCase.want {
+			t.Errorf("%s: PlanDeltaSync(%+v) = %+v, want %+v", testCase.name, testCase.cursor, got, testCase.want)
 		}
 	}
 }

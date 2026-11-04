@@ -92,7 +92,7 @@ func configureComputedColumns(dbTable *ScyllaTable, schema TableSchema, structRe
 }
 
 // rejectComputedColumnUses fails the compile when a computed column is named anywhere that needs it
-// stored. A multi-column UseIndexGroup is the one use allowed: it stores hashes computed from the
+// stored. A multi-column TypeCacheGroup is the one use allowed: it stores hashes computed from the
 // record in memory. A single-column group indexes the column itself.
 func rejectComputedColumnUses(dbTable *ScyllaTable, schema TableSchema) {
 	if len(dbTable.computedColumns) == 0 {
@@ -113,7 +113,7 @@ func rejectComputedColumnUses(dbTable *ScyllaTable, schema TableSchema) {
 	}
 	for _, index := range schema.Indexes {
 		storedUses = slices.Concat(storedUses, index.Cols, []Coln{index.Partition})
-		isHashedIndexGroup := index.UseIndexGroup && len(index.Keys) > 1 && index.Type != TypeInheritFromKey
+		isHashedIndexGroup := (index.Type == TypeCacheGroup || index.Type == TypeCacheGroupS3) && len(index.Keys) > 1
 		if !isHashedIndexGroup {
 			storedUses = append(storedUses, index.Keys...)
 		}
@@ -127,7 +127,7 @@ func rejectComputedColumnUses(dbTable *ScyllaTable, schema TableSchema) {
 			continue
 		}
 		if column := dbTable.ColumnsMap[use.GetName()]; column != nil && !column.IsNil() && column.GetInfo().IsComputed {
-			panic(fmt.Sprintf(`Table "%v": computed column "%v" has no storage: only a UseIndexGroup of two or more Keys can name it`,
+			panic(fmt.Sprintf(`Table "%v": computed column "%v" has no storage: only a TypeCacheGroup of two or more Keys can name it`,
 				dbTable.Name, use.GetName()))
 		}
 	}
@@ -168,7 +168,7 @@ func storedColumnsOf(scyllaTable *ScyllaTable, column IColInfo) []IColInfo {
 func rejectComputedStatements(scyllaTable ScyllaTable, remainingStatements []ColumnStatement) error {
 	for _, statement := range remainingStatements {
 		if column := scyllaTable.ColumnsMap[statement.Col]; column != nil && !column.IsNil() && column.GetInfo().IsComputed {
-			return fmt.Errorf(`table "%v": computed column "%v" can only be queried through a UseIndexGroup that names it, with every Key of that index`,
+			return fmt.Errorf(`table "%v": computed column "%v" can only be queried through a TypeCacheGroup that names it, with every Key of that index`,
 				scyllaTable.Name, statement.Col)
 		}
 	}

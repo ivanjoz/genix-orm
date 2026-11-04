@@ -228,16 +228,66 @@ Inference rules:
 - `Type: TypeViewTable`: derived table with write-side maintenance
 - `Type: TypeDelta`: a materialized view of the whole record ordered by updated (§11). It serves
   `Delta()` and, as a range view on `[part, pinned…, updated]`, plain reads on its pinned keys
-- `UseIndexGroup: true`: write-maintained hash group metadata
+- `Type: TypeCacheGroup`: records grouped by their Keys for `QueryIndexGroup`, with write-maintained
+  group freshness (below). One Key: a local index on the column. Several: a hash column, below
+- `Type: TypeCacheGroupFromKey`: a cache group whose Keys are a prefix of `KeyIntPacking`; a group is
+  a range of the packed primary key, so it creates no index
+- `Type: TypeCacheGroupS3`: a `TypeCacheGroup` (same indexes, same marks) that also keeps each settled
+  group in the file store (group snapshots, below). The record must round-trip through colbin, or
+  the compile panics
 
-An index group compiles to exactly one virtual hash column per declaration (`zz_ig_` for scalars,
-`zz_igs_` for collections). There was once a second, week-coded variant per declaration
+A cache group of several Keys compiles to exactly one virtual hash column (`zz_ig_` int for scalars,
+`zz_igs_` `set<int>` when a Key is a slice). Every grouped read pins the partition, so an int hash
+gets a local index `((partition), zz_ig_…)` (`_index_1`). A `set<int>` hash keeps a global index
+(`_index_0`): Scylla has no local index on a collection ("Local secondary index on collection column
+… is not implemented yet", checked on 2026.3.4), and no view can key on a collection's elements
+either. For the same reason a `TypeLocalIndex` on a slice column fails the compile. A cache group
+takes Keys only: `Cols` or `UseHash` on one fails the compile. There was once a second, week-coded variant per declaration
 (`zz_iwk_` / `zz_iwks_`, opted into with `Col.StoreAsWeek()`), meant to answer wide date ranges with
 one hash per week instead of one per day. It was never implemented on the read side: both
 `scoreIndexGroupCandidate` and `resolveIndexGroupQueryValues` refused it. `ComputeCapabilities`
 missed that exclusion, so it advertised range signatures identical to the raw variant's and the
 planner could route to a view that failed at bind time. `StoreAsWeek` and the week variant are gone;
 week-coded bucketing is a separate feature that lives in composite bucketing (§8.4, `Col.IsWeek()`).
+
+**Group freshness** (`index_groups.go`, `select_grouped.go`). `<table>__index_updated` keeps one row
+per group, `PRIMARY KEY ((partition_id), index_id, index_hash)`, with `last_write` (SUnixTime): the
+label a client stores per group (`RecordGroup.LastWrite`, json `lw`, sent back as `cc-lw`).
+
+- Write: `collectIndexGroupMarks` runs before the CQL, on the pre-write read (`readStoredWrittenRows`
+  adds the groups' stored columns). Each record marks the groups it ends in — a group column the write
+  leaves out takes its stored value, so a partial update marks the record's real group, not the zero
+  value's — and, when stored, the groups it was in, so a record that leaves a group changes that
+  group too. `markIndexGroupsBeforeWrite` publishes them **before** the rows, with `last_write` = its
+  own time. Marking first fails safe: a failed mark stops the write with nothing written, and a write
+  that dies after the mark costs one needless refetch. It is the one marker that goes ahead of its
+  data; the settle margin below is what makes that safe.
+- Read: the probe reads each candidate group's `last_write`. A group written less than
+  `indexGroupSettleTicks` (16 s) ago is unsettled: it is always fetched whole and labelled 0, which no
+  later probe matches, so a client that read it while writes of the same 2 s tick (or one still
+  landing) were in flight refetches it once it settles. A settled group whose `last_write` the client
+  holds goes back as metadata only.
+- Known gaps, not handled: a data phase that lands more than 16 s after its mark can be read by a
+  settled fetch without its rows, and clients keep the group without that write until its next one. Rows and reads go at `LocalOne`:
+  with RF > 1, a replica lagging more than the 16 s margin can serve a settled fetch without a row
+  that already landed elsewhere, and the client keeps it under a real label. Writing the rows and
+  reading the fetch at `LocalQuorum` would close it.
+
+**Group snapshots** (`TypeCacheGroupS3`, `cache_group_snapshot.go`; file layout in
+`db/cache/record_snapshot.go`, shared with delta snapshots). A group to fetch on such an index goes
+through `readCacheGroupRecords`:
+
+- Unsettled (label 0): a plain database read, never stored.
+- Settled: GET `cache-group/<table>/<partition>/<indexID>/<hash>.cb`. Served when the file's label
+  (`RecordSnapshot.Cursor`) equals the probe's `last_write`, its fingerprint matches, and it is not
+  older than `RecordSnapshotMaxAgeTicks` (2 h). Otherwise the group is read whole from the database
+  (no post-filter in the scan) and written with `PutFileIfMatch` on the ETag the GET saw: a raced
+  write is dropped. An empty group is not stored.
+- The read's post-filter runs in memory on either source (`filterGroupRecords`), so one file serves
+  every query shape on the group. A store error is a miss; it never fails the read. The fetches of an
+  S3 index run 16 at a time.
+- The max age bounds the known gaps above for the file store only: a stale file is served for at most
+  2 h. A browser already holding the group under the same label keeps it until the group's next write.
 
 ### 8.2 Packed Indexes
 
@@ -341,8 +391,8 @@ only the IDs whose slot moved (`part = ? AND key IN (…)`, at LocalQuorum), and
 returned record's `Updated` with the tick the client now holds. The table needs one integer key, an
 integer partition, and an `Updated int32` field.
 
-**Delta** (`TypeDelta`, `delta_view.go`): the window protocol of `db/cache/delta_window.go`, no file
-store. The table needs one integer key and an integer partition. Every declared Key is pinned: each
+**Delta** (`TypeDelta`, `delta_view.go`): the window protocol of `db/cache/delta_window.go`. The file
+store only keeps replace snapshots (below), which a sync never needs. The table needs one integer key and an integer partition. Every declared Key is pinned: each
 index compiles to `<table>__dlt_<keys>_view`, holding every stored column, with
 `PRIMARY KEY ((part), zz_dlt_<keys>, id)` ordered `DESC`, where the virtual bigint `zz_dlt_…` packs
 the key values over `updated` (31 bits) — Scylla allows one non-key base column in a view's key, so
@@ -364,14 +414,25 @@ marker phase after the rows. The generic "columns updated together" check skips 
 `resolveDeltaPrefixes` turns the read into prefixes: each key takes its equality, the last one
 `Delta()`'s values, and a key with neither fans out over its `FixedValues` (at most
 `maxFixedValueFanoutQueries` prefixes); `selectDeltaIndex` picks the index with the most equalities,
-then the fewest prefixes. Each prefix is read in parallel. It first reads the changed records
-(`updated ≥ C − 10 s`) and the moves since `C − 15 min`, each with `LIMIT threshold + 1`: the view
+then the fewest prefixes. The cursor is `C.V` (`cache.DeltaWindowCursor`); `cache.PlanDeltaSync`
+places the unsettled slice `[V − DeltaWriteLagTicks, C]`, the writes the client may have missed.
+`execDelta` takes the next V (`ReadTime`, on `getManagedUnixTime`) before any read. Each prefix is
+read in parallel. It first reads the changed records (`updated > C`, or from the slice's start on a
+`C.V.r` resend) and the moves since the slice's start, each with `LIMIT threshold + 1`: the view
 lists newest first, so deciding costs at most that many rows whatever the cursor's age, and the
-threshold counts across every prefix. Not a replace: those records are the answer, the window
-`[C − 15 min, C − 10 s)` is read slim (ID, updated, version) and hashed, and moved IDs not back in a
-prefix are sent as removed. A cursor of 0, or more changed or moved records than
+threshold counts across every prefix. Not a replace: those records are the answer, the slice is
+read slim (ID, updated, version) and hashed (nothing once C is settled, or on a resend), and moved
+IDs not back in a prefix are sent as removed. A cursor of 0, or more changed or moved records than
 `Index.DeltaReplaceThreshold` (default 100), answers a replace: each prefix read with `LIMIT <Limit>`,
-merged newest `updated` first and cut at `Limit`. The result ends with one Metadata record (key = −1). Two concurrent writers of one
+merged newest `updated` first and cut at `Limit`. On a replace without a projection each prefix
+goes through `readDeltaPrefixReplace` (`delta_snapshot.go`): it first tries the prefix's snapshot
+file in the ORM file store (`db/cache/delta_snapshot.go`), runs the window protocol against it from
+its stored C and V (changed records, moves, the slice's hash compared over the file's records, at most
+`threshold + 1` rows each), and serves the merge without storing it. A miss, a file older than
+`RecordSnapshotMaxAgeTicks` (2 h past its V), a mismatch, more than
+the threshold, or a `Limit` cut a removal opened reads the view, and only that full read writes the
+file (`PutFileIfMatch` on the ETag it read; an empty prefix is not stored). A record type with a
+stored `cb:"-"` field never uses snapshots. The result ends with one Metadata record (key = −1). Two concurrent writers of one
 record can store the same version: one write is then not re-applied until the record's next change
 (the hash compares versions, not content).
 

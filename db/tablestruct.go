@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // TableStruct is embedded in both the record struct and the table struct of every
@@ -120,8 +122,8 @@ func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
 	e.tableInfo.SetBetween(colname, from, to)
 }
 
-// Delta turns the query into a delta-cache read (db/cache delta_window.go). cursorUpdated is the
-// highest Updated the client holds; 0 is a first sync, which lists every record of the TypeDelta
+// Delta turns the query into a delta-cache read (db/cache delta_window.go). cursor is what the
+// client holds (db.ParseDeltaCursor); the zero cursor is a first sync, which lists every record of the TypeDelta
 // index's prefixes. Every Key of the index is pinned: each takes the query's equality on it, or —
 // the last Key — lastKeyValues, or else every value its FixedValues enumerates, one prefix per
 // combination, read in parallel. A later sync returns the records written since in those prefixes,
@@ -131,8 +133,8 @@ func (e *TableStruct[D, T, E]) SetBetween(colname string, from, to any) {
 //
 // The driver picks the TypeDelta index whose Keys all resolve, the one the query's equalities fix
 // most, then the one with fewest prefixes. Call it last.
-func (e *TableStruct[D, T, E]) Delta(cursorUpdated int32, lastKeyValues ...any) *T {
-	e.tableInfo.Delta = &DeltaRead{CursorUpdated: cursorUpdated, LastKeyValues: lastKeyValues}
+func (e *TableStruct[D, T, E]) Delta(cursor cache.DeltaWindowCursor, lastKeyValues ...any) *T {
+	e.tableInfo.Delta = &DeltaRead{Cursor: cursor, LastKeyValues: lastKeyValues}
 	return e.schemaStruct
 }
 
@@ -217,11 +219,12 @@ func (e *TableStruct[D, T, E]) OrderDesc() *T {
 	return e.schemaStruct
 }
 
-func (e *TableStruct[D, T, E]) IncludeCachedGroup(indexGroupHash int32, updateCountValue int32) *T {
+// IncludeCachedGroup declares a group the client holds, with the LastWrite it holds it at.
+func (e *TableStruct[D, T, E]) IncludeCachedGroup(indexGroupHash int32, lastWrite int32) *T {
 	if e.tableInfo.CachedIndexGroups == nil {
 		e.tableInfo.CachedIndexGroups = map[int32]int32{}
 	}
-	e.tableInfo.CachedIndexGroups[indexGroupHash] = updateCountValue
+	e.tableInfo.CachedIndexGroups[indexGroupHash] = lastWrite
 	return e.schemaStruct
 }
 

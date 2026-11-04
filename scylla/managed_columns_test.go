@@ -1,6 +1,7 @@
 package scylla
 
 import (
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -97,12 +98,12 @@ func (e indexGroupSchema) GetSchema() TableSchema {
 		Keys:      Cols(e.ID),
 		Indexes: []Index{
 			{
-				Keys:          Cols(e.Date),
-				UseIndexGroup: true,
+				Type: TypeCacheGroup,
+				Keys: Cols(e.Date),
 			},
 			{
-				Keys:          Cols(e.Date, e.ClientID, e.ProductIDs),
-				UseIndexGroup: true,
+				Type: TypeCacheGroup,
+				Keys: Cols(e.Date, e.ClientID, e.ProductIDs),
 			},
 		},
 	}
@@ -308,16 +309,79 @@ func TestMakeUpdateStatementsRejectsIndexGroupUpdateWhenOmittedValuesMissingInSt
 	MakeUpdateStatements(&records, table.ClientID)
 }
 
-func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
+// indexGroupHashesOf is every group hash a record falls in, across the table's index groups.
+func indexGroupHashesOf(scyllaTable ScyllaTable, record *indexGroupRecord) map[int32]bool {
+	hashes := map[int32]bool{}
+	for _, indexGroup := range scyllaTable.indexGroups {
+		for _, hashValue := range computeIndexGroupHashes(unsafe.Pointer(record), indexGroup.sourceColumns) {
+			hashes[hashValue] = true
+		}
+	}
+	return hashes
+}
+
+// A write marks the groups each record ends in and, for a stored record, the ones it leaves. A
+// group column the write leaves out keeps its stored value, so the mark is not the zero value's group.
+func TestCollectIndexGroupMarksUsesTheStoredRow(t *testing.T) {
+	scyllaTable := MakeScyllaTable[indexGroupRecord, indexGroupSchema]()
+	columnNamed := func(name string) IColInfo {
+		for _, column := range scyllaTable.Columns {
+			if column.GetName() == name {
+				return column
+			}
+		}
+		t.Fatalf("no column %q", name)
+		return nil
+	}
+	// The stored rows as MapScan returns them.
+	stored := storedRows{
+		{7, 1}: {"date": int16(18754), "client_id": 5, "product_ids": []int{11, 17}},
+		{7, 2}: {"date": int16(18754), "client_id": 5, "product_ids": []int{11}},
+	}
+	// Record 1 renames only: its group columns are not written and carry zero values.
+	renamed := []indexGroupRecord{{CompanyID: 7, ID: 1}}
+	// Record 2 moves to another date.
+	moved := []indexGroupRecord{{CompanyID: 7, ID: 2, Date: 18760, ClientID: 5, ProductIDs: []int32{11}}}
+	phases := []writePhase{
+		{records: makeRecordSlice(&renamed), writtenColumns: nil},
+		{records: makeRecordSlice(&moved), writtenColumns: []IColInfo{columnNamed("date"), columnNamed("client_id"), columnNamed("product_ids")}},
+	}
+	marks := collectIndexGroupMarks(&scyllaTable, phases, stored)
+
+	expectedHashes := indexGroupHashesOf(scyllaTable, &indexGroupRecord{CompanyID: 7, ID: 1, Date: 18754, ClientID: 5, ProductIDs: []int32{11, 17}})
+	for hashValue := range indexGroupHashesOf(scyllaTable, &indexGroupRecord{CompanyID: 7, ID: 2, Date: 18754, ClientID: 5, ProductIDs: []int32{11}}) {
+		expectedHashes[hashValue] = true // the groups record 2 leaves
+	}
+	for hashValue := range indexGroupHashesOf(scyllaTable, &moved[0]) {
+		expectedHashes[hashValue] = true // the groups record 2 enters
+	}
+	markedHashes := map[int32]bool{}
+	for _, mark := range marks {
+		if markedHashes[mark.indexHash] {
+			t.Fatalf("group %d marked twice", mark.indexHash)
+		}
+		markedHashes[mark.indexHash] = true
+	}
+	// Equal sets also prove the zero value's groups (record 1 as passed in) were not marked.
+	if !maps.Equal(markedHashes, expectedHashes) {
+		t.Fatalf("marked %v, expected %v", markedHashes, expectedHashes)
+	}
+}
+
+// The pre-write mark stamps every group with its own time, not the records' updated.
+func TestMarkIndexGroupsBeforeWriteStampsTheMarkerTime(t *testing.T) {
 	scyllaTable := MakeScyllaTable[indexGroupRecord, indexGroupSchema]()
 	records := []indexGroupRecord{
 		{CompanyID: 7, ID: 1, Date: 18754, ClientID: 5, ProductIDs: []int32{11, 11, 17}},
 	}
 
 	originalPersistIndexUpdatedRows := persistIndexUpdatedRows
+	originalManagedUnixTime := getManagedUnixTime
 	t.Cleanup(func() {
 		persistIndexUpdatedRows = originalPersistIndexUpdatedRows
+		getManagedUnixTime = originalManagedUnixTime
 	})
+	getManagedUnixTime = func() int32 { return 77 }
 
 	var persistedKeyspace string
 	var persistedTable string
@@ -329,12 +393,9 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 		return nil
 	}
 
-	managedValues := managedWriteValues{
-		updatedValues: []any{int32(41)},
-	}
-
-	if err := syncIndexGroupsAfterWrite(recordSliceGroup{makeRecordSlice(&records)}, &scyllaTable, managedValues); err != nil {
-		t.Fatalf("syncIndexGroupsAfterWrite returned error: %v", err)
+	marks := collectIndexGroupMarks(&scyllaTable, []writePhase{{records: makeRecordSlice(&records)}}, nil)
+	if err := markIndexGroupsBeforeWrite(&scyllaTable, marks); err != nil {
+		t.Fatalf("markIndexGroupsBeforeWrite returned error: %v", err)
 	}
 
 	if persistedKeyspace != "test_keyspace" {
@@ -363,8 +424,8 @@ func TestSyncIndexGroupsAfterWritePersistsDedupedRows(t *testing.T) {
 		if row.indexID == 0 {
 			t.Fatalf("expected persisted index_id: %+v", row)
 		}
-		if row.updateCounter != 41 {
-			t.Fatalf("unexpected update counter: %+v", row)
+		if row.lastWrite != 77 {
+			t.Fatalf("expected the marker time as last_write: %+v", row)
 		}
 		if _, ok := expectedHashes[row.indexHash]; !ok {
 			t.Fatalf("unexpected index hash persisted: %+v", row)
@@ -403,7 +464,7 @@ func TestAllocateIndexGroupIDAvoidsHashCollisions(t *testing.T) {
 	}
 }
 
-func TestAppendIndexUpdatedRowsForRecordKeepsMaxUpdateCounterPerHash(t *testing.T) {
+func TestAppendIndexUpdatedRowsForRecordKeepsMaxLastWritePerHash(t *testing.T) {
 	scyllaTable := MakeScyllaTable[indexGroupRecord, indexGroupSchema]()
 	record := indexGroupRecord{
 		CompanyID:  7,
@@ -429,8 +490,8 @@ func TestAppendIndexUpdatedRowsForRecordKeepsMaxUpdateCounterPerHash(t *testing.
 		if row.partitionID != 7 {
 			t.Fatalf("unexpected partition id: %+v", row)
 		}
-		if row.updateCounter != 55 {
-			t.Fatalf("expected deduped row to keep max update counter 55, got %+v", row)
+		if row.lastWrite != 55 {
+			t.Fatalf("expected deduped row to keep max last_write 55, got %+v", row)
 		}
 	}
 }

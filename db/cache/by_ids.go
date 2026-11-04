@@ -22,6 +22,10 @@ import (
 //
 //	key = ids-cache/<cycle year>/<base pk>   256 × uint24 LE, slot i at [3i, 3i+3); missing = zeros
 //
+// The scylla driver doesn't use the files: it keeps each slot's full Updated in a
+// table (scylla/cache_by_ids.go) and converts it to the current cycle's tick on read
+// (YearTickOfUpdated, PlanCachedIDs). Clients see the same ticks from both.
+//
 // A year cycle starts on January 1 at 07:00 UTC. A year tick counts 2 seconds
 // from it, one Updated (SUnixTime) unit (a leap year is 15,811,200 ticks, under
 // uint24's 16,777,215):
@@ -204,12 +208,26 @@ func RaiseSlotTicks(key string, ticksBySlot map[uint8]uint32) error {
 	}
 }
 
-// CachedIDsPlan is a by-IDs request checked against the current cycle's slot files: which IDs the
+// SlotTicks are a partition's 256 slot ticks in the current year cycle, 0 for a slot with no write in
+// it. A driver builds them from wherever it keeps its slots: the slot files, or scylla's slots table.
+type SlotTicks [256]uint32
+
+// YearTickOfUpdated is the tick of a slot whose last write was stamped updated, in the cycle starting
+// at cycleStart: 0 (no write this cycle) for a write of an earlier cycle. A driver that stores the
+// full Updated converts it with this on read, so the client sees the same ticks from every driver.
+func YearTickOfUpdated(updated, cycleStart int64) uint32 {
+	if updated < cycleStart {
+		return 0
+	}
+	return WrittenYearTick(updated, cycleStart)
+}
+
+// CachedIDsPlan is a by-IDs request checked against the current cycle's slot ticks: which IDs the
 // driver must read, and the Updated each record it returns carries.
 type CachedIDsPlan struct {
-	cycleStart          int64
-	trustedBelow        int64
-	slotFileByPartition map[int64][]byte
+	cycleStart           int64
+	trustedBelow         int64
+	slotTicksByPartition map[int64]*SlotTicks
 	// IDsToRead are the requested IDs whose held tick differs from their slot's, without duplicates.
 	IDsToRead []CachedID
 }
@@ -217,15 +235,30 @@ type CachedIDsPlan struct {
 // ReadCachedIDsPlan reads the current cycle's slot file of every requested partition (basePKByPartition
 // names each partition's file) and selects the IDs to read.
 func ReadCachedIDsPlan(request CachedIDsRequest, basePKByPartition map[int64]string, now time.Time) (*CachedIDsPlan, error) {
+	slotFileByPartition, err := readSlotFiles(YearCycleOf(now), basePKByPartition)
+	if err != nil {
+		return nil, err
+	}
+	slotTicksByPartition := make(map[int64]*SlotTicks, len(slotFileByPartition))
+	for partition, slotFile := range slotFileByPartition {
+		slotTicks := &SlotTicks{}
+		for slot := range slotTicks {
+			slotTicks[slot] = SlotTickOf(slotFile, uint8(slot))
+		}
+		slotTicksByPartition[partition] = slotTicks
+	}
+	return PlanCachedIDs(request, slotTicksByPartition, now), nil
+}
+
+// PlanCachedIDs selects the IDs to read given every requested partition's slot ticks in the cycle
+// holding now. A partition missing from slotTicksByPartition reads as no write this cycle.
+func PlanCachedIDs(request CachedIDsRequest, slotTicksByPartition map[int64]*SlotTicks, now time.Time) *CachedIDsPlan {
 	cycleYear := YearCycleOf(now)
 	plan := &CachedIDsPlan{
 		cycleStart: utils.SUnixTimeOf(CycleStartTime(cycleYear)),
 		// Ticks at or above it may still be raised by a write stamped inside their window.
-		trustedBelow: utils.SUnixTimeOf(now) - SlotTrustTicks,
-	}
-	var err error
-	if plan.slotFileByPartition, err = readSlotFiles(cycleYear, basePKByPartition); err != nil {
-		return nil, err
+		trustedBelow:         utils.SUnixTimeOf(now) - SlotTrustTicks,
+		slotTicksByPartition: slotTicksByPartition,
 	}
 	// A client on another cycle computed its ticks against another cycle start: none can be compared.
 	isHeldTickComparable := request.CycleYear == cycleYear
@@ -242,13 +275,17 @@ func ReadCachedIDsPlan(request CachedIDsRequest, basePKByPartition map[int64]str
 		}
 		plan.IDsToRead = append(plan.IDsToRead, cachedID)
 	}
-	return plan, nil
+	return plan
 }
 
 // trustedSlotTick is the slot's tick, 1 when the cycle has no write to it, and 0 while it is younger
 // than SlotTrustTicks.
 func (plan *CachedIDsPlan) trustedSlotTick(partition int64, slot uint8) uint32 {
-	tick := max(SlotTickOf(plan.slotFileByPartition[partition], slot), 1) // stored 0: no write this cycle
+	var storedTick uint32
+	if slotTicks := plan.slotTicksByPartition[partition]; slotTicks != nil {
+		storedTick = slotTicks[slot]
+	}
+	tick := max(storedTick, 1) // stored 0: no write this cycle
 	if YearTickToUpdated(tick, plan.cycleStart) <= plan.trustedBelow {
 		return tick
 	}

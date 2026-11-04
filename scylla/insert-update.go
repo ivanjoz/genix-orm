@@ -665,13 +665,6 @@ func UpdateExclude[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	})
 }
 
-func mergeManagedWriteValues(first managedWriteValues, second managedWriteValues) managedWriteValues {
-	return managedWriteValues{
-		createdValues: append(append([]any{}, first.createdValues...), second.createdValues...),
-		updatedValues: append(append([]any{}, first.updatedValues...), second.updatedValues...),
-	}
-}
-
 func InsertUpdateBase[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	recordsForInsert *[]T,
 	recordsForUpdate *[]T,
@@ -840,11 +833,16 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 		return err
 	}
 	deltaPackedValuesByPhase, deltaMoves := stampDeltaWrites(scyllaTable, writePhases, storedWrittenRows)
+	indexGroupMarks := collectIndexGroupMarks(&scyllaTable, writePhases, storedWrittenRows)
 	managedInsertValues.deltaPackedValues = deltaPackedValuesByPhase[0]
 	managedUpdateValues.deltaPackedValues = deltaPackedValuesByPhase[1]
 	// Before the rows: a change in the table always has its log row (data_frame_log.go).
 	if err := writeDataFrameLog(scyllaTable, writePhases, storedWrittenRows); err != nil {
 		return err
+	}
+	// Before the rows: the group marks are published ahead of the data they gate (markIndexGroupsBeforeWrite).
+	if err := markIndexGroupsBeforeWrite(&scyllaTable, indexGroupMarks); err != nil {
+		return fmt.Errorf("marking index groups: %w", err)
 	}
 
 	session := getScyllaConnection()
@@ -906,15 +904,14 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 		}
 	}
 
-	combinedManagedValues := mergeManagedWriteValues(managedInsertValues, managedUpdateValues)
-
 	// The post-write syncs run in two parallel phases, separated by a barrier.
 	//
 	// Phase 1 writes the derived DATA (view tables, search index). Phase 2 writes the FRESHNESS
-	// MARKERS the caches read to decide whether to refetch (__index_updated counters, the by-IDs
-	// slot files and the delta moves). The barrier is what makes the protocol safe: publishing a
-	// marker before the data it gates lets a client refetch a stale row and then record the new
-	// version, permanently missing the update.
+	// MARKERS the caches read to decide whether to refetch (the by-IDs slot files and the delta
+	// moves). The barrier is what makes the protocol safe: publishing a marker before the data it
+	// gates lets a client refetch a stale row and then record the new version, permanently missing
+	// the update. The index-group marks are the exception, written before the rows: their readers
+	// never trust a group marked less than indexGroupSettleTicks ago (markIndexGroupsBeforeWrite).
 	//
 	// Within a phase the syncs target distinct tables and only ever read the record slices, so
 	// they are independent. Each sync KIND keeps its own insert/update phases sequential inside
@@ -963,13 +960,6 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	}
 
 	var markerSyncGroup errgroup.Group
-
-	markerSyncGroup.Go(func() error {
-		if err := syncIndexGroupsAfterWrite(allWrittenRecords, &scyllaTable, combinedManagedValues); err != nil {
-			return fmt.Errorf("syncing index groups: %w", err)
-		}
-		return nil
-	})
 
 	// Combined insert/update writes raise each touched slot once for the merged mutation set.
 	markerSyncGroup.Go(func() error {

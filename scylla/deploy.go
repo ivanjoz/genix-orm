@@ -385,21 +385,22 @@ func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.
 
 		record := reflect.New(recordType).Elem()
 		recordPointer := record.Addr().UnsafePointer()
-		updateCounterValue := int64(0)
+		// Rebuilt, a group's last_write is the newest updated among its records.
+		lastWriteValue := int64(0)
 
 		for valueIndex, selectedColumn := range selectedColumns {
 			rawValue := dereferenceScyllaValue(rowData.Values[valueIndex])
 			if selectedColumn.GetName() == managedUpdatedColumnName {
-				updateCounterValue = convertToInt64(rawValue)
+				lastWriteValue = convertToInt64(rawValue)
 				continue
 			}
 			selectedColumn.SetValue(recordPointer, rawValue)
 		}
-		if updateCounterValue == 0 {
+		if lastWriteValue == 0 {
 			continue
 		}
 
-		appendIndexUpdatedRowsForRecord(recordPointer, &scyllaTable, int32(partValue), updateCounterValue, rowsByPartitionAndHash, &rowsToPersist)
+		appendIndexUpdatedRowsForRecord(recordPointer, &scyllaTable, int32(partValue), lastWriteValue, rowsByPartitionAndHash, &rowsToPersist)
 	}
 
 	if err := queryIterator.Close(); err != nil {
@@ -1099,6 +1100,13 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 			}
 		}
 
+		// The by-IDs slots are raised after every write, so their keyspace table must exist first.
+		if table.CacheByIDs {
+			if err := QueryExec(cacheSlotsCreateScript(resolveKeyspace(table))); err != nil {
+				panic(fmt.Sprintf(`Error creando la tabla de slots by-IDs "%v" | %v`, cacheSlotsTableName, err))
+			}
+		}
+
 		// Revisa si posee índices, en su defecto los crea
 		tableIndexes := tableIndexesMap[tableName]
 
@@ -1118,7 +1126,7 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 					{Name: "partition_id", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
 					{Name: "index_id", Type: "smallint", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
 					{Name: "index_hash", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
-					{Name: "update_counter", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "last_write", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
 				}
 				Logx(2, fmt.Sprintf(`Index update table created "%v"`+"\n", table.indexUpdatedTable.name))
 			}

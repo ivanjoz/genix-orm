@@ -3,6 +3,8 @@ package db
 import (
 	"fmt"
 	"strings"
+
+	"github.com/ivanjoz/genix-orm/db/cache"
 )
 
 // ColumnStatement is one predicate against a column. It is a plain description
@@ -38,10 +40,10 @@ func (q ColumnStatement) GetValue() any {
 	}
 }
 
-// DeltaRead is what a Delta() call asked for (db/cache delta_window.go): the highest Updated the client
-// holds (0 on a first sync), and the values of the index's last Key whose prefixes the read covers.
+// DeltaRead is what a Delta() call asked for (db/cache delta_window.go): the client's cursor (the
+// zero cursor on a first sync), and the values of the index's last Key whose prefixes the read covers.
 type DeltaRead struct {
-	CursorUpdated int32
+	Cursor        cache.DeltaWindowCursor
 	LastKeyValues []any
 }
 
@@ -57,7 +59,7 @@ type TableInfo struct {
 	OrderBy        string
 	Limit          int32
 	AllowFilter    bool
-	// CachedIndexGroups stores client freshness by hash for grouped-index reads.
+	// CachedIndexGroups is the LastWrite the client holds, by group hash, for grouped-index reads.
 	CachedIndexGroups map[int32]int32
 	// UseIndexGroupSelect routes Exec into grouped hash fetches.
 	UseIndexGroupSelect bool

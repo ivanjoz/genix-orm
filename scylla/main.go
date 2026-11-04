@@ -70,6 +70,8 @@ type indexGroupInfo struct {
 	usesCollectionValues bool
 	// inheritFromKey routes grouped fetches through KeyIntPacking primary-key ranges instead of a secondary index.
 	inheritFromKey bool
+	// snapshotInS3 (TypeCacheGroupS3) keeps each settled group in the file store (cache_group_snapshot.go).
+	snapshotInS3 bool
 }
 
 type indexUpdatedTableInfo struct {

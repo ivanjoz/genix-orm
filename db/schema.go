@@ -37,11 +37,13 @@ type ColumnSetInfo interface {
 // maps each onto whatever it actually has (a Scylla materialized view, a
 // DynamoDB GSI) and rejects the ones it cannot express.
 const (
-	TypeGlobalIndex    int8 = 1
-	TypeLocalIndex     int8 = 2
-	TypeInheritFromKey int8 = 4
-	TypeView           int8 = 6
-	TypeViewTable      int8 = 9
+	TypeGlobalIndex int8 = 1
+	TypeLocalIndex  int8 = 2
+	// TypeCacheGroupFromKey is a cache group (TypeCacheGroup) whose Keys are a prefix of the table's
+	// KeyIntPacking: a group is a range of the packed primary key, so it needs no index of its own.
+	TypeCacheGroupFromKey int8 = 4
+	TypeView              int8 = 6
+	TypeViewTable         int8 = 9
 	// TypeDelta is a delta-cache index (Scylla: db/cache delta_window.go). Every Key is pinned: a
 	// read covers one prefix per combination of key values, the last Key's from Delta()'s values, the
 	// others from equalities, and a key with neither fans out over its FixedValues. The Scylla driver
@@ -52,17 +54,31 @@ const (
 	// hard-deleted: a soft delete (Status 0) is a write like any other. A keyless TypeDelta syncs the
 	// whole partition.
 	TypeDelta int8 = 10
+	// TypeCacheGroup buckets records by their Keys' values: QueryIndexGroup reads them grouped, and a
+	// client holding a group at its LastWrite gets it back as metadata only. Every write marks the
+	// groups it touches in <table>__index_updated. On Scylla one Key is a local index on the column;
+	// several Keys are hashed into a virtual column with a local index, or a global one when a Key is
+	// a slice (Scylla has no local index on a collection).
+	TypeCacheGroup int8 = 11
+	// TypeCacheGroupS3 is a TypeCacheGroup (same indexes, same marks) whose settled groups the server
+	// also keeps in the file store, one file per group labelled with its last_write: a client that
+	// lacks a group is answered from the file instead of a database read. The record type must
+	// round-trip through colbin (no cb:"-" on a stored column). There is no FromKey variant: a FromKey
+	// group is a primary-key range read, already cheap.
+	TypeCacheGroupS3 int8 = 12
 )
 
 // IndexTypeNames labels index kinds for logs and deploy output.
 var IndexTypeNames = map[int8]string{
-	TypeGlobalIndex:    "Global Index",
-	TypeLocalIndex:     "Local Index",
-	3:                  "Hash Index",
-	TypeInheritFromKey: "Inherit From Key",
-	TypeView:           "View",
-	TypeViewTable:      "View Table",
-	TypeDelta:          "Delta",
+	TypeGlobalIndex:       "Global Index",
+	TypeLocalIndex:        "Local Index",
+	3:                     "Hash Index",
+	TypeCacheGroupFromKey: "Cache Group From Key",
+	TypeView:              "View",
+	TypeViewTable:         "View Table",
+	TypeDelta:             "Delta",
+	TypeCacheGroup:        "Cache Group",
+	TypeCacheGroupS3:      "Cache Group S3",
 }
 
 // ColumnNameUpdated is the column the ORM maintains as every record's last-write timestamp. It is
@@ -90,8 +106,7 @@ type Index struct {
 	// almost every schema wants: key = (part_col) new_col, pk_col
 	Partition Coln
 	// Create a hash for use with IN operators
-	UseHash       bool
-	UseIndexGroup bool
+	UseHash bool
 	// DeltaReplaceThreshold (TypeDelta) is how many changed or moved records a sync answers before
 	// it answers a replace instead; 0 is cache.DefaultDeltaReplaceThreshold.
 	DeltaReplaceThreshold int
@@ -187,7 +202,7 @@ type TableSchema struct {
 //
 //	{Col: e.DetailProductIDs, From: db.Cols(e.Lines), Value: db.Compute((*SaleOrder).DetailProductIDs)}
 //
-// The column is never written, read or deployed. Only a multi-column UseIndexGroup can name it, since
+// The column is never written, read or deployed. Only a multi-column TypeCacheGroup can name it, since
 // that index stores hashes computed from the record in memory; every other use is rejected when the
 // table compiles. A query on it must be served by one of those index groups.
 type ComputedCol struct {
@@ -285,12 +300,14 @@ type GenericRecord struct {
 	Updated int32 `json:"upd,omitempty"`
 }
 
-// RecordGroup is a set of records sharing one index-group hash, plus the counter
-// the client uses to decide whether its cached copy is still fresh.
+// RecordGroup is a set of records sharing one index-group hash, plus the label the client stores
+// to decide whether its cached copy is still fresh.
 type RecordGroup[T any] struct {
 	IndexID          int16   `json:"ig"`
 	GroupHash        int32   `json:"id"`
 	IndexGroupValues []int64 `json:"igVal"`
 	Records          []T     `json:"records"`
-	UpdateCounter    int32   `json:"upc"`
+	// LastWrite (SUnixTime) is when the group's latest write landed; 0 while the group is still
+	// settling, which no later sync matches, so the client refetches it.
+	LastWrite int32 `json:"lw"`
 }

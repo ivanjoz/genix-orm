@@ -115,8 +115,9 @@ first version kept the view slim (ID, updated, version, filter) and read the rec
 sync of 5,000 records cost 1 + 50 queries.
 **Decision** — A TypeDelta index is a materialized view of every stored column, ordered by updated.
 A sync reads the changed records straight from it, and a full sync is one paged range read. The
-client checks the 15 minutes behind its cursor with a hash of `(ID, version)` and asks for a replace
-on a mismatch. Pinned-value changes go to a small moves table.
+client checks the unsettled slice behind its cursor with a hash of `(ID, version)` and asks for
+that slice again on a mismatch (see "The delta cursor carries the server's read time" in
+db/cache/RATIONALE.md). Pinned-value changes go to a small moves table.
 **Rationale** — No S3 on the write path, a sync is 2 or 3 queries whatever it returns, and missed
 writes (late landings, view lag) heal on the next sync instead of never. Cost: each TypeDelta index
 is a full copy of the table, and every write moves its view row (updated is in the key), leaving a

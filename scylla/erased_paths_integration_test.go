@@ -86,7 +86,7 @@ func (e indexGroupITSchema) GetSchema() TableSchema {
 		Name:      "index_group_it_records",
 		Partition: e.CompanyID,
 		Keys:      Cols(e.ID),
-		Indexes:   []Index{{Keys: Cols(e.Date), UseIndexGroup: true}},
+		Indexes:   []Index{{Type: TypeCacheGroup, Keys: Cols(e.Date)}},
 	}
 }
 
@@ -108,6 +108,10 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 		Table:  MakeScyllaTable[indexGroupITRecord, indexGroupITSchema](),
 		Schema: MakeSchema[indexGroupITRecord, indexGroupITSchema](),
 	})
+	// The write lands at clockStart; the reads run once the groups settled.
+	clockStart := currentManagedUnixTime() - 3600
+	getManagedUnixTime = func() int32 { return clockStart }
+	t.Cleanup(func() { getManagedUnixTime = currentManagedUnixTime })
 	if err := Insert(&[]indexGroupITRecord{
 		{CompanyID: 8, ID: 1, Date: 100, Name: "a"},
 		{CompanyID: 8, ID: 2, Date: 100, Name: "b"},
@@ -116,6 +120,22 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Still settling: the groups come back whole, labelled 0.
+	getManagedUnixTime = func() int32 { return clockStart + indexGroupSettleTicks - 1 }
+	unsettledGroups := []RecordGroup[indexGroupITRecord]{}
+	unsettledQuery := QueryIndexGroup(&unsettledGroups)
+	unsettledQuery.CompanyID.Equals(8)
+	unsettledQuery.Date.Between(100, 102)
+	if err := unsettledQuery.Exec(); err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range unsettledGroups {
+		if group.LastWrite != 0 {
+			t.Fatalf("an unsettled group must be labelled 0: %+v", group)
+		}
+	}
+	getManagedUnixTime = func() int32 { return clockStart + indexGroupSettleTicks }
+
 	readGroups := func(cachedGroups []RecordGroup[indexGroupITRecord]) []RecordGroup[indexGroupITRecord] {
 		t.Helper()
 		groups := []RecordGroup[indexGroupITRecord]{}
@@ -123,7 +143,7 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 		query.CompanyID.Equals(8)
 		query.Date.Between(100, 102)
 		for _, cachedGroup := range cachedGroups {
-			query.IncludeCachedGroup(cachedGroup.GroupHash, cachedGroup.UpdateCounter)
+			query.IncludeCachedGroup(cachedGroup.GroupHash, cachedGroup.LastWrite)
 		}
 		if err := query.Exec(); err != nil {
 			t.Fatal(err)
@@ -146,7 +166,7 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 		t.Fatalf("records by date = %v", counts)
 	}
 
-	// The client holds date 100 at its current counter: it comes back without records.
+	// The client holds date 100 at its current last_write: it comes back without records.
 	var heldGroup RecordGroup[indexGroupITRecord]
 	for _, group := range groups {
 		if group.IndexGroupValues[0] == 100 {

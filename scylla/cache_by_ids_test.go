@@ -64,22 +64,3 @@ func (e tableIDCollisionSchema) GetSchema() TableSchema {
 		Keys:      Cols(e.ID),
 	}
 }
-
-// A written record raises its slot in its partition's file to the tick of its Updated.
-func TestRaiseWrittenSlotsRaisesThePartitionFile(t *testing.T) {
-	resetORMTableCachesForTesting()
-	withMemoryFileStore(t)
-
-	scyllaTable := MakeScyllaTable[genericLabelRecord, genericLabelSchema]()
-	scyllaTable.Namespace = "genix_test"
-	cycleStart := utils.SUnixTimeOf(cache.CycleStartTime(2026))
-	records := []genericLabelRecord{{CompanyID: 7, ID: 300, Updated: int32(cycleStart + 10_000)}}
-
-	if err := raiseWrittenSlots(recordSliceGroup{makeRecordSlice(&records)}, scyllaTable); err != nil {
-		t.Fatal(err)
-	}
-	slotFile, _, err := cache.ReadSlotFile(cache.SlotFileKey(2026, "genix_test/10000/7"))
-	if err != nil || cache.SlotTickOf(slotFile, cache.SlotOfRecordID(300)) != cache.WrittenYearTick(cycleStart+10_000, cycleStart) {
-		t.Fatalf("slot 44 = %d, err %v", cache.SlotTickOf(slotFile, 44), err)
-	}
-}

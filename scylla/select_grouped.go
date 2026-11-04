@@ -24,7 +24,8 @@ type indexGroupSelectPlan struct {
 type indexGroupFetchState struct {
 	hashValue        int32
 	indexGroupValues []int64
-	updateCounter    int32
+	// lastWrite is the label the group goes out with: its stored last_write, or 0 while unsettled.
+	lastWrite int32
 }
 
 // loadIndexGroupFreshnessRows is overridable in tests so grouped planning can be verified without Scylla.
@@ -47,7 +48,7 @@ func execIndexGroupQuery[T TableSchemaInterface[T], E any](schemaStruct *T, tabl
 			GroupHash:        erasedGroup.GroupHash,
 			IndexGroupValues: erasedGroup.IndexGroupValues,
 			Records:          records,
-			UpdateCounter:    erasedGroup.UpdateCounter,
+			LastWrite:        erasedGroup.LastWrite,
 		})
 	}
 	return err
@@ -90,14 +91,15 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 		return nil, err
 	}
 
-	fetchStates, cachedStates := splitIndexGroupFetches(queryPlan.hashGroups, serverFreshnessByHash, tableInfo.CachedIndexGroups)
+	readTime := getManagedUnixTime()
+	fetchStates, cachedStates := splitIndexGroupFetches(queryPlan.hashGroups, serverFreshnessByHash, tableInfo.CachedIndexGroups, readTime)
 	if len(fetchStates) == 0 && len(cachedStates) == 0 {
 		fmt.Printf("QueryIndexGroup skipped all groups: table=%s partition=%d hashes=%d\n",
 			scyllaTable.Name, queryPlan.partitionValue, len(hashValues))
 		return nil, nil
 	}
 
-	fetchedGroups, err := fetchIndexGroupRecordGroups(sink, scyllaTable, queryPlan, fetchStates, collectSelectStatements(tableInfo), time.Now())
+	fetchedGroups, err := fetchIndexGroupRecordGroups(sink, scyllaTable, queryPlan, fetchStates, collectSelectStatements(tableInfo), time.Now(), readTime)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +111,7 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 			IndexID:          queryPlan.indexGroup.indexID,
 			GroupHash:        cachedState.hashValue,
 			IndexGroupValues: append([]int64(nil), cachedState.indexGroupValues...),
-			UpdateCounter:    cachedState.updateCounter,
+			LastWrite:        cachedState.lastWrite,
 		}
 	}
 	for _, fetchedGroup := range fetchedGroups {
@@ -162,7 +164,7 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 	}
 
 	if bestIndexGroup == nil {
-		return nil, fmt.Errorf(`QueryIndexGroup did not find a compatible UseIndexGroup for table "%v"`, scyllaTable.Name)
+		return nil, fmt.Errorf(`QueryIndexGroup did not find a compatible TypeCacheGroup for table "%v"`, scyllaTable.Name)
 	}
 
 	hashGroups, err := buildQueryIndexGroupHashes(*bestIndexGroup, statements)
@@ -364,7 +366,7 @@ func loadIndexGroupFreshnessRowsFromScylla(
 		}
 
 		queryStr := fmt.Sprintf(
-			`SELECT index_hash, update_counter FROM %v.%v WHERE partition_id = ? AND index_id = ? AND index_hash IN (%v)`,
+			`SELECT index_hash, last_write FROM %v.%v WHERE partition_id = ? AND index_id = ? AND index_hash IN (%v)`,
 			scyllaTable.Namespace,
 			scyllaTable.indexUpdatedTable.name,
 			strings.Join(placeholders, ", "),
@@ -375,9 +377,9 @@ func loadIndexGroupFreshnessRowsFromScylla(
 
 		iter := getScyllaConnection().Query(queryStr, queryValues...).Iter()
 		var hashValue int32
-		var updateCounter int32
-		for iter.Scan(&hashValue, &updateCounter) {
-			freshnessByHash[hashValue] = updateCounter
+		var lastWrite int32
+		for iter.Scan(&hashValue, &lastWrite) {
+			freshnessByHash[hashValue] = lastWrite
 		}
 		if err := iter.Close(); err != nil {
 			return nil, err
@@ -387,48 +389,45 @@ func loadIndexGroupFreshnessRowsFromScylla(
 	return freshnessByHash, nil
 }
 
-func filterIndexGroupFetches(
-	hashGroups []queryIndexGroupHash,
-	serverFreshnessByHash map[int32]int32,
-	cachedIndexGroups map[int32]int32,
-) []indexGroupFetchState {
-	fetchStates, _ := splitIndexGroupFetches(hashGroups, serverFreshnessByHash, cachedIndexGroups)
-	return fetchStates
-}
-
+// splitIndexGroupFetches decides, per group the server holds, whether it is fetched or answered from
+// the client's cache. A group written less than indexGroupSettleTicks ago is unsettled: a write of
+// the same 2 s tick, or one still landing, may be missing from what a fetch reads now, so it is
+// always fetched and labelled 0. A settled group whose last_write the client holds is cached.
 func splitIndexGroupFetches(
 	hashGroups []queryIndexGroupHash,
 	serverFreshnessByHash map[int32]int32,
 	cachedIndexGroups map[int32]int32,
+	nowTime int32,
 ) ([]indexGroupFetchState, []indexGroupFetchState) {
 	fetchStates := make([]indexGroupFetchState, 0, len(hashGroups))
 	cachedStates := make([]indexGroupFetchState, 0, len(hashGroups))
 	for _, hashGroup := range hashGroups {
-		updateCounter, existsOnServer := serverFreshnessByHash[hashGroup.hashValue]
+		lastWrite, existsOnServer := serverFreshnessByHash[hashGroup.hashValue]
 		if !existsOnServer {
 			continue
 		}
-		if cachedIndexGroups != nil {
-			if cachedCounter, existsInCache := cachedIndexGroups[hashGroup.hashValue]; existsInCache && cachedCounter == updateCounter {
-				cachedStates = append(cachedStates, indexGroupFetchState{
-					hashValue:        hashGroup.hashValue,
-					indexGroupValues: append([]int64(nil), hashGroup.indexGroupValues...),
-					updateCounter:    updateCounter,
-				})
-				continue
-			}
-		}
-		fetchStates = append(fetchStates, indexGroupFetchState{
+		groupState := indexGroupFetchState{
 			hashValue:        hashGroup.hashValue,
 			indexGroupValues: append([]int64(nil), hashGroup.indexGroupValues...),
-			updateCounter:    updateCounter,
-		})
+			lastWrite:        lastWrite,
+		}
+		if nowTime-lastWrite < indexGroupSettleTicks {
+			groupState.lastWrite = 0
+			fetchStates = append(fetchStates, groupState)
+			continue
+		}
+		if cachedLastWrite, existsInCache := cachedIndexGroups[hashGroup.hashValue]; existsInCache && cachedLastWrite == lastWrite {
+			cachedStates = append(cachedStates, groupState)
+			continue
+		}
+		fetchStates = append(fetchStates, groupState)
 	}
 	return fetchStates, cachedStates
 }
 
-// fetchIndexGroupRecordGroups reads the groups concurrently. Each goroutine collects into its own
-// pointer list, so the shared sink is only asked to allocate.
+// fetchIndexGroupRecordGroups reads the groups concurrently, through the group's S3 snapshot when
+// its index keeps one (cache_group_snapshot.go). Each goroutine collects into its own pointer list,
+// so the shared sink is only asked to allocate.
 func fetchIndexGroupRecordGroups(
 	sink recordSink,
 	scyllaTable ScyllaTable,
@@ -436,28 +435,29 @@ func fetchIndexGroupRecordGroups(
 	fetchStates []indexGroupFetchState,
 	postFilterStatements []ColumnStatement,
 	queryNoticeTime time.Time,
+	readTime int32,
 ) ([]RecordGroup[unsafe.Pointer], error) {
 	_, scanColumns, selectExpressions := buildSelectProjection(&TableInfo{}, scyllaTable)
 	groupsByIndex := make([]RecordGroup[unsafe.Pointer], len(fetchStates))
 
 	eg := errgroup.Group{}
+	if queryPlan.indexGroup.snapshotInS3 {
+		eg.SetLimit(cacheGroupSnapshotConcurrency)
+	}
 	for fetchIndex, fetchState := range fetchStates {
 		fetchIndex := fetchIndex
 		fetchState := fetchState
 
 		eg.Go(func() error {
-			queryStr, queryValues := buildIndexGroupFetchQuery(scyllaTable, queryPlan, fetchState, selectExpressions)
-			var records []unsafe.Pointer
-			if err := scanSelectQueryRows(
-				queryStr,
-				queryValues,
-				scanColumns,
-				scyllaTable,
-				sink.collectInto(&records),
-				postFilterStatements,
-				nil,
-				queryNoticeTime,
-			); err != nil {
+			readGroupFromDatabase := func(groupPostFilter []ColumnStatement) ([]unsafe.Pointer, error) {
+				queryStr, queryValues := buildIndexGroupFetchQuery(scyllaTable, queryPlan, fetchState, selectExpressions)
+				var groupRecords []unsafe.Pointer
+				err := scanSelectQueryRows(queryStr, queryValues, scanColumns, scyllaTable,
+					sink.collectInto(&groupRecords), groupPostFilter, nil, queryNoticeTime)
+				return groupRecords, err
+			}
+			records, err := readCacheGroupRecords(sink, scyllaTable, queryPlan, fetchState, readGroupFromDatabase, postFilterStatements, readTime)
+			if err != nil {
 				return err
 			}
 
@@ -466,7 +466,7 @@ func fetchIndexGroupRecordGroups(
 				GroupHash:        fetchState.hashValue,
 				IndexGroupValues: append([]int64(nil), fetchState.indexGroupValues...),
 				Records:          records,
-				UpdateCounter:    fetchState.updateCounter,
+				LastWrite:        fetchState.lastWrite,
 			}
 			return nil
 		})
@@ -490,7 +490,7 @@ func buildIndexGroupFetchQuery(
 	}
 	queryValues := []any{queryPlan.partitionValue}
 
-	// TypeInheritFromKey groups rewrite per-hash fetches to a packed primary-key range,
+	// TypeCacheGroupFromKey groups rewrite per-hash fetches to a packed primary-key range,
 	// so no secondary index is needed and ALLOW_FILTERING is avoided.
 	if queryPlan.indexGroup.inheritFromKey {
 		keyStatements := make([]ColumnStatement, 0, len(queryPlan.indexGroup.sourceColumns))
@@ -503,7 +503,7 @@ func buildIndexGroupFetchQuery(
 		}
 		rewrittenStatements, canRewrite := buildKeyIntPackingStatements(keyStatements, scyllaTable)
 		if !canRewrite || len(rewrittenStatements) == 0 {
-			panic(fmt.Sprintf(`QueryIndexGroup: TypeInheritFromKey fetch could not rewrite keys for table "%v"`, scyllaTable.Name))
+			panic(fmt.Sprintf(`QueryIndexGroup: TypeCacheGroupFromKey fetch could not rewrite keys for table "%v"`, scyllaTable.Name))
 		}
 		keyPredicate := rewrittenStatements[0]
 		keyColumnName := keyPredicate.Col

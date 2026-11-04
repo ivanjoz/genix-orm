@@ -453,15 +453,12 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		if len(indexCfg.Keys) == 0 && resolveSchemaIndexType(indexCfg) != TypeDelta {
 			panic(fmt.Sprintf(`Table "%v": Indexes entry must not be empty`, dbTable.Name))
 		}
-		if indexCfg.Type == TypeInheritFromKey && !indexCfg.UseIndexGroup {
-			panic(fmt.Sprintf(`Table "%v": TypeInheritFromKey requires UseIndexGroup: true`, dbTable.Name))
-		}
 		// Only views materialize their own partition, so an override is meaningless elsewhere.
 		schemaIndexType := resolveSchemaIndexType(indexCfg)
 		if indexPartitionColumnName(indexCfg) != "" && schemaIndexType != TypeView {
 			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView indexes`, dbTable.Name))
 		}
-		if indexCfg.UseIndexGroup {
+		if schemaIndexType == TypeCacheGroup || schemaIndexType == TypeCacheGroupS3 || schemaIndexType == TypeCacheGroupFromKey {
 			registerIndexGroup(&dbTable, &idxCount, indexCfg)
 			continue
 		}
@@ -633,6 +630,8 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 	configureCacheByIDs(&dbTable)
 	// Precompiles the generic by-IDs access plan; depends on the validation above.
 	configureGenericRecordFields(&dbTable, schema)
+	// Needs the final Columns: every stored one must survive colbin.
+	requireCacheGroupSnapshotCodec(&dbTable, structRefValue)
 
 	return dbTable
 }

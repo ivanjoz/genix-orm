@@ -53,7 +53,7 @@ func (e computedSchema) GetSchema() TableSchema {
 			{Col: e.LineProductIDs, From: Cols(e.Lines), Value: db.Compute((*computedRecord).LineProductIDs)},
 		},
 		Indexes: []Index{
-			{Keys: Cols(e.Date, e.LineProductIDs), UseIndexGroup: true},
+			{Type: TypeCacheGroup, Keys: Cols(e.Date, e.LineProductIDs)},
 		},
 	}
 }
@@ -188,7 +188,7 @@ func (e computedSingleKeySchema) GetSchema() TableSchema {
 			{Col: e.LineProductIDs, From: Cols(e.Lines), Value: db.Compute((*computedSingleKeyRecord).LineProductIDs)},
 		},
 		// A single-column group indexes the column itself, which a computed column does not have.
-		Indexes: []Index{{Keys: Cols(e.LineProductIDs), UseIndexGroup: true}},
+		Indexes: []Index{{Type: TypeCacheGroup, Keys: Cols(e.LineProductIDs)}},
 	}
 }
 
