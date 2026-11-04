@@ -243,6 +243,29 @@ func TestBuildNativeGroupByPlanSupportsMax(t *testing.T) {
 	}
 }
 
+// A packed key that turns project_id into an ID range outranks the view by priority, but leaves
+// status uncovered: Scylla refuses that as a filter, so the covering view must win.
+func TestMatchQueryCapabilityPrefersCoverageOverPriority(t *testing.T) {
+	capabilities := []QueryCapability{
+		{Signature: "company_id|=|project_id|=", Priority: 400, IsKey: true},
+		{
+			Signature: "company_id|=|project_id|=|status|=",
+			Priority:  360,
+			Source:    &viewInfo{name: "projects_epic__dlt_project_id_status_view"},
+		},
+	}
+	statements := []ColumnStatement{
+		{Col: "company_id", Operator: "=", Value: 1},
+		{Col: "project_id", Operator: "=", Value: 1},
+		{Col: "status", Operator: "=", Value: 1},
+	}
+
+	bestCapability := MatchQueryCapability(statements, capabilities)
+	if bestCapability == nil || bestCapability.Signature != "company_id|=|project_id|=|status|=" {
+		t.Fatalf("expected the view covering status, got %+v", bestCapability)
+	}
+}
+
 func TestMatchQueryCapabilityReturnsSelectedCapability(t *testing.T) {
 	capabilities := []QueryCapability{
 		{Signature: "empresa_id|=", Priority: 10, IsKey: true},

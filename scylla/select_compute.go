@@ -647,8 +647,8 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 
 				equalityPriority := 360 + len(view.columns)*20
 				if i < len(view.columns)-1 {
-					// Longer prefixes still outrank shorter ones; the cap keeps very wide keys inside
-					// the band, where the more-columns tie-break in MatchQueryCapability takes over.
+					// Longer prefixes still outrank shorter ones; MatchQueryCapability ranks by covered
+					// predicates first anyway, so the cap only orders prefixes of equal coverage.
 					equalityPriority = min(101+i*2, 108)
 				}
 
@@ -794,13 +794,17 @@ func MatchQueryCapability(statements []ColumnStatement, capabilities []QueryCapa
 				fmt.Printf("Capability match: signature=%s priority=%d source=%s isKey=%v\n",	cap.Signature, cap.Priority, sourceName, cap.IsKey)
 			*/
 
-			if bestMatch == nil || cap.Priority > bestMatch.Priority {
+			// Coverage before priority: a capability that leaves a predicate out hands it to Scylla
+			// as an unindexed filter, which it refuses. A packed key turning ProjectID into an ID
+			// range (priority 400) must not beat the view that also covers Status.
+			coveredPredicates := len(parts) / 2
+			bestCoveredPredicates := 0
+			if bestMatch != nil {
+				bestCoveredPredicates = len(strings.Split(bestMatch.Signature, "|")) / 2
+			}
+			if bestMatch == nil || coveredPredicates > bestCoveredPredicates ||
+				(coveredPredicates == bestCoveredPredicates && cap.Priority > bestMatch.Priority) {
 				bestMatch = cap
-			} else if cap.Priority == bestMatch.Priority {
-				// Prefer signature with more columns if priorities are equal
-				if len(parts) > len(strings.Split(bestMatch.Signature, "|")) {
-					bestMatch = cap
-				}
 			}
 		}
 	}
