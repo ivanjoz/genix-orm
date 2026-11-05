@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/ivanjoz/genix-orm/db/cache"
 )
@@ -284,64 +285,74 @@ func getCollectionFrozenDefaultForTableField(tableFieldType reflect.Type) (bool,
 // Only the shim is generic: the body takes the *T as `any` and E as a reflect.Type, so it compiles
 // once instead of once per table. It runs on every Query, which is why its size mattered.
 func InitStructTable[T TableInterface[T], E any](schemaStruct *T) *T {
-	bindStructTable(schemaStruct, (*schemaStruct).GetSchema(), reflect.TypeFor[E]())
+	bindStructTable(schemaStruct, reflect.TypeFor[E]())
 	return schemaStruct
 }
 
-func bindStructTable(schemaStruct any, schema TableSchema, structRefType reflect.Type) {
+// tableBindingPlan is everything bindStructTable resolves that depends only on the table and record
+// types: each column's final ColumnInfo (name, collection defaults, computed flag). It used to be
+// rebuilt on every query — three regexes per field in ToSnakeCase, a tag parse and a GetSchema call —
+// which made binding the largest CPU cost of a cheap request. Now a query only copies it.
+type tableBindingPlan struct {
+	recordType reflect.Type
+	// columnByFieldIndex holds one entry per table struct field; nil marks a field that does not
+	// implement ColGetInfoPointer and is left alone.
+	columnByFieldIndex []*ColumnInfo
+}
+
+// tableBindingPlanCache is keyed by the table struct type (the E in Query[T, E]).
+var tableBindingPlanCache sync.Map
+
+func getOrBuildTableBindingPlan(schemaStruct any, structRefType reflect.Type) *tableBindingPlan {
+	structType := reflect.TypeOf(schemaStruct).Elem()
+	if cachedPlan, cacheHit := tableBindingPlanCache.Load(structType); cacheHit {
+		return cachedPlan.(*tableBindingPlan)
+	}
+
 	recordMetadata := getOrBuildStructFieldMetadata(structRefType)
-	refTableInfo := &TableInfo{}
-
-	structValue := reflect.ValueOf(schemaStruct).Elem()
-	structType := structValue.Type()
-
 	// Read schema-level flags once so the slice-default swap can be applied per column below.
-	useListAsDefault := schema.UseListAsDefault
+	useListAsDefault := schemaStruct.(interface{ GetSchema() TableSchema }).GetSchema().UseListAsDefault
+	structValue := reflect.ValueOf(schemaStruct).Elem()
 
-	for i := 0; i < structValue.NumField(); i++ {
-		field := structValue.Field(i)
-		fieldType := structType.Field(i)
-
-		// Check if field can be addressed and if it implements ColGetInfoPointer interface
+	plan := &tableBindingPlan{
+		recordType:         recordMetadata.recordType,
+		columnByFieldIndex: make([]*ColumnInfo, structType.NumField()),
+	}
+	for fieldIndex := 0; fieldIndex < structType.NumField(); fieldIndex++ {
+		fieldType := structType.Field(fieldIndex)
+		field := structValue.Field(fieldIndex)
 		if !field.CanAddr() || !field.Addr().CanInterface() {
 			fmt.Println("no es::", fieldType.Name)
 			continue
 		}
-
-		fieldAddr := field.Addr()
-		column, ok := fieldAddr.Interface().(ColGetInfoPointer)
-		if !ok {
+		// The embedded TableStruct implements it too, and must: it is how the query reaches its
+		// TableInfo. Its GetInfoPointer returns a throwaway, so the copy below is harmless for it.
+		if _, isColumn := field.Addr().Interface().(ColGetInfoPointer); !isColumn {
 			fmt.Println("El field", fieldType.Name, "no implementa ColGetInfoPointer")
 			continue
 		}
 
-		// Extract column name from db tag or convert field name to snake_case
+		// Name precedence: the table struct's db tag, then the record's, then snake_case.
 		columnName := ParseDBTag(fieldType.Tag.Get("db")).ColumnName
-
-		if colBase, ok := recordMetadata.fieldMetadataByName[fieldType.Name]; ok {
+		columnInfo := ColumnInfo{}
+		if colBase, hasRecordField := recordMetadata.fieldMetadataByName[fieldType.Name]; hasRecordField {
 			if columnName == "" {
 				columnName = colBase.Name
 			}
 			if columnName == "" {
 				columnName = ToSnakeCase(fieldType.Name)
 			}
-
-			colInfo := column.GetInfoPointer()
-			// Copy cached metadata to keep immutable cache entries untouched.
-			*colInfo = colBase
-			colInfo.Name = columnName
-			if colInfo.IsSlice && !colInfo.HasCollectionTagOptions && codec != nil {
+			columnInfo = colBase
+			columnInfo.Name = columnName
+			if columnInfo.IsSlice && !columnInfo.HasCollectionTagOptions && codec != nil {
 				// Honor schema-level UseListAsDefault and the Col-vs-ColSlice frozen default
 				// only when record tags did not already force the collection options.
 				applyFrozenDefault, frozen := getCollectionFrozenDefaultForTableField(fieldType.Type)
-				colInfo.ColType = codec.ApplyCollectionDefaults(
-					colInfo.ColType, useListAsDefault, applyFrozenDefault, frozen)
+				columnInfo.ColType = codec.ApplyCollectionDefaults(
+					columnInfo.ColType, useListAsDefault, applyFrozenDefault, frozen)
 			}
-
-			if column1, ok1 := fieldAddr.Interface().(Coln); ok1 {
-				if column1.GetInfo().Name == "" {
-					panic("No se seteo el nombre: " + columnName)
-				}
+			if columnInfo.Name == "" {
+				panic("No se seteo el nombre: " + fieldType.Name)
 			}
 		} else if fieldType.Name != "TableStruct" {
 			// No record field: only a TableSchema.Computed column may do that. The schema here is
@@ -350,18 +361,36 @@ func bindStructTable(schemaStruct any, schema TableSchema, structRefType reflect
 			if columnName == "" {
 				columnName = ToSnakeCase(fieldType.Name)
 			}
-			colInfo := column.GetInfoPointer()
-			colInfo.Name = columnName
-			colInfo.FieldName = fieldType.Name
-			colInfo.IsComputed = true
+			columnInfo.Name = columnName
+			columnInfo.FieldName = fieldType.Name
+			columnInfo.IsComputed = true
 		}
+		plan.columnByFieldIndex[fieldIndex] = &columnInfo
+	}
 
-		// Set the column name using the interface method
+	actualPlan, _ := tableBindingPlanCache.LoadOrStore(structType, plan)
+	return actualPlan.(*tableBindingPlan)
+}
+
+// bindStructTable points every column handle of a fresh table struct at the cached plan and at a
+// new TableInfo, which is the only per-query state.
+func bindStructTable(schemaStruct any, structRefType reflect.Type) {
+	plan := getOrBuildTableBindingPlan(schemaStruct, structRefType)
+	refTableInfo := &TableInfo{}
+
+	structValue := reflect.ValueOf(schemaStruct).Elem()
+	for fieldIndex, columnInfo := range plan.columnByFieldIndex {
+		if columnInfo == nil {
+			continue
+		}
+		column := structValue.Field(fieldIndex).Addr().Interface().(ColGetInfoPointer)
+		// Copied, so the cached plan stays immutable.
+		*column.GetInfoPointer() = *columnInfo
 		column.SetSchemaStruct(schemaStruct)
 		column.SetTableInfo(refTableInfo)
 	}
 
 	if tableStructMeta, ok := schemaStruct.(tableStructCacheMetaSetter); ok {
-		tableStructMeta.setBaseStructType(recordMetadata.recordType)
+		tableStructMeta.setBaseStructType(plan.recordType)
 	}
 }

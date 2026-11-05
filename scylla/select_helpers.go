@@ -849,8 +849,10 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 			requiresDeduplication: false,
 		}
 
-		fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=false dedup=false\n",
-			scyllaTable.Name, compiledStatement.hash, compiledStatement.route, sourceTableName)
+		if ShouldLog() {
+			fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=false dedup=false\n",
+				scyllaTable.Name, compiledStatement.hash, compiledStatement.route, sourceTableName)
+		}
 		return compiledStatement, nil
 	}
 
@@ -875,8 +877,10 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 		compiledStatement.route = selectRouteCompositeBucket
 		compiledStatement.requiresDeduplication = true
 		compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.Namespace, viewTableName)
-		fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=true dedup=true\n",
-			scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName)
+		if ShouldLog() {
+			fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=true dedup=true\n",
+				scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName)
+		}
 		return compiledStatement, nil
 	}
 
@@ -956,9 +960,11 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 
 	compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.Namespace, viewTableName)
 
-	fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=%v dedup=%v\n",
-		scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName,
-		len(compiledStatement.postFilterStatementIndexes) > 0, compiledStatement.requiresDeduplication)
+	if ShouldLog() {
+		fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=%v dedup=%v\n",
+			scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName,
+			len(compiledStatement.postFilterStatementIndexes) > 0, compiledStatement.requiresDeduplication)
+	}
 
 	return compiledStatement, nil
 }

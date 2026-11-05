@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"reflect"
+	"slices"
 	"unsafe"
 )
 
@@ -127,9 +128,9 @@ func (g recordSliceGroup) at(index int) unsafe.Pointer {
 // recordSink appends decoded rows to a *[]T without naming T. The read path needs this rather
 // than recordSlice because it creates records instead of walking existing ones.
 //
-// Allocate-then-copy is deliberate, matching what the typed code did: writing straight into the
-// destination slice would hand the caller's scan handler a pointer that a later append can
-// invalidate by reallocating the backing array.
+// Decode-then-copy is deliberate: writing straight into the destination slice would hand the
+// caller's scan handler a pointer that a later append can invalidate by reallocating the backing
+// array. Without a scan handler the decode target is one reused scratch record (resetRecord).
 type recordSink struct {
 	newRecord       func() unsafe.Pointer
 	appendRecord    func(unsafe.Pointer)
@@ -139,6 +140,13 @@ type recordSink struct {
 	// destination, including what the caller put there before the read.
 	heldRecords    func() []unsafe.Pointer
 	replaceRecords func([]unsafe.Pointer)
+	// reserve grows the destination's capacity for n more records, so a read that knows its count
+	// copies once instead of doubling the backing array log2(n) times. Nil on a collecting sink.
+	reserve func(additionalRecords int)
+	// resetRecord zeroes a record in place. Non-nil only when appendRecord copies the value, which
+	// is what lets the scan loop decode every row into one scratch record instead of allocating
+	// one per row. A collecting sink keeps the pointer, so it leaves this nil.
+	resetRecord func(unsafe.Pointer)
 }
 
 func makeRecordSink[T any](destination *[]T) recordSink {
@@ -155,6 +163,8 @@ func makeRecordSink[T any](destination *[]T) recordSink {
 			}
 			*destination = replacement
 		},
+		reserve:     func(additionalRecords int) { *destination = slices.Grow(*destination, additionalRecords) },
+		resetRecord: func(record unsafe.Pointer) { *(*T)(record) = *new(T) },
 	}
 }
 
@@ -206,6 +216,8 @@ func (base recordSink) collectInto(collected *[]unsafe.Pointer) recordSink {
 	collector.appendRecord = func(record unsafe.Pointer) { *collected = append(*collected, record) }
 	collector.heldRecords = func() []unsafe.Pointer { return *collected }
 	collector.replaceRecords = func(records []unsafe.Pointer) { *collected = records }
+	collector.reserve = nil
+	collector.resetRecord = nil
 	return collector
 }
 

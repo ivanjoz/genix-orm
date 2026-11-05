@@ -62,8 +62,10 @@ func canUseProjectedView(selectedColumnNames []string, view *viewInfo) bool {
 
 	for _, selectedColumnName := range selectedColumnNames {
 		if !slices.Contains(view.availableColumns, selectedColumnName) {
-			fmt.Printf("Projected view rejected: view=%s missing_column=%s available=%v\n",
-				view.name, selectedColumnName, view.availableColumns)
+			if ShouldLog() {
+				fmt.Printf("Projected view rejected: view=%s missing_column=%s available=%v\n",
+					view.name, selectedColumnName, view.availableColumns)
+			}
 			return false
 		}
 	}
@@ -564,6 +566,14 @@ func scanSelectQueryRows(
 		rowsScaned := 0
 		rowsFinal := 0
 
+		// A sink that copies on append (a typed destination) lets every row decode into one
+		// scratch record. A scan handler or a collecting sink may keep the pointer, so those still
+		// get a fresh record per row.
+		var scratchRecord unsafe.Pointer
+		if sink.resetRecord != nil && scanHandler == nil {
+			scratchRecord = sink.newRecord()
+		}
+
 		scanner := iter.Scanner()
 		for scanner.Next() {
 			rowsScaned++
@@ -574,7 +584,12 @@ func scanSelectQueryRows(
 				return err
 			}
 
-			recordPtr := sink.newRecord()
+			recordPtr := scratchRecord
+			if recordPtr != nil {
+				sink.resetRecord(recordPtr)
+			} else {
+				recordPtr = sink.newRecord()
+			}
 			// shouldLog := ShouldLogFull()
 
 			/*
@@ -638,7 +653,11 @@ func scanSelectQueryRows(
 			sink.appendRecord(recordPtr)
 		}
 
-		fmt.Printf(`Table %v | Rows Scanned %v | Final %v`+"\n", scyllaTable.Name, rowsScaned, rowsFinal)
+		// Per-query detail is debug output (GENIX_DB_LOG): printed unconditionally it was a stdout
+		// write on every query of every request.
+		if ShouldLog() {
+			fmt.Printf(`Table %v | Rows Scanned %v | Final %v`+"\n", scyllaTable.Name, rowsScaned, rowsFinal)
+		}
 
 		return nil
 	}
@@ -846,8 +865,10 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 
 		rawFrom := convertToInt64(bucketStatements[0].From[0].Value)
 		rawTo := convertToInt64(bucketStatements[0].To[0].Value)
-		fmt.Printf("CompositeBucketing select plan selected: index=%s buckets=%d statements=%d rangeNorm=[%d,%d] rangeRaw=[%d,%d] isWeek=%v\n",
-			compositeIndex.name, len(bucketSelections), len(whereStatements), from, to, rawFrom, rawTo, bucketIsWeek)
+		if ShouldLog() {
+			fmt.Printf("CompositeBucketing select plan selected: index=%s buckets=%d statements=%d rangeNorm=[%d,%d] rangeRaw=[%d,%d] isWeek=%v\n",
+				compositeIndex.name, len(bucketSelections), len(whereStatements), from, to, rawFrom, rawTo, bucketIsWeek)
+		}
 
 		return &compositeBucketQueryPlan{
 			whereStatements:  whereStatements,

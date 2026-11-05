@@ -1314,14 +1314,18 @@ func InsertOrUpdate[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
 	}
 
 	if len(recordsToUpdate) > 0 {
-		fmt.Println("Registros a actualizar:", len(recordsToUpdate))
+		if ShouldLog() {
+			fmt.Println("Registros a actualizar:", len(recordsToUpdate))
+		}
 		if err := UpdateExclude(&recordsToUpdate, columnsToExcludeUpdate...); err != nil {
 			return err
 		}
 	}
 
 	if len(recordsToInsert) > 0 {
-		fmt.Println("Registros a insertar:", len(recordsToInsert))
+		if ShouldLog() {
+			fmt.Println("Registros a insertar:", len(recordsToInsert))
+		}
 		if err := Insert(&recordsToInsert, columnsToExcludeInsert...); err != nil {
 			return err
 		}

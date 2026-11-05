@@ -168,7 +168,9 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 	}
 	dbTable.deltaIndexes = append(dbTable.deltaIndexes, deltaIndex)
 	dbTable.views[deltaIndex.viewName] = makeDeltaViewInfo(dbTable, deltaIndex)
-	fmt.Printf("Delta index registered: table=%s view=%s pinnedSlotBits=%v\n", dbTable.Name, deltaIndex.viewName, deltaIndex.pinnedSlotBits)
+	if ShouldLog() {
+		fmt.Printf("Delta index registered: table=%s view=%s pinnedSlotBits=%v\n", dbTable.Name, deltaIndex.viewName, deltaIndex.pinnedSlotBits)
+	}
 }
 
 // planDeltaPinnedSlots sizes each pinned column's slot: an explicit Size(), else its FixedValues
@@ -777,6 +779,11 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 		if tableInfo.Limit > 0 && len(replaceRecords) > int(tableInfo.Limit) {
 			replaceRecords = replaceRecords[:tableInfo.Limit]
 		}
+		// One copy into an array of the final size, not log2(n) doublings: on a 50k first sync the
+		// doublings allocated more than the records themselves. +1 is the metadata record.
+		if sink.reserve != nil {
+			sink.reserve(len(replaceRecords) + 1)
+		}
 		for _, recordPointer := range replaceRecords {
 			metadata.NextCursor = max(metadata.NextCursor, int32(updatedOf(recordPointer)))
 			sink.appendRecord(recordPointer)
@@ -794,6 +801,13 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 		}
 		metadata.WindowFrom, metadata.WindowTo = plan.WindowFrom, plan.WindowTo
 		metadata.NextCursor = cursor.Updated
+		if sink.reserve != nil {
+			changedRecordCount := 1 // the metadata record
+			for _, read := range reads {
+				changedRecordCount += len(read.records)
+			}
+			sink.reserve(changedRecordCount)
+		}
 		isInView := map[int64]bool{}
 		for _, read := range reads {
 			for _, viewRow := range read.windowRows {

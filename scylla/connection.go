@@ -3,6 +3,7 @@ package scylla
 import (
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -147,7 +148,11 @@ func buildScyllaCluster() *gocql.ClusterConfig {
 	cluster.ConnectTimeout = time.Second * time.Duration(connParams.ConnTimeout)
 	cluster.Timeout = time.Second * time.Duration(connParams.QueryTimeout)
 	cluster.WriteTimeout = time.Second * time.Duration(connParams.WriteTimeout)
-	cluster.Compressor = gocql.SnappyCompressor{}
+	// Compression trades CPU for bandwidth. Against a node on this same machine there is no
+	// bandwidth to save, and decoding every frame cost CPU and allocations on each read.
+	if !isLocalDatabaseHost(connParams.Host) {
+		cluster.Compressor = gocql.SnappyCompressor{}
+	}
 	cluster.Authenticator = gocql.PasswordAuthenticator{
 		Username:              connParams.User,
 		Password:              connParams.Password,
@@ -168,6 +173,32 @@ func buildScyllaCluster() *gocql.ClusterConfig {
 	cluster.DisableInitialHostLookup = true
 
 	return cluster
+}
+
+// isLocalDatabaseHost reports whether host names this machine: loopback, or one of its own
+// interface addresses. The second case is the VPS install, where db.host is the server's own IP so
+// that Lambda and other hosts can use the same config.
+func isLocalDatabaseHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	hostIP := net.ParseIP(host)
+	if hostIP == nil {
+		return false
+	}
+	if hostIP.IsLoopback() {
+		return true
+	}
+	interfaceAddresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, interfaceAddress := range interfaceAddresses {
+		if addressCIDR, ok := interfaceAddress.(*net.IPNet); ok && addressCIDR.IP.Equal(hostIP) {
+			return true
+		}
+	}
+	return false
 }
 
 func QueryExec(queryStr string, values ...any) error {

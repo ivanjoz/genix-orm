@@ -69,6 +69,7 @@ func getOrBuildStructFieldMetadata(recordType reflect.Type) *structFieldMetadata
 // tests measure a cold build.
 func ResetMetadataCacheForTesting() {
 	structFieldMetadataCache = sync.Map{}
+	tableBindingPlanCache = sync.Map{}
 }
 
 // DBTag is the parsed `db:"..."` tag of a record field: the column name plus the

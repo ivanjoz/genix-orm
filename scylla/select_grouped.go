@@ -94,8 +94,10 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 	readTime := getManagedUnixTime()
 	fetchStates, cachedStates := splitIndexGroupFetches(queryPlan.hashGroups, serverFreshnessByHash, tableInfo.CachedIndexGroups, readTime)
 	if len(fetchStates) == 0 && len(cachedStates) == 0 {
-		fmt.Printf("QueryIndexGroup skipped all groups: table=%s partition=%d hashes=%d\n",
-			scyllaTable.Name, queryPlan.partitionValue, len(hashValues))
+		if ShouldLog() {
+			fmt.Printf("QueryIndexGroup skipped all groups: table=%s partition=%d hashes=%d\n",
+				scyllaTable.Name, queryPlan.partitionValue, len(hashValues))
+		}
 		return nil, nil
 	}
 
@@ -175,8 +177,10 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 		return nil, fmt.Errorf("QueryIndexGroup did not produce candidate hashes")
 	}
 
-	fmt.Printf("QueryIndexGroup plan selected: table=%s group=%s candidate_hashes=%d\n",
-		scyllaTable.Name, bestIndexGroup.name, len(hashGroups))
+	if ShouldLog() {
+		fmt.Printf("QueryIndexGroup plan selected: table=%s group=%s candidate_hashes=%d\n",
+			scyllaTable.Name, bestIndexGroup.name, len(hashGroups))
+	}
 
 	return &indexGroupSelectPlan{
 		partitionValue: convertToInt32(partitionStatements[0].Value),
@@ -372,8 +376,10 @@ func loadIndexGroupFreshnessRowsFromScylla(
 			strings.Join(placeholders, ", "),
 		)
 
-		fmt.Printf("QueryIndexGroup freshness probe: table=%s partition=%d index_id=%d hashes=%d\n",
-			scyllaTable.Name, partitionValue, indexGroup.indexID, len(hashChunk))
+		if ShouldLog() {
+			fmt.Printf("QueryIndexGroup freshness probe: table=%s partition=%d index_id=%d hashes=%d\n",
+				scyllaTable.Name, partitionValue, indexGroup.indexID, len(hashChunk))
+		}
 
 		iter := getScyllaConnection().Query(queryStr, queryValues...).Iter()
 		var hashValue int32

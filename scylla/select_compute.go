@@ -56,8 +56,10 @@ func canUseViewForAggregateColumns(aggregateColumns []columnInfo, view *viewInfo
 	}
 	for _, aggregateColumn := range aggregateColumns {
 		if !slices.Contains(view.availableColumns, aggregateColumn.GetName()) {
-			fmt.Printf("GroupBy aggregate view rejected: view=%s missing_column=%s available=%v\n",
-				view.name, aggregateColumn.GetName(), view.availableColumns)
+			if ShouldLog() {
+				fmt.Printf("GroupBy aggregate view rejected: view=%s missing_column=%s available=%v\n",
+					view.name, aggregateColumn.GetName(), view.availableColumns)
+			}
 			return false
 		}
 	}
@@ -278,7 +280,9 @@ func buildNativeGroupByPlan(
 		if groupedColumn == nil {
 			return nil, fmt.Errorf(`GroupBy column "%v" was not found`, groupedColumns[0].GetName())
 		}
-		fmt.Printf("Native GroupBy plan selected on base table: group=%v aggregates=%d\n", groupedColumns[0].GetName(), len(aggregateColumns))
+		if ShouldLog() {
+			fmt.Printf("Native GroupBy plan selected on base table: group=%v aggregates=%d\n", groupedColumns[0].GetName(), len(aggregateColumns))
+		}
 		return &nativeGroupByPlan{
 			SelectExpressions: selectExpressions,
 			ScanColumns:       scanColumns,
@@ -297,8 +301,10 @@ func buildNativeGroupByPlan(
 			continue
 		}
 		if !slices.Equal(view.columnsNoPart, groupedColumnNames) {
-			fmt.Printf("GroupBy packed view skipped: view=%s expected=%v got=%v\n",
-				view.name, groupedColumnNames, view.columnsNoPart)
+			if ShouldLog() {
+				fmt.Printf("GroupBy packed view skipped: view=%s expected=%v got=%v\n",
+					view.name, groupedColumnNames, view.columnsNoPart)
+			}
 			continue
 		}
 		if !canUseViewForAggregateColumns(aggregateColumns, view) {
@@ -322,7 +328,9 @@ func buildNativeGroupByPlan(
 			scanColumnsPacked = append(scanColumnsPacked, selectScanColumn{ColumnName: aggregateColumn.GetName()})
 		}
 
-		fmt.Printf("Native GroupBy packed view selected: view=%s groups=%v aggregates=%d\n", view.name, groupedColumnNames, len(aggregateColumns))
+		if ShouldLog() {
+			fmt.Printf("Native GroupBy packed view selected: view=%s groups=%v aggregates=%d\n", view.name, groupedColumnNames, len(aggregateColumns))
+		}
 		return &nativeGroupByPlan{
 			ViewTableName:     view.name,
 			SelectExpressions: selectExpressionsPacked,
@@ -809,7 +817,7 @@ func MatchQueryCapability(statements []ColumnStatement, capabilities []QueryCapa
 		}
 	}
 
-	if bestMatch != nil {
+	if bestMatch != nil && ShouldLog() {
 		sourceName := "base-key"
 		if bestMatch.Source != nil {
 			sourceName = bestMatch.Source.name
