@@ -255,6 +255,9 @@ func handlePreInsert(
 				counterVal++
 
 				colInfo := scyllaTable.AutoincrementCol.(*columnInfo)
+				if colInfo.AutoincrementFirstID > 1 {
+					currentAutoVal += colInfo.AutoincrementFirstID - 1
+				}
 				if colInfo.AutoincrementRandBits > 0 {
 					randomSuffix := rand.Int64N(int64(1) << colInfo.AutoincrementRandBits)
 					currentAutoVal = currentAutoVal<<colInfo.AutoincrementRandBits | randomSuffix

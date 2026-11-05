@@ -57,6 +57,9 @@ type ColumnInfo struct {
 	// randomness, so IDs are non-consecutive and collide less often. -1 means an
 	// autoincrement with no random suffix; 0 means no autoincrement.
 	AutoincrementRandBits int8
+	// AutoincrementFirstID, set by Col.AutoincrementFrom, is the first generated ID: the
+	// sequence value is shifted by AutoincrementFirstID-1. 0 means the IDs start at 1.
+	AutoincrementFirstID int64
 	CompositeBucketSizes    []int8
 	IsWeek                  bool
 	UseInt32Packing         bool

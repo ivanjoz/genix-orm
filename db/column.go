@@ -155,6 +155,18 @@ func (q Col[T, E]) Autoincrement(randSuffixBits int8) Coln {
 	return colRef{q.GetInfo()}
 }
 
+// AutoincrementFrom marks the column as generated, with no random suffix, starting at firstID:
+// ID = sequence + firstID - 1. It keeps the IDs below firstID free for values the code owns
+// (e.g. a catalog defined in code sharing the same ID space as the table).
+func (q Col[T, E]) AutoincrementFrom(firstID int64) Coln {
+	if firstID < 1 {
+		panic(fmt.Sprintf("AutoincrementFrom(%v) must start at 1 or more in: %v", firstID, q.info.Name))
+	}
+	q.setAutoincrement(0)
+	q.info.AutoincrementFirstID = firstID
+	return colRef{q.GetInfo()}
+}
+
 func (c *Col[T, E]) SetSchemaStruct(schemaStruct any) {
 	if schema, ok := schemaStruct.(T); ok {
 		c.schemaStruct = schema

@@ -344,6 +344,9 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		keyInfo := key.GetInfo()
 		if keyInfo.AutoincrementRandBits != 0 {
 			col.SetAutoincrementRandSize(keyInfo.AutoincrementRandBits)
+			if keyInfo.AutoincrementFirstID > 0 {
+				col.(*columnInfo).AutoincrementFirstID = keyInfo.AutoincrementFirstID
+			}
 
 			// Set autoincrementCol if not already set
 			if dbTable.AutoincrementCol == nil {
