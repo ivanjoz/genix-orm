@@ -59,7 +59,7 @@ func readCacheGroupRecords(
 ) ([]unsafe.Pointer, error) {
 	fileStore := cache.FileStore()
 	// lastWrite 0 is an unsettled group: it is never served from a file nor stored.
-	if !queryPlan.indexGroup.snapshotInS3 || fetchState.lastWrite == 0 || fileStore == nil {
+	if !queryPlan.indexGroup.snapshotInS3 || fetchState.lastWrite == 0 || fileStore == nil || !cache.RecordSnapshotsEnabled() {
 		return readGroupFromDatabase(postFilterStatements)
 	}
 	recordType := sinkRecordType(sink)

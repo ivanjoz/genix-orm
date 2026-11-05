@@ -29,7 +29,7 @@ func readDeltaPrefixReplace(
 			0, deltaViewUpdatedMax, int(limit), projection)
 	}
 	fileStore := cache.FileStore()
-	if fileStore == nil || projection != nil {
+	if fileStore == nil || projection != nil || !cache.RecordSnapshotsEnabled() {
 		return readFromView()
 	}
 	recordType := sinkRecordType(sink)

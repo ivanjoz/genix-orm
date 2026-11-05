@@ -21,6 +21,19 @@ import (
 // replica mutation) would otherwise be missing from every first read until the next rewrite.
 const RecordSnapshotMaxAgeTicks = 3600
 
+// recordSnapshotsDisabled turns both snapshot kinds off: every replace and every settled group is read
+// from the database and no file is read or written. Snapshots pay off for short-lived instances that
+// start cold on every request (Lambda); a long-running server reads the database at about the same
+// cost as a store GET and would only add the PUTs. The delta logs and the by-IDs files are not
+// snapshots and keep working: they are the sync protocol, not a cache.
+var recordSnapshotsDisabled bool
+
+// SetRecordSnapshotsEnabled installs the switch. Call it once at boot, next to SetFileStore.
+func SetRecordSnapshotsEnabled(enabled bool) { recordSnapshotsDisabled = !enabled }
+
+// RecordSnapshotsEnabled reports whether a read may use the delta and cache-group snapshot files.
+func RecordSnapshotsEnabled() bool { return !recordSnapshotsDisabled }
+
 // IsRecordSnapshotExpired: the snapshot is older than RecordSnapshotMaxAgeTicks at readTime, the
 // current read's server clock, so the database answers and rewrites it.
 // A snapshot read after readTime is expired too: the clock went back (a backdated seed rewinding
