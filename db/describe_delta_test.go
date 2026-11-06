@@ -60,6 +60,26 @@ func TestDescribeDeltaPinsEveryKeyAndPacksUpdatedLast(t *testing.T) {
 	}
 }
 
+// A delta index that declares Cols copies those plus what the protocol reads, and nothing else.
+func TestDescribeDeltaColsNarrowTheViewColumns(t *testing.T) {
+	core := deltaTestCore()
+	core.ColumnsMap["amount"] = viewTableTestColumn("amount", ColType{FieldType: "int32"}, false)
+	source := core.DescribeDelta(Index{Type: TypeDelta, Keys: []Coln{declared(core, "status")}, Cols: []Coln{declared(core, "amount")}})
+
+	storedNames := []string{}
+	for _, column := range core.DeltaIndexes[0].StoredColumns {
+		storedNames = append(storedNames, column.GetName())
+	}
+	for _, mustCopy := range []string{"company_id", "id", "updated", "version", "status", "amount"} {
+		if !slices.Contains(storedNames, mustCopy) {
+			t.Fatalf("%q missing from the view columns %v", mustCopy, storedNames)
+		}
+	}
+	if slices.Contains(storedNames, "note") || slices.Contains(source.AvailableColumns, "note") {
+		t.Fatalf("note was not declared but is copied: %v / %v", storedNames, source.AvailableColumns)
+	}
+}
+
 func TestDescribeDeltaKeylessPacksUpdatedAlone(t *testing.T) {
 	core := deltaTestCore()
 	source := core.DescribeDelta(Index{Type: TypeDelta})

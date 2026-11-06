@@ -1179,6 +1179,10 @@ func resolveUpdateColumnsForWrite(
 	}
 
 	for _, indexGroup := range scyllaTable.IndexGroups {
+		// A no-index group stores no hash, so a partial update has nothing of it to recompute.
+		if indexGroup.BaseGroup != nil {
+			continue
+		}
 		includedSourceColumns := []string{}
 		missingSourceColumns := []string{}
 

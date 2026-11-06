@@ -28,6 +28,32 @@ func (core *TableCore) DeltaStoredColumns() []IColInfo {
 	return storedColumns
 }
 
+// deltaIndexColumns are the columns one delta index's view copies. Without declared Cols that is
+// every stored column. With Cols it is the declared ones plus what the protocol itself reads: the
+// partition and key (the row's identity), version and updated (the window hash and the cursor)
+// and the pinned columns (the client's filter). Every row of a write pays for each copied column,
+// so a ledger whose delta consumer reads a few columns declares only those.
+func (core *TableCore) deltaIndexColumns(indexCfg Index, pinned []IColInfo) []IColInfo {
+	if len(indexCfg.Cols) == 0 {
+		return core.DeltaStoredColumns()
+	}
+	wanted := map[string]bool{
+		core.GetPartKey().GetName(): true, core.Keys[0].GetName(): true,
+		core.VersionCol.GetName(): true, core.UpdatedCol.GetName(): true,
+	}
+	for _, pinnedColumn := range pinned {
+		wanted[pinnedColumn.GetName()] = true
+	}
+	for _, declaredColumn := range indexCfg.Cols {
+		column := core.ColumnsMap[declaredColumn.GetInfo().Name]
+		if column == nil || column.IsNil() || column.GetInfo().IsVirtual || column.GetInfo().IsComputed {
+			panic(fmt.Sprintf(`Table "%v": TypeDelta Cols column "%v" is not a stored column`, core.Name, declaredColumn.GetInfo().Name))
+		}
+		wanted[column.GetName()] = true
+	}
+	return slices.DeleteFunc(core.DeltaStoredColumns(), func(column IColInfo) bool { return !wanted[column.GetName()] })
+}
+
 // DescribeDelta describes a TypeDelta index and registers it in DeltaIndexes. Every declared Key is
 // pinned, the last one being the one Delta()'s values name; the table's single integer key is the
 // record ID. The packed column holds the pinned values and updated (updated alone on a keyless
@@ -87,6 +113,8 @@ func (core *TableCore) DescribeDelta(indexCfg Index) *IndexSource {
 		}
 	}
 
+	deltaIndex.StoredColumns = core.deltaIndexColumns(indexCfg, deltaIndex.Pinned)
+
 	// A keyless index packs updated alone: every delta index keys on one packed column.
 	deltaIndex.PinnedSlotBits = core.PlanDeltaPinnedSlots(deltaIndex.Pinned, indexCfg)
 	packedColumnSuffix := ColumnNameUpdated
@@ -132,7 +160,7 @@ func (core *TableCore) DescribeDelta(indexCfg Index) *IndexSource {
 		PartitionColumn:    core.GetPartKey(),
 		KeepsBasePartition: true,
 	}
-	for _, storedColumn := range core.DeltaStoredColumns() {
+	for _, storedColumn := range deltaIndex.StoredColumns {
 		source.AvailableColumns = append(source.AvailableColumns, storedColumn.GetName())
 	}
 	core.IndexSources = append(core.IndexSources, source)

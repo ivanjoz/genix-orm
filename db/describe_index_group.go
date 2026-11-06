@@ -29,6 +29,10 @@ func (core *TableCore) DescribeIndexGroup(idxCount *int8, indexCfg Index) *Index
 		core.describeInheritFromKeyIndexGroup(indexCfg, indexID, sourceColumnNames)
 		return nil
 	}
+	if indexCfg.Type == TypeCacheGroupNoIndex {
+		core.describeNoIndexGroup(indexCfg, indexID, sourceColumnNames)
+		return nil
+	}
 
 	if len(indexCfg.Keys) == 1 {
 		localIndexSource := core.DescribeLocalIndex(idxCount, Index{Type: TypeLocalIndex, Keys: indexCfg.Keys})
@@ -108,6 +112,61 @@ func (core *TableCore) DescribeIndexGroup(idxCount *int8, indexCfg Index) *Index
 		Columns:    slices.Clone(sourceColumnNames),
 		IndexGroup: &indexGroup,
 	})
+}
+
+// describeNoIndexGroup registers a TypeCacheGroupNoIndex group. Its BaseGroup is resolved once every
+// index is described (resolveNoIndexBaseGroups), so the FromKey group it reads may be declared after it.
+func (core *TableCore) describeNoIndexGroup(indexCfg Index, indexID int16, sourceColumnNames []string) {
+	sourceColumns := make([]IndexGroupSourceColumn, 0, len(indexCfg.Keys))
+	for _, key := range indexCfg.Keys {
+		baseColumn := core.ColumnsMap[key.GetName()]
+		if baseColumn == nil || baseColumn.IsNil() {
+			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupNoIndex column "%v" was not found`, core.Name, key.GetName()))
+		}
+		if baseColumn.GetType().IsSlice {
+			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupNoIndex does not support slice column "%v"`, core.Name, key.GetName()))
+		}
+		sourceColumns = append(sourceColumns, IndexGroupSourceColumn{Column: baseColumn})
+	}
+	core.IndexGroups = append(core.IndexGroups, IndexGroupInfo{
+		Name:          strings.Join(sourceColumnNames, "_"),
+		IndexID:       indexID,
+		SourceColumns: sourceColumns,
+		// Placeholder until resolveNoIndexBaseGroups names the real one: it marks the group as no-index.
+		BaseGroup: &IndexGroupInfo{},
+	})
+}
+
+// resolveNoIndexBaseGroups gives every TypeCacheGroupNoIndex group its base: the FromKey group with
+// the most Keys, all of them among the group's own Keys. The base must leave at least one Key to
+// filter, otherwise the group would be the base group under another IndexID.
+func (core *TableCore) resolveNoIndexBaseGroups() {
+	for groupIndex := range core.IndexGroups {
+		noIndexGroup := &core.IndexGroups[groupIndex]
+		if noIndexGroup.BaseGroup == nil {
+			continue
+		}
+		groupColumnNames := map[string]bool{}
+		for _, sourceColumn := range noIndexGroup.SourceColumns {
+			groupColumnNames[sourceColumn.Column.GetName()] = true
+		}
+		var baseGroup *IndexGroupInfo
+		for candidateIndex := range core.IndexGroups {
+			candidate := core.IndexGroups[candidateIndex]
+			isContained := candidate.InheritFromKey && len(candidate.SourceColumns) < len(noIndexGroup.SourceColumns) &&
+				!slices.ContainsFunc(candidate.SourceColumns, func(sourceColumn IndexGroupSourceColumn) bool {
+					return !groupColumnNames[sourceColumn.Column.GetName()]
+				})
+			if isContained && (baseGroup == nil || len(candidate.SourceColumns) > len(baseGroup.SourceColumns)) {
+				baseGroup = &candidate
+			}
+		}
+		if baseGroup == nil {
+			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupNoIndex "%v" needs a TypeCacheGroupFromKey group whose Keys are all among its own, and fewer`,
+				core.Name, noIndexGroup.Name))
+		}
+		noIndexGroup.BaseGroup = baseGroup
+	}
 }
 
 // describeInheritFromKeyIndexGroup registers a TypeCacheGroupFromKey group: its keys must be a prefix

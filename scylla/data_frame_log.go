@@ -54,7 +54,7 @@ func dataFrameLogCreateScript(scyllaTable ScyllaTable) string {
 		WITH default_time_to_live = %d
 		and gc_grace_seconds = 3600
 		and compaction = {'class': 'TimeWindowCompactionStrategy', 'compaction_window_unit': 'HOURS', 'compaction_window_size': 6}
-		and compression = {'compression_level': '3', 'sstable_compression': 'org.apache.cassandra.io.compress.ZstdCompressor'};`,
+		and compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'};`,
 		resolveKeyspace(scyllaTable), scyllaTable.dataFrames.logTableName,
 		scyllaTable.PartKey.GetType().DBType, scyllaTable.Keys[0].GetType().DBType, dataFrameLogTTLSeconds)
 }

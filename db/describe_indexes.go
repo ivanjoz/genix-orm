@@ -43,7 +43,8 @@ func (core *TableCore) DescribeIndexes(idxCount *int8, indexes []Index) []*Index
 		if IndexPartitionColumnName(indexCfg) != "" && schemaIndexType != TypeView {
 			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView indexes`, core.Name))
 		}
-		if schemaIndexType == TypeCacheGroup || schemaIndexType == TypeCacheGroupS3 || schemaIndexType == TypeCacheGroupFromKey {
+		if schemaIndexType == TypeCacheGroup || schemaIndexType == TypeCacheGroupS3 ||
+			schemaIndexType == TypeCacheGroupFromKey || schemaIndexType == TypeCacheGroupNoIndex {
 			core.DescribeIndexGroup(idxCount, indexCfg)
 			continue
 		}
@@ -67,6 +68,7 @@ func (core *TableCore) DescribeIndexes(idxCount *int8, indexes []Index) []*Index
 			panic(fmt.Sprintf(`Table "%v": unsupported index type %d`, core.Name, schemaIndexType))
 		}
 	}
+	core.resolveNoIndexBaseGroups()
 	return core.IndexSources[firstNewSource:]
 }
 

@@ -58,6 +58,7 @@ const (
 	TypeDelta             = db.TypeDelta
 	TypeCacheGroup        = db.TypeCacheGroup
 	TypeCacheGroupS3      = db.TypeCacheGroupS3
+	TypeCacheGroupNoIndex = db.TypeCacheGroupNoIndex
 )
 
 // Cols returns columns as the slice required by schema declarations.

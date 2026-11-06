@@ -87,7 +87,7 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 	}
 
 	hashValues := extractQueryIndexGroupHashes(queryPlan.hashGroups)
-	serverFreshnessByHash, err := loadIndexGroupFreshnessRows(scyllaTable, queryPlan.indexGroup, queryPlan.partitionValue, hashValues)
+	serverFreshnessByHash, err := loadPlannedGroupFreshness(scyllaTable, queryPlan, hashValues)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +294,36 @@ func extractQueryIndexGroupHashes(hashGroups []queryIndexGroupHash) []int32 {
 	return hashValues
 }
 
+// loadPlannedGroupFreshness is the last_write of each planned group, by its hash. A no-index group
+// has no marks of its own: each group takes the mark of the base group it is a slice of, so a base
+// group absent on the server (no records that day) leaves the group absent too.
+func loadPlannedGroupFreshness(scyllaTable ScyllaTable, queryPlan *indexGroupSelectPlan, hashValues []int32) (map[int32]int32, error) {
+	indexGroup := queryPlan.indexGroup
+	if indexGroup.BaseGroup == nil {
+		return loadIndexGroupFreshnessRows(scyllaTable, indexGroup, queryPlan.partitionValue, hashValues)
+	}
+	baseHashByGroupHash := make(map[int32]int32, len(queryPlan.hashGroups))
+	baseHashes := []int32{}
+	for _, hashGroup := range queryPlan.hashGroups {
+		baseHash := db.HashInt64(indexGroup.BaseGroupValues(hashGroup.indexGroupValues)...)
+		baseHashByGroupHash[hashGroup.hashValue] = baseHash
+		if !slices.Contains(baseHashes, baseHash) {
+			baseHashes = append(baseHashes, baseHash)
+		}
+	}
+	baseFreshnessByHash, err := loadIndexGroupFreshnessRows(scyllaTable, *indexGroup.BaseGroup, queryPlan.partitionValue, baseHashes)
+	if err != nil {
+		return nil, err
+	}
+	freshnessByHash := make(map[int32]int32, len(baseHashByGroupHash))
+	for groupHash, baseHash := range baseHashByGroupHash {
+		if lastWrite, isOnServer := baseFreshnessByHash[baseHash]; isOnServer {
+			freshnessByHash[groupHash] = lastWrite
+		}
+	}
+	return freshnessByHash, nil
+}
+
 func loadIndexGroupFreshnessRowsFromScylla(
 	scyllaTable ScyllaTable,
 	indexGroup db.IndexGroupInfo,
@@ -422,7 +452,8 @@ func fetchIndexGroupRecordGroups(
 					sink.collectInto(&groupRecords), groupPostFilter, nil, queryNoticeTime)
 				return groupRecords, err
 			}
-			records, err := readCacheGroupRecords(sink, scyllaTable, queryPlan, fetchState, readGroupFromDatabase, postFilterStatements, readTime)
+			records, err := readCacheGroupRecords(sink, scyllaTable, queryPlan, fetchState, readGroupFromDatabase,
+				groupPostFilterStatements(queryPlan.indexGroup, fetchState, postFilterStatements), readTime)
 			if err != nil {
 				return err
 			}
@@ -445,6 +476,22 @@ func fetchIndexGroupRecordGroups(
 	return groupsByIndex, nil
 }
 
+// groupPostFilterStatements is the post-filter of one group's fetch. A no-index group reads its whole
+// base range, so it also pins each of its Keys to the group's own value: the query's IN over a Key
+// fans out into one group per value, and each group must keep only its value's records.
+func groupPostFilterStatements(indexGroup db.IndexGroupInfo, fetchState indexGroupFetchState, postFilterStatements []ColumnStatement) []ColumnStatement {
+	if indexGroup.BaseGroup == nil {
+		return postFilterStatements
+	}
+	groupStatements := slices.Clone(postFilterStatements)
+	for columnIndex, sourceColumn := range indexGroup.SourceColumns {
+		groupStatements = append(groupStatements, ColumnStatement{
+			Col: sourceColumn.Column.GetName(), Operator: "=", Value: fetchState.indexGroupValues[columnIndex],
+		})
+	}
+	return groupStatements
+}
+
 func buildIndexGroupFetchQuery(
 	scyllaTable ScyllaTable,
 	queryPlan *indexGroupSelectPlan,
@@ -456,15 +503,21 @@ func buildIndexGroupFetchQuery(
 	}
 	queryValues := []any{queryPlan.partitionValue}
 
+	// A no-index group reads its base group's range; the post-filter drops its other Keys' misses.
+	keyRangeGroup, keyRangeValues := queryPlan.indexGroup, fetchState.indexGroupValues
+	if keyRangeGroup.BaseGroup != nil {
+		keyRangeGroup, keyRangeValues = *keyRangeGroup.BaseGroup, keyRangeGroup.BaseGroupValues(keyRangeValues)
+	}
+
 	// TypeCacheGroupFromKey groups rewrite per-hash fetches to a packed primary-key range,
 	// so no secondary index is needed and ALLOW_FILTERING is avoided.
-	if queryPlan.indexGroup.InheritFromKey {
-		keyStatements := make([]ColumnStatement, 0, len(queryPlan.indexGroup.SourceColumns))
-		for columnIndex, sourceColumn := range queryPlan.indexGroup.SourceColumns {
+	if keyRangeGroup.InheritFromKey {
+		keyStatements := make([]ColumnStatement, 0, len(keyRangeGroup.SourceColumns))
+		for columnIndex, sourceColumn := range keyRangeGroup.SourceColumns {
 			keyStatements = append(keyStatements, ColumnStatement{
 				Col:      sourceColumn.Column.GetName(),
 				Operator: "=",
-				Value:    fetchState.indexGroupValues[columnIndex],
+				Value:    keyRangeValues[columnIndex],
 			})
 		}
 		rewrittenStatements, canRewrite := scyllaTable.BuildKeyIntPackingStatements(keyStatements)

@@ -72,6 +72,52 @@ func TestDescribeIndexGroupOverOneKeyReusesTheLocalIndex(t *testing.T) {
 	}
 }
 
+// A no-index group describes nothing and reads through the widest FromKey group among its Keys,
+// whichever order they were declared in.
+func TestDescribeNoIndexGroupResolvesItsWidestFromKeyBase(t *testing.T) {
+	core := groupTestCore()
+	core.ColumnsMap["kind"] = viewTableTestColumn("kind", ColType{FieldType: "int16"}, false)
+	sources := core.DescribeIndexes(new(int8), []Index{
+		{Type: TypeCacheGroupNoIndex, Keys: []Coln{declared(core, "day"), declared(core, "status"), declared(core, "kind")}},
+		{Type: TypeCacheGroupFromKey, Keys: []Coln{declared(core, "day")}},
+		{Type: TypeCacheGroupFromKey, Keys: []Coln{declared(core, "day"), declared(core, "status")}},
+	})
+	if len(sources) != 0 {
+		t.Fatalf("no group here may describe an index, got %+v", sources)
+	}
+	noIndexGroup := core.IndexGroups[0]
+	if noIndexGroup.BaseGroup == nil || noIndexGroup.BaseGroup.Name != "day_status" {
+		t.Fatalf("base = %+v, want day_status", noIndexGroup.BaseGroup)
+	}
+	if baseValues := noIndexGroup.BaseGroupValues([]int64{20000, 3, 8}); baseValues[0] != 20000 || baseValues[1] != 3 || len(baseValues) != 2 {
+		t.Fatalf("base values = %v", baseValues)
+	}
+}
+
+func TestDescribeNoIndexGroupRefusesAGroupWithoutABase(t *testing.T) {
+	for caseName, keyNames := range map[string][]string{
+		"no FromKey group among its keys": {"status"},
+		"same keys as its only base":      {"day"},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: expected a panic", caseName)
+				}
+			}()
+			core := groupTestCore()
+			keys := []Coln{}
+			for _, keyName := range keyNames {
+				keys = append(keys, declared(core, keyName))
+			}
+			core.DescribeIndexes(new(int8), []Index{
+				{Type: TypeCacheGroupFromKey, Keys: []Coln{declared(core, "day")}},
+				{Type: TypeCacheGroupNoIndex, Keys: keys},
+			})
+		}()
+	}
+}
+
 func TestDescribeIndexGroupFromKeyNeedsNoIndexAndChecksThePrefix(t *testing.T) {
 	core := groupTestCore()
 	idxCount := int8(0)

@@ -66,6 +66,12 @@ const (
 	// round-trip through colbin (no cb:"-" on a stored column). There is no FromKey variant: a FromKey
 	// group is a primary-key range read, already cheap.
 	TypeCacheGroupS3 int8 = 12
+	// TypeCacheGroupNoIndex is a cache group that writes nothing: no index, no hash column, no marks.
+	// It reads through its base group — the TypeCacheGroupFromKey group with the most Keys, all of
+	// them among its own — as that group's primary-key range, filters its other Keys in memory, and
+	// carries the base group's last_write. A write to a base group therefore refreshes every group
+	// built on it (Scylla only).
+	TypeCacheGroupNoIndex int8 = 13
 )
 
 // IndexTypeNames labels index kinds for logs and deploy output.
@@ -79,6 +85,7 @@ var IndexTypeNames = map[int8]string{
 	TypeDelta:             "Delta",
 	TypeCacheGroup:        "Cache Group",
 	TypeCacheGroupS3:      "Cache Group S3",
+	TypeCacheGroupNoIndex: "Cache Group No Index",
 }
 
 // ColumnNameUpdated is the column the ORM maintains as every record's last-write timestamp. It is

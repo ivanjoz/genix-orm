@@ -33,6 +33,10 @@ func appendIndexUpdatedRowsForRecord(
 	rowsToPersist *[]indexUpdatedRow,
 ) {
 	for _, indexGroup := range scyllaTable.IndexGroups {
+		// A no-index group carries its base group's mark: it writes none of its own.
+		if indexGroup.BaseGroup != nil {
+			continue
+		}
 		hashValues := db.ComputeIndexGroupHashes(recordPointer, indexGroup.SourceColumns)
 		for _, hashValue := range hashValues {
 			dedupKey := fmt.Sprintf("%d|%d|%d", partitionValue, indexGroup.IndexID, hashValue)
@@ -129,6 +133,9 @@ func materializeGroupHashIndex(dbTable *ScyllaTable, view *viewInfo) {
 func indexGroupStoredColumns(scyllaTable *ScyllaTable) []IColInfo {
 	var storedColumns []IColInfo
 	for _, indexGroup := range scyllaTable.IndexGroups {
+		if indexGroup.BaseGroup != nil {
+			continue // marks nothing, so a write needs none of its stored values
+		}
 		for _, sourceColumn := range indexGroup.SourceColumns {
 			for _, storedColumn := range scyllaTable.StoredColumnsOf(sourceColumn.Column) {
 				if !slices.ContainsFunc(storedColumns, func(column IColInfo) bool { return column.GetName() == storedColumn.GetName() }) {

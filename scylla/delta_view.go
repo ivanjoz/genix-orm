@@ -71,7 +71,7 @@ func materializeDeltaView(dbTable *ScyllaTable, view *viewInfo) {
 	// The view is a range view of the query planner on [partition, pinned…, updated].
 	compilePackedRangeDecoder(view, source.PackedSourceColumns, deltaIndex.SlotBits(), false)
 
-	storedColumns := dbTable.DeltaStoredColumns()
+	storedColumns := deltaIndex.StoredColumns
 	view.getExpectedColumns = func() []viewExpectedColumn {
 		return makeViewExpectedColumns(append(slices.Clone(storedColumns), deltaIndex.PackedColumn))
 	}
@@ -406,7 +406,7 @@ func deltaViewRange(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, parti
 
 // readDeltaViewRecords reads whole records of a prefix straight from the view into sink: updated in
 // [fromUpdated, toUpdated], newest first. rowLimit > 0 stops the read there. columnNames projects
-// the read; nil reads every stored column.
+// the read; nil reads every column the view copies.
 func readDeltaViewRecords(
 	sink recordSink, scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, pinnedValues []int64,
 	fromUpdated, toUpdated int64, rowLimit int, columnNames []string,
@@ -415,10 +415,8 @@ func readDeltaViewRecords(
 		return nil
 	}
 	if columnNames == nil {
-		for _, column := range scyllaTable.Columns {
-			if !column.GetInfo().IsVirtual {
-				columnNames = append(columnNames, column.GetName())
-			}
+		for _, column := range deltaIndex.StoredColumns {
+			columnNames = append(columnNames, column.GetName())
 		}
 	}
 	whereClause, queryValues := deltaViewRange(scyllaTable, deltaIndex, partition, pinnedValues, fromUpdated, toUpdated)
@@ -545,6 +543,14 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 	// A first sync is a replace; any other cursor, however old, is decided by how much changed.
 	metadata.IsReplace = cursor.Updated == 0
 	projection := deltaProjection(tableInfo, scyllaTable, deltaIndex)
+	// A view that declared Cols copies fewer columns than the table: a Select() naming one it lacks
+	// would fail in CQL, so the read fails first, naming the column.
+	for _, projectedName := range projection {
+		if !slices.ContainsFunc(deltaIndex.StoredColumns, func(column IColInfo) bool { return column.GetName() == projectedName }) {
+			return fmt.Errorf(`table %q: Delta() projects column %q, which the delta view %v does not copy: add it to the index Cols`,
+				scyllaTable.Name, projectedName, deltaIndex.ViewName)
+		}
+	}
 	recordIDOf := func(recordPointer unsafe.Pointer) int64 {
 		return db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 	}

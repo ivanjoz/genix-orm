@@ -48,7 +48,11 @@ func CompileSummary(table ScyllaTable) string {
 		fmt.Fprintf(&summary, "  delta %v pinnedSlots=%v view=%v threshold=%v\n", deltaIndex.Tag, deltaIndex.PinnedSlotBits, deltaIndex.ViewName, deltaIndex.ReplaceThreshold)
 	}
 	for _, group := range table.IndexGroups {
-		fmt.Fprintf(&summary, "  group %v id=%v virtual=%v collection=%v fromKey=%v s3=%v\n", group.Name, group.IndexID, group.VirtualColumn.GetName(), group.UsesCollectionValues, group.InheritFromKey, group.SnapshotInS3)
+		baseGroupName := ""
+		if group.BaseGroup != nil {
+			baseGroupName = group.BaseGroup.Name
+		}
+		fmt.Fprintf(&summary, "  group %v id=%v virtual=%v collection=%v fromKey=%v s3=%v base=%v\n", group.Name, group.IndexID, group.VirtualColumn.GetName(), group.UsesCollectionValues, group.InheritFromKey, group.SnapshotInS3, baseGroupName)
 	}
 	for _, composite := range table.CompositeBucketIndexes {
 		fmt.Fprintf(&summary, "  composite %v sizes=%v week=%v\n", composite.Name, composite.BucketSizes, composite.BucketIsWeek)

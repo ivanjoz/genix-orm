@@ -45,6 +45,22 @@ type IndexGroupInfo struct {
 	InheritFromKey bool
 	// SnapshotInS3 (TypeCacheGroupS3) keeps each settled group in the file store.
 	SnapshotInS3 bool
+	// BaseGroup (TypeCacheGroupNoIndex) is the FromKey group whose primary-key range this group reads
+	// and whose last_write it carries. A group with a BaseGroup writes no index and no marks.
+	BaseGroup *IndexGroupInfo
+}
+
+// BaseGroupValues picks, out of this group's values (in SourceColumns order), the values of its
+// BaseGroup's columns, in the base group's order: what names the base group's range and mark.
+func (group IndexGroupInfo) BaseGroupValues(groupValues []int64) []int64 {
+	baseValues := make([]int64, len(group.BaseGroup.SourceColumns))
+	for baseIndex, baseColumn := range group.BaseGroup.SourceColumns {
+		position := slices.IndexFunc(group.SourceColumns, func(sourceColumn IndexGroupSourceColumn) bool {
+			return sourceColumn.Column.GetName() == baseColumn.Column.GetName()
+		})
+		baseValues[baseIndex] = groupValues[position]
+	}
+	return baseValues
 }
 
 // PackedIndexInfo stores schema-time metadata for TableSchema.Indexes packed local indexes.
@@ -77,6 +93,10 @@ type DeltaIndexInfo struct {
 	PackedColumn *ColumnInfo
 	// ViewName is the Scylla view's name; other drivers do not read it.
 	ViewName string
+	// StoredColumns are the columns the view copies, in schema order: every stored column of the
+	// record, or — when the Index declares Cols — the partition, key, version, updated and pinned
+	// columns plus the declared Cols. A Delta() read answers these columns only.
+	StoredColumns []IColInfo
 	// ReplaceThreshold is how many changed or moved records a sync answers before it answers a replace.
 	ReplaceThreshold int
 }

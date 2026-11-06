@@ -1035,7 +1035,7 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 		)
 			WITH caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
 			and compaction = {'class': 'SizeTieredCompactionStrategy'}
-			and compression = {'compression_level': '3', 'sstable_compression': 'org.apache.cassandra.io.compress.ZstdCompressor'}
+			and compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}
 			and dclocal_read_repair_chance = 0
 			and speculative_retry = '99.0PERCENTILE';
 		`
