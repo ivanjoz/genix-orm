@@ -53,139 +53,30 @@ const (
 
 /* Compile */
 
-// compileSchemaDeltaView registers a TypeDelta index and its view. Every Key is pinned, the last one
-// being the one Delta()'s values name; the table's single integer key is the record ID.
+// compileSchemaDeltaView describes a TypeDelta index in db and gives it the materialized view that
+// serves it.
 func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
-	if dbTable.VersionCol == nil || dbTable.VersionCol.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires the managed "%v" column; declare Version in the record and table structs`,
-			dbTable.Name, managedVersionColumnName))
-	}
-	if dbTable.UpdatedCol == nil || dbTable.UpdatedCol.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires the managed "%v" column`, dbTable.Name, managedUpdatedColumnName))
-	}
-	if partitionColumn := dbTable.GetPartKey(); partitionColumn == nil || partitionColumn.IsNil() ||
-		!isIntegerFieldType(partitionColumn.GetType().FieldType) {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires an integer partition column`, dbTable.Name))
-	}
-	if len(dbTable.Keys) != 1 || !isIntegerFieldType(dbTable.Keys[0].GetType().FieldType) {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta requires exactly one integer key column, the record ID. A table keyed otherwise answers its route with db.DeltaReplaceMetadata() instead`,
-			dbTable.Name))
-	}
+	source := dbTable.DescribeDelta(indexCfg)
+	view := &viewInfo{IndexSource: source}
+	deltaIndex := dbTable.DeltaIndexes[len(dbTable.DeltaIndexes)-1]
 
-	replaceThreshold := indexCfg.DeltaReplaceThreshold
-	if replaceThreshold <= 0 {
-		replaceThreshold = cache.DefaultDeltaReplaceThreshold
-	}
-	deltaIndex := db.DeltaIndexInfo{Tag: "all", ReplaceThreshold: replaceThreshold}
-
-	declaredColumns := make([]IColInfo, 0, len(indexCfg.Keys))
-	declaredKeyNames := make([]string, 0, len(indexCfg.Keys))
-	for _, declaredKey := range indexCfg.Keys {
-		column := dbTable.ColumnsMap[declaredKey.GetInfo().Name]
-		if column == nil || column.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta column "%v" was not found`, dbTable.Name, declaredKey.GetInfo().Name))
-		}
-		if column.GetType().IsComplexType || column.GetType().IsSlice ||
-			!db.IsSupportedPackedIndexNumericFieldType(column.GetType().FieldType) {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta key "%v" must be a scalar integer. Found: %v`,
-				dbTable.Name, column.GetName(), column.GetType().FieldType))
-		}
-		if column.GetName() == dbTable.Keys[0].GetName() {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta key "%v" is the table's key, the record ID`, dbTable.Name, column.GetName()))
-		}
-		declaredColumns = append(declaredColumns, column)
-		declaredKeyNames = append(declaredKeyNames, column.GetName())
-	}
-	if len(declaredColumns) > 0 {
-		deltaIndex.Tag = strings.Join(declaredKeyNames, "_")
-		deltaIndex.Pinned = declaredColumns
-	}
-	deltaIndex.ViewName = fmt.Sprintf("%v__dlt_%v_view", dbTable.Name, deltaIndex.Tag)
-
-	// A keyless index packs updated alone: every delta view keys on one packed column.
-	deltaIndex.PinnedSlotBits = dbTable.PlanDeltaPinnedSlots(deltaIndex.Pinned, indexCfg)
-	packedColumnSuffix := managedUpdatedColumnName
-	if len(deltaIndex.Pinned) > 0 {
-		packedColumnSuffix = deltaIndex.Tag
-	}
-	packedColumn := &columnInfo{
-		ColInfo: colInfo{IsVirtual: true, Idx: dbTable.MaxColIdx},
-		ColType: colType{FieldType: "int64", DBType: "bigint"},
-	}
-	packedColumn.GetInfo().Name = "zz_dlt_" + packedColumnSuffix
-	dbTable.MaxColIdx++
-	dbTable.ColumnsMap[packedColumn.GetName()] = packedColumn
-	deltaIndex.PackedColumn = packedColumn
-
-	// An insert carries every pinned value on the record, so this is exact there. An update binds
-	// the value stampDeltaWrites computed from the stored pinned values instead (managedWriteValues).
-	tableName, updatedColumn, compiledIndex := dbTable.Name, dbTable.UpdatedCol, deltaIndex
+	// The described value is the shared unsigned layout; Scylla compares the column as signed, so it
+	// is stored with the top bit flipped (deltaPackedStoredValue).
+	packedColumn := deltaIndex.PackedColumn
+	describedValue := packedColumn.GetValueFn
 	packedColumn.GetValueFn = func(recordPointer unsafe.Pointer) any {
-		pinnedValues := make([]int64, len(compiledIndex.Pinned))
-		for i, pinnedColumn := range compiledIndex.Pinned {
-			pinnedValues[i] = db.ConvertToInt64(pinnedColumn.GetValue(recordPointer))
-		}
-		return deltaPackedStoredValue(compiledIndex, tableName, pinnedValues, db.ConvertToInt64(updatedColumn.GetValue(recordPointer)))
+		return storeVirtualPacked(describedValue(recordPointer).(uint64), false)
 	}
 
-	for _, registered := range dbTable.DeltaIndexes {
-		if registered.ViewName == deltaIndex.ViewName {
-			panic(fmt.Sprintf(`Table "%v": two TypeDelta indexes declare the same Keys (%v)`, dbTable.Name, deltaIndex.Tag))
-		}
-	}
-	dbTable.DeltaIndexes = append(dbTable.DeltaIndexes, deltaIndex)
-	dbTable.views[deltaIndex.ViewName] = makeDeltaViewInfo(dbTable, deltaIndex)
-	if ShouldLog() {
-		fmt.Printf("Delta index registered: table=%s view=%s pinnedSlotBits=%v\n", dbTable.Name, deltaIndex.ViewName, deltaIndex.PinnedSlotBits)
-	}
-}
+	// The view is a range view of the query planner on [partition, pinned…, updated].
+	compilePackedRangeAccessors(view, source.PackedSourceColumns, deltaIndex.SlotBits(), false, dbTable.GetPartKey())
 
-// makeDeltaViewInfo registers an index's view in the query planner as a range view on
-// [partition, pinned…, updated]: an equality on the pinned values is one span of the packed column,
-// and an updated range narrows it.
-func makeDeltaViewInfo(dbTable *ScyllaTable, deltaIndex db.DeltaIndexInfo) *viewInfo {
-	partitionColumn := dbTable.GetPartKey()
-	sourceColumns := append(slices.Clone(deltaIndex.Pinned), dbTable.UpdatedCol)
-	sourceNames := make([]string, len(sourceColumns))
-	for i, sourceColumn := range sourceColumns {
-		sourceNames[i] = sourceColumn.GetName()
-	}
-	view := &viewInfo{
-		IndexSource: &db.IndexSource{
-			Type:                    8,
-			IsDeltaView:             true,
-			Name:                    deltaIndex.ViewName,
-			Column:                  deltaIndex.PackedColumn,
-			Columns:                 append([]string{partitionColumn.GetName()}, sourceNames...),
-			ColumnsNoPart:           sourceNames,
-			PackedSourceColumns:     sourceColumns,
-			PackedSlotBitsPerColumn: deltaIndex.SlotBits(),
-		},
-	}
-	compilePackedRangeAccessors(view, sourceColumns, deltaIndex.SlotBits(), false, partitionColumn)
-
-	storedColumns := deltaViewStoredColumns(dbTable)
-	for _, storedColumn := range storedColumns {
-		view.AvailableColumns = append(view.AvailableColumns, storedColumn.GetName())
-	}
+	storedColumns := dbTable.DeltaStoredColumns()
 	view.getExpectedColumns = func() []viewExpectedColumn {
 		return makeViewExpectedColumns(append(slices.Clone(storedColumns), deltaIndex.PackedColumn))
 	}
 	view.getCreateScript = func() string { return deltaViewCreateScript(*dbTable, deltaIndex, storedColumns) }
-	return view
-}
-
-// deltaViewStoredColumns are the columns a delta view copies: every stored column of the record, in
-// schema order. Delta() and the planner read whole records from the view.
-func deltaViewStoredColumns(dbTable *ScyllaTable) []IColInfo {
-	storedColumns := []IColInfo{}
-	for _, column := range dbTable.ColumnsMap {
-		if !column.GetInfo().IsVirtual && !column.GetInfo().IsComputed {
-			storedColumns = append(storedColumns, column)
-		}
-	}
-	slices.SortFunc(storedColumns, func(left, right IColInfo) int { return int(left.GetInfo().Idx - right.GetInfo().Idx) })
-	return storedColumns
+	dbTable.views[deltaIndex.ViewName] = view
 }
 
 // deltaViewCreateScript is the CREATE of an index's view. The view is ordered newest first: a sync

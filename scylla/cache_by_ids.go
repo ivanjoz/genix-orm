@@ -46,9 +46,7 @@ func configureCacheByIDs(scyllaTable *ScyllaTable) {
 	}
 }
 
-func isIntegerFieldType(fieldType string) bool {
-	return fieldType == "int16" || fieldType == "int32" || fieldType == "int64"
-}
+func isIntegerFieldType(fieldType string) bool { return db.IsIntegerFieldType(fieldType) }
 
 func resolveKeyspace(scyllaTable ScyllaTable) string {
 	if scyllaTable.Namespace != "" {
