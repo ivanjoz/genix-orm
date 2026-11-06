@@ -1,0 +1,183 @@
+[
+  {
+    "step": "first sync",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "dos",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        },
+        {
+          "CompanyID": 7,
+          "ID": 3,
+          "WarehouseID": 5,
+          "Name": "tres",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ],
+      "Metadata": ")HxBQd5trfZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "stored snapshot",
+    "value": {
+      "cursor": 380000000,
+      "readTime": 380000001,
+      "records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "dos",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        },
+        {
+          "CompanyID": 7,
+          "ID": 3,
+          "WarehouseID": 5,
+          "Name": "tres",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ]
+    }
+  },
+  {
+    "step": "served from the snapshot",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno bis",
+          "ss": 1,
+          "upd": 380000200,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "from the snapshot",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        },
+        {
+          "CompanyID": 7,
+          "ID": 3,
+          "WarehouseID": 5,
+          "Name": "tres",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ],
+      "Metadata": ")P]MEd5wgcZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "the merged snapshot was not stored",
+    "value": true
+  },
+  {
+    "step": "after the late write",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno bis",
+          "ss": 1,
+          "upd": 380000200,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "dos bis",
+          "ss": 1,
+          "upd": 379999998,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 3,
+          "WarehouseID": 5,
+          "Name": "tres",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ],
+      "Metadata": ")P]MEd5x,mZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "rewritten snapshot",
+    "value": {
+      "cursor": 380000200,
+      "readTime": 380000220,
+      "records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno bis",
+          "ss": 1,
+          "upd": 380000200,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "dos bis",
+          "ss": 1,
+          "upd": 379999998,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 3,
+          "WarehouseID": 5,
+          "Name": "tres",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ]
+    }
+  }
+]

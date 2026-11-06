@@ -83,6 +83,18 @@ func WipePartition(namespace string, tableID int16, partition int64) error {
 	return gate.ClearPrefix(ctx, table.partitionPrefix(partition))
 }
 
+// WipeKeyspace deletes every key of the connected keyspace: all its tables and its counters. For
+// throwaway keyspaces (the conformance suite resets one before each test).
+func WipeKeyspace() error {
+	gate, err := gateClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := requestContext()
+	defer cancel()
+	return gate.ClearPrefix(ctx, namespacePrefix(connParams.Keyspace))
+}
+
 // Ping checks the daemon answers.
 func Ping() error {
 	gate, err := gateClient()

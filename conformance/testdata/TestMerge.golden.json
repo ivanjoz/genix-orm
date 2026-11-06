@@ -1,0 +1,69 @@
+[
+  {
+    "step": "onUpdate saw the previous names",
+    "value": [
+      "dos",
+      "uno"
+    ]
+  },
+  {
+    "step": "the caller's slice after Merge",
+    "value": [
+      {
+        "CompanyID": 6,
+        "ID": 1,
+        "name": "uno bis",
+        "nameUpper": "",
+        "tags": null
+      },
+      {
+        "CompanyID": 6,
+        "ID": 2,
+        "name": "dos bis",
+        "nameUpper": "",
+        "tags": null
+      },
+      {
+        "CompanyID": 6,
+        "ID": 3,
+        "name": "tres",
+        "nameUpper": "TRES",
+        "tags": [
+          "new"
+        ],
+        "upd": 380000010
+      }
+    ]
+  },
+  {
+    "step": "stored after Merge",
+    "value": [
+      {
+        "CompanyID": 6,
+        "ID": 1,
+        "name": "uno bis",
+        "nameUpper": "UNO BIS",
+        "tags": null,
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 6,
+        "ID": 2,
+        "name": "dos",
+        "nameUpper": "DOS",
+        "tags": null,
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 6,
+        "ID": 3,
+        "name": "tres",
+        "nameUpper": "TRES",
+        "tags": [
+          "new"
+        ],
+        "upd": 380000010
+      }
+    ]
+  }
+]

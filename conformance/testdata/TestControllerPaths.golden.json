@@ -1,0 +1,266 @@
+[
+  {
+    "step": "InsertRecordsJSON count",
+    "value": 3
+  },
+  {
+    "step": "after the JSON insert",
+    "value": [
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "name": "uno",
+        "nameUpper": "UNO",
+        "tags": [
+          "a",
+          "b"
+        ],
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 2,
+        "name": "dos",
+        "nameUpper": "DOS",
+        "tags": null,
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 3,
+        "name": "tres",
+        "nameUpper": "TRES",
+        "tags": [
+          "c"
+        ],
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "UpdateRecordsJSON count",
+    "value": 1
+  },
+  {
+    "step": "after the JSON update",
+    "value": [
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "name": "uno",
+        "nameUpper": "UNO",
+        "tags": [
+          "a",
+          "b"
+        ],
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 2,
+        "name": "dos",
+        "nameUpper": "DOS",
+        "tags": [
+          "z"
+        ],
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 3,
+        "name": "tres",
+        "nameUpper": "TRES",
+        "tags": [
+          "c"
+        ],
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "an update with no columns is refused",
+    "value": true
+  },
+  {
+    "step": "QueryRecordsJSON",
+    "value": {
+      "count": 1,
+      "payload": [
+        {
+          "CompanyID": 0,
+          "ID": 3,
+          "name": "tres",
+          "nameUpper": "",
+          "tags": null
+        }
+      ]
+    }
+  },
+  {
+    "step": "QueryRecordsJSON",
+    "value": {
+      "count": 0,
+      "payload": []
+    }
+  },
+  {
+    "step": "GetRecords element types",
+    "value": [
+      "controllerRecord",
+      "controllerRecord",
+      "controllerRecord"
+    ]
+  },
+  {
+    "step": "GetRecordsGob is not empty",
+    "value": true
+  },
+  {
+    "step": "ExportRecordsColbin rows and batches",
+    "value": [
+      3,
+      2
+    ]
+  },
+  {
+    "step": "RestoreRecordsColbin count",
+    "value": 3
+  },
+  {
+    "step": "after the restore",
+    "value": [
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "name": "uno",
+        "nameUpper": "UNO",
+        "tags": [
+          "a",
+          "b"
+        ],
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 2,
+        "name": "dos",
+        "nameUpper": "DOS",
+        "tags": [
+          "z"
+        ],
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 3,
+        "name": "tres",
+        "nameUpper": "TRES",
+        "tags": [
+          "c"
+        ],
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "after the reload",
+    "value": [
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "name": "uno",
+        "nameUpper": "UNO",
+        "tags": [
+          "a",
+          "b"
+        ],
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 5,
+        "ID": 2,
+        "name": "dos",
+        "nameUpper": "DOS",
+        "tags": [
+          "z"
+        ],
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 5,
+        "ID": 3,
+        "name": "tres",
+        "nameUpper": "TRES",
+        "tags": [
+          "c"
+        ],
+        "upd": 380000010
+      }
+    ]
+  },
+  {
+    "step": "DescribeTable",
+    "value": {
+      "cacheByIDs": false,
+      "columns": [
+        {
+          "name": "company_id",
+          "field": "CompanyID",
+          "json": "CompanyID",
+          "type": "int32",
+          "is_partition": true
+        },
+        {
+          "name": "created",
+          "field": "created",
+          "type": "int32",
+          "is_managed": true
+        },
+        {
+          "name": "id",
+          "field": "ID",
+          "json": "ID",
+          "type": "int32",
+          "is_key": true
+        },
+        {
+          "name": "name",
+          "field": "Name",
+          "json": "name",
+          "type": "string"
+        },
+        {
+          "name": "name_upper",
+          "field": "NameUpper",
+          "json": "nameUpper",
+          "type": "string"
+        },
+        {
+          "name": "tags",
+          "field": "Tags",
+          "json": "tags",
+          "type": "[]string"
+        },
+        {
+          "name": "updated",
+          "field": "Updated",
+          "json": "upd",
+          "type": "int32",
+          "is_managed": true
+        },
+        {
+          "name": "version",
+          "field": "Version",
+          "json": "ver",
+          "type": "int16"
+        }
+      ],
+      "id": 12001,
+      "keys": [
+        "id"
+      ],
+      "name": "conformance_controller_records",
+      "partition": "company_id"
+    }
+  }
+]

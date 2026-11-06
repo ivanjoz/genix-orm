@@ -1,0 +1,229 @@
+[
+  {
+    "step": "global index on email",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 1,
+        "Email": "a@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          1,
+          2
+        ],
+        "Status": 1,
+        "Date": 100,
+        "Name": "uno",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "Email": "a@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 100,
+        "Name": "otra empresa",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "local index on client_id",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 1,
+        "Email": "a@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          1,
+          2
+        ],
+        "Status": 1,
+        "Date": 100,
+        "Name": "uno",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 2,
+        "ID": 2,
+        "Email": "b@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 101,
+        "Name": "dos",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "global index on the tags slice",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 1,
+        "Email": "a@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          1,
+          2
+        ],
+        "Status": 1,
+        "Date": 100,
+        "Name": "uno",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 2,
+        "ID": 2,
+        "Email": "b@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 101,
+        "Name": "dos",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "Email": "a@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 100,
+        "Name": "otra empresa",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "view on status and date",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 2,
+        "Email": "b@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 101,
+        "Name": "dos",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "descending key order with a limit",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 4,
+        "Email": "d@x.pe",
+        "ClientID": 11,
+        "Tags": [],
+        "Status": 1,
+        "Date": 103,
+        "Name": "cuatro",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 2,
+        "ID": 3,
+        "Email": "c@x.pe",
+        "ClientID": 11,
+        "Tags": [
+          3
+        ],
+        "Status": 0,
+        "Date": 101,
+        "Name": "tres",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "global index on email after the update",
+    "value": [
+      {
+        "CompanyID": 5,
+        "ID": 1,
+        "Email": "a@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 100,
+        "Name": "otra empresa",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "global index on the tags slice after the update",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 1,
+        "Email": "z@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          3
+        ],
+        "Status": 1,
+        "Date": 102,
+        "Name": "uno",
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 2,
+        "ID": 3,
+        "Email": "c@x.pe",
+        "ClientID": 11,
+        "Tags": [
+          3
+        ],
+        "Status": 0,
+        "Date": 101,
+        "Name": "tres",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "view on status and date after the update",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 1,
+        "Email": "z@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          3
+        ],
+        "Status": 1,
+        "Date": 102,
+        "Name": "uno",
+        "upd": 380000010
+      }
+    ]
+  },
+  {
+    "step": "view on the old status and date after the update",
+    "value": []
+  }
+]

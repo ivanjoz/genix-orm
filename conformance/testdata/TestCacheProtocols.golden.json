@@ -1,0 +1,152 @@
+[
+  {
+    "step": "by-IDs, nothing held",
+    "value": [
+      {
+        "p": 7,
+        "r": [
+          {
+            "CompanyID": 7,
+            "ID": 1,
+            "WarehouseID": 5,
+            "Name": "uno",
+            "ss": 1,
+            "upd": 380000001,
+            "ver": 1
+          },
+          {
+            "CompanyID": 7,
+            "ID": 2,
+            "WarehouseID": 5,
+            "Name": "dos",
+            "ss": 1,
+            "upd": 380000001,
+            "ver": 1
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step": "by-IDs, holding the current ticks",
+    "value": null
+  },
+  {
+    "step": "first sync",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno bis",
+          "ss": 1,
+          "upd": 380000600,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "dos",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ],
+      "Metadata": ")RCbXd5w|mZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "slice sync",
+    "value": {
+      "Records": [],
+      "Metadata": "(qcOVd5x)oZK0-KcK50)o|\u003e)Z!^XUqX=2oP!03)"
+    }
+  },
+  {
+    "step": "resend of the slice",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "uno bis",
+          "ss": 1,
+          "upd": 380000600,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "dos bis",
+          "ss": 1,
+          "upd": 380000598,
+          "ver": 2
+        }
+      ],
+      "Metadata": "(qcOVd5x)oZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "warehouse 5 after the move",
+    "value": {
+      "Records": [],
+      "Metadata": "(qcOVd5wBZZK0-McK50)o|\u003e)Z!G,KkSicEB!DVA+"
+    }
+  },
+  {
+    "step": "warehouse 6 after a partial update",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 6,
+          "Name": "uno ter",
+          "ss": 1,
+          "upd": 380000800,
+          "ver": 4
+        }
+      ],
+      "Metadata": ")LEkxd5u{3ZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "plain query on warehouse and status",
+    "value": []
+  },
+  {
+    "step": "plain query on warehouse and status",
+    "value": [
+      {
+        "CompanyID": 7,
+        "ID": 1,
+        "WarehouseID": 6,
+        "Name": "uno ter",
+        "ss": 1,
+        "upd": 380000800,
+        "ver": 4
+      }
+    ]
+  },
+  {
+    "step": "40-day-old cursor",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 6,
+          "Name": "uno ter",
+          "ss": 1,
+          "upd": 380000800,
+          "ver": 4
+        }
+      ],
+      "Metadata": "(keXvd5t{pZK0*z!!!!!!!\u003e:h!DVA,"
+    }
+  }
+]

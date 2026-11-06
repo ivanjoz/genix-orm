@@ -1,0 +1,103 @@
+[
+  {
+    "step": "packed keys assigned",
+    "value": [
+      {
+        "CompanyID": 3,
+        "ID": 2814749769254043649,
+        "Date": 20000,
+        "WarehouseID": 1,
+        "Kind": 1,
+        "Name": "a"
+      },
+      {
+        "CompanyID": 3,
+        "ID": 2814749771401527298,
+        "Date": 20000,
+        "WarehouseID": 2,
+        "Kind": 2,
+        "Name": "b"
+      },
+      {
+        "CompanyID": 3,
+        "ID": 2814890506742398977,
+        "Date": 20001,
+        "WarehouseID": 1,
+        "Kind": 1,
+        "Name": "c"
+      }
+    ]
+  },
+  {
+    "step": "sequence keys of company 3",
+    "value": [
+      {
+        "CompanyID": 3,
+        "ID": 1,
+        "Email": "",
+        "ClientID": 0,
+        "Tags": [],
+        "Status": 0,
+        "Date": 0,
+        "Name": "uno",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 3,
+        "ID": 2,
+        "Email": "",
+        "ClientID": 0,
+        "Tags": [],
+        "Status": 0,
+        "Date": 0,
+        "Name": "dos",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 3,
+        "ID": 3,
+        "Email": "",
+        "ClientID": 0,
+        "Tags": [],
+        "Status": 0,
+        "Date": 0,
+        "Name": "tres",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "packed key by ID",
+    "value": [
+      {
+        "CompanyID": 3,
+        "ID": 2814749771401527298,
+        "Date": 20000,
+        "WarehouseID": 2,
+        "Kind": 2,
+        "Name": "b"
+      }
+    ]
+  },
+  {
+    "step": "packed key by local index on kind",
+    "value": [
+      {
+        "CompanyID": 3,
+        "ID": 2814749769254043649,
+        "Date": 20000,
+        "WarehouseID": 1,
+        "Kind": 1,
+        "Name": "a"
+      },
+      {
+        "CompanyID": 3,
+        "ID": 2814890506742398977,
+        "Date": 20001,
+        "WarehouseID": 1,
+        "Kind": 1,
+        "Name": "c"
+      }
+    ]
+  }
+]

@@ -1,0 +1,94 @@
+[
+  {
+    "step": "after the insert",
+    "value": {
+      "p1": {
+        "10": "Polo Nike",
+        "11": "Gorra Puma"
+      },
+      "p2": {
+        "20": "Polo Lacoste"
+      }
+    }
+  },
+  {
+    "step": "after an update of name",
+    "value": {
+      "p1": {
+        "10": "Polo Pique Nike",
+        "11": "Gorra Puma"
+      },
+      "p2": {
+        "20": "Polo Lacoste"
+      }
+    }
+  },
+  {
+    "step": "after an update of price",
+    "value": {
+      "p1": {
+        "10": "Polo Pique Nike",
+        "11": "Gorra Puma"
+      },
+      "p2": {
+        "20": "Polo Lacoste"
+      }
+    }
+  },
+  {
+    "step": "after status 0",
+    "value": {
+      "p1": {
+        "10": "Polo Pique Nike"
+      },
+      "p2": {
+        "20": "Polo Lacoste"
+      }
+    }
+  },
+  {
+    "step": "after reactivating 12 with Merge",
+    "value": {
+      "p1": {
+        "10": "Polo Pique Nike",
+        "12": "Casaca Adidas"
+      },
+      "p2": {
+        "20": "Polo Lacoste"
+      }
+    }
+  },
+  {
+    "step": "SearchText polo",
+    "value": {
+      "hits": [
+        {
+          "id": 10,
+          "s": 1
+        }
+      ],
+      "records": [
+        {
+          "CompanyID": 1,
+          "ID": 10,
+          "Name": "Polo Pique",
+          "Brand": "Nike",
+          "Price": 0,
+          "Status": 1
+        }
+      ]
+    }
+  },
+  {
+    "step": "after ReindexTextSearchAll",
+    "value": {
+      "p1": {
+        "10": "Polo Pique Nike",
+        "12": "Casaca Adidas"
+      },
+      "p2": {
+        "20": "Polo Lacoste"
+      }
+    }
+  }
+]

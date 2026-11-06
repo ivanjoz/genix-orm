@@ -1,0 +1,125 @@
+[
+  {
+    "step": "still settling",
+    "value": [
+      {
+        "ig": -9127,
+        "id": -111042848,
+        "igVal": [
+          101
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 101,
+            "Name": "c",
+            "upd": 380000000
+          }
+        ],
+        "lw": 0
+      },
+      {
+        "ig": -9127,
+        "id": 447373267,
+        "igVal": [
+          100
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "Name": "a",
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "Name": "b",
+            "upd": 380000000
+          }
+        ],
+        "lw": 0
+      }
+    ]
+  },
+  {
+    "step": "settled",
+    "value": [
+      {
+        "ig": -9127,
+        "id": -111042848,
+        "igVal": [
+          101
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 101,
+            "Name": "c",
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -9127,
+        "id": 447373267,
+        "igVal": [
+          100
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "Name": "a",
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "Name": "b",
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "holding date 100",
+    "value": [
+      {
+        "ig": -9127,
+        "id": -111042848,
+        "igVal": [
+          101
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 101,
+            "Name": "c",
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -9127,
+        "id": 447373267,
+        "igVal": [
+          100
+        ],
+        "records": [],
+        "lw": 380000000
+      }
+    ]
+  }
+]

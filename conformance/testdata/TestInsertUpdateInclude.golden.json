@@ -1,0 +1,27 @@
+[
+  {
+    "step": "stored after InsertUpdateInclude",
+    "value": [
+      {
+        "CompanyID": 4,
+        "ID": 1,
+        "name": "uno bis",
+        "nameUpper": "UNO",
+        "tags": [
+          "a"
+        ],
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 4,
+        "ID": 2,
+        "name": "dos",
+        "nameUpper": "DOS",
+        "tags": [
+          "b"
+        ],
+        "upd": 380000010
+      }
+    ]
+  }
+]

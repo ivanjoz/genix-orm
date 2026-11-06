@@ -1,0 +1,62 @@
+[
+  {
+    "step": "first projected sync",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 5,
+          "Name": "",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ],
+      "Metadata": ")HxBQd5trfZK0*z!!!!!!!\u003e:h!03)"
+    }
+  },
+  {
+    "step": "the unprojected snapshot was not written",
+    "value": true
+  },
+  {
+    "step": "projected snapshot files",
+    "value": 1
+  },
+  {
+    "step": "served from the projected snapshot",
+    "value": {
+      "Records": [
+        {
+          "CompanyID": 7,
+          "ID": 1,
+          "WarehouseID": 5,
+          "Name": "",
+          "ss": 1,
+          "upd": 380000200,
+          "ver": 2
+        },
+        {
+          "CompanyID": 7,
+          "ID": 2,
+          "WarehouseID": 99,
+          "Name": "",
+          "ss": 1,
+          "upd": 380000000,
+          "ver": 1
+        }
+      ],
+      "Metadata": ")P]MEd5wgcZK0*z!!!!!!!\u003e:h!03)"
+    }
+  }
+]
