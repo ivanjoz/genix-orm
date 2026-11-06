@@ -467,7 +467,7 @@ func buildIndexGroupFetchQuery(
 				Value:    fetchState.indexGroupValues[columnIndex],
 			})
 		}
-		rewrittenStatements, canRewrite := buildKeyIntPackingStatements(keyStatements, scyllaTable)
+		rewrittenStatements, canRewrite := scyllaTable.BuildKeyIntPackingStatements(keyStatements)
 		if !canRewrite || len(rewrittenStatements) == 0 {
 			panic(fmt.Sprintf(`QueryIndexGroup: TypeCacheGroupFromKey fetch could not rewrite keys for table "%v"`, scyllaTable.Name))
 		}

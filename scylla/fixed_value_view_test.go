@@ -479,7 +479,7 @@ func TestNarrowLocalIndexBeatsPackedViewPrefix(t *testing.T) {
 	query.Status.Equals(int8(1))
 	query.RegistryNumber.Equals("20512345678")
 
-	bestCapability := MatchQueryCapability(collectSelectStatements(query.GetTableInfo()), scyllaTable.capabilities)
+	bestCapability := db.MatchQueryCapability(collectSelectStatements(query.GetTableInfo()), scyllaTable.capabilities)
 	if bestCapability == nil || bestCapability.Source == nil {
 		t.Fatalf("expected a capability match, got %+v", bestCapability)
 	}

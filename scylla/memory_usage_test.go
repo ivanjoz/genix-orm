@@ -436,7 +436,7 @@ func TestStructSizes(t *testing.T) {
 	t.Logf("colInfo size: %d bytes", unsafe.Sizeof(colInfo{}))
 	t.Logf("columnInfo size: %d bytes", unsafe.Sizeof(columnInfo{}))
 	t.Logf("viewInfo size: %d bytes", unsafe.Sizeof(viewInfo{}))
-	t.Logf("QueryCapability size: %d bytes", unsafe.Sizeof(QueryCapability{}))
+	t.Logf("db.QueryCapability size: %d bytes", unsafe.Sizeof(db.QueryCapability{}))
 
 	// Create a sample columnInfo to measure actual allocation
 	sampleCol := &columnInfo{

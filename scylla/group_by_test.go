@@ -243,55 +243,6 @@ func TestBuildNativeGroupByPlanSupportsMax(t *testing.T) {
 	}
 }
 
-// A packed key that turns project_id into an ID range outranks the view by priority, but leaves
-// status uncovered: Scylla refuses that as a filter, so the covering view must win.
-func TestMatchQueryCapabilityPrefersCoverageOverPriority(t *testing.T) {
-	capabilities := []QueryCapability{
-		{Signature: "company_id|=|project_id|=", Priority: 400, IsKey: true},
-		{
-			Signature: "company_id|=|project_id|=|status|=",
-			Priority:  360,
-			Source:    &viewInfo{IndexSource: &db.IndexSource{Name: "projects_epic__dlt_project_id_status_view"}},
-		},
-	}
-	statements := []ColumnStatement{
-		{Col: "company_id", Operator: "=", Value: 1},
-		{Col: "project_id", Operator: "=", Value: 1},
-		{Col: "status", Operator: "=", Value: 1},
-	}
-
-	bestCapability := MatchQueryCapability(statements, capabilities)
-	if bestCapability == nil || bestCapability.Signature != "company_id|=|project_id|=|status|=" {
-		t.Fatalf("expected the view covering status, got %+v", bestCapability)
-	}
-}
-
-func TestMatchQueryCapabilityReturnsSelectedCapability(t *testing.T) {
-	capabilities := []QueryCapability{
-		{Signature: "empresa_id|=", Priority: 10, IsKey: true},
-		{
-			Signature: "empresa_id|=|status|=",
-			Priority:  25,
-			Source:    &viewInfo{IndexSource: &db.IndexSource{Name: "product_supply__status_view"}},
-		},
-	}
-	statements := []ColumnStatement{
-		{Col: "empresa_id", Operator: "=", Value: 1},
-		{Col: "status", Operator: "=", Value: 1},
-	}
-
-	bestCapability := MatchQueryCapability(statements, capabilities)
-	if bestCapability == nil {
-		t.Fatal("expected a capability match")
-	}
-	if bestCapability.Signature != "empresa_id|=|status|=" {
-		t.Fatalf("unexpected capability selected: %s", bestCapability.Signature)
-	}
-	if bestCapability.Source == nil || bestCapability.Source.Name != "product_supply__status_view" {
-		t.Fatalf("unexpected capability source: %+v", bestCapability.Source)
-	}
-}
-
 func TestVirtualViewWithoutProjectedColsKeepsFullSelectablePayload(t *testing.T) {
 	scyllaTable := MakeScyllaTable[fullViewRecord, fullViewSchema]()
 
@@ -353,7 +304,7 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 	query.Status.Equals(6)
 	query.Updated.GreaterEqual(0)
 
-	bestCapability := MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
+	bestCapability := db.MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
 	if bestCapability == nil {
 		t.Fatal("expected a packed view capability match")
 	}
@@ -361,12 +312,12 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 		t.Fatalf("expected a packed range view, got %+v", bestCapability.Source)
 	}
 
-	whereStatements := bestCapability.Source.prepareWhereClauses(query.GetTableInfo().Statements...)
+	whereStatements := scyllaTable.viewOfSource(bestCapability.Source).prepareWhereClauses(query.GetTableInfo().Statements...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}
 
-	packedView := bestCapability.Source
+	packedView := scyllaTable.viewOfSource(bestCapability.Source)
 	expectedLowerBound := storedPackedValue(packedView, false, 6, 0)
 	expectedUpperBound := storedPackedValue(packedView, true, 6)
 	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
@@ -392,7 +343,7 @@ func TestInt32PackedViewBoundsAreSignFlippedInt32s(t *testing.T) {
 	query.StatusTrace.Equals(9)
 	query.Updated.GreaterEqual(38768176)
 
-	bestCapability := MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
+	bestCapability := db.MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
 	if bestCapability == nil || bestCapability.Source == nil || bestCapability.Source.Type != 8 {
 		t.Fatalf("expected an int32 packed range view, got %+v", bestCapability)
 	}
@@ -400,12 +351,12 @@ func TestInt32PackedViewBoundsAreSignFlippedInt32s(t *testing.T) {
 		t.Fatal("expected int32 packed range views to skip post-filtering")
 	}
 
-	whereStatements := bestCapability.Source.prepareWhereClauses(query.GetTableInfo().Statements...)
+	whereStatements := scyllaTable.viewOfSource(bestCapability.Source).prepareWhereClauses(query.GetTableInfo().Statements...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}
 
-	packedView := bestCapability.Source
+	packedView := scyllaTable.viewOfSource(bestCapability.Source)
 	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
 		packedView.Column.GetName(),
 		packedView.Column.GetName(),

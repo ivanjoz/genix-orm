@@ -183,7 +183,7 @@ func computeSelectShapeHash(tableInfo *TableInfo, scyllaTable ScyllaTable) uint6
 
 	for _, statement := range collectSelectStatements(tableInfo) {
 		writeText(statement.Col)
-		writeText(capabilityOpForStatement(statement))
+		writeText(db.CapabilityOpForStatement(statement))
 
 		switch statement.Operator {
 		case "IN":
@@ -379,367 +379,6 @@ func buildRemainingStatementsForCompositePlan(statements []ColumnStatement, comp
 	return remainingStatements
 }
 
-func canRewriteKeyConcatenated(statements []ColumnStatement, scyllaTable ScyllaTable) bool {
-	_, canRewrite := buildKeyConcatenatedStatements(statements, scyllaTable)
-	return canRewrite
-}
-
-func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable ScyllaTable) ([]ColumnStatement, bool) {
-	// Convert equality/range prefixes on smart concatenated keys into one physical PK predicate plus residual filters.
-	keyCol := scyllaTable.Keys[0]
-	hasKeyColQuery := false
-	for _, st := range statements {
-		if st.Col == keyCol.GetName() {
-			hasKeyColQuery = true
-			break
-		}
-	}
-	if hasKeyColQuery || len(scyllaTable.KeyConcatenated) == 0 {
-		return nil, false
-	}
-
-	prefixValues := []any{}
-	var rangeStatement *ColumnStatement
-	handledColumns := map[string]bool{}
-
-	for _, concatCol := range scyllaTable.KeyConcatenated {
-		found := false
-		for statementIndex := range statements {
-			statement := statements[statementIndex]
-			if statement.Col != concatCol.GetName() {
-				continue
-			}
-			if statement.Operator == "=" {
-				prefixValues = append(prefixValues, statement.Value)
-				handledColumns[statement.Col] = true
-				found = true
-				break
-			}
-			if slices.Contains(rangeOperators, statement.Operator) || statement.Operator == "BETWEEN" {
-				rangeStatement = &statements[statementIndex]
-				handledColumns[statement.Col] = true
-				found = true
-				break
-			}
-		}
-		if !found || rangeStatement != nil {
-			break
-		}
-	}
-
-	if len(prefixValues) == 0 && rangeStatement == nil {
-		return nil, false
-	}
-
-	prefixValueText := ""
-	if len(prefixValues) > 0 {
-		prefixValueText = MakeKeyConcat(prefixValues...)
-	}
-
-	var rewrittenStatement ColumnStatement
-	if rangeStatement == nil {
-		if len(prefixValues) == len(scyllaTable.KeyConcatenated) {
-			rewrittenStatement = ColumnStatement{Col: keyCol.GetName(), Operator: "=", Value: prefixValueText}
-		} else {
-			rewrittenStatement = ColumnStatement{
-				Col:      keyCol.GetName(),
-				Operator: "BETWEEN",
-				From:     []ColumnStatement{{Col: keyCol.GetName(), Value: prefixValueText + KeyConcatSeparator}},
-				To:       []ColumnStatement{{Col: keyCol.GetName(), Value: prefixValueText + KeyConcatSeparator + "\uffff"}},
-			}
-		}
-	} else {
-		if rangeStatement.Operator == "BETWEEN" {
-			valueFrom := MakeKeyConcat(append(prefixValues, rangeStatement.From[0].Value)...)
-			valueTo := MakeKeyConcat(append(prefixValues, rangeStatement.To[0].Value)...)
-			rewrittenStatement = ColumnStatement{
-				Col:      keyCol.GetName(),
-				Operator: "BETWEEN",
-				From:     []ColumnStatement{{Col: keyCol.GetName(), Value: valueFrom}},
-				To:       []ColumnStatement{{Col: keyCol.GetName(), Value: valueTo + "\uffff"}},
-			}
-		} else if rangeTransform, ok := smartRangeMap[rangeStatement.Operator]; ok {
-			rangeValue := MakeKeyConcat(append(prefixValues, rangeStatement.Value)...)
-			prefixMin, prefixMax := "", "\uffff"
-			if prefixValueText != "" {
-				prefixMin = prefixValueText + KeyConcatSeparator
-				prefixMax = prefixValueText + KeyConcatSeparator + "\uffff"
-			}
-			fromValue := rangeTransform.from(rangeValue, prefixMin, prefixMax)
-			toValue := rangeTransform.to(rangeValue, prefixMin, prefixMax)
-			rewrittenStatement = ColumnStatement{Col: keyCol.GetName(), Operator: "BETWEEN"}
-			if fromValue != "" {
-				rewrittenStatement.From = append(rewrittenStatement.From, ColumnStatement{Col: keyCol.GetName(), Operator: ">=", Value: fromValue})
-			}
-			if toValue != "" {
-				rewrittenStatement.To = append(rewrittenStatement.To, ColumnStatement{Col: keyCol.GetName(), Operator: "<", Value: toValue})
-			}
-		}
-	}
-
-	rewrittenStatements := []ColumnStatement{rewrittenStatement}
-	for _, statement := range statements {
-		if !handledColumns[statement.Col] {
-			rewrittenStatements = append(rewrittenStatements, statement)
-		}
-	}
-
-	return rewrittenStatements, true
-}
-
-func canRewriteKeyIntPacking(statements []ColumnStatement, scyllaTable ScyllaTable) bool {
-	_, canRewrite := buildKeyIntPackingStatements(statements, scyllaTable)
-	return canRewrite
-}
-
-func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable ScyllaTable) ([]ColumnStatement, bool) {
-	// Convert equality/range prefixes on packed numeric keys into one physical PK predicate plus residual filters.
-	keyCol := scyllaTable.Keys[0]
-	hasKeyColQuery := false
-	for _, st := range statements {
-		if st.Col == keyCol.GetName() {
-			hasKeyColQuery = true
-			break
-		}
-	}
-	if hasKeyColQuery || len(scyllaTable.KeyIntPacking) == 0 {
-		return nil, false
-	}
-
-	prefixValues := []any{}
-	var rangeStatement *ColumnStatement
-	handledColumns := map[string]bool{}
-
-	for _, packedCol := range scyllaTable.KeyIntPacking {
-		colName := packedCol.GetName()
-		if colName == "autoincrement_placeholder" {
-			break
-		}
-
-		found := false
-		for statementIndex := range statements {
-			statement := statements[statementIndex]
-			if statement.Col != colName {
-				continue
-			}
-			if statement.Operator == "=" {
-				prefixValues = append(prefixValues, statement.Value)
-				handledColumns[statement.Col] = true
-				found = true
-				break
-			}
-			if slices.Contains(rangeOperators, statement.Operator) || statement.Operator == "BETWEEN" {
-				rangeStatement = &statements[statementIndex]
-				handledColumns[statement.Col] = true
-				found = true
-				break
-			}
-		}
-
-		if !found || rangeStatement != nil {
-			break
-		}
-	}
-
-	if len(prefixValues) == 0 && rangeStatement == nil {
-		return nil, false
-	}
-
-	// The pinned prefix spans one contiguous block of the key; the bounds are inclusive and go
-	// straight into a BETWEEN.
-	makePackedRange := func(values []any, rangeStatement *ColumnStatement) (int64, int64, bool) {
-		slotBits := scyllaTable.KeyIntPackingSlotBits
-		prefix := make([]int64, 0, len(slotBits))
-		for _, value := range values {
-			prefix = append(prefix, db.ConvertToInt64(value))
-		}
-		if len(prefix) == len(slotBits) {
-			packedKey := int64(db.PackSlotValues(prefix, slotBits))
-			return packedKey, packedKey, true
-		}
-
-		fromPrefix, toPrefix := prefix, prefix
-		if rangeStatement != nil {
-			if rangeStatement.Operator == "BETWEEN" {
-				fromPrefix = append(slices.Clone(prefix), db.ConvertToInt64(rangeStatement.From[0].Value))
-				toPrefix = append(slices.Clone(prefix), db.ConvertToInt64(rangeStatement.To[0].Value))
-			} else {
-				// Any other range operator scans the block of its own value.
-				fromPrefix = append(slices.Clone(prefix), db.ConvertToInt64(rangeStatement.Value))
-				toPrefix = fromPrefix
-			}
-		}
-		fromValue := int64(db.PackSlotPrefixBound(fromPrefix, slotBits, false))
-		toValue := int64(db.PackSlotPrefixBound(toPrefix, slotBits, true))
-		return fromValue, toValue, false
-	}
-
-	fromValue, toValue, isEquality := makePackedRange(prefixValues, rangeStatement)
-
-	rewrittenStatement := ColumnStatement{
-		Col:      keyCol.GetName(),
-		Operator: "=",
-		Value:    fromValue,
-	}
-	if !isEquality {
-		rewrittenStatement = ColumnStatement{
-			Col:      keyCol.GetName(),
-			Operator: "BETWEEN",
-			From:     []ColumnStatement{{Col: keyCol.GetName(), Value: fromValue}},
-			To:       []ColumnStatement{{Col: keyCol.GetName(), Value: toValue}},
-		}
-	}
-
-	rewrittenStatements := []ColumnStatement{rewrittenStatement}
-	for _, statement := range statements {
-		if !handledColumns[statement.Col] {
-			rewrittenStatements = append(rewrittenStatements, statement)
-		}
-	}
-
-	return rewrittenStatements, true
-}
-
-// maxFixedValueFanoutPerColumn is the widest declared value set the planner will enumerate to fill
-// a gap in an index key prefix.
-const maxFixedValueFanoutPerColumn = 8
-
-// maxFixedValueFanoutQueries caps the product of the enumerated sets, which is how many parallel
-// queries the fan-out costs. It matches the concurrency limit executeBoundSelectQueries runs under,
-// so a fanned-out read never queues against itself.
-const maxFixedValueFanoutQueries = 8
-
-// buildFixedValueFanoutStatements synthesizes an IN predicate for every unconstrained column whose
-// FixedValues enumerate a small, closed set.
-//
-// An index whose key prefix has a gap at such a column is still reachable: enumerating the column
-// is logically identical to leaving it open, and each resulting value group is one contiguous range
-// over the key. Without this the planner drops to a base-table read that Scylla rejects unless the
-// caller allows filtering — a query pinning only the trailing half of a delta view's keys being the
-// motivating case.
-func buildFixedValueFanoutStatements(statements []ColumnStatement, scyllaTable ScyllaTable) []ColumnStatement {
-	if len(scyllaTable.FixedValueRanges) == 0 {
-		return nil
-	}
-
-	constrainedColumns := map[string]bool{}
-	for _, statement := range statements {
-		constrainedColumns[statement.Col] = true
-		for _, betweenStatement := range statement.From {
-			constrainedColumns[betweenStatement.Col] = true
-		}
-	}
-
-	fanoutStatements := []ColumnStatement{}
-	plannedQueryCount := 1
-	// Walking the table's columns rather than the fixedValueRanges map keeps the synthesized order
-	// stable, which the statement indexes cached on SelectStatement depend on.
-	for _, column := range scyllaTable.Columns {
-		columnName := column.GetName()
-		if constrainedColumns[columnName] {
-			continue
-		}
-		valueRange, isDeclared := scyllaTable.FixedValueRanges[columnName]
-		if !isDeclared || len(valueRange.DeclaredValues) == 0 ||
-			len(valueRange.DeclaredValues) > maxFixedValueFanoutPerColumn ||
-			plannedQueryCount*len(valueRange.DeclaredValues) > maxFixedValueFanoutQueries {
-			continue
-		}
-		plannedQueryCount *= len(valueRange.DeclaredValues)
-
-		fanoutValues := make([]any, 0, len(valueRange.DeclaredValues))
-		for _, declaredValue := range valueRange.DeclaredValues {
-			fanoutValues = append(fanoutValues, db.NarrowInt64ToColumnWidth(declaredValue, column))
-		}
-		fanoutStatements = append(fanoutStatements, ColumnStatement{
-			Col: columnName, Operator: "IN", Values: fanoutValues,
-		})
-	}
-
-	return fanoutStatements
-}
-
-// countSignatureCoveredQueryColumns counts how many of the query's own predicate columns a
-// capability constrains. Columns the fan-out synthesized are deliberately not counted: a signature
-// that only grew by them constrains nothing the caller asked for, so it buys no selectivity while
-// still costing one query per enumerated value.
-func countSignatureCoveredQueryColumns(capability *QueryCapability, statements []ColumnStatement) int {
-	if capability == nil {
-		return 0
-	}
-
-	signatureParts := strings.Split(capability.Signature, "|")
-	coveredColumns := make(map[string]bool, len(signatureParts)/2)
-	for partIndex := 0; partIndex < len(signatureParts); partIndex += 2 {
-		coveredColumns[signatureParts[partIndex]] = true
-	}
-
-	coveredCount := 0
-	for _, statement := range statements {
-		if coveredColumns[statement.Col] {
-			coveredCount++
-		}
-	}
-	return coveredCount
-}
-
-// applyFixedValueFanout retries capability matching with the synthesized predicates and keeps them
-// only when they let an index bind strictly more of the query's own predicates. It returns the
-// capability to compile against and the predicates that must be appended to the statement list.
-func applyFixedValueFanout(statements []ColumnStatement, baseCapability *QueryCapability,
-	scyllaTable ScyllaTable) (*QueryCapability, []ColumnStatement) {
-
-	candidateStatements := buildFixedValueFanoutStatements(statements, scyllaTable)
-	if len(candidateStatements) == 0 {
-		return baseCapability, nil
-	}
-
-	fannedCapability := MatchQueryCapability(append(slices.Clone(statements), candidateStatements...),
-		scyllaTable.capabilities)
-	// A base-key capability is excluded outright: the key rewrite paths read equality and range
-	// predicates only, so a synthesized IN would survive as a plain filter.
-	if fannedCapability == nil || fannedCapability.Source == nil {
-		return baseCapability, nil
-	}
-	// Coverage, not capability priority, is what decides this. Priority ranks a longer packed-key
-	// prefix above a shorter one, but both are one contiguous range over the same column — reaching
-	// the longer one by enumerating a gap costs several queries and returns the very same rows. The
-	// fan-out only pays for itself when it rescues a predicate that would otherwise be left as a
-	// filter Scylla refuses to run.
-	if countSignatureCoveredQueryColumns(fannedCapability, statements) <=
-		countSignatureCoveredQueryColumns(baseCapability, statements) {
-		return baseCapability, nil
-	}
-
-	// A synthesized predicate the chosen source cannot bind would land in remainingStatements as
-	// the very filter this is meant to avoid, so only the bindable ones are kept.
-	fanoutStatements := []ColumnStatement{}
-	fanoutColumnNames := []string{}
-	for _, candidateStatement := range candidateStatements {
-		if slices.Contains(fannedCapability.Source.Columns, candidateStatement.Col) {
-			fanoutStatements = append(fanoutStatements, candidateStatement)
-			fanoutColumnNames = append(fanoutColumnNames, candidateStatement.Col)
-		}
-	}
-	if len(fanoutStatements) == 0 {
-		return baseCapability, nil
-	}
-
-	fanoutQueryCount := 1
-	for _, fanoutStatement := range fanoutStatements {
-		fanoutQueryCount *= len(fanoutStatement.Values)
-	}
-	baseSignature := "none"
-	if baseCapability != nil {
-		baseSignature = baseCapability.Signature
-	}
-	fmt.Printf("FixedValues fanout applied: table=%s columns=%v queries=%d signature=%s (was %s, covering %d of %d predicates)\n",
-		scyllaTable.Name, fanoutColumnNames, fanoutQueryCount, fannedCapability.Signature, baseSignature,
-		countSignatureCoveredQueryColumns(baseCapability, statements), len(statements))
-
-	return fannedCapability, fanoutStatements
-}
-
 func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*SelectStatement, error) {
 	statements := collectSelectStatements(tableInfo)
 	selectShapeHash := computeSelectShapeHash(tableInfo, scyllaTable)
@@ -811,8 +450,8 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 		return compiledStatement, nil
 	}
 
-	bestCapability := MatchQueryCapability(statements, scyllaTable.capabilities)
-	bestCapability, fanoutStatements := applyFixedValueFanout(statements, bestCapability, scyllaTable)
+	bestCapability := db.MatchQueryCapability(statements, scyllaTable.capabilities)
+	bestCapability, fanoutStatements := scyllaTable.ApplyFixedValueFanout(statements, bestCapability, scyllaTable.capabilities)
 	if len(fanoutStatements) > 0 {
 		// The fan-out predicates take part in planning from here on, so they must sit in the
 		// statement list the cached indexes are computed against.
@@ -822,7 +461,7 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 
 	if bestCapability != nil {
 		if bestCapability.Source != nil {
-			selectedView := bestCapability.Source
+			selectedView := scyllaTable.viewOfSource(bestCapability.Source)
 			// Index group views (Type 3) query the main table via a virtual hash column;
 			// projected views (Type >= 6) redirect to a separate view table.
 			hasAccessPlanner := db.HasAccessPlanner(selectedView.IndexSource)
@@ -878,9 +517,9 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 				}
 			}
 		} else if bestCapability.IsKey {
-			if canRewriteKeyConcatenated(statements, scyllaTable) {
+			if _, canRewrite := scyllaTable.BuildKeyConcatenatedStatements(statements); canRewrite {
 				compiledStatement.route = selectRouteKeyConcatenated
-			} else if canRewriteKeyIntPacking(statements, scyllaTable) {
+			} else if _, canRewrite := scyllaTable.BuildKeyIntPackingStatements(statements); canRewrite {
 				compiledStatement.route = selectRouteKeyIntPacking
 			}
 		}
@@ -922,13 +561,13 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 			return nil, fmt.Errorf(`view "%v" cannot serve this query's predicates`, e.sourceView.Name)
 		}
 	case selectRouteKeyConcatenated:
-		rewrittenStatements, canRewrite := buildKeyConcatenatedStatements(statements, scyllaTable)
+		rewrittenStatements, canRewrite := scyllaTable.BuildKeyConcatenatedStatements(statements)
 		if !canRewrite {
 			return nil, fmt.Errorf("key concatenated select shape no longer matches the cached route")
 		}
 		remainingStatements = rewrittenStatements
 	case selectRouteKeyIntPacking:
-		rewrittenStatements, canRewrite := buildKeyIntPackingStatements(statements, scyllaTable)
+		rewrittenStatements, canRewrite := scyllaTable.BuildKeyIntPackingStatements(statements)
 		if !canRewrite {
 			return nil, fmt.Errorf("key int packing select shape no longer matches the cached route")
 		}

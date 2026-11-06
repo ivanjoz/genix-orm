@@ -82,8 +82,8 @@ func TestDeltaIndexCompilesAFullViewInThePlanner(t *testing.T) {
 		view      *viewInfo
 		signature string
 	}{{statusView, "company_id|=|status|="}, {warehouseView, "company_id|=|warehouse_id|="}, {warehouseView, "company_id|=|warehouse_id|=|status|="}} {
-		if !slices.ContainsFunc(scyllaTable.capabilities, func(capability QueryCapability) bool {
-			return capability.Source == served.view && capability.Signature == served.signature
+		if !slices.ContainsFunc(scyllaTable.capabilities, func(capability db.QueryCapability) bool {
+			return capability.Source == served.view.IndexSource && capability.Signature == served.signature
 		}) {
 			t.Fatalf("expected %s served by %s", served.signature, served.view.Name)
 		}

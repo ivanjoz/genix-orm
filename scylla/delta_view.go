@@ -317,7 +317,7 @@ func writeDeltaMoves(scyllaTable ScyllaTable, moves []deltaMove) error {
 // resolveDeltaPrefixes lists the pinned prefixes a Delta() read covers on an index. Each pinned
 // column takes its equality value, or — the last one — the values Delta() names, or else every
 // value its FixedValues enumerates; their combinations are the prefixes. ok is false when a column
-// has none of them, or when the enumerated fan-out passes maxFixedValueFanoutQueries.
+// has none of them, or when the enumerated fan-out passes db.MaxFixedValueFanoutQueries.
 // equalityCount is how many pinned columns the query's own equalities fixed.
 func resolveDeltaPrefixes(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, equalityValues map[string]any, deltaValues []int64) (prefixes [][]int64, equalityCount int, ok bool) {
 	if len(deltaValues) > 0 && len(deltaIndex.Pinned) == 0 {
@@ -347,7 +347,7 @@ func resolveDeltaPrefixes(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo,
 		}
 		prefixes = combined
 	}
-	if enumeratedQueries > maxFixedValueFanoutQueries {
+	if enumeratedQueries > db.MaxFixedValueFanoutQueries {
 		return nil, 0, false
 	}
 	return prefixes, equalityCount, true
@@ -374,7 +374,7 @@ func selectDeltaIndex(scyllaTable ScyllaTable, equalityValues map[string]any, de
 	}
 	if selectedPosition < 0 {
 		return db.DeltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() found no TypeDelta index whose Keys all resolve: each needs an equality, the Delta() values (the last one), or an enumerable FixedValues (at most %d queries)`,
-			scyllaTable.Name, maxFixedValueFanoutQueries)
+			scyllaTable.Name, db.MaxFixedValueFanoutQueries)
 	}
 	if isAmbiguous {
 		return db.DeltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() fits several TypeDelta indexes equally: pin one more Keys column, or drop an index`, scyllaTable.Name)
@@ -494,7 +494,7 @@ type deltaPrefixRead struct {
 // a fanned-out select.
 func readDeltaPrefixes(prefixes [][]int64, reads []deltaPrefixRead, readPrefix func(prefix []int64, read *deltaPrefixRead) error) error {
 	group := errgroup.Group{}
-	group.SetLimit(maxFixedValueFanoutQueries)
+	group.SetLimit(db.MaxFixedValueFanoutQueries)
 	for prefixIndex, prefix := range prefixes {
 		group.Go(func() error { return readPrefix(prefix, &reads[prefixIndex]) })
 	}

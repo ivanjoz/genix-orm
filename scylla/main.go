@@ -24,7 +24,7 @@ type ScyllaTable struct {
 	// readConsistency overrides the cluster's LocalOne on the copy of the table one read runs with:
 	// the cache reads use LocalQuorum. Zero keeps the session default.
 	readConsistency   gocql.Consistency
-	capabilities      []QueryCapability
+	capabilities      []db.QueryCapability
 	indexUpdatedTable *indexUpdatedTableInfo
 	// dataFrames is nil unless the schema declares DataFrames (data_frame.go).
 	dataFrames *dataFrameInfo
@@ -191,4 +191,12 @@ func nextCounterRange(storedCounterValue int64, increment int) (int64, int64) {
 type SeqValue struct {
 	ID      int64 `db:"id"`
 	SeqPart int64 `db:"seq_part"`
+}
+
+// viewOfSource returns the materialized view or index wrapping a compiled IndexSource.
+func (dbTable *ScyllaTable) viewOfSource(source *db.IndexSource) *viewInfo {
+	if view := dbTable.indexes[source.Name]; view != nil {
+		return view
+	}
+	return dbTable.views[source.Name]
 }

@@ -13,37 +13,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type smartRangeDef struct {
-	from func(v, min, max string) string
-	to   func(v, min, max string) string
-}
-
-var smartRangeMap = map[string]smartRangeDef{
-	">=": {
-		from: func(v, min, max string) string { return v },
-		to:   func(v, min, max string) string { return max },
-	},
-	">": {
-		from: func(v, min, max string) string { return v + "\uffff" },
-		to:   func(v, min, max string) string { return max },
-	},
-	"<=": {
-		from: func(v, min, max string) string { return min },
-		to:   func(v, min, max string) string { return v + "\uffff" },
-	},
-	"<": {
-		from: func(v, min, max string) string { return min },
-		to:   func(v, min, max string) string { return v },
-	},
-}
-
-type posibleIndex struct {
-	indexView    *viewInfo
-	colsIncluded []int16
-	colsMissing  []int16
-	priority     int8
-}
-
 // compositeBucketQueryPlan captures the generated indexed where-clauses plus source statements to keep for final exact filtering.
 type compositeBucketQueryPlan struct {
 	whereStatements  []boundWhereClause
