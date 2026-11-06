@@ -12,6 +12,17 @@ import (
 
 // The live tests run against a fdbgate daemon (fdb/container): GENIX_FDB_IT=1 FDBGATE_SOCKET=<path>.
 
+const testKeyspace = "genix_fdbdriver_test"
+
+// TestMain sets the keyspace before any test compiles a table: compiled tables are cached and take
+// their namespace from connParams at compile time. If a unit test compiled first with no keyspace,
+// the live tests would write under "" while WipePartition("") clears testKeyspace, and every run
+// would pile its rows onto the last one's.
+func TestMain(m *testing.M) {
+	connParams.Keyspace = testKeyspace
+	os.Exit(m.Run())
+}
+
 type fixtureLine struct {
 	ProductID int32
 	Quantity  int32
@@ -119,7 +130,7 @@ func requireLiveGate(t *testing.T) {
 	if os.Getenv("GENIX_FDB_IT") == "" || os.Getenv("FDBGATE_SOCKET") == "" {
 		t.Skip("set GENIX_FDB_IT=1 and FDBGATE_SOCKET to run against fdbgate")
 	}
-	SetConnection(ConnParams{SocketPath: os.Getenv("FDBGATE_SOCKET"), Keyspace: "genix_fdbdriver_test"})
+	SetConnection(ConnParams{SocketPath: os.Getenv("FDBGATE_SOCKET"), Keyspace: testKeyspace})
 }
 
 func TestWritesReadsAndDeltaOnFDB(t *testing.T) {

@@ -3,10 +3,8 @@ package fdbdriver
 import (
 	"fmt"
 	"reflect"
-	"slices"
 	"strings"
 	"sync"
-	"unsafe"
 
 	"github.com/ivanjoz/colbin"
 	"github.com/ivanjoz/genix-orm/db"
@@ -70,74 +68,23 @@ func compiledTableOf[TableT db.TableSchemaInterface[TableT], RecordT db.TableBas
 	return getOrCompileFdbTable(db.InitStructTable[TableT, RecordT](new(TableT)))
 }
 
-// compileTable turns a schema into an FdbTable. It follows the Scylla driver's makeTable for
-// everything the shared TableCore means (columns, keys, managed columns, packing, FixedValues), so
-// both drivers agree on what a record is.
+// compileTable turns a schema into an FdbTable. The table-level compile is the shared one
+// (db.TableCore.CompileFromSchema), so every driver agrees on what a record is; below are the parts
+// only this driver has.
 func compileTable(schema db.TableSchema, structRefValue reflect.Value) *FdbTable {
-	if len(schema.Keys) == 0 {
-		panic(fmt.Sprintf(`Table "%v": no Keys declared`, schema.Name))
-	}
-	db.ClaimTableID(schema.ID, schema.Name)
-
-	table := &FdbTable{
-		TableCore: db.TableCore{
-			Namespace:     schema.Namespace,
-			Name:          schema.Name,
-			ID:            schema.ID,
-			CacheByIDs:    schema.CacheByIDs,
-			ColumnsMap:    map[string]db.IColInfo{},
-			ColumnsIdxMap: map[int16]db.IColInfo{},
-			UseSequences:  schema.UseSequences,
-			MaxColIdx:     int16(structRefValue.NumField()) + 1,
-		},
-		storedColumnPositionByID: map[uint16]int{},
-	}
-	if table.Namespace == "" {
-		table.Namespace = connParams.Keyspace
-	}
 	if schema.SequenceColumn != nil || schema.CounterColumn != nil {
 		panic(fmt.Sprintf(`Table "%v": SequenceColumn / CounterColumn are not implemented on FoundationDB yet`, schema.Name))
 	}
-
-	computedPendingColumns := map[string]db.ColumnInfo{}
-	for fieldIndex := 0; fieldIndex < structRefValue.NumField(); fieldIndex++ {
-		field := structRefValue.Field(fieldIndex)
-		columnHandle, isColumn := field.Addr().Interface().(db.Coln)
-		if !isColumn {
-			continue
-		}
-		column := columnHandle.GetInfo()
-		if column.Name == "" {
-			panic(fmt.Sprintf(`Table "%v": a column has no name`, schema.Name))
-		}
-		if column.IsComputed {
-			computedPendingColumns[column.GetName()] = column
-			continue
-		}
-		assertColumnIsEncodable(schema.Name, &column)
-		if _, isRepeated := table.ColumnsMap[column.GetName()]; isRepeated {
-			panic(fmt.Sprintf(`Table "%v": repeated column name "%v"`, schema.Name, column.GetName()))
-		}
-		column.Idx = int16(column.FieldIdx) + 1
-		table.MaxColIdx = max(table.MaxColIdx, column.Idx+1)
-		table.ColumnsMap[column.GetName()] = &column
+	table := &FdbTable{storedColumnPositionByID: map[uint16]int{}}
+	table.CompileFromSchema(schema, structRefValue)
+	if table.Namespace == "" {
+		table.Namespace = connParams.Keyspace
 	}
-
-	bindManagedAuditColumns(table, schema)
-	table.ConfigureComputedColumns(schema, structRefValue, computedPendingColumns)
-	table.FixedValueRanges = table.ResolveFixedValueRanges(schema.FixedValues)
-
-	if schema.Partition != nil {
-		table.PartKey = table.ColumnsMap[schema.Partition.GetInfo().Name]
-		if table.PartKey != nil && !table.PartKey.IsNil() {
-			table.KeysIdx = append(table.KeysIdx, table.PartKey.GetInfo().Idx)
+	for _, column := range table.ColumnsMap {
+		if columnMetadata, isColumnInfo := column.(*db.ColumnInfo); isColumnInfo {
+			assertColumnIsEncodable(table.Name, columnMetadata)
 		}
 	}
-	compileKeys(table, schema)
-	if schema.AutoincrementPart != nil {
-		table.AutoincrementPart = table.ColumnsMap[schema.AutoincrementPart.GetInfo().Name]
-	}
-	table.ConfigureTextSearchIndex(schema)
 
 	for _, indexCfg := range schema.Indexes {
 		if indexCfg.Type == db.TypeDelta {
@@ -152,135 +99,12 @@ func compileTable(schema db.TableSchema, structRefValue reflect.Value) *FdbTable
 			fmt.Sprintf("%v(%v)", db.IndexTypeNames[indexCfg.Type], strings.Join(keyNames, ",")))
 	}
 
-	for _, column := range table.ColumnsMap {
-		if columnInfo, isColumnInfo := column.(*db.ColumnInfo); isColumnInfo {
-			columnInfo.CompileFastAccessors()
-		}
-	}
-	for _, column := range table.ColumnsMap {
-		table.ColumnsIdxMap[column.GetInfo().Idx] = column
-		if !column.GetInfo().IsComputed {
-			table.Columns = append(table.Columns, column)
-		}
-	}
-	slices.SortFunc(table.Columns, func(left, right db.IColInfo) int { return int(left.GetInfo().Idx - right.GetInfo().Idx) })
+	table.FinalizeColumns()
 	compileStoredColumns(table)
 	if db.ShouldLog() && len(table.unservedIndexes) > 0 {
 		fmt.Printf("fdbdriver: table %v keeps no entries for %v (reads scan the partition)\n", table.Name, table.unservedIndexes)
 	}
 	return table
-}
-
-// compileKeys resolves the key columns, autoincrement and key packing, as the Scylla driver does.
-func compileKeys(table *FdbTable, schema db.TableSchema) {
-	for _, key := range schema.Keys {
-		column := table.ColumnsMap[key.GetInfo().Name]
-		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": key column "%v" was not found`, table.Name, key.GetInfo().Name))
-		}
-		table.Keys = append(table.Keys, column)
-		table.KeysIdx = append(table.KeysIdx, column.GetInfo().Idx)
-		keyInfo := key.GetInfo()
-		if keyInfo.AutoincrementRandBits != 0 {
-			column.SetAutoincrementRandSize(keyInfo.AutoincrementRandBits)
-			if keyInfo.AutoincrementFirstID > 0 {
-				column.(*db.ColumnInfo).AutoincrementFirstID = keyInfo.AutoincrementFirstID
-			}
-			if table.AutoincrementCol != nil && table.AutoincrementCol != column {
-				panic(fmt.Sprintf(`Table "%v": several autoincrement columns`, table.Name))
-			}
-			table.AutoincrementCol = column
-		}
-	}
-	for _, column := range table.ColumnsMap {
-		if columnInfo, isColumnInfo := column.(*db.ColumnInfo); isColumnInfo && columnInfo.AutoincrementRandBits != 0 && table.AutoincrementCol == nil {
-			table.AutoincrementCol = column
-		}
-	}
-
-	if len(schema.KeyIntPacking) > 0 {
-		if len(table.Keys) != 1 || table.Keys[0].GetType().Type != 2 {
-			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires exactly one int64 key`, table.Name))
-		}
-		for _, declared := range schema.KeyIntPacking {
-			packedColumn := table.ColumnsMap[declared.GetName()]
-			declaredInfo := declared.GetInfo()
-			if packedColumn == nil {
-				if declaredInfo.AutoincrementRandBits < 0 {
-					panic(fmt.Sprintf(`Table "%v": KeyIntPacking column "%v" not found`, table.Name, declared.GetName()))
-				}
-				// An autoincrement placeholder: a slot filled from the sequence, with no record field.
-				placeholder := &db.ColumnInfo{
-					ColInfo:               db.ColInfo{Name: "autoincrement_placeholder", IsVirtual: true},
-					AutoincrementRandBits: declaredInfo.AutoincrementRandBits,
-					SlotBits:              declaredInfo.SlotBits,
-				}
-				packedColumn = placeholder
-				table.AutoincrementCol = placeholder
-			} else if declaredInfo.SlotBits > 0 {
-				packedColumn.SetSlotBits(declaredInfo.SlotBits)
-			}
-			table.KeyIntPacking = append(table.KeyIntPacking, packedColumn)
-		}
-		table.KeyIntPackingSlotBits = db.KeyIntPackingSlotBits(table.Name, schema.KeyIntPacking)
-	}
-
-	if len(schema.KeyConcatenated) > 0 {
-		if len(table.Keys) != 1 || table.Keys[0].GetType().Type != 1 {
-			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires exactly one string key`, table.Name))
-		}
-		keyColumn := table.Keys[0].(*db.ColumnInfo)
-		concatenatedColumns := []db.IColInfo{}
-		for _, declared := range schema.KeyConcatenated {
-			concatenatedColumns = append(concatenatedColumns, table.ColumnsMap[declared.GetName()])
-		}
-		table.KeyConcatenated = concatenatedColumns
-		keyColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
-			values := make([]any, 0, len(concatenatedColumns))
-			for _, column := range concatenatedColumns {
-				values = append(values, column.GetRawValue(ptr))
-			}
-			return db.MakeKeyConcat(values...)
-		}
-		keyColumn.GetValueFn = keyColumn.GetRawValueFn
-	}
-}
-
-// bindManagedAuditColumns adds created / updated (and version on a TypeDelta table), exactly as the
-// Scylla driver does: a column the record does not declare is stored all the same.
-func bindManagedAuditColumns(table *FdbTable, schema db.TableSchema) {
-	hasDelta := slices.ContainsFunc(schema.Indexes, func(index db.Index) bool { return index.Type == db.TypeDelta })
-	if _, isDeclared := table.ColumnsMap[managedUpdatedColumnName]; (hasDelta || schema.CacheByIDs) && !isDeclared {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta and CacheByIDs need the record field "Updated int32" (json "upd")`, table.Name))
-	}
-	if _, isDeclared := table.ColumnsMap[managedVersionColumnName]; hasDelta && !isDeclared {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta needs the record field "Version int16" (json "ver,omitempty")`, table.Name))
-	}
-	if !schema.DisableDefaultColumns || schema.CacheByIDs {
-		table.CreatedCol = ensureManagedIntColumn(table, managedCreatedColumnName)
-		table.UpdatedCol = ensureManagedIntColumn(table, managedUpdatedColumnName)
-	}
-	if hasDelta {
-		table.VersionCol = ensureManagedIntColumn(table, managedVersionColumnName)
-	}
-}
-
-func ensureManagedIntColumn(table *FdbTable, columnName string) db.IColInfo {
-	if declared := table.ColumnsMap[columnName]; declared != nil {
-		if declared.GetType().IsSlice || !isIntegerFieldType(declared.GetType().FieldType) {
-			panic(fmt.Sprintf(`Table "%v": managed column "%v" must be an integer scalar`, table.Name, columnName))
-		}
-		return declared
-	}
-	table.MaxColIdx++
-	// No record field: the write path stamps it (managedStamp) and the row stores it.
-	managedColumn := &db.ColumnInfo{
-		ColInfo: db.ColInfo{Name: columnName, FieldName: columnName, Idx: table.MaxColIdx, RefType: reflect.TypeOf(int32(0))},
-		ColType: db.GetColTypeByID(3),
-	}
-	managedColumn.GetRawValueFn = func(ptr unsafe.Pointer) any { return nil }
-	table.ColumnsMap[columnName] = managedColumn
-	return managedColumn
 }
 
 func isIntegerFieldType(fieldType string) bool {
