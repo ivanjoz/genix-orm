@@ -159,7 +159,7 @@ func (backend *frameBackend) scanPartition(partition int64, onPage func(page sto
 		}
 	}
 	queryString := fmt.Sprintf("SELECT %v FROM %v.%v WHERE %v = ?", strings.Join(columnNames, ", "), resolveKeyspace(*scyllaTable), scyllaTable.Name, partitionColumn.GetName())
-	queryValues := []any{coerceManagedIntegerValue(partitionColumn, partition)}
+	queryValues := []any{db.CoerceManagedInteger(partitionColumn, partition)}
 	logSince := utils.SUnixTimeOf(backend.startedAt) - dataframe.TargetLag - frameRebuildLogMargin
 
 	flushPage := func(page storedRows) error {

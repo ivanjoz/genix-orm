@@ -144,7 +144,7 @@ func selectDelta(table *FdbTable, tableInfo *db.TableInfo, sink recordSink) erro
 	}
 
 	// V for the client's next sync, taken before any read.
-	metadata.ReadTime = managedUnixTime()
+	metadata.ReadTime = db.ManagedUnixTime()
 	cursor := deltaRead.Cursor
 	plan := cache.PlanDeltaSync(cursor)
 	metadata.IsReplace = cursor.Updated == 0

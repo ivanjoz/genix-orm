@@ -141,8 +141,8 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 	nameAndWarehouse := []IColInfo{scyllaTable.ColumnsMap["name"], scyllaTable.ColumnsMap["warehouse_id"], scyllaTable.UpdatedCol}
 
 	packedByPhase, moves := stampDeltaWrites(scyllaTable, []writePhase{
-		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
-		{records: makeRecordSlice(&records), writtenColumns: nameOnly},
+		{records: db.MakeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
+		{records: db.MakeRecordSlice(&records), writtenColumns: nameOnly},
 	}, stored)
 	packedValues := packedByPhase[1]["zz_dlt_warehouse_id_status"]
 	if packedValues[0] != deltaPackedStoredValue(warehouseIndex, scyllaTable.Name, []int64{41, 1}, 500) {
@@ -153,8 +153,8 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 	}
 
 	_, moves = stampDeltaWrites(scyllaTable, []writePhase{
-		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
-		{records: makeRecordSlice(&records), writtenColumns: nameAndWarehouse},
+		{records: db.MakeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
+		{records: db.MakeRecordSlice(&records), writtenColumns: nameAndWarehouse},
 	}, stored)
 	// Record 1 writes warehouse 0 and record 2 warehouse 42: both leave [41, 1]. Status is not written,
 	// so the status index moves nothing.
@@ -166,8 +166,8 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 	// A status change is a move like any other pinned change: record 1 leaves the [1] prefix.
 	records = []deltaStockRecord{{CompanyID: 7, ID: 1, Status: 0, Updated: 600}}
 	_, moves = stampDeltaWrites(scyllaTable, []writePhase{
-		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
-		{records: makeRecordSlice(&records), writtenColumns: []IColInfo{scyllaTable.ColumnsMap["status"], scyllaTable.UpdatedCol}},
+		{records: db.MakeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
+		{records: db.MakeRecordSlice(&records), writtenColumns: []IColInfo{scyllaTable.ColumnsMap["status"], scyllaTable.UpdatedCol}},
 	}, stored)
 	statusIndex := scyllaTable.DeltaIndexes[1]
 	if len(moves) != 2 || moves[1].indexTag != "status" || moves[1].pinnedPrefix != deltaPackedStoredValue(statusIndex, scyllaTable.Name, []int64{1}, 0) {
@@ -181,8 +181,8 @@ func TestUpdateAlwaysRewritesTheDeltaPackedColumn(t *testing.T) {
 
 	scyllaTable := MakeScyllaTable[deltaStockRecord, deltaStockSchema]()
 	records := []deltaStockRecord{{CompanyID: 7, ID: 1, Name: "renamed"}}
-	_, columnsToUpdate := resolveUpdateColumnsForWrite(scyllaTable, 1, makeRecordSlice(&records).at,
-		[]Coln{TableOf[deltaStockRecord, deltaStockSchema]().Name}, nil, false)
+	columnsToUpdate := scyllaTable.ResolveUpdateColumns(db.MakeRecordSlice(&records),
+		[]Coln{TableOf[deltaStockRecord, deltaStockSchema]().Name}, nil)
 	if !slices.ContainsFunc(columnsToUpdate, func(column IColInfo) bool { return column.GetName() == "zz_dlt_warehouse_id_status" }) {
 		t.Fatalf("expected the packed column in the SET, got %v", columnsToUpdate)
 	}

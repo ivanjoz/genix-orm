@@ -33,11 +33,6 @@ const (
 	maxRowBytes = 100_000
 )
 
-// managedStamp carries the managed columns a write stamped that have no record field to hold them.
-type managedStamp struct {
-	created, updated int64
-}
-
 // rowVersionOf reads the optimistic-concurrency counter of a stored row.
 func rowVersionOf(row []byte) uint64 {
 	if len(row) < 8 {
@@ -47,7 +42,7 @@ func rowVersionOf(row []byte) uint64 {
 }
 
 // encodeRow appends the row of one record.
-func (table *FdbTable) encodeRow(row []byte, rowVersion uint64, recordPointer unsafe.Pointer, stamp managedStamp) ([]byte, error) {
+func (table *FdbTable) encodeRow(row []byte, rowVersion uint64, recordPointer unsafe.Pointer, stamp db.ManagedStamp) ([]byte, error) {
 	row = binary.BigEndian.AppendUint64(row, rowVersion)
 	row = append(row, 0)
 	countOffset := len(row)
@@ -79,12 +74,12 @@ func (table *FdbTable) encodeRow(row []byte, rowVersion uint64, recordPointer un
 	return row, nil
 }
 
-func encodeManagedValue(valueBytes []byte, columnName string, stamp managedStamp) ([]byte, bool) {
+func encodeManagedValue(valueBytes []byte, columnName string, stamp db.ManagedStamp) ([]byte, bool) {
 	switch columnName {
 	case managedCreatedColumnName:
-		return binary.AppendVarint(valueBytes, stamp.created), stamp.created != 0
+		return binary.AppendVarint(valueBytes, stamp.Created), stamp.Created != 0
 	case managedUpdatedColumnName:
-		return binary.AppendVarint(valueBytes, stamp.updated), stamp.updated != 0
+		return binary.AppendVarint(valueBytes, stamp.Updated), stamp.Updated != 0
 	}
 	return valueBytes, false
 }

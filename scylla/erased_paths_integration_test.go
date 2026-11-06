@@ -109,9 +109,9 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 		Schema: MakeSchema[indexGroupITRecord, indexGroupITSchema](),
 	})
 	// The write lands at clockStart; the reads run once the groups settled.
-	clockStart := currentManagedUnixTime() - 3600
+	clockStart := db.ManagedUnixTime() - 3600
 	getManagedUnixTime = func() int32 { return clockStart }
-	t.Cleanup(func() { getManagedUnixTime = currentManagedUnixTime })
+	t.Cleanup(func() { getManagedUnixTime = db.ManagedUnixTime })
 	if err := Insert(&[]indexGroupITRecord{
 		{CompanyID: 8, ID: 1, Date: 100, Name: "a"},
 		{CompanyID: 8, ID: 2, Date: 100, Name: "b"},

@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/ivanjoz/colbin"
+	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/db/cache"
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -80,7 +81,7 @@ func decodeRecordSnapshotFile(
 		fmt.Println("Record snapshot: decoding", snapshotKey, "failed:", err)
 		return snapshot, nil, false
 	}
-	return snapshot, makeReflectRecordSlice(recordsPointer).pointers(), true
+	return snapshot, db.MakeReflectRecordSlice(recordsPointer).Pointers(), true
 }
 
 // writeRecordSnapshotFile stores records as a snapshot labelled cursor, read at readTime. etag is the

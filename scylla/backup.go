@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/ivanjoz/colbin"
+	"github.com/ivanjoz/genix-orm/db"
 )
 
 // exportableColumns are the columns a backup can round-trip: the clustering keys and
@@ -135,18 +136,18 @@ func exportToColbin(
 
 // colbinToRecords decodes one exported batch back into records, with the partition key
 // written on each of them — it was never encoded, so it is the one value the batch itself
-// cannot supply. The records come back as a recordSlice over a reflect-built []recordType.
-func colbinToRecords(scyllaTable *ScyllaTable, recordType reflect.Type, encoded []byte, partValue any) (recordSlice, error) {
+// cannot supply. The records come back as a db.RecordSlice over a reflect-built []recordType.
+func colbinToRecords(scyllaTable *ScyllaTable, recordType reflect.Type, encoded []byte, partValue any) (db.RecordSlice, error) {
 	recordsPointer := reflect.New(reflect.SliceOf(recordType))
 	if err := colbin.Unmarshal(encoded, recordsPointer.Interface()); err != nil {
-		return recordSlice{}, Err("Error al decodificar el batch colbin de", scyllaTable.Name, ":", err)
+		return db.RecordSlice{}, Err("Error al decodificar el batch colbin de", scyllaTable.Name, ":", err)
 	}
 
-	records := makeReflectRecordSlice(recordsPointer)
+	records := db.MakeReflectRecordSlice(recordsPointer)
 	partKey := scyllaTable.GetPartKey()
 	if partKey != nil && !partKey.IsNil() {
-		for index := range records.len() {
-			partKey.SetValue(records.at(index), partValue)
+		for index := range records.Len() {
+			partKey.SetValue(records.At(index), partValue)
 		}
 	}
 

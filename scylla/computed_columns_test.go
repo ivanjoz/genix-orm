@@ -138,8 +138,7 @@ func TestComputedColumnUpdateOfFromRewritesIndexGroup(t *testing.T) {
 	table := TableOf[computedRecord, computedSchema]()
 	records := []computedRecord{{CompanyID: 1, ID: 9, Date: 20000, Lines: []computedLine{{ProductID: 4}}}}
 
-	_, columnsToUpdate := resolveUpdateColumnsForWrite(scyllaTable, len(records),
-		func(index int) unsafe.Pointer { return unsafe.Pointer(&records[index]) }, []Coln{table.Lines}, nil, false)
+	columnsToUpdate := scyllaTable.ResolveUpdateColumns(db.MakeRecordSlice(&records), []Coln{table.Lines}, nil)
 	updatedNames := []string{}
 	for _, column := range columnsToUpdate {
 		updatedNames = append(updatedNames, column.GetName())
@@ -151,8 +150,7 @@ func TestComputedColumnUpdateOfFromRewritesIndexGroup(t *testing.T) {
 		t.Fatalf("the computed column itself must never be written, updated: %v", updatedNames)
 	}
 
-	_, columnsToUpdate = resolveUpdateColumnsForWrite(scyllaTable, len(records),
-		func(index int) unsafe.Pointer { return unsafe.Pointer(&records[index]) }, []Coln{table.Status}, nil, false)
+	columnsToUpdate = scyllaTable.ResolveUpdateColumns(db.MakeRecordSlice(&records), []Coln{table.Status}, nil)
 	for _, column := range columnsToUpdate {
 		if column.GetName() == "zz_igs_date_line_product_ids" {
 			t.Fatal("an update that writes no From column must not rewrite the hashes")

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"reflect"
 	"slices"
 	"unsafe"
@@ -17,7 +16,8 @@ import (
 // The write algorithm (docs/FOUNDATIONDB_PLAN.md §8). Records go in chunks; a chunk is one FDB
 // transaction, so a record, its index entries and its delta moves land together or not at all:
 //
-//  1. prepare: SelfParse, autoincrement and key packing (inserts), the managed columns;
+//  1. prepare (shared with every driver, db/write_prepare.go): SelfParse, autoincrement and key
+//     packing (inserts), the managed columns, the columns written and the partial-update refusals;
 //  2. pre-read the stored rows of the chunk (one GetMany);
 //  3. build each new row: the stored row overlaid with the columns the write writes (a column it
 //     leaves out keeps its stored value, as a CQL upsert does); stamp the managed version;
@@ -34,103 +34,64 @@ const (
 	writeConflictRetries = 5
 )
 
-// recordSlice is a typed slice seen through unsafe pointers, so the write path is not stenciled per
-// record type.
-type recordSlice struct {
-	base       unsafe.Pointer
-	count      int
-	size       uintptr
-	recordType reflect.Type
-}
-
-func makeRecordSlice[RecordT any](records *[]RecordT) recordSlice {
-	slice := recordSlice{size: unsafe.Sizeof(*new(RecordT)), recordType: reflect.TypeFor[RecordT]()}
-	if records != nil && len(*records) > 0 {
-		slice.base, slice.count = unsafe.Pointer(&(*records)[0]), len(*records)
-	}
-	return slice
-}
-
-func (records recordSlice) at(index int) unsafe.Pointer {
-	return unsafe.Add(records.base, uintptr(index)*records.size)
-}
-
 // writePhase is one half of a write call: its records and which columns it writes.
 type writePhase struct {
-	records  recordSlice
+	records  db.RecordSlice
 	isInsert bool
+	// usesIncludeList marks an Update(columns...) phase: declaredColumns are the columns it writes.
+	// Otherwise declaredColumns are the ones it leaves out.
+	usesIncludeList bool
+	declaredColumns []db.Coln
 	// writtenColumns are the stored columns the write sets; every other one keeps its stored value.
-	// nil until resolveWrittenColumns, which then takes every stored column but excludedNames.
+	// Settled by resolveWrittenColumns once the records are prepared.
 	writtenColumns []db.IColInfo
-	excludedNames  map[string]bool
+	// writesEveryColumn: the phase replaces whole rows, so the stored row is not merged.
+	writesEveryColumn bool
 }
 
-func insertPhase[RecordT any](records *[]RecordT, columnsToExclude []db.Coln) writePhase {
-	return writePhase{records: makeRecordSlice(records), isInsert: true, writtenColumns: nil}.withExcluded(columnsToExclude)
+func insertPhase(records db.RecordSlice, columnsToExclude []db.Coln) writePhase {
+	return writePhase{records: records, isInsert: true, declaredColumns: columnsToExclude}
 }
 
-// withExcluded is resolved against the table later (resolveWrittenColumns): keep the names here.
-func (phase writePhase) withExcluded(columnsToExclude []db.Coln) writePhase {
-	phase.excludedNames = map[string]bool{}
-	for _, column := range columnsToExclude {
-		phase.excludedNames[column.GetName()] = true
-	}
-	return phase
+func updateIncludePhase(records db.RecordSlice, columnsToInclude []db.Coln) writePhase {
+	return writePhase{records: records, usesIncludeList: true, declaredColumns: columnsToInclude}
 }
 
-func updateIncludePhase[RecordT any](table *FdbTable, records *[]RecordT, columnsToInclude []db.Coln) writePhase {
-	phase := writePhase{records: makeRecordSlice(records)}
-	if len(columnsToInclude) == 0 {
-		return phase.withExcluded(nil)
-	}
-	for _, declared := range columnsToInclude {
-		column := table.ColumnsMap[declared.GetName()]
-		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": update column "%v" was not found`, table.Name, declared.GetName()))
-		}
-		if slices.Contains(table.KeysIdx, column.GetInfo().Idx) {
-			panic(fmt.Sprintf(`Table "%v": column "%v" is part of the primary key and cannot be updated`, table.Name, column.GetName()))
-		}
-		phase.writtenColumns = append(phase.writtenColumns, table.StoredColumnsOf(column)...)
-	}
-	return phase
+func updateExcludePhase(records db.RecordSlice, columnsToExclude []db.Coln) writePhase {
+	return writePhase{records: records, declaredColumns: columnsToExclude}
 }
 
-func updateExcludePhase[RecordT any](table *FdbTable, records *[]RecordT, columnsToExclude []db.Coln) writePhase {
-	return writePhase{records: makeRecordSlice(records)}.withExcluded(columnsToExclude)
-}
-
-func splitByIsInsert[RecordT any](records *[]RecordT, isInsert func(record *RecordT) bool) (toInsert, toUpdate []RecordT) {
-	for index := range *records {
-		if isInsert(&(*records)[index]) {
-			toInsert = append(toInsert, (*records)[index])
-		} else {
-			toUpdate = append(toUpdate, (*records)[index])
-		}
-	}
-	return toInsert, toUpdate
-}
-
-// resolveWrittenColumns settles which stored columns a phase writes. The managed updated and version
-// are always written; keys and the partition always are (they name the row).
+// resolveWrittenColumns settles which stored columns a phase writes, from the column set every driver
+// resolves (db.ResolveUpdateColumns, with its partial-update refusals). The derived columns in it are
+// not stored here (the driver writes index entries instead), and a computed column is its From
+// columns.
 func (table *FdbTable) resolveWrittenColumns(phase *writePhase) {
-	if phase.writtenColumns == nil {
-		for _, stored := range table.storedColumns {
-			if !phase.excludedNames[stored.column.Name] {
-				phase.writtenColumns = append(phase.writtenColumns, stored.column)
+	var resolvedColumns []db.IColInfo
+	switch {
+	case phase.isInsert:
+		resolvedColumns = table.AffectedColumnsForInsert(phase.declaredColumns)
+	case phase.usesIncludeList:
+		if len(phase.declaredColumns) == 0 {
+			panic("No se incluyeron columnas a actualizar.")
+		}
+		resolvedColumns = table.ResolveUpdateColumns(phase.records, phase.declaredColumns, nil)
+	default:
+		resolvedColumns = table.ResolveUpdateColumns(phase.records, nil, phase.declaredColumns)
+	}
+
+	writtenNames := map[string]bool{}
+	for _, resolvedColumn := range resolvedColumns {
+		for _, storedColumn := range table.StoredColumnsOf(resolvedColumn) {
+			if !storedColumn.GetInfo().IsVirtual && !writtenNames[storedColumn.GetName()] {
+				writtenNames[storedColumn.GetName()] = true
+				phase.writtenColumns = append(phase.writtenColumns, storedColumn)
 			}
 		}
 	}
-	for _, managed := range []db.IColInfo{table.UpdatedCol, table.VersionCol} {
-		if managed != nil && !slices.ContainsFunc(phase.writtenColumns, func(column db.IColInfo) bool { return column.GetName() == managed.GetName() }) {
-			phase.writtenColumns = append(phase.writtenColumns, managed)
-		}
+	for _, keyColumn := range table.keyAndPartitionColumns() {
+		writtenNames[keyColumn.GetName()] = true
 	}
-}
-
-// writesEveryColumn reports a write that replaces the whole row, so the stored row is not merged.
-func (table *FdbTable) writesEveryColumn(phase writePhase) bool {
-	return len(phase.writtenColumns) >= len(table.storedColumns)
+	phase.writesEveryColumn = !slices.ContainsFunc(table.storedColumns, func(stored storedColumn) bool { return !writtenNames[stored.column.Name] })
 }
 
 func writeRecords(table *FdbTable, phases []writePhase) error {
@@ -140,20 +101,22 @@ func writeRecords(table *FdbTable, phases []writePhase) error {
 	}
 	for phaseIndex := range phases {
 		phase := &phases[phaseIndex]
-		if phase.records.count == 0 {
+		if phase.records.Len() == 0 {
 			continue
 		}
-		table.resolveWrittenColumns(phase)
-		runSelfParse(phase.records)
+		db.RunSelfParse(phase.records)
 		if phase.isInsert {
-			if err := table.assignAutoincrementKeys(phase.records); err != nil {
+			err := table.AssignAutoincrementKeys(phase.records, func(counterName string, count int) (int64, error) {
+				return reserveCounter(table.Namespace, counterName, count)
+			})
+			if err != nil {
 				return err
 			}
 		}
-		writeTime := int64(managedUnixTime())
-		stamps := table.stampManagedColumns(phase.records, phase.isInsert, writeTime)
-		for chunkStart := 0; chunkStart < phase.records.count; chunkStart += writeChunkRecords {
-			chunkEnd := min(chunkStart+writeChunkRecords, phase.records.count)
+		stamps := table.StampManagedColumns(phase.records, phase.isInsert, int64(db.ManagedUnixTime()))
+		table.resolveWrittenColumns(phase)
+		for chunkStart := 0; chunkStart < phase.records.Len(); chunkStart += writeChunkRecords {
+			chunkEnd := min(chunkStart+writeChunkRecords, phase.records.Len())
 			if err := table.writeChunk(gate, *phase, stamps, chunkStart, chunkEnd); err != nil {
 				return err
 			}
@@ -162,128 +125,13 @@ func writeRecords(table *FdbTable, phases []writePhase) error {
 	return nil
 }
 
-func runSelfParse(records recordSlice) {
-	for index := range records.count {
-		if parser, hasSelfParse := reflect.NewAt(records.recordType, records.at(index)).Interface().(interface{ SelfParse() }); hasSelfParse {
-			parser.SelfParse()
-		} else {
-			return
-		}
-	}
-}
-
-// managedUnixTime is SUnixTime on the ORM's effective clock (db.Now honours a historical override).
-func managedUnixTime() int32 {
-	return int32((db.Now().Unix() - 1e9) / 2)
-}
-
-// stampManagedColumns sets created (on insert, when the caller left it zero) and updated on every
-// record, and returns the stamps the row stores for managed columns with no record field.
-func (table *FdbTable) stampManagedColumns(records recordSlice, isInsert bool, writeTime int64) []managedStamp {
-	stamps := make([]managedStamp, records.count)
-	for index := range records.count {
-		recordPointer := records.at(index)
-		if isInsert && table.CreatedCol != nil {
-			createdValue := writeTime
-			if current := table.CreatedCol.GetRawValue(recordPointer); current != nil && db.ConvertToInt64(current) > 0 {
-				createdValue = db.ConvertToInt64(current)
-			}
-			table.CreatedCol.SetValue(recordPointer, createdValue)
-			stamps[index].created = createdValue
-		}
-		if table.UpdatedCol != nil {
-			table.UpdatedCol.SetValue(recordPointer, writeTime)
-			stamps[index].updated = writeTime
-		}
-	}
-	return stamps
-}
-
-// assignAutoincrementKeys reserves IDs for the records whose autoincrement column is ≤ 0, one counter
-// per (partition, AutoincrementPart) as the Scylla driver names them, then packs KeyIntPacking keys.
-func (table *FdbTable) assignAutoincrementKeys(records recordSlice) error {
-	if table.AutoincrementCol == nil && len(table.KeyIntPacking) == 0 {
-		return nil
-	}
-	type counterGroup struct {
-		name    string
-		members []int
-	}
-	groups := map[string]*counterGroup{}
-	needsID := make([]bool, records.count)
-	for index := range records.count {
-		recordPointer := records.at(index)
-		if table.AutoincrementCol == nil {
-			continue
-		}
-		if rawValue := table.AutoincrementCol.GetRawValue(recordPointer); rawValue != nil && db.ConvertToInt64(rawValue) > 0 {
-			continue
-		}
-		needsID[index] = true
-		partitionValue := int64(0)
-		if table.PartKey != nil {
-			partitionValue = db.ConvertToInt64(table.PartKey.GetRawValue(recordPointer))
-		}
-		autoincrementPart := int64(0)
-		if table.AutoincrementPart != nil {
-			autoincrementPart = db.ConvertToInt64(table.AutoincrementPart.GetRawValue(recordPointer))
-		}
-		counterName := fmt.Sprintf("x%v_%v_%v", int32(partitionValue), table.Name, autoincrementPart)
-		if groups[counterName] == nil {
-			groups[counterName] = &counterGroup{name: counterName}
-		}
-		groups[counterName].members = append(groups[counterName].members, index)
-	}
-
-	generatedIDs := make([]int64, records.count)
-	for _, group := range groups {
-		firstID, err := reserveCounter(table.Namespace, group.name, len(group.members))
-		if err != nil {
-			return fmt.Errorf("table %q: reserving %d IDs on %s: %w", table.Name, len(group.members), group.name, err)
-		}
-		autoincrementColumn := table.AutoincrementCol.(*db.ColumnInfo)
-		for offset, index := range group.members {
-			generatedID := firstID + int64(offset)
-			if autoincrementColumn.AutoincrementFirstID > 1 {
-				generatedID += autoincrementColumn.AutoincrementFirstID - 1
-			}
-			if autoincrementColumn.AutoincrementRandBits > 0 {
-				generatedID = generatedID<<autoincrementColumn.AutoincrementRandBits | rand.Int64N(int64(1)<<autoincrementColumn.AutoincrementRandBits)
-			}
-			generatedIDs[index] = generatedID
-			if len(table.KeyIntPacking) == 0 {
-				table.AutoincrementCol.SetValue(records.at(index), generatedID)
-			}
-		}
-	}
-
-	if len(table.KeyIntPacking) > 0 {
-		for index := range records.count {
-			recordPointer := records.at(index)
-			componentValues := make([]int64, len(table.KeyIntPacking))
-			for slotIndex, column := range table.KeyIntPacking {
-				if column == table.AutoincrementCol && needsID[index] {
-					componentValues[slotIndex] = generatedIDs[index]
-				} else if column.GetInfo().IsVirtual {
-					componentValues[slotIndex] = 0
-				} else {
-					componentValues[slotIndex] = db.ConvertToInt64(column.GetRawValue(recordPointer))
-				}
-			}
-			packedKey := db.PackRowValues(table.Name, table.Keys[0].GetName(), table.KeyIntPacking, componentValues, table.KeyIntPackingSlotBits)
-			table.Keys[0].SetValue(recordPointer, int64(packedKey))
-		}
-	}
-	return nil
-}
-
 // writeChunk writes records [chunkStart, chunkEnd) of a phase as one transaction, retrying when a
 // concurrent writer changed one of the rows between the pre-read and the commit.
-func (table *FdbTable) writeChunk(gate *fdb.Client, phase writePhase, stamps []managedStamp, chunkStart, chunkEnd int) error {
+func (table *FdbTable) writeChunk(gate *fdb.Client, phase writePhase, stamps []db.ManagedStamp, chunkStart, chunkEnd int) error {
 	recordKeys := make([][]byte, 0, chunkEnd-chunkStart)
 	partitions := make([]int64, 0, chunkEnd-chunkStart)
 	for index := chunkStart; index < chunkEnd; index++ {
-		recordPointer := phase.records.at(index)
+		recordPointer := phase.records.At(index)
 		partition := table.GetPartValue(recordPointer)
 		partitions = append(partitions, partition)
 		recordKeys = append(recordKeys, append(table.partitionPrefix(partition), table.recordSuffix(recordPointer)...))
@@ -328,31 +176,31 @@ func (table *FdbTable) writeChunk(gate *fdb.Client, phase writePhase, stamps []m
 }
 
 // buildRecordMutations builds the row of one record and the delta entries and moves that go with it.
-func (table *FdbTable) buildRecordMutations(phase writePhase, recordIndex int, partition int64, recordKey, storedRow []byte, stamp managedStamp) ([]fdb.Mutation, error) {
-	recordPointer := phase.records.at(recordIndex)
+func (table *FdbTable) buildRecordMutations(phase writePhase, recordIndex int, partition int64, recordKey, storedRow []byte, stamp db.ManagedStamp) ([]fdb.Mutation, error) {
+	recordPointer := phase.records.At(recordIndex)
 	rowVersion := rowVersionOf(storedRow) + 1
 
 	// The stored record, decoded only when something needs it: a partial write merges into it, and the
 	// delta entries and version derive from it.
 	var storedRecord unsafe.Pointer
-	if storedRow != nil && (!table.writesEveryColumn(phase) || len(table.deltaIndexes) > 0 || table.hasManagedWithoutField()) {
-		storedRecord = reflect.New(phase.records.recordType).UnsafePointer()
+	if storedRow != nil && (!phase.writesEveryColumn || len(table.deltaIndexes) > 0 || table.hasManagedWithoutField()) {
+		storedRecord = reflect.New(phase.records.RecordType).UnsafePointer()
 		if err := table.decodeRow(storedRow, storedRecord, nil); err != nil {
 			return nil, fmt.Errorf("table %q: decoding a stored row: %w", table.Name, err)
 		}
 		if !phase.isInsert && table.CreatedCol != nil {
 			// created is never rewritten by an update, field or not.
-			stamp.created = storedManagedInteger(table, storedRow, managedCreatedColumnName)
+			stamp.Created = storedManagedInteger(table, storedRow, managedCreatedColumnName)
 		}
 	}
 
 	// The row to write: the record itself when it writes every column, else the stored record with the
 	// written columns copied over (a new record starts from zero, keys included by the copy).
 	rowRecord := recordPointer
-	if !table.writesEveryColumn(phase) {
-		rowRecord = reflect.New(phase.records.recordType).UnsafePointer()
+	if !phase.writesEveryColumn {
+		rowRecord = reflect.New(phase.records.RecordType).UnsafePointer()
 		if storedRecord != nil {
-			copyRecord(phase.records.recordType, rowRecord, storedRecord)
+			copyRecord(phase.records.RecordType, rowRecord, storedRecord)
 		}
 		for _, column := range append(slices.Clone(phase.writtenColumns), table.keyAndPartitionColumns()...) {
 			copyColumnValue(column, rowRecord, recordPointer)

@@ -123,7 +123,7 @@ func deltaMovesCreateScript(scyllaTable ScyllaTable) string {
 // writePhase is one half of a write call: its records and the columns it writes. A column it does not
 // write keeps its stored value, which is what the delta view and the frame log must see.
 type writePhase struct {
-	records        recordSlice
+	records        db.RecordSlice
 	writtenColumns []IColInfo
 }
 
@@ -157,7 +157,7 @@ type storedRows map[[2]int64]map[string]any
 // and the index groups need of the records about to be written: the version and the pinned columns,
 // the whole row for the frames (a ToFrames method may read any field), and the group columns (the
 // groups a record leaves are marked too). nil when the table has none of them. The keys must be
-// final (after handlePreInsert).
+// final (after db.AssignAutoincrementKeys).
 func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (storedRows, error) {
 	var columns []IColInfo
 	if len(scyllaTable.DeltaIndexes) > 0 {
@@ -176,8 +176,8 @@ func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (stored
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 	idsOfPartition := map[int64][]int64{}
 	for _, phase := range phases {
-		for i := range phase.records.len() {
-			recordPointer := phase.records.at(i)
+		for i := range phase.records.Len() {
+			recordPointer := phase.records.At(i)
 			partition := db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer))
 			idsOfPartition[partition] = append(idsOfPartition[partition], db.ConvertToInt64(keyColumn.GetRawValue(recordPointer)))
 		}
@@ -203,14 +203,14 @@ func stampDeltaWrites(scyllaTable ScyllaTable, phases []writePhase, stored store
 			isWritten[column.GetName()] = true
 		}
 		packedValuesByPhase[phaseIndex] = map[string][]any{}
-		for i := range phase.records.len() {
-			recordPointer := phase.records.at(i)
+		for i := range phase.records.Len() {
+			recordPointer := phase.records.At(i)
 			partition := db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer))
 			recordID := db.ConvertToInt64(keyColumn.GetRawValue(recordPointer))
 			updated := db.ConvertToInt64(scyllaTable.UpdatedCol.GetValue(recordPointer))
 			storedRow, isStored := stored[[2]int64{partition, recordID}]
 			version := cache.NextVersion(storedIntegerOf(storedRow, managedVersionColumnName))
-			scyllaTable.VersionCol.SetValue(recordPointer, coerceManagedIntegerValue(scyllaTable.VersionCol, version))
+			scyllaTable.VersionCol.SetValue(recordPointer, db.CoerceManagedInteger(scyllaTable.VersionCol, version))
 
 			// A pinned column the write leaves out keeps its stored value.
 			finalValues := map[string]int64{}
@@ -303,8 +303,8 @@ func writeDeltaMoves(scyllaTable ScyllaTable, moves []deltaMove) error {
 	session := getScyllaConnection()
 	batch := session.NewBatch(gocql.UnloggedBatch)
 	for _, move := range moves {
-		batch.Query(statement, coerceManagedIntegerValue(scyllaTable.GetPartKey(), move.partition), move.indexTag,
-			move.pinnedPrefix, int32(move.updated), coerceManagedIntegerValue(scyllaTable.Keys[0], move.recordID))
+		batch.Query(statement, db.CoerceManagedInteger(scyllaTable.GetPartKey(), move.partition), move.indexTag,
+			move.pinnedPrefix, int32(move.updated), db.CoerceManagedInteger(scyllaTable.Keys[0], move.recordID))
 	}
 	if err := session.ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("table %q: writing %d delta move(s): %w", scyllaTable.Name, len(moves), err)
@@ -330,7 +330,7 @@ func deltaViewRange(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, parti
 	packedName := deltaIndex.PackedColumn.GetName()
 	return fmt.Sprintf("%v = ? AND %v >= ? AND %v <= ?", scyllaTable.GetPartKey().GetName(), packedName, packedName),
 		[]any{
-			coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition),
+			db.CoerceManagedInteger(scyllaTable.GetPartKey(), partition),
 			deltaPackedStoredValue(deltaIndex, scyllaTable.Name, pinnedValues, fromUpdated),
 			deltaPackedStoredValue(deltaIndex, scyllaTable.Name, pinnedValues, toUpdated),
 		}
@@ -399,7 +399,7 @@ func readDeltaMovedIDs(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, pa
 	queryString := fmt.Sprintf("SELECT id FROM %v.%v WHERE partition_id = ? AND index_tag = ? AND pinned_prefix = ? AND updated >= ? LIMIT %d",
 		resolveKeyspace(scyllaTable), deltaMovesTableName(scyllaTable), rowLimit)
 	iterator := getScyllaConnection().Query(queryString,
-		coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition), deltaIndex.Tag,
+		db.CoerceManagedInteger(scyllaTable.GetPartKey(), partition), deltaIndex.Tag,
 		deltaPackedStoredValue(deltaIndex, scyllaTable.Name, pinnedValues, 0), int32(fromUpdated)).Consistency(gocql.LocalQuorum).Iter()
 	var movedIDs []int64
 	var movedID int64
@@ -628,7 +628,7 @@ func deltaMetadataRecord(sink recordSink, scyllaTable ScyllaTable, metadataText 
 	}
 	metadataField.Set(reflect.ValueOf(&metadataText))
 	keyColumn := scyllaTable.Keys[0]
-	keyColumn.SetValue(record, coerceManagedIntegerValue(keyColumn, -1))
+	keyColumn.SetValue(record, db.CoerceManagedInteger(keyColumn, -1))
 	return record, nil
 }
 

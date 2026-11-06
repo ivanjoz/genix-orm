@@ -118,7 +118,7 @@ func insertRecordsJSON(scyllaTable *ScyllaTable, recordType reflect.Type, payloa
 	if err := insertTableRecords(scyllaTable, records, excluded); err != nil {
 		return 0, err
 	}
-	return records.len(), nil
+	return records.Len(), nil
 }
 
 // UpdateRecordsJSON updates only columnsToInclude on every record of the JSON array. The list is
@@ -149,21 +149,21 @@ func updateRecordsJSON(scyllaTable *ScyllaTable, recordType reflect.Type, payloa
 	if err != nil {
 		return 0, err
 	}
-	return records.len(), nil
+	return records.Len(), nil
 }
 
 // parseRecordsJSON decodes the payload into the table's record type. This is the HTTP payload, which
 // is JSON — colbin is the storage encoding and never appears here. Going through encoding/json is
 // what makes complex fields work: nested structs, slices and the blob-backed columns all decode by
 // their own rules, with no per-type assignment code here.
-func parseRecordsJSON(scyllaTable *ScyllaTable, recordType reflect.Type, payload []byte) (recordSlice, error) {
+func parseRecordsJSON(scyllaTable *ScyllaTable, recordType reflect.Type, payload []byte) (db.RecordSlice, error) {
 	recordsPointer := reflect.New(reflect.SliceOf(recordType))
 	if err := json.Unmarshal(payload, recordsPointer.Interface()); err != nil {
-		return recordSlice{}, Err("no se pudo interpretar los registros de", scyllaTable.Name, ":", err)
+		return db.RecordSlice{}, Err("no se pudo interpretar los registros de", scyllaTable.Name, ":", err)
 	}
-	records := makeReflectRecordSlice(recordsPointer)
-	if records.len() == 0 {
-		return recordSlice{}, Err("no se envió ningún registro para", scyllaTable.Name)
+	records := db.MakeReflectRecordSlice(recordsPointer)
+	if records.Len() == 0 {
+		return db.RecordSlice{}, Err("no se envió ningún registro para", scyllaTable.Name)
 	}
 	return records, nil
 }

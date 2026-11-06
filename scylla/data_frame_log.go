@@ -91,8 +91,8 @@ func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored stor
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
 	var logRows []dataFrameLogRow
 	for _, phase := range phases {
-		for i := range phase.records.len() {
-			recordPointer := phase.records.at(i)
+		for i := range phase.records.Len() {
+			recordPointer := phase.records.At(i)
 			logRow := dataFrameLogRow{partition: db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer)), recordID: db.ConvertToInt64(keyColumn.GetRawValue(recordPointer))}
 			if logRow.partition < 0 {
 				return fmt.Errorf("table %q: a table with DataFrames takes no negative partition (%d): it names the frames' folders", scyllaTable.Name, logRow.partition)
@@ -136,8 +136,8 @@ func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored stor
 		batch := session.NewBatch(gocql.UnloggedBatch)
 		batch.SetConsistency(gocql.LocalQuorum)
 		for _, logRow := range logRows[start:min(start+maxInsertBatchRows, len(logRows))] {
-			batch.Query(statement, halfHour, coerceManagedIntegerValue(partitionColumn, logRow.partition), offsetMicros,
-				coerceManagedIntegerValue(keyColumn, logRow.recordID), logRow.changes)
+			batch.Query(statement, halfHour, db.CoerceManagedInteger(partitionColumn, logRow.partition), offsetMicros,
+				db.CoerceManagedInteger(keyColumn, logRow.recordID), logRow.changes)
 		}
 		if err := session.ExecuteBatch(batch); err != nil {
 			return fmt.Errorf("table %q: writing the DataFrame log: %w", scyllaTable.Name, err)
@@ -181,7 +181,7 @@ func readDataFrameLog(scyllaTable ScyllaTable, partition int64, afterMoment int6
 	lastHalfHour, _ := dataFrameLogPosition(now)
 	queryString := fmt.Sprintf("SELECT partition_id, ts, record_id, changes FROM %v.%v WHERE half_hour = ? AND partition_id = ?",
 		resolveKeyspace(scyllaTable), info.logTableName)
-	partitionValue := coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition)
+	partitionValue := db.CoerceManagedInteger(scyllaTable.GetPartKey(), partition)
 
 	changesByRecord := map[[2]int64][]dataframe.HistoryChange{}
 	for halfHour := firstHalfHour; halfHour <= lastHalfHour; halfHour++ {

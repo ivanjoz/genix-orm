@@ -67,9 +67,9 @@ func readPartitionRecords(scyllaTable *ScyllaTable, recordType reflect.Type, par
 	return readTableRecords(scyllaTable, recordType, tableInfo)
 }
 
-// insertTableRecords is Insert over a recordSlice: the same managed write path, every managed
+// insertTableRecords is Insert over a db.RecordSlice: the same managed write path, every managed
 // column and sync included.
-func insertTableRecords(scyllaTable *ScyllaTable, records recordSlice, columnsToExclude []Coln) error {
+func insertTableRecords(scyllaTable *ScyllaTable, records db.RecordSlice, columnsToExclude []Coln) error {
 	return executeInsertUpdateBatchErased(erasedInsertUpdateParams{
 		insertRecords:           records,
 		compiledTable:           *scyllaTable,
@@ -117,7 +117,7 @@ func reloadTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partV
 		fmt.Println("Error al consultar", scyllaTable.Name, ":", err)
 		return err
 	}
-	if err := insertTableRecords(scyllaTable, makeReflectRecordSlice(recordsPointer), nil); err != nil {
+	if err := insertTableRecords(scyllaTable, db.MakeReflectRecordSlice(recordsPointer), nil); err != nil {
 		return Err("Error al re-insertar registros:", err)
 	}
 	return nil
@@ -803,7 +803,7 @@ func restoreColbinBatch(
 	if err := insertTableRecords(scyllaTable, records, nil); err != nil {
 		return 0, Err("Error al insertar registros:", err)
 	}
-	return records.len(), nil
+	return records.Len(), nil
 }
 
 type ScyllaColumns struct {

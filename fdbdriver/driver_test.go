@@ -84,7 +84,7 @@ func TestRowCodecRoundTrip(t *testing.T) {
 		Tags: []int32{-1, 0, 1 << 30}, Labels: []string{"a", "", "c"}, Lines: []fixtureLine{{ProductID: 9, Quantity: -4}},
 		Note: &note, Updated: 1234, Version: 2,
 	}
-	row, err := table.encodeRow(nil, 5, unsafe.Pointer(&original), managedStamp{created: 99})
+	row, err := table.encodeRow(nil, 5, unsafe.Pointer(&original), db.ManagedStamp{Created: 99})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +109,42 @@ func TestRowCodecRoundTrip(t *testing.T) {
 	if projected.Name != original.Name || projected.Price != 0 || projected.Tags != nil {
 		t.Fatalf("projection decoded too much: %+v", projected)
 	}
+}
+
+// The written columns come from the shared resolution (db.ResolveUpdateColumns): an Update writes
+// its columns plus the managed updated and version, and merges into the stored row; an Update with
+// no columns is refused as on every driver.
+func TestResolveWrittenColumnsFollowsTheSharedContract(t *testing.T) {
+	table := compiledTableOf[fixtureSchema, fixtureRecord]()
+	records := []fixtureRecord{{CompanyID: 7, ID: 1, Name: "renamed"}}
+
+	insert := insertPhase(db.MakeRecordSlice(&records), nil)
+	table.resolveWrittenColumns(&insert)
+	if !insert.writesEveryColumn {
+		t.Fatalf("an insert must write the whole row, wrote %v", columnNamesOf(insert.writtenColumns))
+	}
+
+	update := updateIncludePhase(db.MakeRecordSlice(&records), []db.Coln{mustColn(t, table, "name")})
+	table.resolveWrittenColumns(&update)
+	if written := columnNamesOf(update.writtenColumns); !slices.Equal(written, []string{"name", "updated", "version"}) || update.writesEveryColumn {
+		t.Fatalf("Update(name) wrote %v (whole row: %v)", written, update.writesEveryColumn)
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("an Update with no columns must be refused")
+		}
+	}()
+	emptyUpdate := updateIncludePhase(db.MakeRecordSlice(&records), nil)
+	table.resolveWrittenColumns(&emptyUpdate)
+}
+
+func columnNamesOf(columns []db.IColInfo) []string {
+	names := make([]string, 0, len(columns))
+	for _, column := range columns {
+		names = append(names, column.GetName())
+	}
+	return names
 }
 
 func TestOrderedKeyComponents(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/dataframe"
 	"github.com/ivanjoz/genix-orm/db"
@@ -97,27 +98,24 @@ func (Exec[TableT, RecordT]) SelectGrouped(schema *TableT, tableInfo *db.TableIn
 }
 
 func (Exec[TableT, RecordT]) Insert(records *[]RecordT, columnsToExclude ...db.Coln) error {
-	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{insertPhase(records, columnsToExclude)})
+	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{insertPhase(db.MakeRecordSlice(records), columnsToExclude)})
 }
 
 func (Exec[TableT, RecordT]) Update(records *[]RecordT, columnsToInclude ...db.Coln) error {
-	table := compiledTableOf[TableT, RecordT]()
-	return writeRecords(table, []writePhase{updateIncludePhase(table, records, columnsToInclude)})
+	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{updateIncludePhase(db.MakeRecordSlice(records), columnsToInclude)})
 }
 
 func (Exec[TableT, RecordT]) UpdateExclude(records *[]RecordT, columnsToExclude ...db.Coln) error {
-	table := compiledTableOf[TableT, RecordT]()
-	return writeRecords(table, []writePhase{updateExcludePhase(table, records, columnsToExclude)})
+	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{updateExcludePhase(db.MakeRecordSlice(records), columnsToExclude)})
 }
 
 func (Exec[TableT, RecordT]) InsertUpdate(
 	recordsForInsert, recordsForUpdate *[]RecordT,
 	columnsToIncludeUpdate []db.Coln, columnsToExcludeInsert ...db.Coln,
 ) error {
-	table := compiledTableOf[TableT, RecordT]()
-	return writeRecords(table, []writePhase{
-		insertPhase(recordsForInsert, columnsToExcludeInsert),
-		updateIncludePhase(table, recordsForUpdate, columnsToIncludeUpdate),
+	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{
+		insertPhase(db.MakeRecordSlice(recordsForInsert), columnsToExcludeInsert),
+		updateIncludePhase(db.MakeRecordSlice(recordsForUpdate), columnsToIncludeUpdate),
 	})
 }
 
@@ -125,11 +123,10 @@ func (Exec[TableT, RecordT]) InsertUpdateInclude(
 	records *[]RecordT, isInsert func(record *RecordT) bool,
 	columnsToIncludeUpdate []db.Coln, columnsToExcludeInsert ...db.Coln,
 ) error {
-	table := compiledTableOf[TableT, RecordT]()
-	toInsert, toUpdate := splitByIsInsert(records, isInsert)
-	return writeRecords(table, []writePhase{
-		insertPhase(&toInsert, columnsToExcludeInsert),
-		updateIncludePhase(table, &toUpdate, columnsToIncludeUpdate),
+	toInsert, toUpdate := db.SplitInsertAndUpdateRecords(db.MakeRecordSlice(records), erasedIsInsert(isInsert))
+	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{
+		insertPhase(toInsert, columnsToExcludeInsert),
+		updateIncludePhase(toUpdate, columnsToIncludeUpdate),
 	})
 }
 
@@ -137,12 +134,16 @@ func (Exec[TableT, RecordT]) InsertUpdateExclude(
 	records *[]RecordT, isInsert func(record *RecordT) bool,
 	columnsToExcludeUpdate []db.Coln, columnsToExcludeInsert ...db.Coln,
 ) error {
-	table := compiledTableOf[TableT, RecordT]()
-	toInsert, toUpdate := splitByIsInsert(records, isInsert)
-	return writeRecords(table, []writePhase{
-		insertPhase(&toInsert, columnsToExcludeInsert),
-		updateExcludePhase(table, &toUpdate, columnsToExcludeUpdate),
+	toInsert, toUpdate := db.SplitInsertAndUpdateRecords(db.MakeRecordSlice(records), erasedIsInsert(isInsert))
+	return writeRecords(compiledTableOf[TableT, RecordT](), []writePhase{
+		insertPhase(toInsert, columnsToExcludeInsert),
+		updateExcludePhase(toUpdate, columnsToExcludeUpdate),
 	})
+}
+
+// erasedIsInsert adapts the caller's typed classifier to records by pointer.
+func erasedIsInsert[RecordT any](isInsert func(record *RecordT) bool) func(unsafe.Pointer) bool {
+	return func(record unsafe.Pointer) bool { return isInsert((*RecordT)(record)) }
 }
 
 func (Exec[TableT, RecordT]) Merge(

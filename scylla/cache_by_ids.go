@@ -69,7 +69,7 @@ func cacheSlotsCreateScript(keyspace string) string {
 // the rows are written: a slot raised first would let a client read the old row, hold the new tick,
 // and never read the record again.
 func raiseWrittenSlots(records recordSliceGroup, scyllaTable ScyllaTable) error {
-	if !scyllaTable.CacheByIDs || records.len() == 0 {
+	if !scyllaTable.CacheByIDs || records.Len() == 0 {
 		return nil
 	}
 	// USING TIMESTAMP applies to a whole statement, so there is one per partition and stamp. A write
@@ -79,8 +79,8 @@ func raiseWrittenSlots(records recordSliceGroup, scyllaTable ScyllaTable) error 
 		updated   int32
 	}
 	slotsByStamp := map[partitionStamp]map[int8]int32{}
-	for i := range records.len() {
-		recordPointer := records.at(i)
+	for i := range records.Len() {
+		recordPointer := records.At(i)
 		stamp := partitionStamp{
 			partition: db.ConvertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer)),
 			updated:   int32(db.ConvertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))),
@@ -189,9 +189,9 @@ func forEachIDsBatch(
 	for partition, ids := range idsOfPartition {
 		for _, idBatch := range splitIDsIntoBatches(ids, queryCachedIDsMaxBatchSize) {
 			queryValues := make([]any, 0, len(idBatch)+1)
-			queryValues = append(queryValues, coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition))
+			queryValues = append(queryValues, db.CoerceManagedInteger(scyllaTable.GetPartKey(), partition))
 			for _, id := range idBatch {
-				queryValues = append(queryValues, coerceManagedIntegerValue(scyllaTable.Keys[0], id))
+				queryValues = append(queryValues, db.CoerceManagedInteger(scyllaTable.Keys[0], id))
 			}
 			queryString := fmt.Sprintf("SELECT %v FROM %v.%v WHERE %v = ? AND %v IN (%v)",
 				projection, resolveKeyspace(scyllaTable), scyllaTable.Name,
@@ -268,7 +268,7 @@ func queryCachedIDs(scyllaTable ScyllaTable, request cache.CachedIDsRequest, sin
 		partition := db.ConvertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer))
 		id := db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 		scyllaTable.UpdatedCol.SetValue(recordPointer,
-			coerceManagedIntegerValue(scyllaTable.UpdatedCol, plan.HeldUpdated(partition, id)))
+			db.CoerceManagedInteger(scyllaTable.UpdatedCol, plan.HeldUpdated(partition, id)))
 		recordsByPartition[partition] = append(recordsByPartition[partition], recordPointer)
 	}
 	partitions := make([]cachedPartitionRead, 0, len(recordsByPartition))

@@ -310,10 +310,10 @@ func setFrameRowKey(scyllaTable *ScyllaTable, frame *dataframe.Frame, keyPointer
 	}
 	for k, key := range frame.Keys {
 		column := scyllaTable.ColumnsMap[key.FieldName]
-		column.SetValue(keyPointer, coerceManagedIntegerValue(column, row.Keys[k]))
+		column.SetValue(keyPointer, db.CoerceManagedInteger(column, row.Keys[k]))
 	}
 	for c, rowColumn := range frame.Rows {
 		column := scyllaTable.ColumnsMap[rowColumn.FieldName]
-		column.SetValue(keyPointer, coerceManagedIntegerValue(column, row.RowValues[c]))
+		column.SetValue(keyPointer, db.CoerceManagedInteger(column, row.RowValues[c]))
 	}
 }

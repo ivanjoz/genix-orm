@@ -19,7 +19,7 @@ func TestCacheByIDsSlotKeepsTheLatestStamp(t *testing.T) {
 	now := utils.SUnixTimeOf(db.Now())
 	for _, updated := range []int64{now - 1000, now - 2000} { // the newer stamp lands first
 		records := []cacheITRecord{{CompanyID: 99, ID: 300, Updated: int32(updated)}}
-		if err := raiseWrittenSlots(recordSliceGroup{makeRecordSlice(&records)}, scyllaTable); err != nil {
+		if err := raiseWrittenSlots(recordSliceGroup{db.MakeRecordSlice(&records)}, scyllaTable); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -132,9 +132,9 @@ func deployCacheITTable(t *testing.T) (table *cacheITSchema, clockStart int32, s
 		Schema: MakeSchema[cacheITRecord, cacheITSchema](),
 	})
 
-	clockStart = currentManagedUnixTime() - 3600
+	clockStart = db.ManagedUnixTime() - 3600
 	setClock = func(offset int32) { getManagedUnixTime = func() int32 { return clockStart + offset } }
-	t.Cleanup(func() { getManagedUnixTime = currentManagedUnixTime })
+	t.Cleanup(func() { getManagedUnixTime = db.ManagedUnixTime })
 	return TableOf[cacheITRecord](), clockStart, setClock
 }
 

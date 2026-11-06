@@ -86,14 +86,14 @@ loudly with a "rename" message.
 ## Type-erased read, merge and controller paths
 **Context** — Go compiles a generic function once per record struct, so every body that took `T`
 existed 55 times in genix. The write path and the row scan were already erased (`recordSlice`,
-`recordSink`); the outer read path, Merge, the grouped read, InsertUpdateInclude and every
+now `db.RecordSlice`, and `recordSink`); the outer read path, Merge, the grouped read, InsertUpdateInclude and every
 `ScyllaController` method were not. The plan assumed they needed `reflect.MakeSlice` for their
 intermediate `[]T`.
 **Decision** — The exported API stays generic. Each entry point is a shim over a non-generic body:
 - Intermediate results are `[]unsafe.Pointer` collected through `recordSink.collectInto`, not new
   `[]T`. Only the caller's destination is typed.
 - When a body must build a slice of its own, it uses a reflect-built `[]T` from
-  `recordSlice.recordType` (`newRecordList`, `appendCopy`) or `makeReflectRecordSlice` /
+  `db.RecordSlice.RecordType` (`NewRecordList`, `AppendCopy`) or `db.MakeReflectRecordSlice` /
   `makeReflectRecordSink`. Those bodies are Merge and InsertUpdate*'s insert/update split, plus the
   controller's JSON, colbin and reload paths.
 - `ScyllaController` methods pass `&e.Table` and `reflect.TypeFor[T]()` to a free function, and

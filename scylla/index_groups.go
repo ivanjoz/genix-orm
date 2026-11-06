@@ -160,15 +160,15 @@ func collectIndexGroupMarks(scyllaTable *ScyllaTable, phases []writePhase, store
 		for _, column := range phase.writtenColumns {
 			isWritten[column.GetName()] = true
 		}
-		for i := range phase.records.len() {
-			recordPointer := phase.records.at(i)
+		for i := range phase.records.Len() {
+			recordPointer := phase.records.At(i)
 			partition := db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer))
 			storedRow, isStored := stored[[2]int64{partition, db.ConvertToInt64(keyColumn.GetRawValue(recordPointer))}]
 
-			finalRecord := reflect.New(phase.records.recordType).UnsafePointer()
-			phase.records.copyRecord(finalRecord, recordPointer)
+			finalRecord := reflect.New(phase.records.RecordType).UnsafePointer()
+			phase.records.CopyRecord(finalRecord, recordPointer)
 			if isStored {
-				leftRecord := reflect.New(phase.records.recordType).UnsafePointer()
+				leftRecord := reflect.New(phase.records.RecordType).UnsafePointer()
 				for _, column := range groupColumns {
 					storedValue, hasValue := storedRow[column.GetName()]
 					if !hasValue {

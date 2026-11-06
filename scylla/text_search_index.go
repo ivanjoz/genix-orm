@@ -12,7 +12,7 @@ import (
 
 // textSearchWrite is one phase of a write, as the index sees it.
 type textSearchWrite struct {
-	records recordSlice
+	records db.RecordSlice
 	// columns are the columns the phase wrote.
 	columns []IColInfo
 	// skip lists the IDs whose text and status are known not to have changed (Merge holds the
@@ -42,13 +42,13 @@ func syncTextSearchAfterWrite(scyllaTable *ScyllaTable, writes ...textSearchWrit
 	partitions := []int64{}
 
 	for _, write := range writes {
-		if write.records.len() == 0 || !info.Touches(write.columns) {
+		if write.records.Len() == 0 || !info.Touches(write.columns) {
 			continue
 		}
 		known := info.WritesAll(write.columns)
 
-		for i := range write.records.len() {
-			recordPointer := write.records.at(i)
+		for i := range write.records.Len() {
+			recordPointer := write.records.At(i)
 			recordID := db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 			if write.skip[recordID] {
 				continue

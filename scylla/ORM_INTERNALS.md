@@ -362,7 +362,7 @@ Supports autoincrement placeholders as packing components.
 
 ### 10.2 Pre-Insert Autoincrement
 
-`handlePreInsert`:
+`db.TableCore.AssignAutoincrementKeys` (shared with every driver; Scylla passes `reserveCounter`):
 - groups rows by partition/autoincrement partition
 - requests counters in bulk
 - fills autoincrement field (optional random suffix)

@@ -99,8 +99,8 @@ func TestTextSearchSyncInsert(t *testing.T) {
 	}
 
 	err := syncTextSearchAfterWrite(&scyllaTable, textSearchWrite{
-		records: makeRecordSlice(&records),
-		columns: collectAffectedColumnsForInsert(&scyllaTable, nil),
+		records: db.MakeRecordSlice(&records),
+		columns: scyllaTable.AffectedColumnsForInsert(nil),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestTextSearchSyncUpdate(t *testing.T) {
 		{CompanyID: 1, ID: 11, Name: "Gorra", Brand: "Puma", Status: 0},
 		{CompanyID: 1, ID: 12, Name: "Casaca", Brand: "Adidas", Status: 1},
 	}
-	slice := makeRecordSlice(&records)
+	slice := db.MakeRecordSlice(&records)
 
 	// An update that does not touch the text or the status changes nothing.
 	write := textSearchWrite{records: slice, columns: columnsNamed(&scyllaTable, "price", "updated")}
@@ -162,7 +162,7 @@ func TestTextSearchSyncUpdate(t *testing.T) {
 func TestTextSearchManualAndMissingBackend(t *testing.T) {
 	scyllaTable := compiledTextSearchTable(t)
 	records := []textSearchRecord{{CompanyID: 1, ID: 10, Name: "Polo", Status: 1}}
-	write := textSearchWrite{records: makeRecordSlice(&records), columns: collectAffectedColumnsForInsert(&scyllaTable, nil)}
+	write := textSearchWrite{records: db.MakeRecordSlice(&records), columns: scyllaTable.AffectedColumnsForInsert(nil)}
 
 	db.SetTextSearchBackend(nil)
 	err := syncTextSearchAfterWrite(&scyllaTable, write)

@@ -165,14 +165,16 @@ func TestApplyWriteManagedColumnsAlwaysStampsUpdated(t *testing.T) {
 	t.Cleanup(func() { getManagedUnixTime = originalManagedUnixTime })
 	getManagedUnixTime = func() int32 { return 77 }
 
-	managedValues := applyWriteManagedColumns(makeRecordSlice(&records), scyllaTable, true)
+	managedValues := applyWriteManagedColumns(db.MakeRecordSlice(&records), scyllaTable, true)
 	for recordIndex := range records {
-		if managedValues.createdValues[recordIndex] != int32(77) {
-			t.Fatalf("expected managed created 77, got %v at index %d", managedValues.createdValues[recordIndex], recordIndex)
+		createdValue, _ := managedValues.getValueForColumn(recordIndex, scyllaTable.CreatedCol, true)
+		if createdValue != int32(77) {
+			t.Fatalf("expected managed created 77, got %v at index %d", createdValue, recordIndex)
 		}
-		if managedValues.updatedValues[recordIndex] != int32(77) || records[recordIndex].Updated != 77 {
+		updatedValue, _ := managedValues.getValueForColumn(recordIndex, scyllaTable.UpdatedCol, true)
+		if updatedValue != int32(77) || records[recordIndex].Updated != 77 {
 			t.Fatalf("expected updated 77 on the record and the statement, got %v / %v at index %d",
-				managedValues.updatedValues[recordIndex], records[recordIndex].Updated, recordIndex)
+				updatedValue, records[recordIndex].Updated, recordIndex)
 		}
 	}
 }
@@ -344,8 +346,8 @@ func TestCollectIndexGroupMarksUsesTheStoredRow(t *testing.T) {
 	// Record 2 moves to another date.
 	moved := []indexGroupRecord{{CompanyID: 7, ID: 2, Date: 18760, ClientID: 5, ProductIDs: []int32{11}}}
 	phases := []writePhase{
-		{records: makeRecordSlice(&renamed), writtenColumns: nil},
-		{records: makeRecordSlice(&moved), writtenColumns: []IColInfo{columnNamed("date"), columnNamed("client_id"), columnNamed("product_ids")}},
+		{records: db.MakeRecordSlice(&renamed), writtenColumns: nil},
+		{records: db.MakeRecordSlice(&moved), writtenColumns: []IColInfo{columnNamed("date"), columnNamed("client_id"), columnNamed("product_ids")}},
 	}
 	marks := collectIndexGroupMarks(&scyllaTable, phases, stored)
 
@@ -394,7 +396,7 @@ func TestMarkIndexGroupsBeforeWriteStampsTheMarkerTime(t *testing.T) {
 		return nil
 	}
 
-	marks := collectIndexGroupMarks(&scyllaTable, []writePhase{{records: makeRecordSlice(&records)}}, nil)
+	marks := collectIndexGroupMarks(&scyllaTable, []writePhase{{records: db.MakeRecordSlice(&records)}}, nil)
 	if err := markIndexGroupsBeforeWrite(&scyllaTable, marks); err != nil {
 		t.Fatalf("markIndexGroupsBeforeWrite returned error: %v", err)
 	}
