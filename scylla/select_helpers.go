@@ -51,22 +51,31 @@ type SelectStatement struct {
 	// queryTemplate already includes SELECT + FROM and expects the final WHERE/GROUP/ORDER/LIMIT suffix.
 	queryTemplate string
 	scanColumns   []selectScanColumn
-	route         selectExecutionRoute
-	sourceView    *viewInfo
-	// selectedStatementIndexes tracks the predicates consumed by a source view so bind-time can reuse current values.
-	selectedStatementIndexes   []int
-	remainingStatementIndexes  []int
-	postFilterStatementIndexes []int
-	// fixedValueFanoutStatements are the schema-derived IN predicates that filled a gap in the
-	// chosen source's key prefix. They depend only on the schema, so bind-time appends them after
-	// the query's own statements exactly as compile-time did and every cached index stays valid.
-	fixedValueFanoutStatements []ColumnStatement
-	requiresDeduplication      bool
-	orderBy                    string
-	orderColumnName            string
-	limit                      int32
-	allowFilter                bool
-	groupByColumns             []string
+	// accessRoute is the driver-neutral route db chose for this shape (nil for a native GROUP BY);
+	// route and sourceView restate it for logs and tests.
+	accessRoute     *db.AccessRoute
+	route           selectExecutionRoute
+	sourceView      *viewInfo
+	orderBy         string
+	orderColumnName string
+	limit           int32
+	allowFilter     bool
+	groupByColumns  []string
+}
+
+// selectRouteOfAccessRoute is the CQL route label of a db access route.
+func selectRouteOfAccessRoute(kind db.AccessRouteKind) selectExecutionRoute {
+	switch kind {
+	case db.AccessRouteSource:
+		return selectRouteViewStatements
+	case db.AccessRouteKeyConcatenated:
+		return selectRouteKeyConcatenated
+	case db.AccessRouteKeyIntPacking:
+		return selectRouteKeyIntPacking
+	case db.AccessRouteCompositeBucket:
+		return selectRouteCompositeBucket
+	}
+	return selectRouteAllStatements
 }
 
 func newSelectPlanCache() *selectPlanCache {
@@ -94,16 +103,6 @@ func (e *selectPlanCache) Store(hash uint64, plan *SelectStatement) {
 	defer e.mutex.Unlock()
 
 	e.plans[hash] = plan
-}
-
-func collectSelectStatements(tableInfo *TableInfo) []ColumnStatement {
-	// Keep statement extraction centralized so compile and bind share the exact same logical input order.
-	statements := make([]ColumnStatement, 0, len(tableInfo.Statements)+1)
-	statements = append(statements, tableInfo.Statements...)
-	if len(tableInfo.Between.From) > 0 {
-		statements = append(statements, tableInfo.Between)
-	}
-	return statements
 }
 
 func shouldAutoSelectColumn(column IColInfo) bool {
@@ -181,7 +180,7 @@ func computeSelectShapeHash(tableInfo *TableInfo, scyllaTable ScyllaTable) uint6
 		}
 	}
 
-	for _, statement := range collectSelectStatements(tableInfo) {
+	for _, statement := range tableInfo.SelectStatements() {
 		writeText(statement.Col)
 		writeText(db.CapabilityOpForStatement(statement))
 
@@ -202,17 +201,6 @@ func computeSelectShapeHash(tableInfo *TableInfo, scyllaTable ScyllaTable) uint6
 	}
 
 	return hashBuilder.Sum64()
-}
-
-func pickStatementsByIndexes(statements []ColumnStatement, indexes []int) []ColumnStatement {
-	pickedStatements := make([]ColumnStatement, 0, len(indexes))
-	for _, statementIndex := range indexes {
-		if statementIndex < 0 || statementIndex >= len(statements) {
-			continue
-		}
-		pickedStatements = append(pickedStatements, statements[statementIndex])
-	}
-	return pickedStatements
 }
 
 func makeSelectQueryTemplate(selectExpressions []string, keyspace, sourceTableName string) string {
@@ -369,18 +357,8 @@ func buildBoundSelectPlan(
 	}
 }
 
-func buildRemainingStatementsForCompositePlan(statements []ColumnStatement, compositePlan *compositeBucketQueryPlan) []ColumnStatement {
-	remainingStatements := []ColumnStatement{}
-	for _, statement := range statements {
-		if !compositePlan.handledColumns[statement.Col] {
-			remainingStatements = append(remainingStatements, statement)
-		}
-	}
-	return remainingStatements
-}
-
 func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*SelectStatement, error) {
-	statements := collectSelectStatements(tableInfo)
+	statements := tableInfo.SelectStatements()
 	selectShapeHash := computeSelectShapeHash(tableInfo, scyllaTable)
 
 	if len(tableInfo.GroupByColumns) > 0 {
@@ -403,16 +381,15 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 		}
 
 		compiledStatement := &SelectStatement{
-			hash:                  selectShapeHash,
-			queryTemplate:         makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.Namespace, sourceTableName),
-			scanColumns:           slices.Clone(groupByPlan.ScanColumns),
-			route:                 selectRouteNativeGroupBy,
-			orderBy:               tableInfo.OrderBy,
-			orderColumnName:       orderColumnName,
-			limit:                 tableInfo.Limit,
-			allowFilter:           tableInfo.AllowFilter,
-			groupByColumns:        slices.Clone(groupByPlan.GroupByColumns),
-			requiresDeduplication: false,
+			hash:            selectShapeHash,
+			queryTemplate:   makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.Namespace, sourceTableName),
+			scanColumns:     slices.Clone(groupByPlan.ScanColumns),
+			route:           selectRouteNativeGroupBy,
+			orderBy:         tableInfo.OrderBy,
+			orderColumnName: orderColumnName,
+			limit:           tableInfo.Limit,
+			allowFilter:     tableInfo.AllowFilter,
+			groupByColumns:  slices.Clone(groupByPlan.GroupByColumns),
 		}
 
 		if ShouldLog() {
@@ -429,166 +406,57 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 		orderColumnName = scyllaTable.Keys[0].GetName()
 	}
 
+	// db chooses the route; only the CQL table to read and its ORDER BY column are decided here.
+	accessRoute := scyllaTable.ChooseAccessRoute(statements, scyllaTable.capabilities, columnNames)
 	compiledStatement := &SelectStatement{
-		hash:            computeSelectShapeHash(tableInfo, scyllaTable),
+		hash:            selectShapeHash,
 		scanColumns:     slices.Clone(scanColumns),
+		accessRoute:     accessRoute,
+		route:           selectRouteOfAccessRoute(accessRoute.Kind),
 		orderBy:         tableInfo.OrderBy,
 		orderColumnName: orderColumnName,
 		limit:           tableInfo.Limit,
 		allowFilter:     tableInfo.AllowFilter,
-		route:           selectRouteAllStatements,
 	}
-
-	if compositePlan := tryBuildCompositeBucketPlan(statements, scyllaTable); compositePlan != nil {
-		compiledStatement.route = selectRouteCompositeBucket
-		compiledStatement.requiresDeduplication = true
-		compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.Namespace, viewTableName)
-		if ShouldLog() {
-			fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=true dedup=true\n",
-				scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName)
-		}
-		return compiledStatement, nil
+	if accessRoute.Kind == db.AccessRouteSource {
+		compiledStatement.sourceView = scyllaTable.viewOfSource(accessRoute.Source)
 	}
-
-	bestCapability := db.MatchQueryCapability(statements, scyllaTable.capabilities)
-	bestCapability, fanoutStatements := scyllaTable.ApplyFixedValueFanout(statements, bestCapability, scyllaTable.capabilities)
-	if len(fanoutStatements) > 0 {
-		// The fan-out predicates take part in planning from here on, so they must sit in the
-		// statement list the cached indexes are computed against.
-		statements = append(slices.Clone(statements), fanoutStatements...)
-		compiledStatement.fixedValueFanoutStatements = fanoutStatements
-	}
-
-	if bestCapability != nil {
-		if bestCapability.Source != nil {
-			selectedView := scyllaTable.viewOfSource(bestCapability.Source)
-			// Index group views (Type 3) query the main table via a virtual hash column;
-			// projected views (Type >= 6) redirect to a separate view table.
-			hasAccessPlanner := db.HasAccessPlanner(selectedView.IndexSource)
-			isIndexGroupView := selectedView.Type == 3 && hasAccessPlanner
-			isProjectedView := selectedView.Type >= 6 && canUseProjectedView(columnNames, selectedView)
-
-			if isProjectedView {
-				viewTableName = selectedView.Name
-				if selectedView.Type == 9 {
-					compiledStatement.requiresDeduplication = true
-				}
-				// The view's first clustering column drives ORDER BY in the view table, not the base ID.
-				if selectedView.Column != nil && !selectedView.Column.IsNil() {
-					compiledStatement.orderColumnName = selectedView.Column.GetName()
-				}
-			}
-
-			if (isProjectedView && hasAccessPlanner) || isIndexGroupView {
-				selectedStatementIndexes := []int{}
-				remainingStatementIndexes := []int{}
-
-				for statementIndex, statement := range statements {
-					if slices.Contains(selectedView.Columns, statement.Col) {
-						selectedStatementIndexes = append(selectedStatementIndexes, statementIndex)
-						continue
-					}
-					if len(statement.From) > 0 {
-						isIncluded := true
-						for _, betweenStatement := range statement.From {
-							if !slices.Contains(selectedView.Columns, betweenStatement.Col) {
-								isIncluded = false
-								break
-							}
-						}
-						if isIncluded {
-							selectedStatementIndexes = append(selectedStatementIndexes, statementIndex)
-						} else {
-							remainingStatementIndexes = append(remainingStatementIndexes, statementIndex)
-						}
-						continue
-					}
-					remainingStatementIndexes = append(remainingStatementIndexes, statementIndex)
-				}
-
-				compiledStatement.route = selectRouteViewStatements
-				compiledStatement.sourceView = selectedView
-				compiledStatement.selectedStatementIndexes = selectedStatementIndexes
-				compiledStatement.remainingStatementIndexes = remainingStatementIndexes
-				if selectedView.RequiresPostFilter || isIndexGroupView {
-					// Index group views: always post-filter to guard against hash collisions.
-					compiledStatement.postFilterStatementIndexes = slices.Clone(selectedStatementIndexes)
-					compiledStatement.requiresDeduplication = true
-				}
-			}
-		} else if bestCapability.IsKey {
-			if _, canRewrite := scyllaTable.BuildKeyConcatenatedStatements(statements); canRewrite {
-				compiledStatement.route = selectRouteKeyConcatenated
-			} else if _, canRewrite := scyllaTable.BuildKeyIntPackingStatements(statements); canRewrite {
-				compiledStatement.route = selectRouteKeyIntPacking
-			}
+	if accessRoute.ReadsSourceTable {
+		viewTableName = accessRoute.Source.Name
+		// The view's first clustering column drives ORDER BY in the view table, not the base ID.
+		if accessRoute.Source.Column != nil && !accessRoute.Source.Column.IsNil() {
+			compiledStatement.orderColumnName = accessRoute.Source.Column.GetName()
 		}
 	}
-
 	compiledStatement.queryTemplate = makeSelectQueryTemplate(selectExpressions, scyllaTable.Namespace, viewTableName)
 
 	if ShouldLog() {
 		fmt.Printf("Select plan compiled: table=%s hash=%d route=%d source=%s post_filter=%v dedup=%v\n",
 			scyllaTable.Name, compiledStatement.hash, compiledStatement.route, viewTableName,
-			len(compiledStatement.postFilterStatementIndexes) > 0, compiledStatement.requiresDeduplication)
+			len(accessRoute.PostFilterStatementIndexes) > 0, accessRoute.RequiresDeduplication)
 	}
-
 	return compiledStatement, nil
 }
 
 func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable) (*BoundSelectPlan, error) {
 	// Bind current values into the cached query shape without rerunning planner selection in selectExec.
-	statements := collectSelectStatements(tableInfo)
-	if len(e.fixedValueFanoutStatements) > 0 {
-		statements = append(statements, e.fixedValueFanoutStatements...)
-	}
-	whereStatements := []boundWhereClause{{}}
-	remainingStatements := statements
-	postFilterStatements := pickStatementsByIndexes(statements, e.postFilterStatementIndexes)
-	scanColumns := slices.Clone(e.scanColumns)
 	queryTemplate := e.queryTemplate
+	scanColumns := slices.Clone(e.scanColumns)
 	groupByColumns := slices.Clone(e.groupByColumns)
 	orderColumnName := e.orderColumnName
+	var whereStatements []boundWhereClause
+	var postFilterStatements []ColumnStatement
+	requiresDeduplication := false
 
-	switch e.route {
-	case selectRouteViewStatements:
-		selectedStatements := pickStatementsByIndexes(statements, e.selectedStatementIndexes)
-		remainingStatements = pickStatementsByIndexes(statements, e.remainingStatementIndexes)
-		whereStatements = e.sourceView.prepareWhereClauses(selectedStatements...)
-		if len(whereStatements) == 0 {
-			// A view that cannot bind the predicates would otherwise yield zero bound statements,
-			// which reads as an empty result set instead of a planning failure.
-			return nil, fmt.Errorf(`view "%v" cannot serve this query's predicates`, e.sourceView.Name)
-		}
-	case selectRouteKeyConcatenated:
-		rewrittenStatements, canRewrite := scyllaTable.BuildKeyConcatenatedStatements(statements)
-		if !canRewrite {
-			return nil, fmt.Errorf("key concatenated select shape no longer matches the cached route")
-		}
-		remainingStatements = rewrittenStatements
-	case selectRouteKeyIntPacking:
-		rewrittenStatements, canRewrite := scyllaTable.BuildKeyIntPackingStatements(statements)
-		if !canRewrite {
-			return nil, fmt.Errorf("key int packing select shape no longer matches the cached route")
-		}
-		remainingStatements = rewrittenStatements
-	case selectRouteCompositeBucket:
-		compositePlan := tryBuildCompositeBucketPlan(statements, scyllaTable)
-		if compositePlan == nil {
-			return nil, fmt.Errorf("composite bucket select shape no longer matches the cached route")
-		}
-		whereStatements = compositePlan.whereStatements
-		remainingStatements = buildRemainingStatementsForCompositePlan(statements, compositePlan)
-		postFilterStatements = slices.Clone(compositePlan.filterStatements)
-	case selectRouteNativeGroupBy:
-		groupByPlan, err := buildNativeGroupByPlan(tableInfo, statements, scyllaTable)
+	if e.route == selectRouteNativeGroupBy {
+		// Native GROUP BY is Scylla-only and stays outside the AccessPlan.
+		groupByPlan, err := buildNativeGroupByPlan(tableInfo, tableInfo.SelectStatements(), scyllaTable)
 		if err != nil {
 			return nil, err
 		}
 		if groupByPlan == nil {
 			return nil, fmt.Errorf("group by select shape no longer matches the cached route")
 		}
-
 		sourceTableName := scyllaTable.Name
 		if groupByPlan.ViewTableName != "" {
 			sourceTableName = groupByPlan.ViewTableName
@@ -596,22 +464,26 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 		queryTemplate = makeSelectQueryTemplate(groupByPlan.SelectExpressions, scyllaTable.Namespace, sourceTableName)
 		scanColumns = slices.Clone(groupByPlan.ScanColumns)
 		groupByColumns = slices.Clone(groupByPlan.GroupByColumns)
-		remainingStatements = nil
 		whereStatements = slices.Clone(groupByPlan.WhereStatements)
 		if groupByPlan.OrderColumn != nil && !groupByPlan.OrderColumn.IsNil() {
 			orderColumnName = groupByPlan.OrderColumn.GetName()
 		}
-	}
-	if err := scyllaTable.RejectComputedStatements(remainingStatements); err != nil {
-		return nil, err
+	} else {
+		accessPlan, err := scyllaTable.BindAccessPlan(e.accessRoute, tableInfo)
+		if err != nil {
+			return nil, err
+		}
+		whereStatements = renderAccessPlan(&scyllaTable, accessPlan)
+		postFilterStatements = accessPlan.PostFilter
+		requiresDeduplication = e.accessRoute.RequiresDeduplication
 	}
 
 	return buildBoundSelectPlan(
 		queryTemplate,
 		scanColumns,
-		e.requiresDeduplication,
+		requiresDeduplication,
 		whereStatements,
-		remainingStatements,
+		nil,
 		postFilterStatements,
 		groupByColumns,
 		e.orderBy,

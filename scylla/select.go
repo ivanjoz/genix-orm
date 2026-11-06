@@ -5,38 +5,12 @@ import (
 	"fmt"
 	"github.com/ivanjoz/genix-orm/db"
 	"reflect"
-	"slices"
 	"strings"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sync/errgroup"
 )
-
-// compositeBucketQueryPlan captures the generated indexed where-clauses plus source statements to keep for final exact filtering.
-type compositeBucketQueryPlan struct {
-	whereStatements  []boundWhereClause
-	handledColumns   map[string]bool
-	filterStatements []ColumnStatement
-}
-
-func canUseProjectedView(selectedColumnNames []string, view *viewInfo) bool {
-	if view == nil || len(view.AvailableColumns) == 0 {
-		return true
-	}
-
-	for _, selectedColumnName := range selectedColumnNames {
-		if !slices.Contains(view.AvailableColumns, selectedColumnName) {
-			if ShouldLog() {
-				fmt.Printf("Projected view rejected: view=%s missing_column=%s available=%v\n",
-					view.Name, selectedColumnName, view.AvailableColumns)
-			}
-			return false
-		}
-	}
-
-	return true
-}
 
 func deduplicateRecordsByPrimaryKey(sink recordSink, scyllaTable ScyllaTable) {
 	records := sink.heldRecords()
@@ -535,144 +509,6 @@ func executeBoundSelectQueries(
 	}
 	if requiresDeduplication {
 		deduplicateRecordsByPrimaryKey(sink, scyllaTable)
-	}
-
-	return nil
-}
-
-func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable ScyllaTable) *compositeBucketQueryPlan {
-	// Build a specialized plan for composite-bucket indexes before generic capability matching.
-	partitionColumn := scyllaTable.GetPartKey()
-	if partitionColumn == nil || partitionColumn.IsNil() {
-		return nil
-	}
-
-	statementByColumn := map[string][]ColumnStatement{}
-	for _, statement := range statements {
-		statementByColumn[statement.Col] = append(statementByColumn[statement.Col], statement)
-	}
-
-	partitionStatements := statementByColumn[partitionColumn.GetName()]
-	if len(partitionStatements) == 0 || partitionStatements[0].Operator != "=" {
-		return nil
-	}
-
-	for _, compositeIndex := range scyllaTable.CompositeBucketIndexes {
-		// The composite strategy requires a range on the bucketed column and hashable predicates for remaining source columns.
-		bucketStatements := statementByColumn[compositeIndex.BucketColumn.GetName()]
-		if len(bucketStatements) == 0 {
-			continue
-		}
-
-		bucketIsWeek := compositeIndex.BucketIsWeek
-		from, to, ok := db.BetweenRange(bucketStatements[0], bucketIsWeek)
-		if !ok {
-			continue
-		}
-
-		valueOptionsByColumn := map[string][]int64{}
-		filterStatements := []ColumnStatement{bucketStatements[0]}
-		handledColumns := map[string]bool{
-			compositeIndex.BucketColumn.GetName(): true,
-			partitionColumn.GetName():             true,
-		}
-		isValid := true
-
-		for _, sourceColumn := range compositeIndex.SourceColumns {
-			if sourceColumn.GetName() == compositeIndex.BucketColumn.GetName() {
-				continue
-			}
-
-			sourceStatements := statementByColumn[sourceColumn.GetName()]
-			if len(sourceStatements) == 0 {
-				isValid = false
-				break
-			}
-
-			values, valueOk := db.StatementValuesForHash(sourceStatements[0])
-			if !valueOk || len(values) == 0 {
-				isValid = false
-				break
-			}
-
-			valueOptionsByColumn[sourceColumn.GetName()] = values
-			filterStatements = append(filterStatements, sourceStatements[0])
-			handledColumns[sourceColumn.GetName()] = true
-		}
-
-		if !isValid {
-			continue
-		}
-
-		bucketSelections := db.PlanCompositeBuckets(from, to, compositeIndex.BucketSizes)
-		if len(bucketSelections) == 0 {
-			continue
-		}
-
-		queryValueGroups := []map[string]int64{{}}
-		// Expand all hash input combinations for IN/equality source predicates.
-		for _, sourceColumn := range compositeIndex.SourceColumns {
-			if sourceColumn.GetName() == compositeIndex.BucketColumn.GetName() {
-				continue
-			}
-			nextGroups := []map[string]int64{}
-			for _, queryValueGroup := range queryValueGroups {
-				for _, value := range valueOptionsByColumn[sourceColumn.GetName()] {
-					nextGroup := map[string]int64{}
-					for key, currentValue := range queryValueGroup {
-						nextGroup[key] = currentValue
-					}
-					nextGroup[sourceColumn.GetName()] = value
-					nextGroups = append(nextGroups, nextGroup)
-				}
-			}
-			queryValueGroups = nextGroups
-		}
-
-		whereStatements := []boundWhereClause{}
-		// Emit one indexed CONTAINS statement per (bucket selection x source tuple) combination.
-		partitionValue := partitionStatements[0].GetValue()
-		for _, bucketSelection := range bucketSelections {
-			virtualColumn := compositeIndex.VirtualColumnsBySize[bucketSelection.BucketSize]
-			if virtualColumn == nil {
-				isValid = false
-				break
-			}
-
-			for _, queryValueGroup := range queryValueGroups {
-				hashValues := make([]int64, 0, len(compositeIndex.SourceColumns))
-				for _, sourceColumn := range compositeIndex.SourceColumns {
-					if sourceColumn.GetName() == compositeIndex.BucketColumn.GetName() {
-						hashValues = append(hashValues, bucketSelection.BucketID)
-						continue
-					}
-					hashValues = append(hashValues, queryValueGroup[sourceColumn.GetName()])
-				}
-
-				hashValue := db.HashInt64(hashValues...)
-				whereStatements = append(whereStatements, boundWhereClause{
-					Clause: fmt.Sprintf("%v = ? AND %v CONTAINS ?", partitionColumn.GetName(), virtualColumn.GetName()),
-					Values: []any{partitionValue, hashValue},
-				})
-			}
-		}
-
-		if !isValid || len(whereStatements) == 0 {
-			continue
-		}
-
-		rawFrom := db.ConvertToInt64(bucketStatements[0].From[0].Value)
-		rawTo := db.ConvertToInt64(bucketStatements[0].To[0].Value)
-		if ShouldLog() {
-			fmt.Printf("CompositeBucketing select plan selected: index=%s buckets=%d statements=%d rangeNorm=[%d,%d] rangeRaw=[%d,%d] isWeek=%v\n",
-				compositeIndex.Name, len(bucketSelections), len(whereStatements), from, to, rawFrom, rawTo, bucketIsWeek)
-		}
-
-		return &compositeBucketQueryPlan{
-			whereStatements:  whereStatements,
-			handledColumns:   handledColumns,
-			filterStatements: filterStatements,
-		}
 	}
 
 	return nil

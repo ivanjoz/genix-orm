@@ -335,7 +335,7 @@ func TestPackedViewServesLeadingKeyAlone(t *testing.T) {
 		t.Fatalf("expected the packed view to serve a leading-key query, got %+v", compiledStatement.sourceView)
 	}
 
-	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(query.GetTableInfo().SelectStatements()...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one prefix range, got %d", len(whereStatements))
 	}
@@ -360,7 +360,7 @@ func TestPackedViewUpperBoundIsTheLayoutMaximum(t *testing.T) {
 	// slot at its max, bound as an int32 so it fits the int packed column.
 	query.Status.GreaterEqual(int8(1))
 
-	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(query.GetTableInfo().SelectStatements()...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one range clause, got %d", len(whereStatements))
 	}
@@ -383,7 +383,7 @@ func TestPackedViewServesTwoColumnPrefix(t *testing.T) {
 	query.Status.Equals(int8(1))
 	query.Type.Equals(int8(2))
 
-	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(query.GetTableInfo().SelectStatements()...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one clause, got %d", len(whereStatements))
 	}
@@ -403,7 +403,7 @@ func TestPackedViewFansOutPrefixInValues(t *testing.T) {
 	query.CompanyID.Equals(7)
 	query.Status.In(int8(0), int8(1))
 
-	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(query.GetTableInfo().SelectStatements()...)
 	if len(whereStatements) != 2 {
 		t.Fatalf("expected one prefix range per IN value, got %d", len(whereStatements))
 	}
@@ -422,7 +422,7 @@ func TestPackedViewKeepsBetweenOnTrailingKey(t *testing.T) {
 	query.Status.Equals(int8(1))
 	query.Type.Between(int8(1), int8(2))
 
-	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(query.GetTableInfo().SelectStatements()...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single BETWEEN clause, got %d", len(whereStatements))
 	}
@@ -479,7 +479,7 @@ func TestNarrowLocalIndexBeatsPackedViewPrefix(t *testing.T) {
 	query.Status.Equals(int8(1))
 	query.RegistryNumber.Equals("20512345678")
 
-	bestCapability := db.MatchQueryCapability(collectSelectStatements(query.GetTableInfo()), scyllaTable.capabilities)
+	bestCapability := db.MatchQueryCapability(query.GetTableInfo().SelectStatements(), scyllaTable.capabilities)
 	if bestCapability == nil || bestCapability.Source == nil {
 		t.Fatalf("expected a capability match, got %+v", bestCapability)
 	}
@@ -530,14 +530,14 @@ func TestFixedValueFanoutFillsAGapInThePackedKeyPrefix(t *testing.T) {
 	if compiledStatement.sourceView == nil {
 		t.Fatal("expected the packed view to serve the query, got a base-table read")
 	}
-	if len(compiledStatement.fixedValueFanoutStatements) != 1 ||
-		compiledStatement.fixedValueFanoutStatements[0].Col != "status" {
-		t.Fatalf("expected one synthesized status predicate, got %+v", compiledStatement.fixedValueFanoutStatements)
+	if len(compiledStatement.accessRoute.FixedValueFanoutStatements) != 1 ||
+		compiledStatement.accessRoute.FixedValueFanoutStatements[0].Col != "status" {
+		t.Fatalf("expected one synthesized status predicate, got %+v", compiledStatement.accessRoute.FixedValueFanoutStatements)
 	}
 	// The values must carry the column's own width: an int64 0 would bind wrong and hash wrong.
-	if _, isInt8 := compiledStatement.fixedValueFanoutStatements[0].Values[0].(int8); !isInt8 {
+	if _, isInt8 := compiledStatement.accessRoute.FixedValueFanoutStatements[0].Values[0].(int8); !isInt8 {
 		t.Fatalf("expected int8 fan-out values for an int8 column, got %T",
-			compiledStatement.fixedValueFanoutStatements[0].Values[0])
+			compiledStatement.accessRoute.FixedValueFanoutStatements[0].Values[0])
 	}
 
 	boundPlan, err := compiledStatement.Compute(query.GetTableInfo(), scyllaTable)
@@ -569,8 +569,8 @@ func TestFixedValueFanoutNeverDisplacesTheKeyRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected compile error: %v", err)
 	}
-	if len(compiledStatement.fixedValueFanoutStatements) > 0 {
-		t.Fatalf("expected no fan-out over a primary key read, got %+v", compiledStatement.fixedValueFanoutStatements)
+	if len(compiledStatement.accessRoute.FixedValueFanoutStatements) > 0 {
+		t.Fatalf("expected no fan-out over a primary key read, got %+v", compiledStatement.accessRoute.FixedValueFanoutStatements)
 	}
 	if compiledStatement.sourceView != nil {
 		t.Fatalf("expected the base-key route, got view %v", compiledStatement.sourceView.Name)
@@ -694,9 +694,9 @@ func TestFixedValueFanoutSkipsAColumnTooWideToEnumerate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected compile error: %v", err)
 	}
-	if len(compiledStatement.fixedValueFanoutStatements) > 0 {
+	if len(compiledStatement.accessRoute.FixedValueFanoutStatements) > 0 {
 		t.Fatalf("expected no fan-out over a 501-value column, got %+v",
-			compiledStatement.fixedValueFanoutStatements)
+			compiledStatement.accessRoute.FixedValueFanoutStatements)
 	}
 	if compiledStatement.sourceView != nil {
 		t.Fatalf("expected the base-table route, got view %v", compiledStatement.sourceView.Name)
@@ -721,9 +721,9 @@ func TestFixedValueFanoutSkipsAPrefixThatAlreadyCoversTheQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected compile error: %v", err)
 	}
-	if len(compiledStatement.fixedValueFanoutStatements) > 0 {
+	if len(compiledStatement.accessRoute.FixedValueFanoutStatements) > 0 {
 		t.Fatalf("expected no fan-out when [status] already binds every predicate, got %+v",
-			compiledStatement.fixedValueFanoutStatements)
+			compiledStatement.accessRoute.FixedValueFanoutStatements)
 	}
 
 	boundPlan, err := compiledStatement.Compute(query.GetTableInfo(), scyllaTable)

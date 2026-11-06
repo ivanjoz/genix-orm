@@ -97,3 +97,19 @@ func (t *TableInfo) SetBetween(colname string, from, to any) {
 func (t *TableInfo) SetOrderDesc() {
 	t.OrderBy = "ORDER BY %v DESC"
 }
+
+// IsOrderDescending tells whether the read was asked newest / highest key first.
+func (t *TableInfo) IsOrderDescending() bool {
+	return strings.Contains(t.OrderBy, "DESC")
+}
+
+// SelectStatements is every predicate of the read in one list: the statements, then the fluent
+// Between. Planning and binding read the same list, so cached statement indexes stay valid.
+func (t *TableInfo) SelectStatements() []ColumnStatement {
+	statements := make([]ColumnStatement, 0, len(t.Statements)+1)
+	statements = append(statements, t.Statements...)
+	if len(t.Between.From) > 0 {
+		statements = append(statements, t.Between)
+	}
+	return statements
+}

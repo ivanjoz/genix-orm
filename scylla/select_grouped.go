@@ -102,7 +102,7 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 		return nil, nil
 	}
 
-	fetchedGroups, err := fetchIndexGroupRecordGroups(sink, scyllaTable, queryPlan, fetchStates, collectSelectStatements(tableInfo), time.Now(), readTime)
+	fetchedGroups, err := fetchIndexGroupRecordGroups(sink, scyllaTable, queryPlan, fetchStates, tableInfo.SelectStatements(), time.Now(), readTime)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 }
 
 func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*indexGroupSelectPlan, error) {
-	statements := collectSelectStatements(tableInfo)
+	statements := tableInfo.SelectStatements()
 	partitionColumn := scyllaTable.GetPartKey()
 	if partitionColumn == nil || partitionColumn.IsNil() {
 		return nil, fmt.Errorf(`QueryIndexGroup requires a partition column on table "%v"`, scyllaTable.Name)

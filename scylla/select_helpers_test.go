@@ -321,7 +321,10 @@ func TestCompiledSelectStatementBindsPackedViewFanout(t *testing.T) {
 		t.Fatalf("expected 2 bound statements from packed-view fanout, got %d", len(boundPlan.Statements))
 	}
 
-	selectedStatements := pickStatementsByIndexes(collectSelectStatements(query.GetTableInfo()), compiledStatement.selectedStatementIndexes)
+	selectedStatements := []ColumnStatement{}
+	for _, statementIndex := range compiledStatement.accessRoute.SelectedStatementIndexes {
+		selectedStatements = append(selectedStatements, query.GetTableInfo().SelectStatements()[statementIndex])
+	}
 	expectedWhereStatements := compiledStatement.sourceView.prepareWhereClauses(selectedStatements...)
 	expectedQueries := map[string]bool{}
 	for _, whereStatement := range expectedWhereStatements {

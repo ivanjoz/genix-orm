@@ -45,10 +45,12 @@ type KeyValues struct {
 	Values []any
 }
 
-// ElementLookup reads the rows whose collection column holds Value (a set CONTAINS).
+// ElementLookup reads the rows whose collection column holds Value (a set CONTAINS), within the
+// partition EqualPrefix pins when the collection index is partition-scoped (a composite bucket).
 type ElementLookup struct {
-	Column string
-	Value  any
+	EqualPrefix []KeyValues
+	Column      string
+	Value       any
 }
 
 // Values in a step use the neutral layout the IndexSource describes: unsigned packed values

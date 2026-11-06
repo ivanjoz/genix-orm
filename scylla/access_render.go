@@ -18,6 +18,16 @@ func (view *viewInfo) prepareWhereClauses(statements ...ColumnStatement) []bound
 	return renderAccessSteps(view, steps, filter)
 }
 
+// renderAccessPlan renders a bound AccessPlan as the WHERE clauses of its reads. A plan with no
+// source reads the base table, whose values need no driver encoding.
+func renderAccessPlan(scyllaTable *ScyllaTable, plan *db.AccessPlan) []boundWhereClause {
+	var view *viewInfo
+	if plan.Source != nil {
+		view = scyllaTable.viewOfSource(plan.Source)
+	}
+	return renderAccessSteps(view, plan.Steps, plan.Filter)
+}
+
 // renderAccessSteps renders every step, with the Filter statements pushed into each one's WHERE.
 // Each step goes through the generic batcher, so a value list on a clustering column is split into
 // as many queries as the node's restriction ceiling needs.
@@ -34,21 +44,11 @@ func renderAccessSteps(view *viewInfo, steps []db.AccessStep, filter []ColumnSta
 // a BETWEEN (inclusive both ends) or one-sided operators for the bound, CONTAINS for an element.
 func accessStepStatements(view *viewInfo, step db.AccessStep) []ColumnStatement {
 	if step.Element != nil {
-		return []ColumnStatement{{Col: step.Element.Column, Operator: "CONTAINS", Value: step.Element.Value}}
+		return append(equalPrefixStatements(view, step.Element.EqualPrefix),
+			ColumnStatement{Col: step.Element.Column, Operator: "CONTAINS", Value: step.Element.Value})
 	}
 	keyRange := step.Range
-	statements := make([]ColumnStatement, 0, len(keyRange.EqualPrefix)+2)
-	for _, keyValues := range keyRange.EqualPrefix {
-		values := make([]any, 0, len(keyValues.Values))
-		for _, value := range keyValues.Values {
-			values = append(values, encodeAccessValue(view, keyValues.Column, value))
-		}
-		if len(values) == 1 {
-			statements = append(statements, ColumnStatement{Col: keyValues.Column, Operator: "=", Value: values[0]})
-		} else {
-			statements = append(statements, ColumnStatement{Col: keyValues.Column, Operator: "IN", Values: values})
-		}
-	}
+	statements := equalPrefixStatements(view, keyRange.EqualPrefix)
 	if keyRange.BoundColumn == "" {
 		return statements
 	}
@@ -78,11 +78,28 @@ func accessStepStatements(view *viewInfo, step db.AccessStep) []ColumnStatement 
 	return statements
 }
 
+// equalPrefixStatements renders pinned key columns: = for one value, IN for several.
+func equalPrefixStatements(view *viewInfo, equalPrefix []db.KeyValues) []ColumnStatement {
+	statements := make([]ColumnStatement, 0, len(equalPrefix)+2)
+	for _, keyValues := range equalPrefix {
+		values := make([]any, 0, len(keyValues.Values))
+		for _, value := range keyValues.Values {
+			values = append(values, encodeAccessValue(view, keyValues.Column, value))
+		}
+		if len(values) == 1 {
+			statements = append(statements, ColumnStatement{Col: keyValues.Column, Operator: "=", Value: values[0]})
+		} else {
+			statements = append(statements, ColumnStatement{Col: keyValues.Column, Operator: "IN", Values: values})
+		}
+	}
+	return statements
+}
+
 // encodeAccessValue applies Scylla's storage encoding to a planned value: a packed column holds the
 // unsigned layout with the top bit flipped, because Scylla compares integers signed.
 func encodeAccessValue(view *viewInfo, column string, value any) any {
 	packedValue, isPacked := value.(uint64)
-	if !isPacked {
+	if !isPacked || view == nil {
 		return value
 	}
 	if view.PackedIndex != nil && column == view.PackedIndex.PackedColumnName {
