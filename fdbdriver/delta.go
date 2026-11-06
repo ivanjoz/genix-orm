@@ -25,73 +25,10 @@ import (
 // updated, pk) in the same commit as its row, so there is no view or replica lag; the protocol keeps
 // its settle margin (DeltaWriteLagTicks) anyway.
 //
-// Prefix resolution and index choice are the Scylla driver's rules (delta_view.go), reproduced here
-// until the planner moves to genix-orm/db (plan §7).
+// Prefix resolution and index choice are shared with every driver (db.TableCore.PlanDeltaRead).
 
+// maxDeltaPrefixReads is how many prefixes are read concurrently.
 const maxDeltaPrefixReads = 16
-
-// resolveDeltaPrefixes lists the pinned prefixes a Delta() read covers on an index: each pinned
-// column takes its equality value, or — the last one — Delta()'s values, or every FixedValues value.
-func resolveDeltaPrefixes(table *FdbTable, deltaIndex fdbDeltaIndex, equalityValues map[string]any, deltaValues []int64) (prefixes [][]int64, equalityCount int, ok bool) {
-	if len(deltaValues) > 0 && len(deltaIndex.Pinned) == 0 {
-		return nil, 0, false
-	}
-	prefixes = [][]int64{{}}
-	enumeratedQueries := 1
-	for pinnedIndex, pinnedColumn := range deltaIndex.Pinned {
-		var columnValues []int64
-		isLastPinned := pinnedIndex == len(deltaIndex.Pinned)-1
-		if equalityValue, hasEquality := equalityValues[pinnedColumn.GetName()]; hasEquality {
-			columnValues = []int64{db.ConvertToInt64(equalityValue)}
-			equalityCount++
-		} else if isLastPinned && len(deltaValues) > 0 {
-			columnValues = deltaValues
-		} else if valueRange, isDeclared := table.FixedValueRanges[pinnedColumn.GetName()]; isDeclared && len(valueRange.DeclaredValues) > 0 {
-			columnValues = valueRange.DeclaredValues
-			enumeratedQueries *= len(columnValues)
-		} else {
-			return nil, 0, false
-		}
-		combined := make([][]int64, 0, len(prefixes)*len(columnValues))
-		for _, prefix := range prefixes {
-			for _, columnValue := range columnValues {
-				combined = append(combined, append(slices.Clone(prefix), columnValue))
-			}
-		}
-		prefixes = combined
-	}
-	if enumeratedQueries > maxDeltaPrefixReads {
-		return nil, 0, false
-	}
-	return prefixes, equalityCount, true
-}
-
-// selectDeltaIndex picks the index a Delta() read runs on: of those whose prefixes resolve, the one
-// the equalities fix most, then the one with fewest prefixes.
-func selectDeltaIndex(table *FdbTable, equalityValues map[string]any, deltaValues []int64) (fdbDeltaIndex, [][]int64, error) {
-	selectedPosition, isAmbiguous, selectedEqualityCount := -1, false, -1
-	var selectedPrefixes [][]int64
-	for position, deltaIndex := range table.deltaIndexes {
-		prefixes, equalityCount, ok := resolveDeltaPrefixes(table, deltaIndex, equalityValues, deltaValues)
-		if !ok {
-			continue
-		}
-		switch {
-		case equalityCount > selectedEqualityCount,
-			equalityCount == selectedEqualityCount && len(prefixes) < len(selectedPrefixes):
-			selectedPosition, selectedPrefixes, selectedEqualityCount, isAmbiguous = position, prefixes, equalityCount, false
-		case equalityCount == selectedEqualityCount && len(prefixes) == len(selectedPrefixes):
-			isAmbiguous = true
-		}
-	}
-	if selectedPosition < 0 {
-		return fdbDeltaIndex{}, nil, fmt.Errorf(`table %q: Delta() found no TypeDelta index whose Keys all resolve`, table.Name)
-	}
-	if isAmbiguous {
-		return fdbDeltaIndex{}, nil, fmt.Errorf(`table %q: Delta() fits several TypeDelta indexes equally: pin one more Keys column`, table.Name)
-	}
-	return table.deltaIndexes[selectedPosition], selectedPrefixes, nil
-}
 
 // deltaPrefixRead is what one prefix of a Delta() read returned; each prefix has its own goroutine.
 type deltaPrefixRead struct {
@@ -189,25 +126,12 @@ func selectDelta(table *FdbTable, tableInfo *db.TableInfo, sink recordSink) erro
 		return err
 	}
 	deltaRead := tableInfo.Delta
-	equalityValues := map[string]any{}
-	for _, statement := range tableInfo.Statements {
-		if statement.Operator == "=" {
-			equalityValues[statement.Col] = statement.Value
-		}
-	}
-	partitionValue, isPartitionPinned := equalityValues[table.GetPartKey().GetName()]
-	if !isPartitionPinned {
-		return fmt.Errorf(`table %q: Delta() needs an equality on the partition column`, table.Name)
-	}
-	deltaValues := make([]int64, len(deltaRead.LastKeyValues))
-	for index, deltaValue := range deltaRead.LastKeyValues {
-		deltaValues[index] = db.ConvertToInt64(deltaValue)
-	}
-	deltaIndex, prefixes, err := selectDeltaIndex(table, equalityValues, deltaValues)
+	deltaPlan, err := table.PlanDeltaRead(tableInfo)
 	if err != nil {
 		return err
 	}
-	partition := db.ConvertToInt64(partitionValue)
+	// Index positions in deltaIndexes mirror TableCore.DeltaIndexes, which the plan indexes.
+	deltaIndex, prefixes, partition := table.deltaIndexes[deltaPlan.IndexPosition], deltaPlan.Prefixes, deltaPlan.Partition
 
 	metadata := cache.DeltaWindowMetadata{}
 	if len(deltaIndex.Pinned) > 0 {

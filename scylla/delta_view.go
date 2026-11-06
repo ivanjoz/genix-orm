@@ -314,74 +314,6 @@ func writeDeltaMoves(scyllaTable ScyllaTable, moves []deltaMove) error {
 
 /* Read */
 
-// resolveDeltaPrefixes lists the pinned prefixes a Delta() read covers on an index. Each pinned
-// column takes its equality value, or — the last one — the values Delta() names, or else every
-// value its FixedValues enumerates; their combinations are the prefixes. ok is false when a column
-// has none of them, or when the enumerated fan-out passes db.MaxFixedValueFanoutQueries.
-// equalityCount is how many pinned columns the query's own equalities fixed.
-func resolveDeltaPrefixes(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, equalityValues map[string]any, deltaValues []int64) (prefixes [][]int64, equalityCount int, ok bool) {
-	if len(deltaValues) > 0 && len(deltaIndex.Pinned) == 0 {
-		return nil, 0, false // a keyless index has no column for the values to name
-	}
-	prefixes = [][]int64{{}}
-	enumeratedQueries := 1
-	for pinnedIndex, pinnedColumn := range deltaIndex.Pinned {
-		var columnValues []int64
-		isLastPinned := pinnedIndex == len(deltaIndex.Pinned)-1
-		if equalityValue, hasEquality := equalityValues[pinnedColumn.GetName()]; hasEquality {
-			columnValues = []int64{db.ConvertToInt64(equalityValue)}
-			equalityCount++
-		} else if isLastPinned && len(deltaValues) > 0 {
-			columnValues = deltaValues
-		} else if valueRange, isDeclared := scyllaTable.FixedValueRanges[pinnedColumn.GetName()]; isDeclared && len(valueRange.DeclaredValues) > 0 {
-			columnValues = valueRange.DeclaredValues
-			enumeratedQueries *= len(columnValues)
-		} else {
-			return nil, 0, false
-		}
-		combined := make([][]int64, 0, len(prefixes)*len(columnValues))
-		for _, prefix := range prefixes {
-			for _, columnValue := range columnValues {
-				combined = append(combined, append(slices.Clone(prefix), columnValue))
-			}
-		}
-		prefixes = combined
-	}
-	if enumeratedQueries > db.MaxFixedValueFanoutQueries {
-		return nil, 0, false
-	}
-	return prefixes, equalityCount, true
-}
-
-// selectDeltaIndex picks the TypeDelta index a Delta() read runs on: of those whose prefixes
-// resolve, the one the query's equalities fix most, then the one with fewest prefixes.
-func selectDeltaIndex(scyllaTable ScyllaTable, equalityValues map[string]any, deltaValues []int64) (db.DeltaIndexInfo, [][]int64, error) {
-	selectedPosition, isAmbiguous := -1, false
-	var selectedPrefixes [][]int64
-	selectedEqualityCount := -1
-	for position, deltaIndex := range scyllaTable.DeltaIndexes {
-		prefixes, equalityCount, ok := resolveDeltaPrefixes(scyllaTable, deltaIndex, equalityValues, deltaValues)
-		if !ok {
-			continue
-		}
-		switch {
-		case equalityCount > selectedEqualityCount,
-			equalityCount == selectedEqualityCount && len(prefixes) < len(selectedPrefixes):
-			selectedPosition, selectedPrefixes, selectedEqualityCount, isAmbiguous = position, prefixes, equalityCount, false
-		case equalityCount == selectedEqualityCount && len(prefixes) == len(selectedPrefixes):
-			isAmbiguous = true
-		}
-	}
-	if selectedPosition < 0 {
-		return db.DeltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() found no TypeDelta index whose Keys all resolve: each needs an equality, the Delta() values (the last one), or an enumerable FixedValues (at most %d queries)`,
-			scyllaTable.Name, db.MaxFixedValueFanoutQueries)
-	}
-	if isAmbiguous {
-		return db.DeltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() fits several TypeDelta indexes equally: pin one more Keys column, or drop an index`, scyllaTable.Name)
-	}
-	return scyllaTable.DeltaIndexes[selectedPosition], selectedPrefixes, nil
-}
-
 // deltaViewRow is the (ID, updated, version) of one row of a delta view.
 type deltaViewRow struct {
 	recordID int64
@@ -503,25 +435,11 @@ func readDeltaPrefixes(prefixes [][]int64, reads []deltaPrefixRead, readPrefix f
 // step reads each pinned prefix on its own, in parallel: one contiguous span of the view.
 func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) error {
 	deltaRead := tableInfo.Delta
-	equalityValues := map[string]any{}
-	for _, statement := range tableInfo.Statements {
-		if statement.Operator == "=" {
-			equalityValues[statement.Col] = statement.Value
-		}
-	}
-	partitionValue, isPartitionPinned := equalityValues[scyllaTable.GetPartKey().GetName()]
-	if !isPartitionPinned {
-		return fmt.Errorf(`table %q: Delta() needs an equality on the partition column`, scyllaTable.Name)
-	}
-	deltaValues := make([]int64, len(deltaRead.LastKeyValues))
-	for i, deltaValue := range deltaRead.LastKeyValues {
-		deltaValues[i] = db.ConvertToInt64(deltaValue)
-	}
-	deltaIndex, prefixes, err := selectDeltaIndex(scyllaTable, equalityValues, deltaValues)
+	deltaPlan, err := scyllaTable.PlanDeltaRead(tableInfo)
 	if err != nil {
 		return err
 	}
-	partition := db.ConvertToInt64(partitionValue)
+	deltaIndex, prefixes, partition := deltaPlan.Index, deltaPlan.Prefixes, deltaPlan.Partition
 
 	// The client hashes the records it holds whose last pinned value is one the read covered.
 	metadata := cache.DeltaWindowMetadata{}

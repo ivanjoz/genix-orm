@@ -246,11 +246,18 @@ func TestSelectDeltaIndexPicksTheMostSpecificFit(t *testing.T) {
 		// No Delta() values: Status fans out over its FixedValues.
 		{map[string]any{"company_id": int32(7)}, nil, "status", [][]int64{{0}, {1}}},
 	} {
-		deltaIndex, prefixes, err := selectDeltaIndex(scyllaTable, selection.equalities, selection.deltaValues)
-		if err != nil || deltaIndex.Tag != selection.expectedTag ||
-			!slices.EqualFunc(prefixes, selection.expectedPrefixes, slices.Equal[[]int64]) {
-			t.Fatalf("%v %v: expected %s %v, got %s %v err %v", selection.equalities, selection.deltaValues,
-				selection.expectedTag, selection.expectedPrefixes, deltaIndex.Tag, prefixes, err)
+		tableInfo := &TableInfo{Delta: &db.DeltaRead{}}
+		for column, value := range selection.equalities {
+			tableInfo.SetWhere(column, "=", value)
+		}
+		for _, deltaValue := range selection.deltaValues {
+			tableInfo.Delta.LastKeyValues = append(tableInfo.Delta.LastKeyValues, deltaValue)
+		}
+		deltaPlan, err := scyllaTable.PlanDeltaRead(tableInfo)
+		if err != nil || deltaPlan.Index.Tag != selection.expectedTag ||
+			!slices.EqualFunc(deltaPlan.Prefixes, selection.expectedPrefixes, slices.Equal[[]int64]) {
+			t.Fatalf("%v %v: expected %s %v, got %+v err %v", selection.equalities, selection.deltaValues,
+				selection.expectedTag, selection.expectedPrefixes, deltaPlan, err)
 		}
 	}
 }
