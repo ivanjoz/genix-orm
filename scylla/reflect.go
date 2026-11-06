@@ -23,12 +23,6 @@ var makeStatementWith string = `	WITH caching = {'keys': 'ALL', 'rows_per_partit
 	and dclocal_read_repair_chance = 0
 	and speculative_retry = '99.0PERCENTILE'`
 
-// https://forum.scylladb.com/t/what-is-the-difference-between-clustering-primary-partition-and-composite-or-compound-keys-in-scylladb/41
-type statementRangeGroup struct {
-	from      *ColumnStatement
-	betweenTo *ColumnStatement
-}
-
 // makeTable is deliberately NOT generic. It is 400+ lines that work purely through the schema
 // and reflection, so a type parameter here would stencil the whole body once per table type —
 // it cost ~850 KB of binary across 54 tables. The caller does the two lines of type-specific

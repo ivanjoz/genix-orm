@@ -102,10 +102,9 @@ func persistIndexUpdatedRowsBatch(keyspace string, tableName string, rows []inde
 // materializeGroupHashIndex gives a group's hash column its CQL. A scalar hash is indexed locally,
 // one partition's index answering a grouped read; Scylla has no local index on a collection
 // ("not implemented yet"), so the hashes of a slice key are a set<int> with a global index and are
-// bound as a collection literal.
+// bound as a collection literal. Reads are planned by db.PlanSourceSteps.
 func materializeGroupHashIndex(dbTable *ScyllaTable, view *viewInfo) {
 	indexGroup := view.IndexGroup
-	sourceColumns := indexGroup.SourceColumns
 	usesCollectionValues := indexGroup.UsesCollectionValues
 	virtualColumn := view.Column.(*columnInfo)
 	virtualColumnName := virtualColumn.GetName()
@@ -122,47 +121,6 @@ func materializeGroupHashIndex(dbTable *ScyllaTable, view *viewInfo) {
 			return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, view.Name, dbTable.GetFullName(), virtualColumnName)
 		}
 		return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`, view.Name, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), virtualColumnName)
-	}
-
-	view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
-		// Build all hash input combinations using resolveIndexGroupQueryValues, which handles
-		// =, CONTAINS, IN, and BETWEEN (BETWEEN is expanded into one value per step in range).
-		valuesGroups := [][]int64{{}}
-		for _, sourceColumn := range sourceColumns {
-			st, err := findIndexGroupStatement(sourceColumn.Column.GetName(), statements)
-			if err != nil {
-				return nil
-			}
-			columnValues, err := resolveIndexGroupQueryValues(st)
-			if err != nil || len(columnValues) == 0 {
-				return nil
-			}
-			nextGroups := make([][]int64, 0, len(valuesGroups)*len(columnValues))
-			for _, vg := range valuesGroups {
-				for _, v := range columnValues {
-					nextGroups = append(nextGroups, append(append([]int64{}, vg...), v))
-				}
-			}
-			valuesGroups = nextGroups
-		}
-
-		// Emit one WHERE clause per unique hash value.
-		// Collection columns (set<int>) require CONTAINS; scalar columns use =.
-		seen := map[int32]struct{}{}
-		clauses := make([]boundWhereClause, 0, len(valuesGroups))
-		for _, vg := range valuesGroups {
-			hashValue := db.HashInt64(vg...)
-			if _, exists := seen[hashValue]; exists {
-				continue
-			}
-			seen[hashValue] = struct{}{}
-			clause := fmt.Sprintf("%v = ?", virtualColumnName)
-			if usesCollectionValues {
-				clause = fmt.Sprintf("%v CONTAINS ?", virtualColumnName)
-			}
-			clauses = append(clauses, boundWhereClause{Clause: clause, Values: []any{hashValue}})
-		}
-		return clauses
 	}
 }
 

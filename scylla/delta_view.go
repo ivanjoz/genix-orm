@@ -69,7 +69,7 @@ func materializeDeltaView(dbTable *ScyllaTable, view *viewInfo) {
 	}
 
 	// The view is a range view of the query planner on [partition, pinned…, updated].
-	compilePackedRangeAccessors(view, source.PackedSourceColumns, deltaIndex.SlotBits(), false, dbTable.GetPartKey())
+	compilePackedRangeDecoder(view, source.PackedSourceColumns, deltaIndex.SlotBits(), false)
 
 	storedColumns := dbTable.DeltaStoredColumns()
 	view.getExpectedColumns = func() []viewExpectedColumn {

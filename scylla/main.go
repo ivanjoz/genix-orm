@@ -40,7 +40,6 @@ type indexUpdatedTableInfo struct {
 // planner matches against, plus how the index exists in CQL.
 type viewInfo struct {
 	*db.IndexSource
-	getStatementPrepared  func(statements ...ColumnStatement) []boundWhereClause
 	decomposeVirtualValue func(rawValue any) []any
 	getCreateScript       func() string
 	// getExpectedColumns reports the columns this view must hold in the DB. Deploy compares it

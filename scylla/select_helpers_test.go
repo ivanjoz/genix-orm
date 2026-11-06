@@ -322,7 +322,7 @@ func TestCompiledSelectStatementBindsPackedViewFanout(t *testing.T) {
 	}
 
 	selectedStatements := pickStatementsByIndexes(collectSelectStatements(query.GetTableInfo()), compiledStatement.selectedStatementIndexes)
-	expectedWhereStatements := compiledStatement.sourceView.getStatementPrepared(selectedStatements...)
+	expectedWhereStatements := compiledStatement.sourceView.prepareWhereClauses(selectedStatements...)
 	expectedQueries := map[string]bool{}
 	for _, whereStatement := range expectedWhereStatements {
 		expectedQueries[fmt.Sprintf(compiledStatement.queryTemplate, " WHERE "+whereStatement.Clause)] = true

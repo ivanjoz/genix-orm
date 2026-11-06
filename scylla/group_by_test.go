@@ -361,7 +361,7 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 		t.Fatalf("expected a packed range view, got %+v", bestCapability.Source)
 	}
 
-	whereStatements := bestCapability.Source.getStatementPrepared(query.GetTableInfo().Statements...)
+	whereStatements := bestCapability.Source.prepareWhereClauses(query.GetTableInfo().Statements...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}
@@ -400,7 +400,7 @@ func TestInt32PackedViewBoundsAreSignFlippedInt32s(t *testing.T) {
 		t.Fatal("expected int32 packed range views to skip post-filtering")
 	}
 
-	whereStatements := bestCapability.Source.getStatementPrepared(query.GetTableInfo().Statements...)
+	whereStatements := bestCapability.Source.prepareWhereClauses(query.GetTableInfo().Statements...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
 	}

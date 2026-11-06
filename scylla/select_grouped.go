@@ -239,12 +239,12 @@ func buildQueryIndexGroupHashes(indexGroup db.IndexGroupInfo, statements []Colum
 	valuesGroups := [][]int64{{}}
 
 	for _, sourceColumn := range indexGroup.SourceColumns {
-		statement, err := findIndexGroupStatement(sourceColumn.Column.GetName(), statements)
+		statement, err := db.FindIndexGroupStatement(sourceColumn.Column.GetName(), statements)
 		if err != nil {
 			return nil, err
 		}
 
-		columnValues, err := resolveIndexGroupQueryValues(statement)
+		columnValues, err := db.ResolveIndexGroupQueryValues(statement)
 		if err != nil {
 			return nil, err
 		}
@@ -292,47 +292,6 @@ func extractQueryIndexGroupHashes(hashGroups []queryIndexGroupHash) []int32 {
 		hashValues = append(hashValues, hashGroup.hashValue)
 	}
 	return hashValues
-}
-
-func findIndexGroupStatement(columnName string, statements []ColumnStatement) (ColumnStatement, error) {
-	for _, statement := range statements {
-		if statement.Col == columnName {
-			return statement, nil
-		}
-	}
-	return ColumnStatement{}, fmt.Errorf(`QueryIndexGroup missing statement for column "%v"`, columnName)
-}
-
-func resolveIndexGroupQueryValues(statement ColumnStatement) ([]int64, error) {
-	switch statement.Operator {
-	case "=":
-		return db.FlattenInt64Values(statement.Value), nil
-	case "CONTAINS":
-		return db.FlattenInt64Values(statement.Value), nil
-	case "IN":
-		columnValues := make([]int64, 0, len(statement.Values))
-		for _, rawValue := range statement.Values {
-			columnValues = append(columnValues, db.FlattenInt64Values(rawValue)...)
-		}
-		return columnValues, nil
-	case "BETWEEN":
-		if len(statement.From) == 0 || len(statement.To) == 0 {
-			return nil, fmt.Errorf(`QueryIndexGroup received an invalid BETWEEN for "%v"`, statement.Col)
-		}
-
-		fromValue := db.ConvertToInt64(statement.From[0].Value)
-		toValue := db.ConvertToInt64(statement.To[0].Value)
-		if toValue < fromValue {
-			fromValue, toValue = toValue, fromValue
-		}
-		columnValues := make([]int64, 0, int(toValue-fromValue)+1)
-		for currentValue := fromValue; currentValue <= toValue; currentValue++ {
-			columnValues = append(columnValues, currentValue)
-		}
-		return columnValues, nil
-	default:
-		return nil, fmt.Errorf(`QueryIndexGroup does not support operator "%v" on "%v"`, statement.Operator, statement.Col)
-	}
 }
 
 func loadIndexGroupFreshnessRowsFromScylla(

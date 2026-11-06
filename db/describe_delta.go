@@ -128,6 +128,9 @@ func (core *TableCore) DescribeDelta(indexCfg Index) *IndexSource {
 		ColumnsNoPart:           sourceNames,
 		PackedSourceColumns:     sourceColumns,
 		PackedSlotBitsPerColumn: deltaIndex.SlotBits(),
+		// A delta view is always keyed on the base partition.
+		PartitionColumn:    core.GetPartKey(),
+		KeepsBasePartition: true,
 	}
 	for _, storedColumn := range core.DeltaStoredColumns() {
 		source.AvailableColumns = append(source.AvailableColumns, storedColumn.GetName())

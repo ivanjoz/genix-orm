@@ -294,7 +294,7 @@ func TestFixedValueViewServesAFullKeyIn(t *testing.T) {
 		{Col: "status", Operator: "=", Value: int8(1)},
 		{Col: "type", Operator: "IN", Values: []any{int8(1), int8(2)}},
 	}
-	whereStatements := view.getStatementPrepared(statements...)
+	whereStatements := view.prepareWhereClauses(statements...)
 	if len(whereStatements) != 1 || !strings.Contains(whereStatements[0].Clause, "IN (?, ?)") {
 		t.Fatalf("expected one IN clause, got %+v", whereStatements)
 	}
@@ -335,7 +335,7 @@ func TestPackedViewServesLeadingKeyAlone(t *testing.T) {
 		t.Fatalf("expected the packed view to serve a leading-key query, got %+v", compiledStatement.sourceView)
 	}
 
-	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one prefix range, got %d", len(whereStatements))
 	}
@@ -360,7 +360,7 @@ func TestPackedViewUpperBoundIsTheLayoutMaximum(t *testing.T) {
 	// slot at its max, bound as an int32 so it fits the int packed column.
 	query.Status.GreaterEqual(int8(1))
 
-	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one range clause, got %d", len(whereStatements))
 	}
@@ -383,7 +383,7 @@ func TestPackedViewServesTwoColumnPrefix(t *testing.T) {
 	query.Status.Equals(int8(1))
 	query.Type.Equals(int8(2))
 
-	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected one clause, got %d", len(whereStatements))
 	}
@@ -403,7 +403,7 @@ func TestPackedViewFansOutPrefixInValues(t *testing.T) {
 	query.CompanyID.Equals(7)
 	query.Status.In(int8(0), int8(1))
 
-	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
 	if len(whereStatements) != 2 {
 		t.Fatalf("expected one prefix range per IN value, got %d", len(whereStatements))
 	}
@@ -422,7 +422,7 @@ func TestPackedViewKeepsBetweenOnTrailingKey(t *testing.T) {
 	query.Status.Equals(int8(1))
 	query.Type.Between(int8(1), int8(2))
 
-	whereStatements := view.getStatementPrepared(collectSelectStatements(query.GetTableInfo())...)
+	whereStatements := view.prepareWhereClauses(collectSelectStatements(query.GetTableInfo())...)
 	if len(whereStatements) != 1 {
 		t.Fatalf("expected a single BETWEEN clause, got %d", len(whereStatements))
 	}
@@ -501,7 +501,7 @@ func TestPackedViewRefusesFilterBehindUnconstrainedKey(t *testing.T) {
 		{Col: "company_id", Operator: "=", Value: int32(7)},
 		{Col: "type", Operator: "=", Value: int8(2)},
 	}
-	if whereStatements := view.getStatementPrepared(statements...); whereStatements != nil {
+	if whereStatements := view.prepareWhereClauses(statements...); whereStatements != nil {
 		t.Fatalf("expected the view to refuse a gapped predicate set, got %+v", whereStatements)
 	}
 }

@@ -240,45 +240,6 @@ func getMaxClusteringKeyRestrictionsPerQuery() int {
 	return maxClusteringKeys
 }
 
-// buildChunkedInWhereClauses turns one IN list into as many clauses as the node's
-// clustering-key restriction ceiling requires. Views bind their predicates directly
-// into a clause string, so they cannot go through buildRemainingWhereClauseBatches
-// and need the split here instead.
-func buildChunkedInWhereClauses(columnName string, inValues []any) []boundWhereClause {
-	if len(inValues) == 0 {
-		return nil
-	}
-
-	valueChunks := db.ChunkValues(inValues, getMaxClusteringKeyRestrictionsPerQuery())
-	whereClauses := make([]boundWhereClause, 0, len(valueChunks))
-
-	for _, valueChunk := range valueChunks {
-		if len(valueChunk) == 1 {
-			whereClauses = append(whereClauses, boundWhereClause{
-				Clause: fmt.Sprintf("%v = ?", columnName),
-				Values: valueChunk,
-			})
-			continue
-		}
-
-		placeholders := make([]string, len(valueChunk))
-		for placeholderIndex := range placeholders {
-			placeholders[placeholderIndex] = "?"
-		}
-		whereClauses = append(whereClauses, boundWhereClause{
-			Clause: fmt.Sprintf("%v IN (%v)", columnName, strings.Join(placeholders, ", ")),
-			Values: valueChunk,
-		})
-	}
-
-	if len(whereClauses) > 1 {
-		fmt.Printf("View batching IN query: column=%s values=%d batches=%d\n",
-			columnName, len(inValues), len(whereClauses))
-	}
-
-	return whereClauses
-}
-
 func buildRemainingWhereClauseBatches(remainingStatements []ColumnStatement) []boundWhereClause {
 	if len(remainingStatements) == 0 {
 		return []boundWhereClause{{}}
@@ -864,7 +825,8 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 			selectedView := bestCapability.Source
 			// Index group views (Type 3) query the main table via a virtual hash column;
 			// projected views (Type >= 6) redirect to a separate view table.
-			isIndexGroupView := selectedView.Type == 3 && selectedView.getStatementPrepared != nil
+			hasAccessPlanner := db.HasAccessPlanner(selectedView.IndexSource)
+			isIndexGroupView := selectedView.Type == 3 && hasAccessPlanner
 			isProjectedView := selectedView.Type >= 6 && canUseProjectedView(columnNames, selectedView)
 
 			if isProjectedView {
@@ -878,7 +840,7 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 				}
 			}
 
-			if (isProjectedView && selectedView.getStatementPrepared != nil) || isIndexGroupView {
+			if (isProjectedView && hasAccessPlanner) || isIndexGroupView {
 				selectedStatementIndexes := []int{}
 				remainingStatementIndexes := []int{}
 
@@ -953,7 +915,7 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 	case selectRouteViewStatements:
 		selectedStatements := pickStatementsByIndexes(statements, e.selectedStatementIndexes)
 		remainingStatements = pickStatementsByIndexes(statements, e.remainingStatementIndexes)
-		whereStatements = e.sourceView.getStatementPrepared(selectedStatements...)
+		whereStatements = e.sourceView.prepareWhereClauses(selectedStatements...)
 		if len(whereStatements) == 0 {
 			// A view that cannot bind the predicates would otherwise yield zero bound statements,
 			// which reads as an empty result set instead of a planning failure.
