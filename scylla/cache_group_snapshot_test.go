@@ -5,6 +5,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/db/cache"
 	"github.com/ivanjoz/genix-orm/utils"
 )
@@ -133,9 +134,9 @@ func TestCacheGroupSnapshotServesAndRewrites(t *testing.T) {
 	resetORMTableCachesForTesting()
 	store := withMemoryFileStore(t)
 	scyllaTable := MakeScyllaTable[cacheGroupS3Record, cacheGroupS3Schema]()
-	queryPlan := &indexGroupSelectPlan{partitionValue: 7, indexGroup: scyllaTable.IndexGroups[0]}
+	queryPlan := &db.IndexGroupReadPlan{PartitionValue: 7, IndexGroup: scyllaTable.IndexGroups[0]}
 	sink := makeRecordSink(&[]cacheGroupS3Record{})
-	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.indexGroup.IndexID, 55)
+	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.IndexGroup.IndexID, 55)
 	database := &fakeGroupDatabase{rows: []cacheGroupS3Record{
 		{CompanyID: 7, ID: 1, Date: 100, Status: 1, ClientID: 3, Name: "a"},
 		{CompanyID: 7, ID: 2, Date: 100, Status: 1, ClientID: 4, Name: "b"},
@@ -144,7 +145,7 @@ func TestCacheGroupSnapshotServesAndRewrites(t *testing.T) {
 	const readTime = int32(5000)
 
 	// Miss: the database answers with no post-filter, the file is written, the response filtered.
-	records, err := readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 1000},
+	records, err := readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 1000},
 		database.read(scyllaTable), clientFilter, readTime)
 	if err != nil || database.reads != 1 || database.lastFilter != nil {
 		t.Fatalf("miss: err %v, reads %d, filter %v", err, database.reads, database.lastFilter)
@@ -158,7 +159,7 @@ func TestCacheGroupSnapshotServesAndRewrites(t *testing.T) {
 	}
 
 	// Same label: served from the file, no database read, filtered in memory.
-	records, err = readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 1000},
+	records, err = readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 1000},
 		database.read(scyllaTable), clientFilter, readTime+10)
 	if err != nil || database.reads != 1 {
 		t.Fatalf("hit: err %v, reads %d", err, database.reads)
@@ -166,7 +167,7 @@ func TestCacheGroupSnapshotServesAndRewrites(t *testing.T) {
 	if ids := groupRecordIDs(records); len(ids) != 1 || ids[0] != 2 || (*cacheGroupS3Record)(records[0]).Name != "b" {
 		t.Fatalf("hit: got %v", ids)
 	}
-	records, _ = readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 1000},
+	records, _ = readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 1000},
 		database.read(scyllaTable), nil, readTime+10)
 	if len(records) != 2 || database.reads != 1 {
 		t.Fatalf("hit without filter: %d records, reads %d", len(records), database.reads)
@@ -174,7 +175,7 @@ func TestCacheGroupSnapshotServesAndRewrites(t *testing.T) {
 
 	// New label: the database answers and the file carries it.
 	database.rows = append(database.rows, cacheGroupS3Record{CompanyID: 7, ID: 3, Date: 100, Status: 1, ClientID: 4})
-	records, _ = readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 1002},
+	records, _ = readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 1002},
 		database.read(scyllaTable), clientFilter, readTime+20)
 	if database.reads != 2 || len(records) != 2 {
 		t.Fatalf("new label: reads %d, %d records", database.reads, len(records))
@@ -185,7 +186,7 @@ func TestCacheGroupSnapshotServesAndRewrites(t *testing.T) {
 
 	// Past the max age, the same label reads the database and rewrites the file.
 	expiredReadTime := readTime + 20 + cache.RecordSnapshotMaxAgeTicks + 1
-	readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 1002},
+	readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 1002},
 		database.read(scyllaTable), nil, expiredReadTime)
 	if database.reads != 3 {
 		t.Fatalf("expired: reads %d", database.reads)
@@ -200,24 +201,24 @@ func TestCacheGroupSnapshotSkipsUnsettledAndEmptyGroups(t *testing.T) {
 	resetORMTableCachesForTesting()
 	store := withMemoryFileStore(t)
 	scyllaTable := MakeScyllaTable[cacheGroupS3Record, cacheGroupS3Schema]()
-	queryPlan := &indexGroupSelectPlan{partitionValue: 7, indexGroup: scyllaTable.IndexGroups[0]}
+	queryPlan := &db.IndexGroupReadPlan{PartitionValue: 7, IndexGroup: scyllaTable.IndexGroups[0]}
 	sink := makeRecordSink(&[]cacheGroupS3Record{})
 	clientFilter := []ColumnStatement{{Col: "client_id", Operator: "=", Value: int32(4)}}
 
 	database := &fakeGroupDatabase{rows: []cacheGroupS3Record{{CompanyID: 7, ID: 1, Date: 100, Status: 1, ClientID: 4}}}
-	readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 0},
+	readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 0},
 		database.read(scyllaTable), clientFilter, 5000)
 	if database.reads != 1 || len(database.lastFilter) != 1 {
 		t.Fatalf("unsettled: reads %d, filter %v (the scan filters it)", database.reads, database.lastFilter)
 	}
-	if _, isStored := readStoredGroupSnapshot(t, store, cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.indexGroup.IndexID, 55)); isStored {
+	if _, isStored := readStoredGroupSnapshot(t, store, cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.IndexGroup.IndexID, 55)); isStored {
 		t.Fatal("an unsettled group must never be stored")
 	}
 
 	emptyDatabase := &fakeGroupDatabase{}
-	readCacheGroupRecords(sink, scyllaTable, queryPlan, indexGroupFetchState{hashValue: 56, lastWrite: 1000},
+	readCacheGroupRecords(sink, scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 56, LastWrite: 1000},
 		emptyDatabase.read(scyllaTable), nil, 5000)
-	if _, isStored := readStoredGroupSnapshot(t, store, cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.indexGroup.IndexID, 56)); isStored {
+	if _, isStored := readStoredGroupSnapshot(t, store, cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.IndexGroup.IndexID, 56)); isStored {
 		t.Fatal("an empty group must not be stored")
 	}
 }
@@ -227,9 +228,9 @@ func TestCacheGroupWithoutS3IgnoresTheStore(t *testing.T) {
 	resetORMTableCachesForTesting()
 	store := withMemoryFileStore(t)
 	scyllaTable := MakeScyllaTable[cacheGroupScalarRecord, cacheGroupScalarSchema]()
-	queryPlan := &indexGroupSelectPlan{partitionValue: 7, indexGroup: scyllaTable.IndexGroups[0]}
+	queryPlan := &db.IndexGroupReadPlan{PartitionValue: 7, IndexGroup: scyllaTable.IndexGroups[0]}
 	reads := 0
-	readCacheGroupRecords(makeRecordSink(&[]cacheGroupScalarRecord{}), scyllaTable, queryPlan, indexGroupFetchState{hashValue: 55, lastWrite: 1000},
+	readCacheGroupRecords(makeRecordSink(&[]cacheGroupScalarRecord{}), scyllaTable, queryPlan, db.IndexGroupFetchState{HashValue: 55, LastWrite: 1000},
 		func([]ColumnStatement) ([]unsafe.Pointer, error) {
 			reads++
 			return []unsafe.Pointer{unsafe.Pointer(&cacheGroupScalarRecord{CompanyID: 7, ID: 1})}, nil
@@ -237,7 +238,7 @@ func TestCacheGroupWithoutS3IgnoresTheStore(t *testing.T) {
 	if reads != 1 {
 		t.Fatalf("reads %d", reads)
 	}
-	if _, isStored := readStoredGroupSnapshot(t, store, cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.indexGroup.IndexID, 55)); isStored {
+	if _, isStored := readStoredGroupSnapshot(t, store, cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.IndexGroup.IndexID, 55)); isStored {
 		t.Fatal("a TypeCacheGroup must not write snapshots")
 	}
 }
@@ -248,8 +249,8 @@ func TestCacheGroupSnapshotDropsAWriteRacedByAnother(t *testing.T) {
 	resetORMTableCachesForTesting()
 	store := withMemoryFileStore(t)
 	scyllaTable := MakeScyllaTable[cacheGroupS3Record, cacheGroupS3Schema]()
-	queryPlan := &indexGroupSelectPlan{partitionValue: 7, indexGroup: scyllaTable.IndexGroups[0]}
-	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.indexGroup.IndexID, 55)
+	queryPlan := &db.IndexGroupReadPlan{PartitionValue: 7, IndexGroup: scyllaTable.IndexGroups[0]}
+	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, 7, queryPlan.IndexGroup.IndexID, 55)
 	database := &fakeGroupDatabase{rows: []cacheGroupS3Record{{CompanyID: 7, ID: 1, Date: 100, Status: 1}}}
 	// The other request stores its file while this one reads the database.
 	database.beforeReply = func() {
@@ -259,7 +260,7 @@ func TestCacheGroupSnapshotDropsAWriteRacedByAnother(t *testing.T) {
 		}
 	}
 	records, err := readCacheGroupRecords(makeRecordSink(&[]cacheGroupS3Record{}), scyllaTable, queryPlan,
-		indexGroupFetchState{hashValue: 55, lastWrite: 1000}, database.read(scyllaTable), nil, 5000)
+		db.IndexGroupFetchState{HashValue: 55, LastWrite: 1000}, database.read(scyllaTable), nil, 5000)
 	if err != nil || len(records) != 1 {
 		t.Fatalf("err %v, %d records", err, len(records))
 	}

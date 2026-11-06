@@ -62,16 +62,16 @@ func TestNoIndexGroupIsPlannedAndReadsItsBaseKeyRange(t *testing.T) {
 		{Col: "kind", Operator: "=", Value: int16(8)},
 	}}
 
-	queryPlan, err := buildIndexGroupSelectPlan(tableInfo, scyllaTable)
+	queryPlan, err := scyllaTable.PlanIndexGroupRead(tableInfo)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	if queryPlan.indexGroup.Name != "date_kind" || queryPlan.indexGroup.BaseGroup == nil || queryPlan.indexGroup.BaseGroup.Name != "date" {
-		t.Fatalf("planned %q with base %+v", queryPlan.indexGroup.Name, queryPlan.indexGroup.BaseGroup)
+	if queryPlan.IndexGroup.Name != "date_kind" || queryPlan.IndexGroup.BaseGroup == nil || queryPlan.IndexGroup.BaseGroup.Name != "date" {
+		t.Fatalf("planned %q with base %+v", queryPlan.IndexGroup.Name, queryPlan.IndexGroup.BaseGroup)
 	}
 
 	// The fetch is the base group's primary-key range: no secondary index, no hash column.
-	fetchState := indexGroupFetchState{hashValue: db.HashInt64(20000, 8), indexGroupValues: []int64{20000, 8}}
+	fetchState := db.IndexGroupFetchState{HashValue: db.HashInt64(20000, 8), IndexGroupValues: []int64{20000, 8}}
 	queryStr, queryValues := buildIndexGroupFetchQuery(scyllaTable, queryPlan, fetchState, []string{"*"})
 	if !strings.HasSuffix(queryStr, "WHERE empresa_id = ? AND id >= ? AND id < ?") || len(queryValues) != 3 {
 		t.Fatalf("query = %s %v", queryStr, queryValues)
@@ -80,13 +80,13 @@ func TestNoIndexGroupIsPlannedAndReadsItsBaseKeyRange(t *testing.T) {
 
 func TestNoIndexGroupCarriesItsBaseGroupLastWrite(t *testing.T) {
 	scyllaTable := MakeScyllaTable[ledgerRecord, ledgerSchema]()
-	queryPlan := &indexGroupSelectPlan{
-		partitionValue: 7,
-		indexGroup:     ledgerGroupNamed(t, scyllaTable, "date_kind"),
-		hashGroups: []queryIndexGroupHash{
-			{hashValue: db.HashInt64(20000, 8), indexGroupValues: []int64{20000, 8}},
-			{hashValue: db.HashInt64(20000, 3), indexGroupValues: []int64{20000, 3}},
-			{hashValue: db.HashInt64(20001, 8), indexGroupValues: []int64{20001, 8}},
+	queryPlan := &db.IndexGroupReadPlan{
+		PartitionValue: 7,
+		IndexGroup:     ledgerGroupNamed(t, scyllaTable, "date_kind"),
+		HashGroups: []db.IndexGroupHash{
+			{HashValue: db.HashInt64(20000, 8), IndexGroupValues: []int64{20000, 8}},
+			{HashValue: db.HashInt64(20000, 3), IndexGroupValues: []int64{20000, 3}},
+			{HashValue: db.HashInt64(20001, 8), IndexGroupValues: []int64{20001, 8}},
 		},
 	}
 
@@ -99,7 +99,7 @@ func TestNoIndexGroupCarriesItsBaseGroupLastWrite(t *testing.T) {
 		return map[int32]int32{db.HashInt64(20000): 555}, nil
 	}
 
-	freshness, err := loadPlannedGroupFreshness(scyllaTable, queryPlan, extractQueryIndexGroupHashes(queryPlan.hashGroups))
+	freshness, err := loadPlannedGroupFreshness(scyllaTable, queryPlan, queryPlan.HashValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,8 +118,8 @@ func TestNoIndexGroupCarriesItsBaseGroupLastWrite(t *testing.T) {
 func TestNoIndexGroupPostFilterPinsTheGroupsOwnValues(t *testing.T) {
 	scyllaTable := MakeScyllaTable[ledgerRecord, ledgerSchema]()
 	queryStatements := []ColumnStatement{{Col: "kind", Operator: "IN", Values: []any{int16(3), int16(8)}}}
-	groupStatements := groupPostFilterStatements(ledgerGroupNamed(t, scyllaTable, "date_kind"),
-		indexGroupFetchState{indexGroupValues: []int64{20000, 8}}, queryStatements)
+	groupStatements := db.GroupPostFilterStatements(ledgerGroupNamed(t, scyllaTable, "date_kind"),
+		db.IndexGroupFetchState{IndexGroupValues: []int64{20000, 8}}, queryStatements)
 
 	kindThree := ledgerRecord{Date: 20000, Kind: 3}
 	kindEight := ledgerRecord{Date: 20000, Kind: 8}

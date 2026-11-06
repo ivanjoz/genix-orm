@@ -54,18 +54,18 @@ func requireCacheGroupSnapshotCodec(dbTable *ScyllaTable, structRefValue reflect
 // read whole from the database and the file rewritten. Every other group is a plain database read.
 // readTime is the server clock of this request.
 func readCacheGroupRecords(
-	sink recordSink, scyllaTable ScyllaTable, queryPlan *indexGroupSelectPlan, fetchState indexGroupFetchState,
+	sink recordSink, scyllaTable ScyllaTable, queryPlan *db.IndexGroupReadPlan, fetchState db.IndexGroupFetchState,
 	readGroupFromDatabase func(postFilterStatements []ColumnStatement) ([]unsafe.Pointer, error),
 	postFilterStatements []ColumnStatement, readTime int32,
 ) ([]unsafe.Pointer, error) {
 	fileStore := cache.FileStore()
 	// lastWrite 0 is an unsettled group: it is never served from a file nor stored.
-	if !queryPlan.indexGroup.SnapshotInS3 || fetchState.lastWrite == 0 || fileStore == nil || !cache.RecordSnapshotsEnabled() {
+	if !queryPlan.IndexGroup.SnapshotInS3 || fetchState.LastWrite == 0 || fileStore == nil || !cache.RecordSnapshotsEnabled() {
 		return readGroupFromDatabase(postFilterStatements)
 	}
 	recordType := sinkRecordType(sink)
 	codec := recordSnapshotCodecFor(scyllaTable, recordType)
-	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, int64(queryPlan.partitionValue), queryPlan.indexGroup.IndexID, fetchState.hashValue)
+	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, int64(queryPlan.PartitionValue), queryPlan.IndexGroup.IndexID, fetchState.HashValue)
 
 	content, etag, err := fileStore.GetFile(snapshotKey)
 	switch {
@@ -77,7 +77,7 @@ func readCacheGroupRecords(
 		return readGroupFromDatabase(postFilterStatements)
 	default:
 		snapshot, snapshotRecords, isUsable := decodeRecordSnapshotFile(content, codec, recordType, readTime, snapshotKey)
-		if isUsable && snapshot.Cursor == fetchState.lastWrite {
+		if isUsable && snapshot.Cursor == fetchState.LastWrite {
 			return filterGroupRecords(snapshotRecords, postFilterStatements, scyllaTable), nil
 		}
 	}
@@ -88,7 +88,7 @@ func readCacheGroupRecords(
 	}
 	// An empty group is not stored: reading it again costs next to nothing.
 	if len(groupRecords) > 0 {
-		writeRecordSnapshotFile(fileStore, snapshotKey, etag, codec, recordType, fetchState.lastWrite, readTime, groupRecords)
+		writeRecordSnapshotFile(fileStore, snapshotKey, etag, codec, recordType, fetchState.LastWrite, readTime, groupRecords)
 	}
 	return filterGroupRecords(groupRecords, postFilterStatements, scyllaTable), nil
 }

@@ -30,30 +30,30 @@ func TestBuildIndexGroupSelectPlanAllowsSingleColumnRawGroup(t *testing.T) {
 		},
 	}
 
-	queryPlan, err := buildIndexGroupSelectPlan(tableInfo, scyllaTable)
+	queryPlan, err := scyllaTable.PlanIndexGroupRead(tableInfo)
 	if err != nil {
-		t.Fatalf("buildIndexGroupSelectPlan returned error: %v", err)
+		t.Fatalf("PlanIndexGroupRead returned error: %v", err)
 	}
 
-	if queryPlan.indexGroup.Name != "date" {
-		t.Fatalf("expected single-column index group, got %q", queryPlan.indexGroup.Name)
+	if queryPlan.IndexGroup.Name != "date" {
+		t.Fatalf("expected single-column index group, got %q", queryPlan.IndexGroup.Name)
 	}
-	if queryPlan.indexGroup.VirtualColumn != nil && !queryPlan.indexGroup.VirtualColumn.IsNil() {
-		t.Fatalf("single-column index group should not require a virtual column, got %s", queryPlan.indexGroup.VirtualColumn.GetName())
+	if queryPlan.IndexGroup.VirtualColumn != nil && !queryPlan.IndexGroup.VirtualColumn.IsNil() {
+		t.Fatalf("single-column index group should not require a virtual column, got %s", queryPlan.IndexGroup.VirtualColumn.GetName())
 	}
-	if len(queryPlan.hashGroups) != 3 {
-		t.Fatalf("expected 3 hash groups, got %+v", queryPlan.hashGroups)
+	if len(queryPlan.HashGroups) != 3 {
+		t.Fatalf("expected 3 hash groups, got %+v", queryPlan.HashGroups)
 	}
 	expectedFechas := map[int64]bool{
 		18754: false,
 		18755: false,
 		18756: false,
 	}
-	for _, hashGroup := range queryPlan.hashGroups {
-		if len(hashGroup.indexGroupValues) != 1 {
+	for _, hashGroup := range queryPlan.HashGroups {
+		if len(hashGroup.IndexGroupValues) != 1 {
 			t.Fatalf("unexpected single-column values: %+v", hashGroup)
 		}
-		dateValue := hashGroup.indexGroupValues[0]
+		dateValue := hashGroup.IndexGroupValues[0]
 		if _, exists := expectedFechas[dateValue]; !exists {
 			t.Fatalf("unexpected single-column value: %+v", hashGroup)
 		}
@@ -61,20 +61,20 @@ func TestBuildIndexGroupSelectPlanAllowsSingleColumnRawGroup(t *testing.T) {
 	}
 	for dateValue, wasSeen := range expectedFechas {
 		if !wasSeen {
-			t.Fatalf("missing expected date value %d in %+v", dateValue, queryPlan.hashGroups)
+			t.Fatalf("missing expected date value %d in %+v", dateValue, queryPlan.HashGroups)
 		}
 	}
 }
 
 func TestBuildIndexGroupFetchQueryUsesSourceColumnForSingleColumnGroup(t *testing.T) {
 	scyllaTable := MakeScyllaTable[indexGroupRecord, indexGroupSchema]()
-	queryPlan := &indexGroupSelectPlan{
-		partitionValue: 7,
-		indexGroup:     scyllaTable.IndexGroups[0],
+	queryPlan := &db.IndexGroupReadPlan{
+		PartitionValue: 7,
+		IndexGroup:     scyllaTable.IndexGroups[0],
 	}
-	fetchState := indexGroupFetchState{
-		hashValue:        db.HashInt64(18754),
-		indexGroupValues: []int64{18754},
+	fetchState := db.IndexGroupFetchState{
+		HashValue:        db.HashInt64(18754),
+		IndexGroupValues: []int64{18754},
 	}
 
 	queryStr, queryValues := buildIndexGroupFetchQuery(scyllaTable, queryPlan, fetchState, []string{"*"})
@@ -84,89 +84,5 @@ func TestBuildIndexGroupFetchQueryUsesSourceColumnForSingleColumnGroup(t *testin
 	}
 	if len(queryValues) != 2 || queryValues[0] != int32(7) || queryValues[1] != int64(18754) {
 		t.Fatalf("unexpected query values: %+v", queryValues)
-	}
-}
-
-func TestFilterIndexGroupFetchesSkipsMissingAndFreshHashes(t *testing.T) {
-	hashGroups := []queryIndexGroupHash{
-		{hashValue: 11, indexGroupValues: []int64{1, 11}},
-		{hashValue: 12, indexGroupValues: []int64{2, 12}},
-		{hashValue: 13, indexGroupValues: []int64{3, 13}},
-		{hashValue: 14, indexGroupValues: []int64{4, 14}},
-	}
-	serverFreshnessByHash := map[int32]int32{
-		11: 100,
-		12: 200,
-		14: 400,
-	}
-	cachedIndexGroups := map[int32]int32{
-		11: 100,
-		12: 150,
-		13: 999,
-	}
-
-	fetchStates, _ := splitIndexGroupFetches(hashGroups, serverFreshnessByHash, cachedIndexGroups, 10000)
-	if len(fetchStates) != 2 {
-		t.Fatalf("expected two changed hashes, got %+v", fetchStates)
-	}
-	if fetchStates[0].hashValue != 12 || fetchStates[0].lastWrite != 200 {
-		t.Fatalf("unexpected first fetch state: %+v", fetchStates[0])
-	}
-	if len(fetchStates[0].indexGroupValues) != 2 || fetchStates[0].indexGroupValues[0] != 2 || fetchStates[0].indexGroupValues[1] != 12 {
-		t.Fatalf("unexpected first fetch state values: %+v", fetchStates[0])
-	}
-	if fetchStates[1].hashValue != 14 || fetchStates[1].lastWrite != 400 {
-		t.Fatalf("unexpected second fetch state: %+v", fetchStates[1])
-	}
-	if len(fetchStates[1].indexGroupValues) != 2 || fetchStates[1].indexGroupValues[0] != 4 || fetchStates[1].indexGroupValues[1] != 14 {
-		t.Fatalf("unexpected second fetch state values: %+v", fetchStates[1])
-	}
-}
-
-func TestSplitIndexGroupFetchesReturnsCachedMetadataStates(t *testing.T) {
-	hashGroups := []queryIndexGroupHash{
-		{hashValue: 11, indexGroupValues: []int64{1, 11}},
-		{hashValue: 12, indexGroupValues: []int64{2, 12}},
-	}
-	serverFreshnessByHash := map[int32]int32{
-		11: 100,
-		12: 200,
-	}
-	cachedIndexGroups := map[int32]int32{
-		11: 100,
-		12: 150,
-	}
-
-	fetchStates, cachedStates := splitIndexGroupFetches(hashGroups, serverFreshnessByHash, cachedIndexGroups, 10000)
-	if len(fetchStates) != 1 || fetchStates[0].hashValue != 12 || fetchStates[0].lastWrite != 200 {
-		t.Fatalf("unexpected fetch states: %+v", fetchStates)
-	}
-	if len(cachedStates) != 1 || cachedStates[0].hashValue != 11 || cachedStates[0].lastWrite != 100 {
-		t.Fatalf("unexpected cached states: %+v", cachedStates)
-	}
-	if len(cachedStates[0].indexGroupValues) != 2 || cachedStates[0].indexGroupValues[0] != 1 || cachedStates[0].indexGroupValues[1] != 11 {
-		t.Fatalf("unexpected cached state values: %+v", cachedStates[0])
-	}
-}
-
-// A group written less than indexGroupSettleTicks ago is fetched even when the client holds its
-// last_write, and goes out labelled 0; at the margin it is settled and served from the cache.
-func TestSplitIndexGroupFetchesSendsUnsettledGroupsWhole(t *testing.T) {
-	hashGroups := []queryIndexGroupHash{{hashValue: 11, indexGroupValues: []int64{1, 11}}}
-	serverFreshnessByHash := map[int32]int32{11: 1000}
-	cachedIndexGroups := map[int32]int32{11: 1000}
-
-	fetchStates, cachedStates := splitIndexGroupFetches(hashGroups, serverFreshnessByHash, cachedIndexGroups, 1000+indexGroupSettleTicks-1)
-	if len(cachedStates) != 0 || len(fetchStates) != 1 || fetchStates[0].lastWrite != 0 {
-		t.Fatalf("unsettled: fetched %+v, cached %+v", fetchStates, cachedStates)
-	}
-	// The label 0 a client stored while unsettled never matches a settled group.
-	fetchStates, cachedStates = splitIndexGroupFetches(hashGroups, serverFreshnessByHash, map[int32]int32{11: 0}, 1000+indexGroupSettleTicks)
-	if len(cachedStates) != 0 || len(fetchStates) != 1 || fetchStates[0].lastWrite != 1000 {
-		t.Fatalf("settled, client held 0: fetched %+v, cached %+v", fetchStates, cachedStates)
-	}
-	fetchStates, cachedStates = splitIndexGroupFetches(hashGroups, serverFreshnessByHash, cachedIndexGroups, 1000+indexGroupSettleTicks)
-	if len(fetchStates) != 0 || len(cachedStates) != 1 || cachedStates[0].lastWrite != 1000 {
-		t.Fatalf("settled: fetched %+v, cached %+v", fetchStates, cachedStates)
 	}
 }

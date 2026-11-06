@@ -263,7 +263,7 @@ label a client stores per group (`RecordGroup.LastWrite`, json `lw`, sent back a
   that dies after the mark costs one needless refetch. It is the one marker that goes ahead of its
   data; the settle margin below is what makes that safe.
 - Read: the probe reads each candidate group's `last_write`. A group written less than
-  `indexGroupSettleTicks` (16 s) ago is unsettled: it is always fetched whole and labelled 0, which no
+  `db.IndexGroupSettleTicks` (16 s) ago is unsettled: it is always fetched whole and labelled 0, which no
   later probe matches, so a client that read it while writes of the same 2 s tick (or one still
   landing) were in flight refetches it once it settles. A settled group whose `last_write` the client
   holds goes back as metadata only.

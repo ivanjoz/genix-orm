@@ -121,7 +121,7 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 	}
 
 	// Still settling: the groups come back whole, labelled 0.
-	getManagedUnixTime = func() int32 { return clockStart + indexGroupSettleTicks - 1 }
+	getManagedUnixTime = func() int32 { return clockStart + db.IndexGroupSettleTicks - 1 }
 	unsettledGroups := []RecordGroup[indexGroupITRecord]{}
 	unsettledQuery := QueryIndexGroup(&unsettledGroups)
 	unsettledQuery.CompanyID.Equals(8)
@@ -134,7 +134,7 @@ func TestQueryIndexGroupOnScylla(t *testing.T) {
 			t.Fatalf("an unsettled group must be labelled 0: %+v", group)
 		}
 	}
-	getManagedUnixTime = func() int32 { return clockStart + indexGroupSettleTicks }
+	getManagedUnixTime = func() int32 { return clockStart + db.IndexGroupSettleTicks }
 
 	readGroups := func(cachedGroups []RecordGroup[indexGroupITRecord]) []RecordGroup[indexGroupITRecord] {
 		t.Helper()

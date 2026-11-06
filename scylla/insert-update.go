@@ -914,7 +914,7 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 	// moves). The barrier is what makes the protocol safe: publishing a marker before the data it
 	// gates lets a client refetch a stale row and then record the new version, permanently missing
 	// the update. The index-group marks are the exception, written before the rows: their readers
-	// never trust a group marked less than indexGroupSettleTicks ago (markIndexGroupsBeforeWrite).
+	// never trust a group marked less than db.IndexGroupSettleTicks ago (markIndexGroupsBeforeWrite).
 	//
 	// Within a phase the syncs target distinct tables and only ever read the record slices, so
 	// they are independent. Each sync KIND keeps its own insert/update phases sequential inside

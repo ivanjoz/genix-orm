@@ -18,12 +18,6 @@ type indexUpdatedRow struct {
 	lastWrite int64
 }
 
-// indexGroupSettleTicks (16 s) is how long a group stays unsettled after its last write. An
-// unsettled group is always sent whole and labelled 0, which no stored last_write matches, so a
-// client that read it while writes of the same 2 s tick, or a write still landing, were in flight
-// refetches it once it settles.
-const indexGroupSettleTicks = 8
-
 func appendIndexUpdatedRowsForRecord(
 	recordPointer unsafe.Pointer,
 	scyllaTable *ScyllaTable,
@@ -195,7 +189,7 @@ func collectIndexGroupMarks(scyllaTable *ScyllaTable, phases []writePhase, store
 
 // markIndexGroupsBeforeWrite publishes the marks before the rows are written, with last_write = now.
 // Marking first fails safe: if this fails the write stops with nothing written, and if the write dies
-// after it the cost is one needless refetch. A group stays unsettled for indexGroupSettleTicks (16 s)
+// after it the cost is one needless refetch. A group stays unsettled for db.IndexGroupSettleTicks (16 s)
 // from its mark, which covers the data landing after it. A data phase slower than that can be cached
 // without its rows until the group's next write: the accepted gap (ORM_INTERNALS.md, Group freshness).
 func markIndexGroupsBeforeWrite(scyllaTable *ScyllaTable, marks []indexUpdatedRow) error {
