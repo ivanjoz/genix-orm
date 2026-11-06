@@ -99,16 +99,6 @@ func persistIndexUpdatedRowsBatch(keyspace string, tableName string, rows []inde
 	return session.ExecuteBatch(batch)
 }
 
-// registerIndexGroup describes a cache group in db and materializes the index it needs, if any.
-func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
-	if source := dbTable.DescribeIndexGroup(idxCount, indexCfg); source != nil {
-		dbTable.indexes[source.Name] = materializeIndexSource(dbTable, source)
-	}
-	if dbTable.indexUpdatedTable == nil {
-		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
-	}
-}
-
 // materializeGroupHashIndex gives a group's hash column its CQL. A scalar hash is indexed locally,
 // one partition's index answering a grouped read; Scylla has no local index on a collection
 // ("not implemented yet"), so the hashes of a slice key are a set<int> with a global index and are

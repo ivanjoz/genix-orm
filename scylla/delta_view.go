@@ -53,12 +53,12 @@ const (
 
 /* Compile */
 
-// compileSchemaDeltaView describes a TypeDelta index in db and gives it the materialized view that
-// serves it.
-func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
-	source := dbTable.DescribeDelta(indexCfg)
-	view := &viewInfo{IndexSource: source}
-	deltaIndex := dbTable.DeltaIndexes[len(dbTable.DeltaIndexes)-1]
+// materializeDeltaView gives a described TypeDelta index the materialized view that serves it.
+func materializeDeltaView(dbTable *ScyllaTable, view *viewInfo) {
+	source := view.IndexSource
+	deltaIndex := dbTable.DeltaIndexes[slices.IndexFunc(dbTable.DeltaIndexes, func(registered db.DeltaIndexInfo) bool {
+		return registered.ViewName == source.Name
+	})]
 
 	// The described value is the shared unsigned layout; Scylla compares the column as signed, so it
 	// is stored with the top bit flipped (deltaPackedStoredValue).
@@ -76,7 +76,6 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 		return makeViewExpectedColumns(append(slices.Clone(storedColumns), deltaIndex.PackedColumn))
 	}
 	view.getCreateScript = func() string { return deltaViewCreateScript(*dbTable, deltaIndex, storedColumns) }
-	dbTable.views[deltaIndex.ViewName] = view
 }
 
 // deltaViewCreateScript is the CREATE of an index's view. The view is ordered newest first: a sync

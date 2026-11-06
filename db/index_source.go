@@ -73,6 +73,14 @@ const (
 	// IndexKindGroupHash is a cache group over several columns (or a slice): a generated hash column
 	// the group's grouped reads key on. Its IndexGroup holds the group.
 	IndexKindGroupHash
+	// IndexKindView is a TypeView: a simple, hash or packed-range view (Type 6, 7, 8).
+	IndexKindView
+	// IndexKindViewTable is a TypeViewTable: a table of its own, one row per fan-out element (Type 9).
+	IndexKindViewTable
+	// IndexKindDelta is a TypeDelta index (Type 8 with IsDeltaView).
+	IndexKindDelta
+	// IndexKindCompositeBucket is a global index on one bucket-size hash column of a composite-bucketing index.
+	IndexKindCompositeBucket
 )
 
 // IndexSourceNamed returns the compiled index with that name, or nil.

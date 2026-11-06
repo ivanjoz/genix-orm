@@ -142,6 +142,7 @@ func (core *TableCore) DescribeViewTable(viewCfg Index) *IndexSource {
 	}
 
 	source := &IndexSource{
+		Kind:             IndexKindViewTable,
 		Type:             9,
 		Name:             fmt.Sprintf(`%v__%v_view`, core.Name, strings.Join(keyColumnNames, "_")),
 		Columns:          append([]string{partKey.GetName()}, keyColumnNames...),

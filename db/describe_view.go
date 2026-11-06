@@ -104,6 +104,7 @@ func (core *TableCore) DescribeView(viewCfg Index) *IndexSource {
 	}
 
 	source := &IndexSource{
+		Kind:               IndexKindView,
 		Type:               6,
 		Name:               fmt.Sprintf(`%v__%v_view`, core.Name, colNamesJoined),
 		Columns:            colNames,

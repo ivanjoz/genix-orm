@@ -2,43 +2,23 @@ package scylla
 
 import (
 	"fmt"
+	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/db"
 )
 
-func hasCompositeBucketing(indexCfg Index) bool {
-	for _, key := range indexCfg.Keys {
-		if len(key.GetInfo().CompositeBucketSizes) > 0 {
-			return true
+// registerMaterializedIndex materializes a described index and files it where the driver looks it up:
+// views and view tables (their own tables or materialized views) apart from secondary indexes.
+func registerMaterializedIndex(dbTable *ScyllaTable, source *db.IndexSource) {
+	view := materializeIndexSource(dbTable, source)
+	switch source.Kind {
+	case db.IndexKindView, db.IndexKindViewTable, db.IndexKindDelta:
+		dbTable.views[view.Name] = view
+		if source.Kind == db.IndexKindViewTable {
+			dbTable.hasTableBackedViews = true
 		}
-	}
-	return false
-}
-
-func resolveSchemaIndexType(indexCfg Index) int8 {
-	if indexCfg.Type != 0 {
-		return indexCfg.Type
-	}
-	if len(indexCfg.Cols) > 0 {
-		return TypeView
-	}
-	if len(indexCfg.Keys) == 1 {
-		return TypeLocalIndex
-	}
-	return TypeLocalIndex
-}
-
-// registerSchemaLocalIndex and registerSchemaGlobalIndex describe the index in db (the neutral
-// half) and materialize it as a Scylla secondary index.
-func registerSchemaLocalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
-	if source := dbTable.DescribeLocalIndex(idxCount, indexCfg); source != nil {
-		dbTable.indexes[source.Name] = materializeIndexSource(dbTable, source)
-	}
-}
-
-func registerSchemaGlobalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
-	if source := dbTable.DescribeGlobalIndex(idxCount, indexCfg); source != nil {
-		dbTable.indexes[source.Name] = materializeIndexSource(dbTable, source)
+	default:
+		dbTable.indexes[view.Name] = view
 	}
 }
 
@@ -52,6 +32,14 @@ func materializeIndexSource(dbTable *ScyllaTable, source *db.IndexSource) *viewI
 		materializePackedIndex(dbTable, view)
 	case db.IndexKindGroupHash:
 		materializeGroupHashIndex(dbTable, view)
+	case db.IndexKindCompositeBucket:
+		materializeCompositeBucketIndex(view, dbTable)
+	case db.IndexKindView:
+		materializeView(dbTable, view)
+	case db.IndexKindViewTable:
+		materializeViewTable(dbTable, view)
+	case db.IndexKindDelta:
+		materializeDeltaView(dbTable, view)
 	default:
 		panic(fmt.Sprintf(`Table "%v": index %v has kind %d, which this driver does not materialize`, dbTable.Name, source.Name, source.Kind))
 	}
@@ -75,5 +63,18 @@ func materializeSingleColumnIndex(dbTable *ScyllaTable, view *viewInfo) {
 			colName = fmt.Sprintf("VALUES(%v)", colName)
 		}
 		return fmt.Sprintf(`CREATE INDEX %v ON %v (%v)`, indexName, dbTable.GetFullName(), colName)
+	}
+}
+
+// materializeCompositeBucketIndex indexes the VALUES of a bucket-hash set<int> column. The described
+// value is the []int32 hashes; the statement carries them as a collection literal.
+func materializeCompositeBucketIndex(view *viewInfo, dbTable *ScyllaTable) {
+	hashColumn := view.Column.(*columnInfo)
+	describedHashes := hashColumn.GetValueFn
+	hashColumn.GetValueFn = func(ptr unsafe.Pointer) any {
+		return makeSignedIntCollectionLiteral(hashColumn.DBType, describedHashes(ptr).([]int32))
+	}
+	view.getCreateScript = func() string {
+		return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, view.Name, dbTable.GetFullName(), hashColumn.GetName())
 	}
 }

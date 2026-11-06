@@ -9,14 +9,6 @@ import (
 	"github.com/ivanjoz/genix-orm/db"
 )
 
-// compileSchemaViewTable describes a TypeViewTable in db and gives it the CQL that creates and
-// queries its table.
-func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
-	view := &viewInfo{IndexSource: dbTable.DescribeViewTable(viewCfg)}
-	materializeViewTable(dbTable, view)
-	dbTable.views[view.Name] = view
-}
-
 // materializeViewTable attaches the CQL of a view table: its WHERE rendering, the columns deploy
 // expects and the CREATE TABLE script. Everything it needs is on the IndexSource.
 func materializeViewTable(dbTable *ScyllaTable, view *viewInfo) {
@@ -104,13 +96,6 @@ func materializeViewTable(dbTable *ScyllaTable, view *viewInfo) {
 			makeStatementWith,
 		)
 	}
-}
-
-// compileSchemaView describes a TypeView in db and gives it the materialized view that serves it.
-func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
-	view := &viewInfo{IndexSource: dbTable.DescribeView(viewCfg)}
-	materializeView(dbTable, view)
-	dbTable.views[view.Name] = view
 }
 
 // materializeView attaches the CQL of a described view: the encoding of its virtual column, its

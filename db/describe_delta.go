@@ -119,6 +119,7 @@ func (core *TableCore) DescribeDelta(indexCfg Index) *IndexSource {
 		sourceNames[i] = sourceColumn.GetName()
 	}
 	source := &IndexSource{
+		Kind:                    IndexKindDelta,
 		Type:                    8,
 		IsDeltaView:             true,
 		Name:                    deltaIndex.ViewName,
