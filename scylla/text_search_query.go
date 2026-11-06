@@ -15,7 +15,7 @@ import (
 // table fails with a clear error instead of querying an index that does not exist.
 func resolveTextSearchTable[T TableBaseInterface[E, T], E TableSchemaInterface[E]]() (ScyllaTable, error) {
 	scyllaTable := MakeScyllaTable[T, E]()
-	if scyllaTable.textSearchIndex == nil {
+	if scyllaTable.TextSearchIndex == nil {
 		return scyllaTable, fmt.Errorf(`Table "%v": SearchText requires TextSearch in GetSchema`, scyllaTable.Name)
 	}
 	return scyllaTable, nil

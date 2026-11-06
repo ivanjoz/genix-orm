@@ -71,14 +71,14 @@ func TestFixedValueViewSizesSlotsFromFixedValues(t *testing.T) {
 
 	// Status {0,1} needs one bit and Type 1..2 two: 3 of an int's 32 bits.
 	expectedSlots := []int64{1, 2}
-	if !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
+	if !slices.Equal(view.PackedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.PackedSlotBitsPerColumn)
 	}
-	if view.column.GetType().DBType != "int" {
-		t.Fatalf("expected an int packed column, got %v", view.column.GetType().DBType)
+	if view.Column.GetType().DBType != "int" {
+		t.Fatalf("expected an int packed column, got %v", view.Column.GetType().DBType)
 	}
-	if !strings.HasSuffix(view.name, "pk_status_type_rng_view") {
-		t.Fatalf("expected the view keyed on the declared keys, got %v", view.name)
+	if !strings.HasSuffix(view.Name, "pk_status_type_rng_view") {
+		t.Fatalf("expected the view keyed on the declared keys, got %v", view.Name)
 	}
 }
 
@@ -122,11 +122,11 @@ func TestFixedValueViewFallsBackToBigint(t *testing.T) {
 	scyllaTable := MakeScyllaTable[fixedViewWideLeadRecord, fixedViewWideLeadSchema]()
 	view := fixedValuePackedView(t, scyllaTable)
 
-	if view.column.GetType().DBType != "bigint" {
-		t.Fatalf("expected a bigint packed column when the keys overflow an int, got %v", view.column.GetType().DBType)
+	if view.Column.GetType().DBType != "bigint" {
+		t.Fatalf("expected a bigint packed column when the keys overflow an int, got %v", view.Column.GetType().DBType)
 	}
-	if expectedSlots := []int64{41, 1}; !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
+	if expectedSlots := []int64{41, 1}; !slices.Equal(view.PackedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.PackedSlotBitsPerColumn)
 	}
 }
 
@@ -168,12 +168,12 @@ func TestFixedValueViewLetsAnUndeclaredKeyAbsorbTheBitRemainder(t *testing.T) {
 	scyllaTable := MakeScyllaTable[fixedViewElasticRecord, fixedViewElasticSchema]()
 	view := fixedValuePackedView(t, scyllaTable)
 
-	if view.column.GetType().DBType != "bigint" {
-		t.Fatalf("expected a bigint packed column for an elastic layout, got %v", view.column.GetType().DBType)
+	if view.Column.GetType().DBType != "bigint" {
+		t.Fatalf("expected a bigint packed column for an elastic layout, got %v", view.Column.GetType().DBType)
 	}
 	// 1 bit for the declared Status and the remaining 63 of the 64-bit budget for ListID.
-	if expectedSlots := []int64{63, 1}; !slices.Equal(view.packedSlotBitsPerColumn, expectedSlots) {
-		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.packedSlotBitsPerColumn)
+	if expectedSlots := []int64{63, 1}; !slices.Equal(view.PackedSlotBitsPerColumn, expectedSlots) {
+		t.Fatalf("expected slot widths %v, got %v", expectedSlots, view.PackedSlotBitsPerColumn)
 	}
 }
 
@@ -212,7 +212,7 @@ func TestFixedValueViewWithTwoUndeclaredKeysStaysAHashView(t *testing.T) {
 	scyllaTable := MakeScyllaTable[fixedViewTwoElasticRecord, fixedViewTwoElasticSchema]()
 	for _, view := range scyllaTable.views {
 		if view.Type != 7 {
-			t.Fatalf("expected a hash view, got type %d (%v)", view.Type, view.name)
+			t.Fatalf("expected a hash view, got type %d (%v)", view.Type, view.Name)
 		}
 	}
 }
@@ -272,13 +272,13 @@ func TestFixedValueViewRejectsForcedInt32ThatDoesNotFit(t *testing.T) {
 // packFixedValueViewValue packs a full key the way the view stores it, sign bit flipped.
 func packFixedValueViewValue(t *testing.T, view *viewInfo, componentValues ...int64) int64 {
 	t.Helper()
-	return convertToInt64(storeVirtualPacked(db.PackSlotValues(componentValues, view.packedSlotBitsPerColumn), view.packedIsInt32))
+	return db.ConvertToInt64(storeVirtualPacked(db.PackSlotValues(componentValues, view.PackedSlotBitsPerColumn), view.PackedIsInt32))
 }
 
 // packFixedValueViewUpperBound is the stored inclusive upper bound of the block a prefix pins.
 func packFixedValueViewUpperBound(t *testing.T, view *viewInfo, prefixValues ...int64) int64 {
 	t.Helper()
-	return convertToInt64(storeVirtualPacked(db.PackSlotPrefixBound(prefixValues, view.packedSlotBitsPerColumn, true), view.packedIsInt32))
+	return db.ConvertToInt64(storeVirtualPacked(db.PackSlotPrefixBound(prefixValues, view.PackedSlotBitsPerColumn, true), view.PackedIsInt32))
 }
 
 // Every key pinned, one by IN: the packed view serves it with one exact IN over the packed values.
@@ -331,7 +331,7 @@ func TestPackedViewServesLeadingKeyAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected compile error: %v", err)
 	}
-	if compiledStatement.sourceView == nil || compiledStatement.sourceView.name != view.name {
+	if compiledStatement.sourceView == nil || compiledStatement.sourceView.Name != view.Name {
 		t.Fatalf("expected the packed view to serve a leading-key query, got %+v", compiledStatement.sourceView)
 	}
 
@@ -573,7 +573,7 @@ func TestFixedValueFanoutNeverDisplacesTheKeyRoute(t *testing.T) {
 		t.Fatalf("expected no fan-out over a primary key read, got %+v", compiledStatement.fixedValueFanoutStatements)
 	}
 	if compiledStatement.sourceView != nil {
-		t.Fatalf("expected the base-key route, got view %v", compiledStatement.sourceView.name)
+		t.Fatalf("expected the base-key route, got view %v", compiledStatement.sourceView.Name)
 	}
 }
 
@@ -635,8 +635,8 @@ func TestFixedValueFanoutUsesTheDeclaredListNotItsSpan(t *testing.T) {
 	}
 	// A status reaching 9 needs 4 bits, and Type 2.
 	view := fixedValuePackedView(t, scyllaTable)
-	if !slices.Equal(view.packedSlotBitsPerColumn, []int64{4, 2}) {
-		t.Fatalf("expected slot widths [4 2], got %v", view.packedSlotBitsPerColumn)
+	if !slices.Equal(view.PackedSlotBitsPerColumn, []int64{4, 2}) {
+		t.Fatalf("expected slot widths [4 2], got %v", view.PackedSlotBitsPerColumn)
 	}
 	expectedValues := []any{}
 	for _, statusValue := range []int64{0, 5, 9} {
@@ -699,7 +699,7 @@ func TestFixedValueFanoutSkipsAColumnTooWideToEnumerate(t *testing.T) {
 			compiledStatement.fixedValueFanoutStatements)
 	}
 	if compiledStatement.sourceView != nil {
-		t.Fatalf("expected the base-table route, got view %v", compiledStatement.sourceView.name)
+		t.Fatalf("expected the base-table route, got view %v", compiledStatement.sourceView.Name)
 	}
 }
 

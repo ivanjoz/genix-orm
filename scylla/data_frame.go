@@ -134,7 +134,7 @@ func configureDataFrames(scyllaTable *ScyllaTable, schema TableSchema, schemaStr
 // (integers as they are, floats × dataframe.FloatScale, null as 0), none when status is 0.
 func columnLinesOf(lineColumns []IColInfo, statusColumn IColInfo) func(record unsafe.Pointer) ([]dataframe.Line, error) {
 	return func(record unsafe.Pointer) ([]dataframe.Line, error) {
-		if statusColumn != nil && convertToInt64(statusColumn.GetRawValue(record)) == 0 {
+		if statusColumn != nil && db.ConvertToInt64(statusColumn.GetRawValue(record)) == 0 {
 			return nil, nil
 		}
 		line := make(dataframe.Line, len(lineColumns))
@@ -164,7 +164,7 @@ func frameValueOf(column IColInfo, rawValue any) (int64, error) {
 		floatValue, isFloat = value, true
 	}
 	if !isFloat {
-		return convertToInt64(rawValue), nil
+		return db.ConvertToInt64(rawValue), nil
 	}
 	scaled, isKept := dataframe.ScaledFloat(floatValue)
 	if !isKept {

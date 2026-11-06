@@ -1,6 +1,7 @@
 package scylla
 
 import (
+	"github.com/ivanjoz/genix-orm/db"
 	"math"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestStoreVirtualPackedKeepsUnsignedOrder(t *testing.T) {
 	for _, testCase := range cases {
 		previousStored := int64(math.MinInt64)
 		for index, packed := range testCase.ordered {
-			stored := convertToInt64(storeVirtualPacked(packed, testCase.isInt32))
+			stored := db.ConvertToInt64(storeVirtualPacked(packed, testCase.isInt32))
 			if index > 0 && stored <= previousStored {
 				t.Fatalf("isInt32=%v: %v stored as %v, not above the previous %v", testCase.isInt32, packed, stored, previousStored)
 			}

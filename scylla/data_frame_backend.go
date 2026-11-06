@@ -177,7 +177,7 @@ func (backend *frameBackend) scanPartition(partition int64, onPage func(page sto
 		if !iterator.MapScan(row) {
 			break
 		}
-		page[[2]int64{convertToInt64(row[columnNames[0]]), convertToInt64(row[columnNames[1]])}] = row
+		page[[2]int64{db.ConvertToInt64(row[columnNames[0]]), db.ConvertToInt64(row[columnNames[1]])}] = row
 		if len(page) == frameScanPageSize {
 			if err := flushPage(page); err != nil {
 				return errors.Join(err, iterator.Close())

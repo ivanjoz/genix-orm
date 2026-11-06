@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"bytes"
+	"github.com/ivanjoz/genix-orm/db"
 	"testing"
 )
 
@@ -36,8 +37,8 @@ func TestMakeNumericSliceMatchesUnderlyingType(t *testing.T) {
 }
 
 func TestConvertToIntMatchesUnderlyingType(t *testing.T) {
-	if got := convertToInt64(namedInt8(10)); got != 10 {
-		t.Fatalf("convertToInt64 = %d, want 10", got)
+	if got := db.ConvertToInt64(namedInt8(10)); got != 10 {
+		t.Fatalf("db.ConvertToInt64 = %d, want 10", got)
 	}
 	if got := convertToInt32(namedInt8(-10)); got != -10 {
 		t.Fatalf("convertToInt32 = %d, want -10", got)
@@ -47,10 +48,10 @@ func TestConvertToIntMatchesUnderlyingType(t *testing.T) {
 // A named type must hash to the same bytes as the type it wraps, otherwise retyping a
 // column from int8 to a named int8 silently invalidates every persisted hash.
 func TestHashIntStableAcrossNamedType(t *testing.T) {
-	if HashInt(namedInt8(10)) != HashInt(int8(10)) {
+	if db.HashInt(namedInt8(10)) != db.HashInt(int8(10)) {
 		t.Fatal("named int8 must hash identically to plain int8")
 	}
-	if HashInt("company", namedInt8(6), int32(42)) != HashInt("company", int8(6), int32(42)) {
+	if db.HashInt("company", namedInt8(6), int32(42)) != db.HashInt("company", int8(6), int32(42)) {
 		t.Fatal("mixed-value hash must be stable across named types")
 	}
 }

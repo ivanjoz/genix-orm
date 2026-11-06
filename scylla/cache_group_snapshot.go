@@ -3,6 +3,7 @@ package scylla
 import (
 	"errors"
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"reflect"
 	"slices"
 	"unsafe"
@@ -32,7 +33,7 @@ const cacheGroupSnapshotConcurrency = 16
 // record does not round-trip through colbin: a column colbin drops would come back zero from the file
 // and filled from the database, so a read's result would depend on whether the cache was hit.
 func requireCacheGroupSnapshotCodec(dbTable *ScyllaTable, structRefValue reflect.Value) {
-	if !slices.ContainsFunc(dbTable.indexGroups, func(indexGroup indexGroupInfo) bool { return indexGroup.snapshotInS3 }) {
+	if !slices.ContainsFunc(dbTable.IndexGroups, func(indexGroup db.IndexGroupInfo) bool { return indexGroup.SnapshotInS3 }) {
 		return
 	}
 	var recordType reflect.Type
@@ -59,12 +60,12 @@ func readCacheGroupRecords(
 ) ([]unsafe.Pointer, error) {
 	fileStore := cache.FileStore()
 	// lastWrite 0 is an unsettled group: it is never served from a file nor stored.
-	if !queryPlan.indexGroup.snapshotInS3 || fetchState.lastWrite == 0 || fileStore == nil || !cache.RecordSnapshotsEnabled() {
+	if !queryPlan.indexGroup.SnapshotInS3 || fetchState.lastWrite == 0 || fileStore == nil || !cache.RecordSnapshotsEnabled() {
 		return readGroupFromDatabase(postFilterStatements)
 	}
 	recordType := sinkRecordType(sink)
 	codec := recordSnapshotCodecFor(scyllaTable, recordType)
-	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, int64(queryPlan.partitionValue), queryPlan.indexGroup.indexID, fetchState.hashValue)
+	snapshotKey := cache.CacheGroupSnapshotKey(scyllaTable.Name, int64(queryPlan.partitionValue), queryPlan.indexGroup.IndexID, fetchState.hashValue)
 
 	content, etag, err := fileStore.GetFile(snapshotKey)
 	switch {

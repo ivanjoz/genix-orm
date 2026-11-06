@@ -4,125 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"slices"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/ivanjoz/genix-orm/db"
 )
-
-// configureTextSearchIndex validates a table's TextSearch declaration: a partition column, exactly
-// one numeric key (the document ID), persisted string columns for the text and an optional int8
-// status column. Schema mistakes panic when the table compiles; they are never recoverable at
-// runtime.
-func configureTextSearchIndex(scyllaTable *ScyllaTable, schema TableSchema) {
-	textSearch := schema.TextSearch
-	if textSearch == nil {
-		return
-	}
-
-	fail := func(format string, args ...any) {
-		panic(fmt.Sprintf(`Table "%v": TextSearch `, scyllaTable.Name) + fmt.Sprintf(format, args...))
-	}
-
-	if scyllaTable.PartKey == nil || scyllaTable.PartKey.IsNil() {
-		fail("requires a partition column")
-	}
-	if fieldType := scyllaTable.PartKey.GetType().FieldType; fieldType != "int32" && fieldType != "int" {
-		fail(`partition column "%v" must be int32. Found: %v`, scyllaTable.PartKey.GetName(), fieldType)
-	}
-	if len(scyllaTable.Keys) != 1 {
-		fail("requires exactly one key column. Found: %v", len(scyllaTable.Keys))
-	}
-	if fieldType := scyllaTable.Keys[0].GetType().FieldType; !slices.Contains([]string{"int16", "int32", "int64", "int"}, fieldType) {
-		fail(`key column "%v" must be numeric. Found: %v`, scyllaTable.Keys[0].GetName(), fieldType)
-	}
-	if len(textSearch.Columns) == 0 {
-		fail("declares no Columns")
-	}
-
-	info := &textSearchIndexInfo{manual: textSearch.Manual}
-
-	for _, declared := range textSearch.Columns {
-		column := scyllaTable.ColumnsMap[declared.GetName()]
-		if column == nil {
-			fail(`column "%v" was not found`, declared.GetName())
-		}
-		if fieldType := column.GetType().FieldType; fieldType != "string" {
-			fail(`column "%v" must be string. Found: %v`, column.GetName(), fieldType)
-		}
-		// A reindex reads the text back from the table, so it has to be stored there.
-		if column.GetInfo().IsVirtual {
-			fail(`column "%v" is virtual; the indexed text must be persisted`, column.GetName())
-		}
-		info.columns = append(info.columns, column)
-	}
-
-	if textSearch.Status != nil {
-		column := scyllaTable.ColumnsMap[textSearch.Status.GetName()]
-		if column == nil {
-			fail(`status column "%v" was not found`, textSearch.Status.GetName())
-		}
-		if fieldType := column.GetType().FieldType; fieldType != "int8" {
-			fail(`status column "%v" must be int8. Found: %v`, column.GetName(), fieldType)
-		}
-		info.statusColumn = column
-	}
-
-	scyllaTable.textSearchIndex = info
-}
-
-// textOf is the indexed text of a record: its TextSearch columns joined by a space.
-func (info *textSearchIndexInfo) textOf(recordPointer unsafe.Pointer) string {
-	values := make([]string, len(info.columns))
-	for i, column := range info.columns {
-		values[i], _ = column.GetRawValue(recordPointer).(string)
-	}
-	return db.JoinSearchText(values...)
-}
-
-// activeOf reports whether a record belongs in the index: its status is not 0, or the table has
-// no status column.
-func (info *textSearchIndexInfo) activeOf(recordPointer unsafe.Pointer) bool {
-	return info.statusColumn == nil || convertToInt64(info.statusColumn.GetRawValue(recordPointer)) != 0
-}
-
-// writesAll reports whether a write that set columns wrote every column the index depends on, so
-// the records in memory hold their stored text and status.
-func (info *textSearchIndexInfo) writesAll(columns []IColInfo) bool {
-	written := make(map[string]bool, len(columns))
-	for _, column := range columns {
-		if column != nil {
-			written[column.GetName()] = true
-		}
-	}
-
-	for _, column := range info.columns {
-		if !written[column.GetName()] {
-			return false
-		}
-	}
-	return info.statusColumn == nil || written[info.statusColumn.GetName()]
-}
-
-// touches reports whether a write that set columns can change the index at all.
-func (info *textSearchIndexInfo) touches(columns []IColInfo) bool {
-	for _, column := range columns {
-		if column == nil {
-			continue
-		}
-		if info.statusColumn != nil && column.GetName() == info.statusColumn.GetName() {
-			return true
-		}
-		for _, textColumn := range info.columns {
-			if column.GetName() == textColumn.GetName() {
-				return true
-			}
-		}
-	}
-	return false
-}
 
 // textSearchWrite is one phase of a write, as the index sees it.
 type textSearchWrite struct {
@@ -147,8 +33,8 @@ type textSearchPartitionChanges struct {
 // put with its text, an inactive one is deleted (a delete of a record the index does not hold
 // costs nothing: it travels in the same batch). Each partition gets one Apply.
 func syncTextSearchAfterWrite(scyllaTable *ScyllaTable, writes ...textSearchWrite) error {
-	info := scyllaTable.textSearchIndex
-	if info == nil || info.manual {
+	info := scyllaTable.TextSearchIndex
+	if info == nil || info.Manual {
 		return nil
 	}
 
@@ -156,14 +42,14 @@ func syncTextSearchAfterWrite(scyllaTable *ScyllaTable, writes ...textSearchWrit
 	partitions := []int64{}
 
 	for _, write := range writes {
-		if write.records.len() == 0 || !info.touches(write.columns) {
+		if write.records.len() == 0 || !info.Touches(write.columns) {
 			continue
 		}
-		known := info.writesAll(write.columns)
+		known := info.WritesAll(write.columns)
 
 		for i := range write.records.len() {
 			recordPointer := write.records.at(i)
-			recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+			recordID := db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 			if write.skip[recordID] {
 				continue
 			}
@@ -182,8 +68,8 @@ func syncTextSearchAfterWrite(scyllaTable *ScyllaTable, writes ...textSearchWrit
 			switch {
 			case !known:
 				changes.reread = append(changes.reread, recordID)
-			case info.activeOf(recordPointer):
-				changes.puts = append(changes.puts, db.TextDoc{ID: int32(recordID), Text: info.textOf(recordPointer)})
+			case info.ActiveOf(recordPointer):
+				changes.puts = append(changes.puts, db.TextDoc{ID: int32(recordID), Text: info.TextOf(recordPointer)})
 			default:
 				changes.dels = append(changes.dels, int32(recordID))
 			}
@@ -249,14 +135,14 @@ type textSearchStoredDoc struct {
 // scanTextSearchDocs reads the key, text columns and status of a partition's records: all of
 // them, or those of ids.
 func scanTextSearchDocs(scyllaTable *ScyllaTable, partValue int64, ids []int64, emit func(textSearchStoredDoc) error) error {
-	info := scyllaTable.textSearchIndex
+	info := scyllaTable.TextSearchIndex
 
 	columnNames := []string{scyllaTable.Keys[0].GetName()}
-	for _, column := range info.columns {
+	for _, column := range info.Columns {
 		columnNames = append(columnNames, column.GetName())
 	}
-	if info.statusColumn != nil {
-		columnNames = append(columnNames, info.statusColumn.GetName())
+	if info.StatusColumn != nil {
+		columnNames = append(columnNames, info.StatusColumn.GetName())
 	}
 
 	queryBase := fmt.Sprintf("SELECT %v FROM %v WHERE %v = ?",
@@ -267,12 +153,12 @@ func scanTextSearchDocs(scyllaTable *ScyllaTable, partValue int64, ids []int64, 
 		scanner := iter.Scanner()
 
 		var recordID, status int64
-		texts := make([]string, len(info.columns))
+		texts := make([]string, len(info.Columns))
 		targets := []any{&recordID}
 		for i := range texts {
 			targets = append(targets, &texts[i])
 		}
-		if info.statusColumn != nil {
+		if info.StatusColumn != nil {
 			targets = append(targets, &status)
 		}
 

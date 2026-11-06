@@ -84,13 +84,13 @@ func raiseWrittenSlots(records recordSliceGroup, scyllaTable ScyllaTable) error 
 	for i := range records.len() {
 		recordPointer := records.at(i)
 		stamp := partitionStamp{
-			partition: convertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer)),
-			updated:   int32(convertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))),
+			partition: db.ConvertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer)),
+			updated:   int32(db.ConvertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))),
 		}
 		if slotsByStamp[stamp] == nil {
 			slotsByStamp[stamp] = map[int8]int32{}
 		}
-		recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+		recordID := db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 		slotsByStamp[stamp][int8(cache.SlotOfRecordID(recordID))] = stamp.updated
 	}
 
@@ -267,8 +267,8 @@ func queryCachedIDs(scyllaTable ScyllaTable, request cache.CachedIDsRequest, sin
 
 	recordsByPartition := map[int64][]unsafe.Pointer{}
 	for _, recordPointer := range records {
-		partition := convertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer))
-		id := convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+		partition := db.ConvertToInt64(scyllaTable.GetPartKey().GetRawValue(recordPointer))
+		id := db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 		scyllaTable.UpdatedCol.SetValue(recordPointer,
 			coerceManagedIntegerValue(scyllaTable.UpdatedCol, plan.HeldUpdated(partition, id)))
 		recordsByPartition[partition] = append(recordsByPartition[partition], recordPointer)

@@ -171,7 +171,7 @@ func TestTextSearchManualAndMissingBackend(t *testing.T) {
 	}
 
 	fake := installFakeTextSearch(t)
-	scyllaTable.textSearchIndex.manual = true
+	scyllaTable.TextSearchIndex.Manual = true
 	if err := syncTextSearchAfterWrite(&scyllaTable, write); err != nil || len(fake.applies) != 0 {
 		t.Errorf("a Manual table synced on write: %+v %v", fake.applies, err)
 	}

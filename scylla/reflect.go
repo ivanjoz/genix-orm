@@ -30,36 +30,6 @@ type statementRangeGroup struct {
 	betweenTo *ColumnStatement
 }
 
-func normalizeCompositeBucketSizes(rawSizes []int8) []int8 {
-	// Normalize and validate bucket sizes once so read/write logic can rely on deterministic order.
-	bucketSizeSeen := map[int8]bool{}
-	bucketSizes := make([]int8, 0, len(rawSizes))
-	for _, bucketSize := range rawSizes {
-		if bucketSize <= 0 {
-			panic(fmt.Sprintf("CompositeBucketing requires bucket sizes > 0. Got: %v", bucketSize))
-		}
-		if bucketSizeSeen[bucketSize] {
-			continue
-		}
-		bucketSizeSeen[bucketSize] = true
-		bucketSizes = append(bucketSizes, bucketSize)
-	}
-	if len(bucketSizes) == 0 {
-		panic("CompositeBucketing requires at least one bucket size.")
-	}
-	slices.Sort(bucketSizes)
-	return bucketSizes
-}
-
-func isCompositeNumericFieldType(fieldType string) bool {
-	// Composite bucket hashing currently supports integer scalars/slices only, matching query planner assumptions.
-	switch fieldType {
-	case "int", "int8", "int16", "int32", "int64", "[]int", "[]int8", "[]int16", "[]int32", "[]int64":
-		return true
-	}
-	return false
-}
-
 func isManagedIntFieldType(fieldType string) bool {
 	// Managed audit columns are shared scalar values written back into one numeric column.
 	switch fieldType {
@@ -129,81 +99,6 @@ func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
 	if hasDeltaIndex(schema) {
 		dbTable.VersionCol = ensureManagedIntColumn(dbTable, managedVersionColumnName)
 	}
-}
-
-func flattenCompositeInt64Values(rawValue any) []int64 {
-	// Treat scalar values as a single-item list so composite hashing works for both scalar and slice numeric columns.
-	if rawValue == nil {
-		return nil
-	}
-
-	rv := reflect.ValueOf(rawValue)
-	for rv.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return nil
-		}
-		rv = rv.Elem()
-	}
-
-	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
-		return []int64{convertToInt64(rv.Interface())}
-	}
-
-	values := make([]int64, 0, rv.Len())
-	for i := 0; i < rv.Len(); i++ {
-		values = append(values, convertToInt64(rv.Index(i).Interface()))
-	}
-	return values
-}
-
-func getCompositeBucketValues(rawValue any, bucketSize int8, isWeek bool) []int64 {
-	// Composite buckets index bucket IDs (week/size), not raw week values.
-	flatValues := flattenCompositeInt64Values(rawValue)
-	bucketValues := make([]int64, 0, len(flatValues))
-	for _, value := range flatValues {
-		bucketValues = append(bucketValues, makeCompositeBucketID(value, bucketSize, isWeek))
-	}
-	return bucketValues
-}
-
-func computeCompositeHashSet(ptr unsafe.Pointer, sourceColumns []IColInfo, bucketColumn IColInfo, bucketSize int8, bucketIsWeek bool) []int32 {
-	// Build the cartesian product across up to 3 numeric source columns, then hash each tuple for set<int> indexing.
-	combinations := [][]int64{{}}
-
-	for _, sourceColumn := range sourceColumns {
-		var columnValues []int64
-		if sourceColumn.GetName() == bucketColumn.GetName() {
-			columnValues = getCompositeBucketValues(sourceColumn.GetRawValue(ptr), bucketSize, bucketIsWeek)
-		} else {
-			columnValues = flattenCompositeInt64Values(sourceColumn.GetRawValue(ptr))
-		}
-
-		if len(columnValues) == 0 {
-			return []int32{}
-		}
-
-		nextCombinations := make([][]int64, 0, len(combinations)*len(columnValues))
-		for _, combination := range combinations {
-			for _, columnValue := range columnValues {
-				combinationExpanded := append(append([]int64{}, combination...), columnValue)
-				nextCombinations = append(nextCombinations, combinationExpanded)
-			}
-		}
-		combinations = nextCombinations
-	}
-
-	uniqueHashes := map[int32]struct{}{}
-	// Deduplicate hashes per record to keep generated set values compact and stable.
-	for _, combination := range combinations {
-		uniqueHashes[HashInt64(combination...)] = struct{}{}
-	}
-
-	hashValues := make([]int32, 0, len(uniqueHashes))
-	for hashValue := range uniqueHashes {
-		hashValues = append(hashValues, hashValue)
-	}
-	slices.Sort(hashValues)
-	return hashValues
 }
 
 // makeTable is deliberately NOT generic. It is 400+ lines that work purely through the schema
@@ -319,11 +214,11 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 
 	// Default audit columns are added unless the schema explicitly opts out.
 	bindManagedAuditColumns(&dbTable, schema)
-	configureComputedColumns(&dbTable, schema, structRefValue, computedPendingColumns)
+	dbTable.ConfigureComputedColumns(schema, structRefValue, computedPendingColumns)
 
 	// Resolve declared value ranges before any index compiles, since TypeDelta sizes its bit
 	// slots from them.
-	dbTable.fixedValueRanges = resolveFixedValueRanges(&dbTable, schema.FixedValues)
+	dbTable.FixedValueRanges = dbTable.ResolveFixedValueRanges(schema.FixedValues)
 
 	if schema.Partition != nil {
 		dbTable.PartKey = dbTable.ColumnsMap[schema.Partition.GetInfo().Name]
@@ -362,7 +257,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		dbTable.AutoincrementPart = dbTable.ColumnsMap[schema.AutoincrementPart.GetInfo().Name]
 	}
 
-	configureTextSearchIndex(&dbTable, schema)
+	dbTable.ConfigureTextSearchIndex(schema)
 	configureDataFrames(&dbTable, schema, structRefValue)
 
 	// Identify autoincrement column from direct column definitions (backward compatibility)
@@ -416,9 +311,9 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 					packedCol.SetSlotBits(info.SlotBits)
 				}
 			}
-			dbTable.keyIntPacking = append(dbTable.keyIntPacking, packedCol)
+			dbTable.KeyIntPacking = append(dbTable.KeyIntPacking, packedCol)
 		}
-		dbTable.keyIntPackingSlotBits = db.KeyIntPackingSlotBits(dbTable.Name, schema.KeyIntPacking)
+		dbTable.KeyIntPackingSlotBits = db.KeyIntPackingSlotBits(dbTable.Name, schema.KeyIntPacking)
 	}
 
 	if len(schema.KeyConcatenated) > 0 {
@@ -434,7 +329,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		for _, col := range schema.KeyConcatenated {
 			concatCol := dbTable.ColumnsMap[col.GetName()]
 			concatCols = append(concatCols, concatCol)
-			dbTable.keyConcatenated = append(dbTable.keyConcatenated, concatCol)
+			dbTable.KeyConcatenated = append(dbTable.KeyConcatenated, concatCol)
 		}
 
 		keyCol.GetRawValueFn = func(ptr unsafe.Pointer) any {
@@ -490,7 +385,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 				if column == nil {
 					panic(fmt.Sprintf(`Table "%v": composite-bucketing column "%v" was not found`, dbTable.Name, indexColumnInfo.Name))
 				}
-				if !isCompositeNumericFieldType(column.GetType().FieldType) {
+				if !db.IsCompositeNumericFieldType(column.GetType().FieldType) {
 					panic(fmt.Sprintf(`Table "%v": composite-bucketing column "%v" must be integer scalar/slice. Found: %v`, dbTable.Name, column.GetName(), column.GetType().FieldType))
 				}
 				sourceColumns = append(sourceColumns, column)
@@ -506,7 +401,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 					}
 					bucketColumn = column
 					bucketIsWeek = indexColumnInfo.IsWeek
-					bucketSizes = normalizeCompositeBucketSizes(bucketDefs)
+					bucketSizes = db.NormalizeCompositeBucketSizes(bucketDefs)
 				}
 			}
 
@@ -514,13 +409,13 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 				panic(fmt.Sprintf(`Table "%v": composite-bucketing requires one column marked with CompositeBucketing`, dbTable.Name))
 			}
 
-			compositeIndex := compositeBucketIndex{
-				name:                 strings.Join(sourceColumnNames, "_"),
-				sourceColumns:        sourceColumns,
-				bucketColumn:         bucketColumn,
-				bucketIsWeek:         bucketIsWeek,
-				bucketSizes:          bucketSizes,
-				virtualColumnsBySize: map[int8]IColInfo{},
+			compositeIndex := db.CompositeBucketIndex{
+				Name:                 strings.Join(sourceColumnNames, "_"),
+				SourceColumns:        sourceColumns,
+				BucketColumn:         bucketColumn,
+				BucketIsWeek:         bucketIsWeek,
+				BucketSizes:          bucketSizes,
+				VirtualColumnsBySize: map[int8]IColInfo{},
 			}
 
 			for _, bucketSize := range bucketSizes {
@@ -548,36 +443,38 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 					},
 				}
 
-				bucketIsWeekLocal := compositeIndex.bucketIsWeek
+				bucketIsWeekLocal := compositeIndex.BucketIsWeek
 				virtualColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
-					return computeCompositeHashSet(ptr, sourceColumnsLocal, bucketColumnLocal, bucketSizeLocal, bucketIsWeekLocal)
+					return db.ComputeCompositeHashSet(ptr, sourceColumnsLocal, bucketColumnLocal, bucketSizeLocal, bucketIsWeekLocal)
 				}
 				virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
-					hashValues := computeCompositeHashSet(ptr, sourceColumnsLocal, bucketColumnLocal, bucketSizeLocal, bucketIsWeekLocal)
+					hashValues := db.ComputeCompositeHashSet(ptr, sourceColumnsLocal, bucketColumnLocal, bucketSizeLocal, bucketIsWeekLocal)
 					return makeSignedIntCollectionLiteral(virtualColumn.DBType, hashValues)
 				}
 
 				dbTable.MaxColIdx++
 				dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
-				compositeIndex.virtualColumnsBySize[bucketSize] = virtualColumn
+				compositeIndex.VirtualColumnsBySize[bucketSize] = virtualColumn
 
 				index := &viewInfo{
-					Type:    1,
-					name:    fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumn.GetName()),
-					idx:     idxCount,
-					column:  virtualColumn,
-					columns: []string{virtualColumn.GetName()},
+					IndexSource: &db.IndexSource{
+						Type:    1,
+						Name:    fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumn.GetName()),
+						Idx:     idxCount,
+						Column:  virtualColumn,
+						Columns: []string{virtualColumn.GetName()},
+					},
 				}
 				index.getCreateScript = func() string {
-					return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, index.name, dbTable.GetFullName(), virtualColumn.GetName())
+					return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, index.Name, dbTable.GetFullName(), virtualColumn.GetName())
 				}
 
 				idxCount++
-				dbTable.indexes[index.name] = index
+				dbTable.indexes[index.Name] = index
 			}
 
-			dbTable.compositeBucketIndexes = append(dbTable.compositeBucketIndexes, compositeIndex)
-			fmt.Printf("CompositeBucketing index registered: table=%s index=%s bucketSizes=%v\n", dbTable.Name, compositeIndex.name, compositeIndex.bucketSizes)
+			dbTable.CompositeBucketIndexes = append(dbTable.CompositeBucketIndexes, compositeIndex)
+			fmt.Printf("CompositeBucketing index registered: table=%s index=%s bucketSizes=%v\n", dbTable.Name, compositeIndex.Name, compositeIndex.BucketSizes)
 			continue
 		}
 
@@ -624,13 +521,13 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 	// runs whenever two sources advertise the same signature at the same priority. Sorting by name
 	// pins the tie-break to something stable.
 	slices.SortFunc(dbTable.indexViews, func(leftView, rightView *viewInfo) int {
-		return strings.Compare(leftView.name, rightView.name)
+		return strings.Compare(leftView.Name, rightView.Name)
 	})
 
 	for _, idxview := range dbTable.indexViews {
-		for _, colname := range idxview.columns {
+		for _, colname := range idxview.Columns {
 			col := dbTable.ColumnsMap[colname]
-			idxview.columnsIdx = append(idxview.columnsIdx, col.GetInfo().Idx)
+			idxview.ColumnsIdx = append(idxview.ColumnsIdx, col.GetInfo().Idx)
 		}
 	}
 

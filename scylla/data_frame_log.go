@@ -93,7 +93,7 @@ func writeDataFrameLog(scyllaTable ScyllaTable, phases []writePhase, stored stor
 	for _, phase := range phases {
 		for i := range phase.records.len() {
 			recordPointer := phase.records.at(i)
-			logRow := dataFrameLogRow{partition: convertToInt64(partitionColumn.GetRawValue(recordPointer)), recordID: convertToInt64(keyColumn.GetRawValue(recordPointer))}
+			logRow := dataFrameLogRow{partition: db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer)), recordID: db.ConvertToInt64(keyColumn.GetRawValue(recordPointer))}
 			if logRow.partition < 0 {
 				return fmt.Errorf("table %q: a table with DataFrames takes no negative partition (%d): it names the frames' folders", scyllaTable.Name, logRow.partition)
 			}

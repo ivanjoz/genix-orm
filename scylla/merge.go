@@ -131,13 +131,13 @@ func preloadExistingRecordsBySingleKey(records recordSlice, scyllaTable ScyllaTa
 // textSearchRecordChanged reports whether a record's indexed text or status differs between the
 // previously-stored record and the incoming one. When neither changed, the index write for that
 // record is redundant and is skipped.
-func textSearchRecordChanged(info *textSearchIndexInfo, previousPointer, currentPointer unsafe.Pointer) bool {
-	for _, column := range info.columns {
+func textSearchRecordChanged(info *db.TextSearchIndexInfo, previousPointer, currentPointer unsafe.Pointer) bool {
+	for _, column := range info.Columns {
 		if !column.FieldsEqual(previousPointer, currentPointer) {
 			return true
 		}
 	}
-	return info.statusColumn != nil && !info.statusColumn.FieldsEqual(previousPointer, currentPointer)
+	return info.StatusColumn != nil && !info.StatusColumn.FieldsEqual(previousPointer, currentPointer)
 }
 
 func Merge[T TableBaseInterface[E, T], E TableSchemaInterface[E]](
@@ -176,7 +176,7 @@ func mergeRecords(
 	recordsToUpdate := records.newRecordList()
 	insertRecordIndexes := []int{}
 	skipTextSearchRecordsIDs := []int64{}
-	textSearchInfo := scyllaTable.textSearchIndex
+	textSearchInfo := scyllaTable.TextSearchIndex
 	existingByRecordKey, err := preloadExistingRecordsBySingleKey(records, scyllaTable)
 	if err != nil {
 		return Err("merge bulk lookup failed:", err)
@@ -192,7 +192,7 @@ func mergeRecords(
 				// We already hold the previous record, so decide here whether the searchable
 				// content actually changed and let the write path skip unchanged re-indexes.
 				if textSearchInfo != nil && !textSearchRecordChanged(textSearchInfo, previousRecordPointer, currentRecordPointer) {
-					recordID := convertToInt64(scyllaTable.Keys[0].GetRawValue(currentRecordPointer))
+					recordID := db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(currentRecordPointer))
 					skipTextSearchRecordsIDs = append(skipTextSearchRecordsIDs, recordID)
 				}
 			}

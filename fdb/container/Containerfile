@@ -1,0 +1,18 @@
+FROM docker.io/foundationdb/foundationdb:8.0.0 AS fdb
+
+FROM docker.io/library/golang:1.27-bookworm AS build
+# C headers for cgo (the tarball is flat: no top-level directory); libfdb_c comes from the runtime
+# image so the client and server versions match exactly.
+ADD https://github.com/apple/foundationdb/releases/download/8.0.0/fdb-headers-8.0.0.tar.gz /tmp/
+# The tarball lacks fdb_c_types.h, which fdb_c.h includes: take it from the same tag.
+ADD https://raw.githubusercontent.com/apple/foundationdb/8.0.0/bindings/c/foundationdb/fdb_c_types.h /usr/include/foundationdb/fdb_c_types.h
+RUN tar -xzf /tmp/fdb-headers-8.0.0.tar.gz -C /usr/include/foundationdb
+COPY --from=fdb /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+WORKDIR /src
+COPY . .
+RUN cd fdbgate && CGO_ENABLED=1 go build -o /out/fdbgate . && CGO_ENABLED=1 go test -c -o /out/fdbgate.test .
+
+FROM fdb
+COPY --from=build /out/fdbgate /out/fdbgate.test /usr/bin/
+COPY container/entrypoint.sh /var/fdb/scripts/entrypoint.sh
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/var/fdb/scripts/entrypoint.sh"]

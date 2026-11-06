@@ -3,6 +3,7 @@ package scylla
 import (
 	"errors"
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"reflect"
 	"slices"
 	"strings"
@@ -43,11 +44,6 @@ type posibleIndex struct {
 	priority     int8
 }
 
-type compositeBucketSelection struct {
-	bucketSize int8
-	bucketID   int64
-}
-
 // compositeBucketQueryPlan captures the generated indexed where-clauses plus source statements to keep for final exact filtering.
 type compositeBucketQueryPlan struct {
 	whereStatements  []boundWhereClause
@@ -56,15 +52,15 @@ type compositeBucketQueryPlan struct {
 }
 
 func canUseProjectedView(selectedColumnNames []string, view *viewInfo) bool {
-	if view == nil || len(view.availableColumns) == 0 {
+	if view == nil || len(view.AvailableColumns) == 0 {
 		return true
 	}
 
 	for _, selectedColumnName := range selectedColumnNames {
-		if !slices.Contains(view.availableColumns, selectedColumnName) {
+		if !slices.Contains(view.AvailableColumns, selectedColumnName) {
 			if ShouldLog() {
 				fmt.Printf("Projected view rejected: view=%s missing_column=%s available=%v\n",
-					view.name, selectedColumnName, view.availableColumns)
+					view.Name, selectedColumnName, view.AvailableColumns)
 			}
 			return false
 		}
@@ -133,173 +129,6 @@ func buildRemainingWhereClauses(statements []ColumnStatement) []boundWhereClause
 	return clauses
 }
 
-func getStatementValueListForHash(statement ColumnStatement) ([]int64, bool) {
-	// Only numeric operators that can be converted into deterministic hash inputs are allowed in composite hash planning.
-	switch statement.Operator {
-	case "=", "CONTAINS":
-		return []int64{convertToInt64(statement.Value)}, true
-	case "IN":
-		if len(statement.Values) == 0 {
-			return nil, false
-		}
-		values := make([]int64, 0, len(statement.Values))
-		for _, value := range statement.Values {
-			values = append(values, convertToInt64(value))
-		}
-		return values, true
-	default:
-		return nil, false
-	}
-}
-
-func flattenRecordInt64Values(rawValue any) []int64 {
-	// Normalize scalar/slice/pointer numeric values for uniform in-memory predicate checks.
-	if rawValue == nil {
-		return nil
-	}
-	rv := reflect.ValueOf(rawValue)
-	for rv.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return nil
-		}
-		rv = rv.Elem()
-	}
-	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
-		return []int64{convertToInt64(rv.Interface())}
-	}
-	values := make([]int64, 0, rv.Len())
-	for i := 0; i < rv.Len(); i++ {
-		values = append(values, convertToInt64(rv.Index(i).Interface()))
-	}
-	return values
-}
-
-func getBetweenRange(statement ColumnStatement, isWeek bool) (int64, int64, bool) {
-	// Composite planner currently targets BETWEEN ranges; this keeps behavior explicit and predictable.
-	if statement.Operator != "BETWEEN" || len(statement.From) == 0 || len(statement.To) == 0 {
-		return 0, 0, false
-	}
-	from, to := normalizeCompositeRange(convertToInt64(statement.From[0].Value), convertToInt64(statement.To[0].Value), isWeek)
-	return from, to, true
-}
-
-func planCompositeBuckets(from, to int64, bucketSizes []int8) []compositeBucketSelection {
-	// Choose the minimum statement-count bucket cover while enforcing max total overfetch of 2 units.
-	if to < from || len(bucketSizes) == 0 {
-		return nil
-	}
-
-	type interval struct {
-		selection compositeBucketSelection
-		start     int64
-		end       int64
-		overfetch int64
-	}
-
-	maxOverfetch := int64(0)
-	for _, size := range bucketSizes {
-		maxOverfetch += int64(size)
-	}
-
-	maxOverfetch = maxOverfetch / int64(len(bucketSizes))
-	minCoverage := from - maxOverfetch
-	maxCoverage := to + maxOverfetch
-
-	intervals := []interval{}
-	// Precompute candidate bucket intervals that intersect the target range and satisfy overfetch constraints.
-	for _, bucketSize := range bucketSizes {
-		size := int64(bucketSize)
-		if size <= 0 {
-			continue
-		}
-
-		minBucketID := minCoverage / size
-		maxBucketID := maxCoverage / size
-		for bucketID := minBucketID; bucketID <= maxBucketID; bucketID++ {
-			start := bucketID * size
-			end := start + size - 1
-			if end < from || start > to {
-				continue
-			}
-			overfetch := int64(0)
-			if start < from {
-				overfetch += from - start
-			}
-			if end > to {
-				overfetch += end - to
-			}
-			if overfetch > maxOverfetch {
-				continue
-			}
-			intervals = append(intervals, interval{
-				selection: compositeBucketSelection{bucketSize: bucketSize, bucketID: bucketID},
-				start:     start,
-				end:       end,
-				overfetch: overfetch,
-			})
-		}
-	}
-
-	type planState struct {
-		count      int
-		overfetch  int64
-		selections []compositeBucketSelection
-		valid      bool
-	}
-
-	memo := map[string]planState{}
-	var solve func(currentWeek, usedOverfetch int64) planState
-	solve = func(currentWeek, usedOverfetch int64) planState {
-		// DP state represents the best plan from currentWeek to end, given accumulated overfetch.
-		if currentWeek > to {
-			return planState{valid: true}
-		}
-
-		memoKey := fmt.Sprintf("%d|%d", currentWeek, usedOverfetch)
-		if state, ok := memo[memoKey]; ok {
-			return state
-		}
-
-		best := planState{valid: false}
-		for _, intervalDef := range intervals {
-			if intervalDef.start > currentWeek || intervalDef.end < currentWeek {
-				continue
-			}
-			nextOverfetch := usedOverfetch + intervalDef.overfetch
-			if nextOverfetch > maxOverfetch {
-				continue
-			}
-
-			nextState := solve(intervalDef.end+1, nextOverfetch)
-			if !nextState.valid {
-				continue
-			}
-
-			candidate := planState{
-				count:      nextState.count + 1,
-				overfetch:  nextState.overfetch + intervalDef.overfetch,
-				selections: append([]compositeBucketSelection{intervalDef.selection}, nextState.selections...),
-				valid:      true,
-			}
-
-			if !best.valid || candidate.count < best.count ||
-				(candidate.count == best.count && candidate.overfetch < best.overfetch) {
-				best = candidate
-			}
-		}
-
-		memo[memoKey] = best
-		return best
-	}
-
-	plan := solve(from, 0)
-	if !plan.valid {
-		return nil
-	}
-
-	return plan.selections
-}
-
 func makePrimaryKeyRecordKey(ptr unsafe.Pointer, scyllaTable ScyllaTable) string {
 	// Dedupe key always includes partition key plus clustering keys to preserve table key semantics.
 	parts := []string{}
@@ -325,30 +154,30 @@ func recordMatchesPostFilter(ptr unsafe.Pointer, statements []ColumnStatement, s
 
 		switch statement.Operator {
 		case "=":
-			if convertToInt64(rawValue) != convertToInt64(statement.Value) {
+			if db.ConvertToInt64(rawValue) != db.ConvertToInt64(statement.Value) {
 				return false
 			}
 		case ">":
-			if convertToInt64(rawValue) <= convertToInt64(statement.Value) {
+			if db.ConvertToInt64(rawValue) <= db.ConvertToInt64(statement.Value) {
 				return false
 			}
 		case ">=":
-			if convertToInt64(rawValue) < convertToInt64(statement.Value) {
+			if db.ConvertToInt64(rawValue) < db.ConvertToInt64(statement.Value) {
 				return false
 			}
 		case "<":
-			if convertToInt64(rawValue) >= convertToInt64(statement.Value) {
+			if db.ConvertToInt64(rawValue) >= db.ConvertToInt64(statement.Value) {
 				return false
 			}
 		case "<=":
-			if convertToInt64(rawValue) > convertToInt64(statement.Value) {
+			if db.ConvertToInt64(rawValue) > db.ConvertToInt64(statement.Value) {
 				return false
 			}
 		case "IN":
 			matched := false
-			rawValueInt := convertToInt64(rawValue)
+			rawValueInt := db.ConvertToInt64(rawValue)
 			for _, value := range statement.Values {
-				if rawValueInt == convertToInt64(value) {
+				if rawValueInt == db.ConvertToInt64(value) {
 					matched = true
 					break
 				}
@@ -358,8 +187,8 @@ func recordMatchesPostFilter(ptr unsafe.Pointer, statements []ColumnStatement, s
 			}
 		case "CONTAINS":
 			contains := false
-			statementValue := convertToInt64(statement.Value)
-			for _, value := range flattenRecordInt64Values(rawValue) {
+			statementValue := db.ConvertToInt64(statement.Value)
+			for _, value := range db.FlattenInt64Values(rawValue) {
 				if value == statementValue {
 					contains = true
 					break
@@ -372,9 +201,9 @@ func recordMatchesPostFilter(ptr unsafe.Pointer, statements []ColumnStatement, s
 			if len(statement.From) == 0 || len(statement.To) == 0 {
 				return false
 			}
-			valueI64 := convertToInt64(rawValue)
-			fromI64 := convertToInt64(statement.From[0].Value)
-			toI64 := convertToInt64(statement.To[0].Value)
+			valueI64 := db.ConvertToInt64(rawValue)
+			fromI64 := db.ConvertToInt64(statement.From[0].Value)
+			toI64 := db.ConvertToInt64(statement.To[0].Value)
 			if valueI64 < fromI64 || valueI64 > toI64 {
 				return false
 			}
@@ -622,7 +451,7 @@ func scanSelectQueryRows(
 				if scanColumn.DecomposeView != nil && scanColumn.DecomposeView.decomposeVirtualValue != nil {
 					// Packed group keys are scanned as one virtual column and decomposed back into the primitive fields.
 					decomposedValues := scanColumn.DecomposeView.decomposeVirtualValue(normalizeScannedValue(value))
-					for valueIndex, sourceColumn := range scanColumn.DecomposeView.packedSourceColumns {
+					for valueIndex, sourceColumn := range scanColumn.DecomposeView.PackedSourceColumns {
 						if valueIndex >= len(decomposedValues) {
 							break
 						}
@@ -759,15 +588,15 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 		return nil
 	}
 
-	for _, compositeIndex := range scyllaTable.compositeBucketIndexes {
+	for _, compositeIndex := range scyllaTable.CompositeBucketIndexes {
 		// The composite strategy requires a range on the bucketed column and hashable predicates for remaining source columns.
-		bucketStatements := statementByColumn[compositeIndex.bucketColumn.GetName()]
+		bucketStatements := statementByColumn[compositeIndex.BucketColumn.GetName()]
 		if len(bucketStatements) == 0 {
 			continue
 		}
 
-		bucketIsWeek := compositeIndex.bucketIsWeek
-		from, to, ok := getBetweenRange(bucketStatements[0], bucketIsWeek)
+		bucketIsWeek := compositeIndex.BucketIsWeek
+		from, to, ok := db.BetweenRange(bucketStatements[0], bucketIsWeek)
 		if !ok {
 			continue
 		}
@@ -775,13 +604,13 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 		valueOptionsByColumn := map[string][]int64{}
 		filterStatements := []ColumnStatement{bucketStatements[0]}
 		handledColumns := map[string]bool{
-			compositeIndex.bucketColumn.GetName(): true,
+			compositeIndex.BucketColumn.GetName(): true,
 			partitionColumn.GetName():             true,
 		}
 		isValid := true
 
-		for _, sourceColumn := range compositeIndex.sourceColumns {
-			if sourceColumn.GetName() == compositeIndex.bucketColumn.GetName() {
+		for _, sourceColumn := range compositeIndex.SourceColumns {
+			if sourceColumn.GetName() == compositeIndex.BucketColumn.GetName() {
 				continue
 			}
 
@@ -791,7 +620,7 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 				break
 			}
 
-			values, valueOk := getStatementValueListForHash(sourceStatements[0])
+			values, valueOk := db.StatementValuesForHash(sourceStatements[0])
 			if !valueOk || len(values) == 0 {
 				isValid = false
 				break
@@ -806,15 +635,15 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 			continue
 		}
 
-		bucketSelections := planCompositeBuckets(from, to, compositeIndex.bucketSizes)
+		bucketSelections := db.PlanCompositeBuckets(from, to, compositeIndex.BucketSizes)
 		if len(bucketSelections) == 0 {
 			continue
 		}
 
 		queryValueGroups := []map[string]int64{{}}
 		// Expand all hash input combinations for IN/equality source predicates.
-		for _, sourceColumn := range compositeIndex.sourceColumns {
-			if sourceColumn.GetName() == compositeIndex.bucketColumn.GetName() {
+		for _, sourceColumn := range compositeIndex.SourceColumns {
+			if sourceColumn.GetName() == compositeIndex.BucketColumn.GetName() {
 				continue
 			}
 			nextGroups := []map[string]int64{}
@@ -835,23 +664,23 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 		// Emit one indexed CONTAINS statement per (bucket selection x source tuple) combination.
 		partitionValue := partitionStatements[0].GetValue()
 		for _, bucketSelection := range bucketSelections {
-			virtualColumn := compositeIndex.virtualColumnsBySize[bucketSelection.bucketSize]
+			virtualColumn := compositeIndex.VirtualColumnsBySize[bucketSelection.BucketSize]
 			if virtualColumn == nil {
 				isValid = false
 				break
 			}
 
 			for _, queryValueGroup := range queryValueGroups {
-				hashValues := make([]int64, 0, len(compositeIndex.sourceColumns))
-				for _, sourceColumn := range compositeIndex.sourceColumns {
-					if sourceColumn.GetName() == compositeIndex.bucketColumn.GetName() {
-						hashValues = append(hashValues, bucketSelection.bucketID)
+				hashValues := make([]int64, 0, len(compositeIndex.SourceColumns))
+				for _, sourceColumn := range compositeIndex.SourceColumns {
+					if sourceColumn.GetName() == compositeIndex.BucketColumn.GetName() {
+						hashValues = append(hashValues, bucketSelection.BucketID)
 						continue
 					}
 					hashValues = append(hashValues, queryValueGroup[sourceColumn.GetName()])
 				}
 
-				hashValue := HashInt64(hashValues...)
+				hashValue := db.HashInt64(hashValues...)
 				whereStatements = append(whereStatements, boundWhereClause{
 					Clause: fmt.Sprintf("%v = ? AND %v CONTAINS ?", partitionColumn.GetName(), virtualColumn.GetName()),
 					Values: []any{partitionValue, hashValue},
@@ -863,11 +692,11 @@ func tryBuildCompositeBucketPlan(statements []ColumnStatement, scyllaTable Scyll
 			continue
 		}
 
-		rawFrom := convertToInt64(bucketStatements[0].From[0].Value)
-		rawTo := convertToInt64(bucketStatements[0].To[0].Value)
+		rawFrom := db.ConvertToInt64(bucketStatements[0].From[0].Value)
+		rawTo := db.ConvertToInt64(bucketStatements[0].To[0].Value)
 		if ShouldLog() {
 			fmt.Printf("CompositeBucketing select plan selected: index=%s buckets=%d statements=%d rangeNorm=[%d,%d] rangeRaw=[%d,%d] isWeek=%v\n",
-				compositeIndex.name, len(bucketSelections), len(whereStatements), from, to, rawFrom, rawTo, bucketIsWeek)
+				compositeIndex.Name, len(bucketSelections), len(whereStatements), from, to, rawFrom, rawTo, bucketIsWeek)
 		}
 
 		return &compositeBucketQueryPlan{

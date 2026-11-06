@@ -300,7 +300,7 @@ func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
 }
 
 func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.Type, partValue int32) error {
-	if scyllaTable.indexUpdatedTable == nil || len(scyllaTable.indexGroups) == 0 {
+	if scyllaTable.indexUpdatedTable == nil || len(scyllaTable.IndexGroups) == 0 {
 		return nil
 	}
 
@@ -329,10 +329,10 @@ func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.
 	if scyllaTable.UpdatedCol != nil {
 		appendSelectedColumn(scyllaTable.UpdatedCol)
 	}
-	for _, indexGroup := range scyllaTable.indexGroups {
-		for _, sourceColumn := range indexGroup.sourceColumns {
+	for _, indexGroup := range scyllaTable.IndexGroups {
+		for _, sourceColumn := range indexGroup.SourceColumns {
 			// A computed source has no storage: its From columns are read and it is computed from them.
-			for _, storedColumn := range storedColumnsOf(&scyllaTable, sourceColumn.column) {
+			for _, storedColumn := range scyllaTable.StoredColumnsOf(sourceColumn.Column) {
 				appendSelectedColumn(storedColumn)
 			}
 		}
@@ -391,7 +391,7 @@ func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.
 		for valueIndex, selectedColumn := range selectedColumns {
 			rawValue := dereferenceScyllaValue(rowData.Values[valueIndex])
 			if selectedColumn.GetName() == managedUpdatedColumnName {
-				lastWriteValue = convertToInt64(rawValue)
+				lastWriteValue = db.ConvertToInt64(rawValue)
 				continue
 			}
 			selectedColumn.SetValue(recordPointer, rawValue)
@@ -568,7 +568,7 @@ func (e *ScyllaController[T, E]) ReindexTextSearchAll() error {
 }
 
 func reindexTextSearchAllForTable(scyllaTable *ScyllaTable) error {
-	if scyllaTable.textSearchIndex == nil {
+	if scyllaTable.TextSearchIndex == nil {
 		return nil
 	}
 	partValues, err := scanPartitionValues(scyllaTable)
@@ -626,7 +626,7 @@ func dropTextSearchForTable(scyllaTable *ScyllaTable, partValue int32) error {
 
 // withTextSearch runs one index maintenance step, or nothing for a table without TextSearch.
 func withTextSearch(scyllaTable *ScyllaTable, partValue int32, step string, run func(backend db.TextSearchBackend, table, partition string) error) error {
-	if scyllaTable.textSearchIndex == nil {
+	if scyllaTable.TextSearchIndex == nil {
 		return nil
 	}
 	backend, err := db.GetTextSearchBackend()
@@ -718,18 +718,18 @@ func deleteViewsAndIndexesForTable(controllerTable *ScyllaTable) error {
 			continue
 		}
 
-		for _, indexName := range liveIndexesByTable[view.name] {
+		for _, indexName := range liveIndexesByTable[view.Name] {
 			dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.Namespace, indexName)
 			fmt.Println("DeleteViewsAndIndexes |", dropIndexStatement)
 			if err := QueryExec(dropIndexStatement); err != nil {
-				return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for view table", view.name, ":", err)
+				return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for view table", view.Name, ":", err)
 			}
 		}
 
-		dropViewTableStatement := fmt.Sprintf("DROP TABLE IF EXISTS %v.%v", scyllaTable.Namespace, view.name)
+		dropViewTableStatement := fmt.Sprintf("DROP TABLE IF EXISTS %v.%v", scyllaTable.Namespace, view.Name)
 		fmt.Println("DeleteViewsAndIndexes |", dropViewTableStatement)
 		if err := QueryExec(dropViewTableStatement); err != nil {
-			return Err("DeleteViewsAndIndexes failed dropping view table", view.name, "for table", scyllaTable.Name, ":", err)
+			return Err("DeleteViewsAndIndexes failed dropping view table", view.Name, "for table", scyllaTable.Name, ":", err)
 		}
 	}
 
@@ -852,7 +852,7 @@ func getViewMissingColumns(view *viewInfo, liveViewColumns []ScyllaColumns) []vi
 		}
 		if liveType != expectedColumn.dbType {
 			Logx(5, fmt.Sprintf(`La columna "%v" de la view "%v" está en la BD como "%v" pero el Struct la declara como "%v".`+"\n",
-				expectedColumn.name, view.name, liveType, expectedColumn.dbType))
+				expectedColumn.name, view.Name, liveType, expectedColumn.dbType))
 		}
 	}
 	return missingColumns
@@ -875,23 +875,23 @@ func repairViewMissingColumns(table *ScyllaTable, view *viewInfo, liveViewColumn
 		return
 	}
 
-	viewFullName := table.Namespace + "." + view.name
+	viewFullName := table.Namespace + "." + view.Name
 	missingColumnNames := []string{}
 	for _, missingColumn := range missingColumns {
 		missingColumnNames = append(missingColumnNames, missingColumn.name)
 	}
 	Logx(5, fmt.Sprintf(`A la view "%v" le faltan las columnas: %v. Reparando...`+"\n",
-		view.name, strings.Join(missingColumnNames, ", ")))
+		view.Name, strings.Join(missingColumnNames, ", ")))
 
 	if view.Type == TypeViewTable {
 		for _, missingColumn := range missingColumns {
 			alterStatement := fmt.Sprintf(`ALTER TABLE %v ADD %v %v`, viewFullName, missingColumn.name, missingColumn.dbType)
 			fmt.Println(alterStatement)
 			if err := QueryExec(alterStatement); err != nil {
-				panic(fmt.Sprintf(`Error agregando la columna "%v" a la view table "%v" | %v`, missingColumn.name, view.name, err))
+				panic(fmt.Sprintf(`Error agregando la columna "%v" a la view table "%v" | %v`, missingColumn.name, view.Name, err))
 			}
 		}
-		Logx(2, fmt.Sprintf(`View table columns added "%v": %v`+"\n", view.name, strings.Join(missingColumnNames, ", ")))
+		Logx(2, fmt.Sprintf(`View table columns added "%v": %v`+"\n", view.Name, strings.Join(missingColumnNames, ", ")))
 		return
 	}
 
@@ -902,14 +902,14 @@ func repairViewMissingColumns(table *ScyllaTable, view *viewInfo, liveViewColumn
 	dropStatement := fmt.Sprintf(`DROP MATERIALIZED VIEW IF EXISTS %v`, viewFullName)
 	fmt.Println(dropStatement)
 	if err := QueryExec(dropStatement); err != nil {
-		panic(fmt.Sprintf(`Error eliminando la view "%v" para recrearla | %v`, view.name, err))
+		panic(fmt.Sprintf(`Error eliminando la view "%v" para recrearla | %v`, view.Name, err))
 	}
 
 	fmt.Println(createScript)
 	if err := QueryExec(createScript); err != nil {
-		panic(fmt.Sprintf(`Error recreando la view "%v" en %v | %v`, view.name, table.GetFullName(), err))
+		panic(fmt.Sprintf(`Error recreando la view "%v" en %v | %v`, view.Name, table.GetFullName(), err))
 	}
-	Logx(2, fmt.Sprintf(`View rebuilt with the missing columns "%v"`+"\n", view.name))
+	Logx(2, fmt.Sprintf(`View rebuilt with the missing columns "%v"`+"\n", view.Name))
 }
 
 func DeployScylla(cacheCode int32, controllers ...db.Controller) {
@@ -1136,39 +1136,39 @@ func DeployScylla(cacheCode int32, controllers ...db.Controller) {
 		// each partition's index on its first write, so deploy does nothing here.
 
 		for _, index := range table.indexes {
-			if slices.Contains(tableIndexes, index.name) {
+			if slices.Contains(tableIndexes, index.Name) {
 				continue
 			}
-			Logx(5, fmt.Sprintf(`No se encontró el índice "%v" en "%v". Creando...`+"\n", index.name, tableName))
+			Logx(5, fmt.Sprintf(`No se encontró el índice "%v" en "%v". Creando...`+"\n", index.Name, tableName))
 
 			createScript := index.getCreateScript()
 			fmt.Println(createScript)
 			if err := QueryExec(createScript); err != nil {
 				fmt.Println(err)
-				panic(fmt.Sprintf(`Error creando el índice "%v" en %v`, index.name, tableName))
+				panic(fmt.Sprintf(`Error creando el índice "%v" en %v`, index.Name, tableName))
 			}
-			Logx(2, fmt.Sprintf(`Index created "%v"`+"\n", index.name))
+			Logx(2, fmt.Sprintf(`Index created "%v"`+"\n", index.Name))
 		}
 
 		// Revisa si posee views, en su defecto las crea
 		for _, view := range table.views {
-			name := table.Namespace + "." + view.name
+			name := table.Namespace + "." + view.Name
 			if liveViewColumns, ok := tableColumnsMap[name]; ok {
 				repairViewMissingColumns(&table, view, liveViewColumns)
 			} else {
-				Logx(5, fmt.Sprintf(`No se encontró la view "%v" en la tabla "%v". Preparando creación...`+"\n", view.name, table.Name))
+				Logx(5, fmt.Sprintf(`No se encontró la view "%v" en la tabla "%v". Preparando creación...`+"\n", view.Name, table.Name))
 
 				createScript := view.getCreateScript()
 				fmt.Println(createScript)
 				if err := QueryExec(createScript); err != nil {
 					fmt.Println(err)
-					panic(fmt.Sprintf(`Error creando la view "%v" en %v`, view.name, tableName))
+					panic(fmt.Sprintf(`Error creando la view "%v" en %v`, view.Name, tableName))
 				}
 
-				Logx(2, fmt.Sprintf(`View created "%v"`+"\n", view.name))
+				Logx(2, fmt.Sprintf(`View created "%v"`+"\n", view.Name))
 			}
 
-			viewTableName := table.Namespace + "." + view.name
+			viewTableName := table.Namespace + "." + view.Name
 			if view.Type == 9 {
 				maintenanceIndexName := getViewTableMaintenanceIndexName(view)
 				viewTableIndexes := tableIndexesMap[viewTableName]

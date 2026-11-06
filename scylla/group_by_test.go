@@ -11,8 +11,8 @@ import (
 
 // storedPackedValue packs a prefix bound the way the view stores its key, sign bit flipped.
 func storedPackedValue(view *viewInfo, fillWithMax bool, values ...int64) int64 {
-	packed := db.PackSlotPrefixBound(values, view.packedSlotBitsPerColumn, fillWithMax)
-	return convertToInt64(storeVirtualPacked(packed, view.packedIsInt32))
+	packed := db.PackSlotPrefixBound(values, view.PackedSlotBitsPerColumn, fillWithMax)
+	return db.ConvertToInt64(storeVirtualPacked(packed, view.PackedIsInt32))
 }
 
 type groupedMovementRecord struct {
@@ -147,7 +147,7 @@ func (e int32PackedViewSchema) GetSchema() TableSchema {
 func findPackedGroupView(t *testing.T, scyllaTable ScyllaTable) *viewInfo {
 	t.Helper()
 	for _, view := range scyllaTable.indexViews {
-		if view.Type == 8 && slices.Equal(view.columnsNoPart, []string{"date", "producto_id"}) {
+		if view.Type == 8 && slices.Equal(view.ColumnsNoPart, []string{"date", "producto_id"}) {
 			return view
 		}
 	}
@@ -188,11 +188,11 @@ func TestBuildNativeGroupByPlanWithPackedView(t *testing.T) {
 	}
 
 	packedView := plan.ScanColumns[0].DecomposeView
-	expectedClause := fmt.Sprintf("empresa_id = ? AND %s >= ?", packedView.column.GetName())
+	expectedClause := fmt.Sprintf("empresa_id = ? AND %s >= ?", packedView.Column.GetName())
 	if len(plan.WhereStatements) != 1 || plan.WhereStatements[0].Clause != expectedClause {
 		t.Fatalf("unexpected packed where clauses: %v", plan.WhereStatements)
 	}
-	if got := plan.WhereStatements[0].Values; len(got) != 2 || convertToInt64(got[0]) != 7 || convertToInt64(got[1]) != storedPackedValue(packedView, false, 15) {
+	if got := plan.WhereStatements[0].Values; len(got) != 2 || db.ConvertToInt64(got[0]) != 7 || db.ConvertToInt64(got[1]) != storedPackedValue(packedView, false, 15) {
 		t.Fatalf("unexpected packed where values: %v", got)
 	}
 }
@@ -251,7 +251,7 @@ func TestMatchQueryCapabilityPrefersCoverageOverPriority(t *testing.T) {
 		{
 			Signature: "company_id|=|project_id|=|status|=",
 			Priority:  360,
-			Source:    &viewInfo{name: "projects_epic__dlt_project_id_status_view"},
+			Source:    &viewInfo{IndexSource: &db.IndexSource{Name: "projects_epic__dlt_project_id_status_view"}},
 		},
 	}
 	statements := []ColumnStatement{
@@ -272,7 +272,7 @@ func TestMatchQueryCapabilityReturnsSelectedCapability(t *testing.T) {
 		{
 			Signature: "empresa_id|=|status|=",
 			Priority:  25,
-			Source:    &viewInfo{name: "product_supply__status_view"},
+			Source:    &viewInfo{IndexSource: &db.IndexSource{Name: "product_supply__status_view"}},
 		},
 	}
 	statements := []ColumnStatement{
@@ -287,7 +287,7 @@ func TestMatchQueryCapabilityReturnsSelectedCapability(t *testing.T) {
 	if bestCapability.Signature != "empresa_id|=|status|=" {
 		t.Fatalf("unexpected capability selected: %s", bestCapability.Signature)
 	}
-	if bestCapability.Source == nil || bestCapability.Source.name != "product_supply__status_view" {
+	if bestCapability.Source == nil || bestCapability.Source.Name != "product_supply__status_view" {
 		t.Fatalf("unexpected capability source: %+v", bestCapability.Source)
 	}
 }
@@ -307,8 +307,8 @@ func TestVirtualViewWithoutProjectedColsKeepsFullSelectablePayload(t *testing.T)
 	}
 
 	for _, expectedColumn := range []string{"empresa_id", "id", "status", "updated", "nombre"} {
-		if !slices.Contains(packedView.availableColumns, expectedColumn) {
-			t.Fatalf("expected view to expose column %q, available=%v", expectedColumn, packedView.availableColumns)
+		if !slices.Contains(packedView.AvailableColumns, expectedColumn) {
+			t.Fatalf("expected view to expose column %q, available=%v", expectedColumn, packedView.AvailableColumns)
 		}
 	}
 }
@@ -331,8 +331,8 @@ func TestVirtualViewCreateScriptExcludesUnrelatedVirtualColumns(t *testing.T) {
 	if strings.Contains(createScript, "SELECT *") {
 		t.Fatalf("expected explicit view projection, got %q", createScript)
 	}
-	if !strings.Contains(createScript, packedView.column.GetName()) {
-		t.Fatalf("expected view key virtual column %q in create script, got %q", packedView.column.GetName(), createScript)
+	if !strings.Contains(createScript, packedView.Column.GetName()) {
+		t.Fatalf("expected view key virtual column %q in create script, got %q", packedView.Column.GetName(), createScript)
 	}
 	if strings.Contains(createScript, "zz_hb_product_ids_fecha_b2") || strings.Contains(createScript, "zz_hb_product_ids_fecha_b6") {
 		t.Fatalf("expected unrelated hash virtual columns to be excluded, got %q", createScript)
@@ -370,13 +370,13 @@ func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
 	expectedLowerBound := storedPackedValue(packedView, false, 6, 0)
 	expectedUpperBound := storedPackedValue(packedView, true, 6)
 	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
-		packedView.column.GetName(),
-		packedView.column.GetName(),
+		packedView.Column.GetName(),
+		packedView.Column.GetName(),
 	)
 	if whereStatements[0].Clause != expectedWhere {
 		t.Fatalf("unexpected packed where clause: %v", whereStatements[0])
 	}
-	if got := whereStatements[0].Values; len(got) != 3 || convertToInt64(got[0]) != 1 || convertToInt64(got[1]) != expectedLowerBound || convertToInt64(got[2]) != expectedUpperBound {
+	if got := whereStatements[0].Values; len(got) != 3 || db.ConvertToInt64(got[0]) != 1 || db.ConvertToInt64(got[1]) != expectedLowerBound || db.ConvertToInt64(got[2]) != expectedUpperBound {
 		t.Fatalf("unexpected packed where values: %v", got)
 	}
 }
@@ -407,16 +407,16 @@ func TestInt32PackedViewBoundsAreSignFlippedInt32s(t *testing.T) {
 
 	packedView := bestCapability.Source
 	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
-		packedView.column.GetName(),
-		packedView.column.GetName(),
+		packedView.Column.GetName(),
+		packedView.Column.GetName(),
 	)
 	if whereStatements[0].Clause != expectedWhere {
 		t.Fatalf("unexpected int32 packed where clause: %v", whereStatements[0])
 	}
 	got := whereStatements[0].Values
-	if len(got) != 3 || convertToInt64(got[0]) != 1 ||
-		convertToInt64(got[1]) != storedPackedValue(packedView, false, 9, 38768176) ||
-		convertToInt64(got[2]) != storedPackedValue(packedView, true, 9) {
+	if len(got) != 3 || db.ConvertToInt64(got[0]) != 1 ||
+		db.ConvertToInt64(got[1]) != storedPackedValue(packedView, false, 9, 38768176) ||
+		db.ConvertToInt64(got[2]) != storedPackedValue(packedView, true, 9) {
 		t.Fatalf("unexpected int32 packed where values: %v", got)
 	}
 	if _, isInt32 := got[1].(int32); !isInt32 {

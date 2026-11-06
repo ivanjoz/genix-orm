@@ -56,10 +56,10 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 
 	declaredColumns := []IColInfo{}
 	keyColumnNames := []string{}
-	physicalColumns := []viewTableColumnInfo{
+	physicalColumns := []db.ViewTableColumnInfo{
 		makeViewTableColumn(partKey, false),
 	}
-	physicalKeyColumns := []viewTableColumnInfo{}
+	physicalKeyColumns := []db.ViewTableColumnInfo{}
 	rebuildColumnNames := map[string]bool{}
 	fanoutColumnName := ""
 	sliceKeyCount := 0
@@ -133,16 +133,18 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 	viewColumns := append([]string{partKey.GetName()}, keyColumnNames...)
 	viewName := fmt.Sprintf(`%v__%v_view`, dbTable.Name, strings.Join(keyColumnNames, "_"))
 	view := &viewInfo{
-		Type:                9,
-		name:                viewName,
-		columns:             viewColumns,
-		columnsNoPart:       append([]string{}, keyColumnNames...),
-		column:              declaredColumns[0],
-		availableColumns:    []string{},
-		Operators:           []string{"=", "IN", "CONTAINS"},
-		fanoutColumnName:    fanoutColumnName,
-		tableColumns:        physicalColumns,
-		tableKeyColumns:     physicalKeyColumns,
+		IndexSource: &db.IndexSource{
+			Type:             9,
+			Name:             viewName,
+			Columns:          viewColumns,
+			ColumnsNoPart:    append([]string{}, keyColumnNames...),
+			Column:           declaredColumns[0],
+			AvailableColumns: []string{},
+			Operators:        []string{"=", "IN", "CONTAINS"},
+			FanoutColumnName: fanoutColumnName,
+			TableColumns:     physicalColumns,
+			TableKeyColumns:  physicalKeyColumns,
+		},
 		maintenanceIDColumn: idColumn,
 		rebuildColumnNames:  rebuildColumnNames,
 	}
@@ -163,9 +165,9 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		selectableColumnNames[projectedColumn.GetName()] = true
 	}
 	for selectableColumnName := range selectableColumnNames {
-		view.availableColumns = append(view.availableColumns, selectableColumnName)
+		view.AvailableColumns = append(view.AvailableColumns, selectableColumnName)
 	}
-	slices.Sort(view.availableColumns)
+	slices.Sort(view.AvailableColumns)
 
 	viewPtr := view
 	view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
@@ -188,7 +190,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 			}
 
 			operator := statement.Operator
-			if viewPtr.fanoutColumnName == statement.Col && operator == "CONTAINS" {
+			if viewPtr.FanoutColumnName == statement.Col && operator == "CONTAINS" {
 				operator = "="
 			}
 			if operator == "IN" {
@@ -221,8 +223,8 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		return []boundWhereClause{combinedClause}
 	}
 	view.getExpectedColumns = func() []viewExpectedColumn {
-		expectedColumns := make([]viewExpectedColumn, 0, len(viewPtr.tableColumns))
-		for _, column := range viewPtr.tableColumns {
+		expectedColumns := make([]viewExpectedColumn, 0, len(viewPtr.TableColumns))
+		for _, column := range viewPtr.TableColumns {
 			expectedColumns = append(expectedColumns, viewExpectedColumn{
 				name:   getViewTableColumnName(column),
 				dbType: getViewTableColumnType(column.SourceColumn, column.UsesSliceElement).DBType,
@@ -231,7 +233,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		return expectedColumns
 	}
 	view.getCreateScript = func() string {
-		columnDefinitions := make([]string, 0, len(viewPtr.tableColumns))
+		columnDefinitions := make([]string, 0, len(viewPtr.TableColumns))
 		for _, column := range viewPtr.getExpectedColumns() {
 			columnDefinitions = append(columnDefinitions, fmt.Sprintf("%v %v", column.name, column.dbType))
 		}
@@ -244,7 +246,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		)
 		%v;`,
 			dbTable.Namespace,
-			viewPtr.name,
+			viewPtr.Name,
 			strings.Join(columnDefinitions, ", "),
 			partKey.GetName(),
 			strings.Join(primaryKeyColumns, ", "),
@@ -252,7 +254,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		)
 	}
 
-	dbTable.views[view.name] = view
+	dbTable.views[view.Name] = view
 }
 
 // compileSchemaView builds the materialized view backing one TypeView declaration. A packed view
@@ -294,7 +296,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		}
 	}
 
-	fixedValueSlots := planFixedValueViewSlots(dbTable, viewCfg)
+	fixedValueSlots := dbTable.PlanFixedValueViewSlots(viewCfg)
 	isRangeView := len(viewCfg.Keys) > 1 && (packedViewHintFound || fixedValueSlots != nil)
 
 	// Views keep the base table partition unless the schema declares another column.
@@ -350,14 +352,16 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	}
 
 	view := &viewInfo{
-		Type:          6,
-		name:          fmt.Sprintf(`%v__%v_view`, dbTable.Name, colNamesJoined),
-		columns:       colNames,
-		columnsNoPart: colNamesNoPart,
+		IndexSource: &db.IndexSource{
+			Type:          6,
+			Name:          fmt.Sprintf(`%v__%v_view`, dbTable.Name, colNamesJoined),
+			Columns:       colNames,
+			ColumnsNoPart: colNamesNoPart,
+		},
 	}
 
 	if len(columns) > 1 {
-		view.column = &columnInfo{
+		view.Column = &columnInfo{
 			ColInfo: colInfo{
 				IsVirtual: true,
 				Idx:       dbTable.MaxColIdx,
@@ -366,13 +370,13 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 				FieldType: "int32", DBType: "int",
 			},
 		}
-		view.column.GetInfo().Name = fmt.Sprintf(`zz_%v`, colNamesJoined)
+		view.Column.GetInfo().Name = fmt.Sprintf(`zz_%v`, colNamesJoined)
 		dbTable.MaxColIdx++
-		dbTable.ColumnsMap[view.column.GetName()] = view.column
+		dbTable.ColumnsMap[view.Column.GetName()] = view.Column
 	}
 
 	if isSingleDeclaredSimpleView {
-		view.column = declaredColumns[0]
+		view.Column = declaredColumns[0]
 		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
 			// Simple MVs keep their source columns, so predicates bind without key rewriting
 			// and the generic batcher applies as-is: an IN on the view's clustering key is
@@ -380,14 +384,14 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			return buildRemainingWhereClauseBatches(statements)
 		}
 	} else if len(columns) == 1 {
-		view.column = columns[0]
+		view.Column = columns[0]
 	} else if isRangeView {
 		view.Type = 8
-		view.column.GetType().FieldType = "int64"
-		view.column.GetType().DBType = "bigint"
+		view.Column.GetType().FieldType = "int64"
+		view.Column.GetType().DBType = "bigint"
 
 		if len(columns) < 2 {
-			panic(fmt.Sprintf(`The view "%v" in "%v" requires at least 2 columns for Size() packed range views`, view.name, dbTable.Name))
+			panic(fmt.Sprintf(`The view "%v" in "%v" requires at least 2 columns for Size() packed range views`, view.Name, dbTable.Name))
 		}
 
 		isInt32PackedView := false
@@ -396,11 +400,11 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		if fixedValueSlots != nil {
 			// Every slot comes from FixedValues: the leading column carries a real width instead of
 			// absorbing the bit remainder.
-			isInt32PackedView = fixedValueSlots.useInt32
-			slotBitsPerColumn = append(slotBitsPerColumn, fixedValueSlots.slotBitsPerColumn...)
+			isInt32PackedView = fixedValueSlots.UseInt32
+			slotBitsPerColumn = append(slotBitsPerColumn, fixedValueSlots.SlotBitsPerColumn...)
 		} else {
 			if viewColumnsConfig[0].SlotBits > 0 {
-				panic(fmt.Sprintf(`The view "%v" in "%v" cannot set Size() on the first column; it takes the bits the remaining columns leave`, view.name, dbTable.Name))
+				panic(fmt.Sprintf(`The view "%v" in "%v" cannot set Size() on the first column; it takes the bits the remaining columns leave`, view.Name, dbTable.Name))
 			}
 
 			isInt32PackedView = viewColumnsConfig[0].UseInt32Packing
@@ -409,43 +413,43 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 				slotBits := int64(viewColumnsConfig[columnIndex].SlotBits)
 				if slotBits <= 0 {
 					panic(fmt.Sprintf(`The view "%v" in "%v" must set Size() on column "%v" (only the first column can be inferred)`,
-						view.name, dbTable.Name, columns[columnIndex].GetName()))
+						view.Name, dbTable.Name, columns[columnIndex].GetName()))
 				}
 				slotBitsPerColumn = append(slotBitsPerColumn, slotBits)
 			}
 
-			budgetBits := packedVirtualBudgetBits(isInt32PackedView)
-			slotBitsPerColumn[0] = budgetBits - sumSlotBits(slotBitsPerColumn, 1)
+			budgetBits := db.PackedVirtualBudgetBits(isInt32PackedView)
+			slotBitsPerColumn[0] = budgetBits - db.SumSlotBits(slotBitsPerColumn, 1)
 			if slotBitsPerColumn[0] <= 0 {
 				panic(fmt.Sprintf(`The view "%v" in "%v": the trailing Size() slots take all %v bits, leaving none for "%v"`,
-					view.name, dbTable.Name, budgetBits, columns[0].GetName()))
+					view.Name, dbTable.Name, budgetBits, columns[0].GetName()))
 			}
 		}
 
 		if isInt32PackedView {
-			view.column.GetType().FieldType = "int32"
-			view.column.GetType().DBType = "int"
+			view.Column.GetType().FieldType = "int32"
+			view.Column.GetType().DBType = "int"
 		}
-		view.packedSourceColumns = append([]IColInfo{}, columns...)
-		view.packedSlotBitsPerColumn = append([]int64{}, slotBitsPerColumn...)
-		view.packedIsInt32 = isInt32PackedView
+		view.PackedSourceColumns = append([]IColInfo{}, columns...)
+		view.PackedSlotBitsPerColumn = append([]int64{}, slotBitsPerColumn...)
+		view.PackedIsInt32 = isInt32PackedView
 
 		supportedTypes := []string{"int8", "int16", "int32", "int64", "int"}
 		for _, col := range columns {
 			if col.GetType().IsSlice || !slices.Contains(supportedTypes, col.GetType().FieldType) {
 				panic(fmt.Sprintf(`For view "%v" in "%v" need the column %v need to be a int type for the radix value be computed.`,
-					view.name, dbTable.Name, col.GetName()))
+					view.Name, dbTable.Name, col.GetName()))
 			}
 		}
 
 		viewCols := columns
-		viewNameForGuard, tableNameForGuard := view.name, dbTable.Name
-		view.column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
+		viewNameForGuard, tableNameForGuard := view.Name, dbTable.Name
+		view.Column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
 			values := []int64{}
 			for _, col := range viewCols {
-				values = append(values, convertToInt64(col.GetValue(ptr)))
+				values = append(values, db.ConvertToInt64(col.GetValue(ptr)))
 			}
-			packed := packRowValues(tableNameForGuard, viewNameForGuard, viewCols, values, slotBitsPerColumn)
+			packed := db.PackRowValues(tableNameForGuard, viewNameForGuard, viewCols, values, slotBitsPerColumn)
 			return storeVirtualPacked(packed, isInt32PackedView)
 		}
 
@@ -456,12 +460,12 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		viewCols := columns
 		view.Operators = []string{"=", "IN"}
 		view.Type = 7
-		view.column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
+		view.Column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
 			values := []any{}
 			for _, e := range viewCols {
 				values = append(values, e.GetValue(ptr))
 			}
-			return HashInt(values...)
+			return db.HashInt(values...)
 		}
 
 		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
@@ -492,10 +496,10 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 
 			hashValues := make([]any, 0, len(valuesGroups))
 			for _, values := range valuesGroups {
-				hashValues = append(hashValues, HashInt(values...))
+				hashValues = append(hashValues, db.HashInt(values...))
 			}
 
-			whereStatements := buildChunkedInWhereClauses(viewPtr.column.GetName(), hashValues)
+			whereStatements := buildChunkedInWhereClauses(viewPtr.Column.GetName(), hashValues)
 
 			if viewPartColPtr != nil {
 				for _, st := range statements {
@@ -520,11 +524,11 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		projectedColumn := dbTable.ColumnsMap[declaredProjectedColumn.GetInfo().Name]
 		if projectedColumn == nil || projectedColumn.IsNil() {
 			panic(fmt.Sprintf(`The projected column "%v" for view "%v" in "%v" wasn't found.`,
-				declaredProjectedColumn.GetInfo().Name, view.name, dbTable.Name))
+				declaredProjectedColumn.GetInfo().Name, view.Name, dbTable.Name))
 		}
 		if projectedColumn.GetInfo().IsVirtual {
 			panic(fmt.Sprintf(`The projected column "%v" for view "%v" in "%v" cannot be virtual.`,
-				projectedColumn.GetName(), view.name, dbTable.Name))
+				projectedColumn.GetName(), view.Name, dbTable.Name))
 		}
 		projectedColumns = appendUniqueColumn(projectedColumns, projectedColumn)
 	}
@@ -549,15 +553,15 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		for _, keyColumn := range dbTable.Keys {
 			selectableColumns = appendUniqueColumn(selectableColumns, keyColumn)
 		}
-		if view.column != nil && !view.column.IsNil() && !view.column.GetInfo().IsVirtual {
-			selectableColumns = appendUniqueColumn(selectableColumns, view.column)
+		if view.Column != nil && !view.Column.IsNil() && !view.Column.GetInfo().IsVirtual {
+			selectableColumns = appendUniqueColumn(selectableColumns, view.Column)
 		}
 		for _, projectedColumn := range projectedColumns {
 			selectableColumns = appendUniqueColumn(selectableColumns, projectedColumn)
 		}
 	}
 	for _, selectableColumn := range selectableColumns {
-		view.availableColumns = append(view.availableColumns, selectableColumn.GetName())
+		view.AvailableColumns = append(view.AvailableColumns, selectableColumn.GetName())
 	}
 
 	viewPtr := view
@@ -565,12 +569,12 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	// both read the layout from here instead of each deriving it.
 	resolveShape := func() materializedViewShape {
 		whereCols := []IColInfo{}
-		if viewPtr.Type == 6 && !viewPtr.column.GetInfo().IsVirtual {
+		if viewPtr.Type == 6 && !viewPtr.Column.GetInfo().IsVirtual {
 			for _, declaredViewColumn := range declaredColumns {
 				whereCols = appendUniqueColumn(whereCols, declaredViewColumn)
 			}
 		} else {
-			whereCols = appendUniqueColumn(whereCols, viewPtr.column)
+			whereCols = appendUniqueColumn(whereCols, viewPtr.Column)
 		}
 		wherePartCol := viewPartCol
 		if !keepsBasePart {
@@ -639,11 +643,11 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			WHERE %v
 			PRIMARY KEY (%v)
 			%v;`,
-			dbTable.Namespace, viewPtr.name, strings.Join(selectColumnNames, ", "), dbTable.GetFullName(),
+			dbTable.Namespace, viewPtr.Name, strings.Join(selectColumnNames, ", "), dbTable.GetFullName(),
 			strings.Join(shape.notNullClauses, " AND "), shape.primaryKeyClause, makeStatementWith)
 	}
 
-	dbTable.views[view.name] = view
+	dbTable.views[view.Name] = view
 }
 
 // materializedViewShape is the column layout of one compiled materialized view, derived once and
@@ -687,7 +691,7 @@ func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPe
 
 	viewColsCopy := append([]IColInfo{}, viewCols...)
 	view.decomposeVirtualValue = func(rawValue any) []any {
-		packed := loadVirtualPacked(convertToInt64(rawValue), isInt32PackedView)
+		packed := loadVirtualPacked(db.ConvertToInt64(rawValue), isInt32PackedView)
 		values := make([]any, 0, len(viewColsCopy))
 		for _, slotValue := range db.UnpackSlotValues(packed, slotBitsPerColumn) {
 			values = append(values, slotValue)
@@ -744,10 +748,10 @@ func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPe
 				valuesToAdd := []int64{}
 				if len(st.Values) > 0 {
 					for _, value := range st.Values {
-						valuesToAdd = append(valuesToAdd, convertToInt64(value))
+						valuesToAdd = append(valuesToAdd, db.ConvertToInt64(value))
 					}
 				} else {
-					valuesToAdd = append(valuesToAdd, convertToInt64(st.Value))
+					valuesToAdd = append(valuesToAdd, db.ConvertToInt64(st.Value))
 				}
 
 				if len(valuesGroups) > 0 {
@@ -774,7 +778,7 @@ func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPe
 			for _, col := range rangeColumns[1:] {
 				if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
 					fmt.Printf("Packed view rejected: view=%s cannot bind a filter on \"%s\" behind an unconstrained column\n",
-						viewPtr.name, col.GetName())
+						viewPtr.Name, col.GetName())
 					return true
 				}
 			}
@@ -798,21 +802,21 @@ func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPe
 					valuesTo = append(valuesTo, int64(db.SlotMaxValue(slotBitsPerColumn[len(valuesTo)])))
 					continue
 				}
-				valuesFrom = append(valuesFrom, convertToInt64(srg.from.Value))
+				valuesFrom = append(valuesFrom, db.ConvertToInt64(srg.from.Value))
 				if srg.betweenTo != nil {
-					valuesTo = append(valuesTo, convertToInt64(srg.betweenTo.Value))
+					valuesTo = append(valuesTo, db.ConvertToInt64(srg.betweenTo.Value))
 				} else {
-					valuesTo = append(valuesTo, convertToInt64(srg.from.Value))
+					valuesTo = append(valuesTo, db.ConvertToInt64(srg.from.Value))
 				}
 			}
 			whereStatement := boundWhereClause{
-				Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
+				Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.Column.GetName(), viewPtr.Column.GetName()),
 				Values: []any{makeValue(valuesFrom), makeValue(valuesTo)},
 			}
 			if partStatement != nil {
 				whereStatement = boundWhereClause{
 					Clause: fmt.Sprintf("%v = ? AND %v", viewPartColPtr.GetName(), whereStatement.Clause),
-					Values: append([]any{convertToInt64(partStatement.Value)}, whereStatement.Values...),
+					Values: append([]any{db.ConvertToInt64(partStatement.Value)}, whereStatement.Values...),
 				}
 			}
 			return []boundWhereClause{whereStatement}
@@ -827,13 +831,13 @@ func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPe
 					// Only the first range column can carry a lower bound; the rest span their slot.
 					rangeFrom := int64(0)
 					if stRange, hasStatement := statementsMap[col.GetName()]; hasStatement && stRange.from != nil {
-						rangeFrom = convertToInt64(stRange.from.Value)
+						rangeFrom = db.ConvertToInt64(stRange.from.Value)
 					}
 					valuesFrom = append(valuesFrom, rangeFrom)
 				}
 
 				whereStatements = append(whereStatements, boundWhereClause{
-					Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.column.GetName(), viewPtr.column.GetName()),
+					Clause: fmt.Sprintf("%v >= ? AND %v <= ?", viewPtr.Column.GetName(), viewPtr.Column.GetName()),
 					Values: []any{makeValue(valuesFrom), makePrefixUpperBound(prefixValues)},
 				})
 			}
@@ -843,14 +847,14 @@ func compilePackedRangeAccessors(view *viewInfo, viewCols []IColInfo, slotBitsPe
 				hashValues = append(hashValues, makeValue(values))
 			}
 			whereStatements = append(whereStatements,
-				buildChunkedInWhereClauses(viewPtr.column.GetName(), hashValues)...)
+				buildChunkedInWhereClauses(viewPtr.Column.GetName(), hashValues)...)
 		}
 
 		if partStatement != nil {
 			for i, ws := range whereStatements {
 				whereStatements[i] = boundWhereClause{
 					Clause: fmt.Sprintf("%v = ? AND %v", viewPartColPtr.GetName(), ws.Clause),
-					Values: append([]any{convertToInt64(partStatement.Value)}, ws.Values...),
+					Values: append([]any{db.ConvertToInt64(partStatement.Value)}, ws.Values...),
 				}
 			}
 		}

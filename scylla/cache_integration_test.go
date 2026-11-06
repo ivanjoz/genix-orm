@@ -297,7 +297,7 @@ func TestCacheProtocolsOnScylla(t *testing.T) {
 func TestDeltaSnapshotServesTheNextReplace(t *testing.T) {
 	table, clockStart, setClock := deployCacheITTable(t)
 	store := cache.FileStore()
-	snapshotKey := cache.DeltaSnapshotKey("cache_it_records", 7, "status", []int64{1}, 0)
+	snapshotKey := cache.DeltaSnapshotKey("cache_it_records", 7, "status", []int64{1}, 0, nil)
 	readSnapshot := func() (cache.RecordSnapshot, []cacheITRecord, string) {
 		t.Helper()
 		content, etag, err := store.GetFile(snapshotKey)
@@ -394,6 +394,93 @@ func TestDeltaSnapshotServesTheNextReplace(t *testing.T) {
 	snapshot, snapshotRecords, _ = readSnapshot()
 	if snapshot.Cursor != clockStart+200 || snapshot.ReadTime != clockStart+220 || namesByID(snapshotRecords)[2] != "dos bis" {
 		t.Fatalf("rewritten snapshot: cursor %d read time %d, %+v", snapshot.Cursor, snapshot.ReadTime, snapshotRecords)
+	}
+}
+
+// TestDeltaSnapshotOfAProjectedRead: a first sync that excludes a column stores its own snapshot,
+// apart from the unprojected one, and the next one is served from it — the changed record merged in
+// is read with the same projection, so the excluded column never reaches the response.
+func TestDeltaSnapshotOfAProjectedRead(t *testing.T) {
+	table, _, setClock := deployCacheITTable(t)
+	store := cache.FileStore()
+	projectedSync := func() []cacheITRecord {
+		t.Helper()
+		response := []cacheITRecord{}
+		query := Query(&response)
+		query.Exclude(query.Name).CompanyID.Equals(7)
+		if err := query.Delta(cache.DeltaWindowCursor{}, int8(1)).Exec(); err != nil {
+			t.Fatal(err)
+		}
+		records := []cacheITRecord{}
+		for _, record := range response {
+			if record.Metadata == nil {
+				records = append(records, record)
+			}
+		}
+		return records
+	}
+
+	setClock(0)
+	if err := Insert(&[]cacheITRecord{
+		{CompanyID: 7, ID: 1, WarehouseID: 5, Name: "uno", Status: 1},
+		{CompanyID: 7, ID: 2, WarehouseID: 5, Name: "dos", Status: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setClock(1)
+	firstRecords := projectedSync()
+	if len(firstRecords) != 2 || firstRecords[0].Name != "" || firstRecords[1].Name != "" {
+		t.Fatalf("first projected sync: %+v", firstRecords)
+	}
+	if _, _, err := store.GetFile(cache.DeltaSnapshotKey("cache_it_records", 7, "status", []int64{1}, 0, nil)); err == nil {
+		t.Fatal("a projected read wrote the unprojected snapshot")
+	}
+
+	// The snapshot is the projected one: find it by its prefix, then mark record 2's warehouse in the
+	// file only, so a response carrying the mark came from the file.
+	snapshotKeys, err := store.ListFiles("delta-snapshot/cache_it_records/7/status/1.l0.p")
+	if err != nil || len(snapshotKeys) != 1 {
+		t.Fatalf("projected snapshot files: %v %v", snapshotKeys, err)
+	}
+	content, etag, err := store.GetFile(snapshotKeys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := cache.DecodeRecordSnapshot(content)
+	snapshotRecords := []cacheITRecord{}
+	if err == nil {
+		err = colbin.Unmarshal(snapshot.Records, &snapshotRecords)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range snapshotRecords {
+		if snapshotRecords[index].ID == 2 {
+			snapshotRecords[index].WarehouseID = 99
+		}
+	}
+	if snapshot.Records, err = colbin.Marshal(&snapshotRecords); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutFileIfMatch(t.Context(), snapshotKeys[0], cache.EncodeRecordSnapshot(snapshot), etag); err != nil {
+		t.Fatal(err)
+	}
+
+	setClock(200)
+	if err := Update(&[]cacheITRecord{{CompanyID: 7, ID: 1, Name: "uno bis"}}, table.Name); err != nil {
+		t.Fatal(err)
+	}
+	setClock(210)
+	served := projectedSync()
+	byID := map[int32]cacheITRecord{}
+	for _, record := range served {
+		byID[record.ID] = record
+	}
+	if len(served) != 2 || byID[2].WarehouseID != 99 {
+		t.Fatalf("not served from the projected snapshot: %+v", served)
+	}
+	if byID[1].Name != "" || byID[2].Name != "" {
+		t.Fatalf("an excluded column reached the response: %+v", served)
 	}
 }
 

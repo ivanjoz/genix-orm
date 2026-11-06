@@ -72,9 +72,9 @@ func TestComputedColumnFeedsIndexGroupWithoutStorage(t *testing.T) {
 	}
 
 	record := computedRecord{CompanyID: 1, ID: 9, Date: 20000, Lines: []computedLine{{ProductID: 4}, {ProductID: 7}}}
-	indexGroup := scyllaTable.indexGroups[0]
-	hashes := indexGroup.virtualColumn.GetRawValue(unsafe.Pointer(&record)).([]int32)
-	expectedHashes := []int32{HashInt64(20000, 4), HashInt64(20000, 7)}
+	indexGroup := scyllaTable.IndexGroups[0]
+	hashes := indexGroup.VirtualColumn.GetRawValue(unsafe.Pointer(&record)).([]int32)
+	expectedHashes := []int32{db.HashInt64(20000, 4), db.HashInt64(20000, 7)}
 	slices.Sort(expectedHashes)
 	if !slices.Equal(hashes, expectedHashes) {
 		t.Fatalf("index group hashes = %v, want %v", hashes, expectedHashes)

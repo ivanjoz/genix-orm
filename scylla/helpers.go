@@ -1,11 +1,8 @@
 package scylla
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"reflect"
 	"strings"
 	"unsafe"
@@ -42,17 +39,6 @@ func ShouldLog() bool {
 	return DebugNormal
 }
 
-func BasicHashInt(s string) int32 {
-	h := fnv.New32a()
-	h.Write([]byte(s))
-	hashValue := int32(h.Sum32())
-	// Keep hash deterministic while reserving 0 as an invalid/sentinel ID.
-	if hashValue == 0 {
-		return 1
-	}
-	return hashValue
-}
-
 // negativeSign marks a negative Int64ToBase64Bytes value: "-" is a digit of utils.Base64Alphabet.
 const negativeSign = '~'
 
@@ -73,102 +59,6 @@ func Base64BytesToInt64(b []byte) int64 {
 		return -int64(magnitude)
 	}
 	return int64(magnitude)
-}
-
-func HashInt(values ...any) int32 {
-	buf := new(bytes.Buffer)
-
-	for _, anyVal := range values {
-		appendHashValue(buf, anyVal)
-		buf.WriteByte(0)
-	}
-
-	h := fnv.New32a()
-	h.Write(buf.Bytes())
-	return int32(h.Sum32())
-}
-
-// appendHashValue writes one value into the hash buffer. A named numeric type is
-// normalized to its underlying plain type and re-dispatched, so it hashes to the SAME
-// bytes as the plain type it wraps — retyping a column from int8 to a named int8 must not
-// silently invalidate every hash already persisted from it. Without this it would fall to
-// the %v branch and hash the decimal text instead of the binary value.
-func appendHashValue(buf *bytes.Buffer, anyVal any) {
-	switch val := anyVal.(type) {
-	case int:
-		binary.Write(buf, binary.LittleEndian, int64(val))
-	case int32:
-		binary.Write(buf, binary.LittleEndian, val)
-	case int64:
-		binary.Write(buf, binary.LittleEndian, val)
-	case int16:
-		binary.Write(buf, binary.LittleEndian, val)
-	case int8:
-		binary.Write(buf, binary.LittleEndian, val)
-	case float32:
-		binary.Write(buf, binary.LittleEndian, val)
-	case float64:
-		binary.Write(buf, binary.LittleEndian, val)
-	case string:
-		buf.WriteString(val)
-	default:
-		if plainValue, isNamed := db.NormalizeNamedNumeric(anyVal); isNamed {
-			appendHashValue(buf, plainValue)
-			return
-		}
-		buf.WriteString(fmt.Sprintf("%v", val))
-	}
-}
-
-func HashInt64(values ...int64) int32 {
-	buf := new(bytes.Buffer)
-
-	for _, value := range values {
-		binary.Write(buf, binary.LittleEndian, value)
-		buf.WriteByte(0)
-	}
-
-	h := fnv.New32a()
-	h.Write(buf.Bytes())
-	return int32(h.Sum32())
-}
-
-func makeWeekIndexFromWeekCode(weekCode int64) (int64, bool) {
-	// Use the Monday unix-day as the real timeline, then collapse it into contiguous week units.
-	mondayUnixDay := makeUnixDayFromWeekCode(int16(weekCode))
-	if mondayUnixDay == 0 {
-		return 0, false
-	}
-	return int64(mondayUnixDay) / 7, true
-}
-
-func normalizeCompositeRange(from, to int64, isWeek bool) (int64, int64) {
-	// Range planning needs contiguous numbers; week-coded values use Monday-date conversion.
-	if isWeek {
-		fromWeekIndex, fromOk := makeWeekIndexFromWeekCode(from)
-		toWeekIndex, toOk := makeWeekIndexFromWeekCode(to)
-		if fromOk && toOk {
-			if toWeekIndex < fromWeekIndex {
-				return toWeekIndex, fromWeekIndex
-			}
-			return fromWeekIndex, toWeekIndex
-		}
-	}
-	if to < from {
-		return to, from
-	}
-	return from, to
-}
-
-func makeCompositeBucketID(value int64, bucketSize int8, isWeek bool) int64 {
-	// Bucket IDs are computed on a contiguous domain using date-derived week indexes when needed.
-	basisValue := value
-	if isWeek {
-		if weekIndex, ok := makeWeekIndexFromWeekCode(value); ok {
-			basisValue = weekIndex
-		}
-	}
-	return basisValue / int64(bucketSize)
 }
 
 func Logx(style int8, messageInColor string, params ...any) {
@@ -200,29 +90,6 @@ func Logx(style int8, messageInColor string, params ...any) {
 	}
 }
 
-func convertToInt64(val any) int64 {
-	// Use a type assertion to check if it's an int or other integer types
-	switch v := val.(type) {
-	case int:
-		return int64(v)
-	case int8:
-		return int64(v)
-	case int16:
-		return int64(v)
-	case int32:
-		return int64(v)
-	case int64:
-		return v
-	default:
-		if plainValue, isNamed := db.NormalizeNamedNumeric(val); isNamed {
-			return convertToInt64(plainValue)
-		}
-		// The value is not an integer
-		fmt.Println("Error: Value is not an integer:", v)
-		return 0
-	}
-}
-
 func convertToInt32(val any) int32 {
 	// Use a type assertion to check if it's an int or other integer types
 	switch v := val.(type) {
@@ -245,7 +112,6 @@ func convertToInt32(val any) int32 {
 		return 0
 	}
 }
-
 
 func Concatx[T any](sep string, slice1 []T) string {
 	sliceOfStrings := []string{}

@@ -1,0 +1,4 @@
+github.com/apple/foundationdb/bindings/go v0.0.0-20260827171757-946e01da3a60 h1:0cmrle70PasTEVSc5t2Y2IqBWjrqzhdQKxk61A5gVRc=
+github.com/apple/foundationdb/bindings/go v0.0.0-20260827171757-946e01da3a60/go.mod h1:OMVSB21p9+xQUIqlGizHPZfjK+SHws1ht+ZytVDoz9U=
+github.com/ivanjoz/colbin v0.9.2 h1:VjVPDz9LZOJfsJPWg/Dl5V/3qRzAL6ezL9gXnpGexXA=
+github.com/ivanjoz/colbin v0.9.2/go.mod h1:l7eNG5MdstOAVGgbNeQrIiq7Hl/Ue9N8ZiUoun7eUMY=

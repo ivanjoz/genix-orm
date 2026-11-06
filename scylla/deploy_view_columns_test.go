@@ -127,13 +127,13 @@ func assertViewExpectedColumnsMatchCreateScript(t *testing.T, scyllaTable Scylla
 
 	for _, view := range scyllaTable.views {
 		if view.getExpectedColumns == nil {
-			t.Fatalf("view %q has no getExpectedColumns", view.name)
+			t.Fatalf("view %q has no getExpectedColumns", view.Name)
 		}
 
 		expectedNames := []string{}
 		for _, expectedColumn := range view.getExpectedColumns() {
 			if expectedColumn.dbType == "" {
-				t.Fatalf("view %q reports column %q without a DB type", view.name, expectedColumn.name)
+				t.Fatalf("view %q reports column %q without a DB type", view.Name, expectedColumn.name)
 			}
 			expectedNames = append(expectedNames, expectedColumn.name)
 		}
@@ -144,7 +144,7 @@ func assertViewExpectedColumnsMatchCreateScript(t *testing.T, scyllaTable Scylla
 
 		if !slices.Equal(expectedNames, createdNames) {
 			t.Fatalf("view %q: expected columns %v do not match the CREATE script columns %v",
-				view.name, expectedNames, createdNames)
+				view.Name, expectedNames, createdNames)
 		}
 	}
 }
@@ -177,7 +177,7 @@ func TestViewMissingColumnsAreDetectedForANewBaseColumn(t *testing.T) {
 
 	fullPayloadView := (*viewInfo)(nil)
 	for _, view := range scyllaTable.views {
-		if view.name == "projected_view_records__pk_status_view" {
+		if view.Name == "projected_view_records__pk_status_view" {
 			fullPayloadView = view
 		}
 	}

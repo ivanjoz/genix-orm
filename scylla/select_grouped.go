@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"slices"
 	"strings"
 	"time"
@@ -17,7 +18,7 @@ type queryIndexGroupHash struct {
 
 type indexGroupSelectPlan struct {
 	partitionValue int32
-	indexGroup     indexGroupInfo
+	indexGroup     db.IndexGroupInfo
 	hashGroups     []queryIndexGroupHash
 }
 
@@ -110,7 +111,7 @@ func queryIndexGroups(scyllaTable ScyllaTable, tableInfo *TableInfo, sink record
 	for _, cachedState := range cachedStates {
 		// Metadata-only groups let the frontend read unchanged records from IndexedDB by igVal key.
 		groupsByHash[cachedState.hashValue] = RecordGroup[unsafe.Pointer]{
-			IndexID:          queryPlan.indexGroup.indexID,
+			IndexID:          queryPlan.indexGroup.IndexID,
 			GroupHash:        cachedState.hashValue,
 			IndexGroupValues: append([]int64(nil), cachedState.indexGroupValues...),
 			LastWrite:        cachedState.lastWrite,
@@ -153,10 +154,10 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 		return nil, fmt.Errorf("QueryIndexGroup requires exactly one BETWEEN statement")
 	}
 
-	var bestIndexGroup *indexGroupInfo
+	var bestIndexGroup *db.IndexGroupInfo
 	bestScore := -1
-	for indexGroupIndex := range scyllaTable.indexGroups {
-		indexGroup := &scyllaTable.indexGroups[indexGroupIndex]
+	for indexGroupIndex := range scyllaTable.IndexGroups {
+		indexGroup := &scyllaTable.IndexGroups[indexGroupIndex]
 		score, isValid := scoreIndexGroupCandidate(*indexGroup, statementByColumn)
 		if !isValid || score <= bestScore {
 			continue
@@ -179,7 +180,7 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 
 	if ShouldLog() {
 		fmt.Printf("QueryIndexGroup plan selected: table=%s group=%s candidate_hashes=%d\n",
-			scyllaTable.Name, bestIndexGroup.name, len(hashGroups))
+			scyllaTable.Name, bestIndexGroup.Name, len(hashGroups))
 	}
 
 	return &indexGroupSelectPlan{
@@ -189,12 +190,12 @@ func buildIndexGroupSelectPlan(tableInfo *TableInfo, scyllaTable ScyllaTable) (*
 	}, nil
 }
 
-func scoreIndexGroupCandidate(indexGroup indexGroupInfo, statementByColumn map[string][]ColumnStatement) (int, bool) {
+func scoreIndexGroupCandidate(indexGroup db.IndexGroupInfo, statementByColumn map[string][]ColumnStatement) (int, bool) {
 	betweenColumns := 0
 	fanoutSize := 1
 
-	for _, sourceColumn := range indexGroup.sourceColumns {
-		columnStatements := statementByColumn[sourceColumn.column.GetName()]
+	for _, sourceColumn := range indexGroup.SourceColumns {
+		columnStatements := statementByColumn[sourceColumn.Column.GetName()]
 		if len(columnStatements) != 1 {
 			return 0, false
 		}
@@ -215,8 +216,8 @@ func scoreIndexGroupCandidate(indexGroup indexGroupInfo, statementByColumn map[s
 				return 0, false
 			}
 			betweenColumns++
-			fromValue := convertToInt64(statement.From[0].Value)
-			toValue := convertToInt64(statement.To[0].Value)
+			fromValue := db.ConvertToInt64(statement.From[0].Value)
+			toValue := db.ConvertToInt64(statement.To[0].Value)
 			if toValue < fromValue {
 				fromValue, toValue = toValue, fromValue
 			}
@@ -231,14 +232,14 @@ func scoreIndexGroupCandidate(indexGroup indexGroupInfo, statementByColumn map[s
 	}
 
 	// Prefer the most specific group and break ties by lower hash fanout.
-	return len(indexGroup.sourceColumns)*100000 - fanoutSize, true
+	return len(indexGroup.SourceColumns)*100000 - fanoutSize, true
 }
 
-func buildQueryIndexGroupHashes(indexGroup indexGroupInfo, statements []ColumnStatement) ([]queryIndexGroupHash, error) {
+func buildQueryIndexGroupHashes(indexGroup db.IndexGroupInfo, statements []ColumnStatement) ([]queryIndexGroupHash, error) {
 	valuesGroups := [][]int64{{}}
 
-	for _, sourceColumn := range indexGroup.sourceColumns {
-		statement, err := findIndexGroupStatement(sourceColumn.column.GetName(), statements)
+	for _, sourceColumn := range indexGroup.SourceColumns {
+		statement, err := findIndexGroupStatement(sourceColumn.Column.GetName(), statements)
 		if err != nil {
 			return nil, err
 		}
@@ -262,7 +263,7 @@ func buildQueryIndexGroupHashes(indexGroup indexGroupInfo, statements []ColumnSt
 
 	hashGroupsByValue := map[int32]queryIndexGroupHash{}
 	for _, valuesGroup := range valuesGroups {
-		hashValue := HashInt64(valuesGroup...)
+		hashValue := db.HashInt64(valuesGroup...)
 		if _, exists := hashGroupsByValue[hashValue]; exists {
 			continue
 		}
@@ -305,13 +306,13 @@ func findIndexGroupStatement(columnName string, statements []ColumnStatement) (C
 func resolveIndexGroupQueryValues(statement ColumnStatement) ([]int64, error) {
 	switch statement.Operator {
 	case "=":
-		return flattenCompositeInt64Values(statement.Value), nil
+		return db.FlattenInt64Values(statement.Value), nil
 	case "CONTAINS":
-		return flattenCompositeInt64Values(statement.Value), nil
+		return db.FlattenInt64Values(statement.Value), nil
 	case "IN":
 		columnValues := make([]int64, 0, len(statement.Values))
 		for _, rawValue := range statement.Values {
-			columnValues = append(columnValues, flattenCompositeInt64Values(rawValue)...)
+			columnValues = append(columnValues, db.FlattenInt64Values(rawValue)...)
 		}
 		return columnValues, nil
 	case "BETWEEN":
@@ -319,8 +320,8 @@ func resolveIndexGroupQueryValues(statement ColumnStatement) ([]int64, error) {
 			return nil, fmt.Errorf(`QueryIndexGroup received an invalid BETWEEN for "%v"`, statement.Col)
 		}
 
-		fromValue := convertToInt64(statement.From[0].Value)
-		toValue := convertToInt64(statement.To[0].Value)
+		fromValue := db.ConvertToInt64(statement.From[0].Value)
+		toValue := db.ConvertToInt64(statement.To[0].Value)
 		if toValue < fromValue {
 			fromValue, toValue = toValue, fromValue
 		}
@@ -336,7 +337,7 @@ func resolveIndexGroupQueryValues(statement ColumnStatement) ([]int64, error) {
 
 func loadIndexGroupFreshnessRowsFromScylla(
 	scyllaTable ScyllaTable,
-	indexGroup indexGroupInfo,
+	indexGroup db.IndexGroupInfo,
 	partitionValue int32,
 	hashValues []int32,
 ) (map[int32]int32, error) {
@@ -363,7 +364,7 @@ func loadIndexGroupFreshnessRowsFromScylla(
 		placeholders := make([]string, 0, len(hashChunk))
 		queryValues := make([]any, 0, len(hashChunk)+2)
 		queryValues = append(queryValues, partitionValue)
-		queryValues = append(queryValues, indexGroup.indexID)
+		queryValues = append(queryValues, indexGroup.IndexID)
 		for _, hashValue := range hashChunk {
 			placeholders = append(placeholders, "?")
 			queryValues = append(queryValues, hashValue)
@@ -378,7 +379,7 @@ func loadIndexGroupFreshnessRowsFromScylla(
 
 		if ShouldLog() {
 			fmt.Printf("QueryIndexGroup freshness probe: table=%s partition=%d index_id=%d hashes=%d\n",
-				scyllaTable.Name, partitionValue, indexGroup.indexID, len(hashChunk))
+				scyllaTable.Name, partitionValue, indexGroup.IndexID, len(hashChunk))
 		}
 
 		iter := getScyllaConnection().Query(queryStr, queryValues...).Iter()
@@ -447,7 +448,7 @@ func fetchIndexGroupRecordGroups(
 	groupsByIndex := make([]RecordGroup[unsafe.Pointer], len(fetchStates))
 
 	eg := errgroup.Group{}
-	if queryPlan.indexGroup.snapshotInS3 {
+	if queryPlan.indexGroup.SnapshotInS3 {
 		eg.SetLimit(cacheGroupSnapshotConcurrency)
 	}
 	for fetchIndex, fetchState := range fetchStates {
@@ -468,7 +469,7 @@ func fetchIndexGroupRecordGroups(
 			}
 
 			groupsByIndex[fetchIndex] = RecordGroup[unsafe.Pointer]{
-				IndexID:          queryPlan.indexGroup.indexID,
+				IndexID:          queryPlan.indexGroup.IndexID,
 				GroupHash:        fetchState.hashValue,
 				IndexGroupValues: append([]int64(nil), fetchState.indexGroupValues...),
 				Records:          records,
@@ -498,11 +499,11 @@ func buildIndexGroupFetchQuery(
 
 	// TypeCacheGroupFromKey groups rewrite per-hash fetches to a packed primary-key range,
 	// so no secondary index is needed and ALLOW_FILTERING is avoided.
-	if queryPlan.indexGroup.inheritFromKey {
-		keyStatements := make([]ColumnStatement, 0, len(queryPlan.indexGroup.sourceColumns))
-		for columnIndex, sourceColumn := range queryPlan.indexGroup.sourceColumns {
+	if queryPlan.indexGroup.InheritFromKey {
+		keyStatements := make([]ColumnStatement, 0, len(queryPlan.indexGroup.SourceColumns))
+		for columnIndex, sourceColumn := range queryPlan.indexGroup.SourceColumns {
 			keyStatements = append(keyStatements, ColumnStatement{
-				Col:      sourceColumn.column.GetName(),
+				Col:      sourceColumn.Column.GetName(),
 				Operator: "=",
 				Value:    fetchState.indexGroupValues[columnIndex],
 			})
@@ -520,17 +521,17 @@ func buildIndexGroupFetchQuery(
 			whereStatements = append(whereStatements, fmt.Sprintf("%v = ?", keyColumnName))
 			queryValues = append(queryValues, keyPredicate.Value)
 		}
-	} else if queryPlan.indexGroup.virtualColumn == nil || queryPlan.indexGroup.virtualColumn.IsNil() {
+	} else if queryPlan.indexGroup.VirtualColumn == nil || queryPlan.indexGroup.VirtualColumn.IsNil() {
 		// Single-column groups already have a real secondary index on the source column,
 		// so grouped fetches can probe that column directly without a virtual hash column.
-		sourceColumn := queryPlan.indexGroup.sourceColumns[0].column
+		sourceColumn := queryPlan.indexGroup.SourceColumns[0].Column
 		whereStatements = append(whereStatements, fmt.Sprintf("%v = ?", sourceColumn.GetName()))
 		queryValues = append(queryValues, fetchState.indexGroupValues[0])
-	} else if queryPlan.indexGroup.usesCollectionValues {
-		whereStatements = append(whereStatements, fmt.Sprintf("%v CONTAINS ?", queryPlan.indexGroup.virtualColumn.GetName()))
+	} else if queryPlan.indexGroup.UsesCollectionValues {
+		whereStatements = append(whereStatements, fmt.Sprintf("%v CONTAINS ?", queryPlan.indexGroup.VirtualColumn.GetName()))
 		queryValues = append(queryValues, fetchState.hashValue)
 	} else {
-		whereStatements = append(whereStatements, fmt.Sprintf("%v = ?", queryPlan.indexGroup.virtualColumn.GetName()))
+		whereStatements = append(whereStatements, fmt.Sprintf("%v = ?", queryPlan.indexGroup.VirtualColumn.GetName()))
 		queryValues = append(queryValues, fetchState.hashValue)
 	}
 

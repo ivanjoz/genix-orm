@@ -1,6 +1,7 @@
 package scylla
 
 import (
+	"github.com/ivanjoz/genix-orm/db"
 	"maps"
 	"slices"
 	"strings"
@@ -312,8 +313,8 @@ func TestMakeUpdateStatementsRejectsIndexGroupUpdateWhenOmittedValuesMissingInSt
 // indexGroupHashesOf is every group hash a record falls in, across the table's index groups.
 func indexGroupHashesOf(scyllaTable ScyllaTable, record *indexGroupRecord) map[int32]bool {
 	hashes := map[int32]bool{}
-	for _, indexGroup := range scyllaTable.indexGroups {
-		for _, hashValue := range computeIndexGroupHashes(unsafe.Pointer(record), indexGroup.sourceColumns) {
+	for _, indexGroup := range scyllaTable.IndexGroups {
+		for _, hashValue := range db.ComputeIndexGroupHashes(unsafe.Pointer(record), indexGroup.SourceColumns) {
 			hashes[hashValue] = true
 		}
 	}
@@ -406,8 +407,8 @@ func TestMarkIndexGroupsBeforeWriteStampsTheMarkerTime(t *testing.T) {
 	}
 
 	expectedHashes := map[int32]struct{}{}
-	for _, indexGroup := range scyllaTable.indexGroups {
-		for _, hashValue := range computeIndexGroupHashes(unsafe.Pointer(&records[0]), indexGroup.sourceColumns) {
+	for _, indexGroup := range scyllaTable.IndexGroups {
+		for _, hashValue := range db.ComputeIndexGroupHashes(unsafe.Pointer(&records[0]), indexGroup.SourceColumns) {
 			expectedHashes[hashValue] = struct{}{}
 		}
 	}
@@ -440,26 +441,26 @@ func TestMarkIndexGroupsBeforeWriteStampsTheMarkerTime(t *testing.T) {
 func TestAllocateIndexGroupIDAvoidsHashCollisions(t *testing.T) {
 	scyllaTable := &ScyllaTable{}
 
-	firstID := allocateIndexGroupID(scyllaTable, []string{"date", "client_id"})
-	reusedID := allocateIndexGroupID(scyllaTable, []string{"date", "client_id"})
+	firstID := scyllaTable.AllocateIndexGroupID([]string{"date", "client_id"})
+	reusedID := scyllaTable.AllocateIndexGroupID([]string{"date", "client_id"})
 	if firstID != reusedID {
 		t.Fatalf("expected the same logical index group to reuse its id, got %d and %d", firstID, reusedID)
 	}
 
-	collisionStart := int16(BasicHashInt("new_group"))
+	collisionStart := int16(db.BasicHashInt("new_group"))
 	if collisionStart == 0 {
 		collisionStart = 1
 	}
-	scyllaTable.indexGroupIDs = map[int16]string{
+	scyllaTable.IndexGroupIDs = map[int16]string{
 		collisionStart:     "occupied_a",
 		collisionStart + 1: "occupied_b",
 	}
 
-	nextID := allocateIndexGroupID(scyllaTable, []string{"new_group"})
+	nextID := scyllaTable.AllocateIndexGroupID([]string{"new_group"})
 	if nextID != collisionStart+2 {
 		t.Fatalf("expected collision handling to advance to %d, got %d", collisionStart+2, nextID)
 	}
-	if scyllaTable.indexGroupIDs[nextID] != "new_group" {
+	if scyllaTable.IndexGroupIDs[nextID] != "new_group" {
 		t.Fatalf("expected allocated id %d to be assigned to new_group", nextID)
 	}
 }

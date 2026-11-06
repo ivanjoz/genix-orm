@@ -240,22 +240,6 @@ func getMaxClusteringKeyRestrictionsPerQuery() int {
 	return maxClusteringKeys
 }
 
-func chunkStatementInValues(values []any, chunkSize int) [][]any {
-	if len(values) == 0 {
-		return nil
-	}
-	if chunkSize <= 0 {
-		chunkSize = 1
-	}
-
-	valueChunks := make([][]any, 0, (len(values)+chunkSize-1)/chunkSize)
-	for startIndex := 0; startIndex < len(values); startIndex += chunkSize {
-		endIndex := min(startIndex+chunkSize, len(values))
-		valueChunks = append(valueChunks, slices.Clone(values[startIndex:endIndex]))
-	}
-	return valueChunks
-}
-
 // buildChunkedInWhereClauses turns one IN list into as many clauses as the node's
 // clustering-key restriction ceiling requires. Views bind their predicates directly
 // into a clause string, so they cannot go through buildRemainingWhereClauseBatches
@@ -265,7 +249,7 @@ func buildChunkedInWhereClauses(columnName string, inValues []any) []boundWhereC
 		return nil
 	}
 
-	valueChunks := chunkStatementInValues(inValues, getMaxClusteringKeyRestrictionsPerQuery())
+	valueChunks := db.ChunkValues(inValues, getMaxClusteringKeyRestrictionsPerQuery())
 	whereClauses := make([]boundWhereClause, 0, len(valueChunks))
 
 	for _, valueChunk := range valueChunks {
@@ -317,7 +301,7 @@ func buildRemainingWhereClauseBatches(remainingStatements []ColumnStatement) []b
 			maxValuesPerBatch = 1
 		}
 
-		valueChunks := chunkStatementInValues(statement.Values, maxValuesPerBatch)
+		valueChunks := db.ChunkValues(statement.Values, maxValuesPerBatch)
 		nextStatementBatches := make([][]ColumnStatement, 0, len(statementBatches)*len(valueChunks))
 		maxChunkSize := 0
 
@@ -449,7 +433,7 @@ func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable Sc
 			break
 		}
 	}
-	if hasKeyColQuery || len(scyllaTable.keyConcatenated) == 0 {
+	if hasKeyColQuery || len(scyllaTable.KeyConcatenated) == 0 {
 		return nil, false
 	}
 
@@ -457,7 +441,7 @@ func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable Sc
 	var rangeStatement *ColumnStatement
 	handledColumns := map[string]bool{}
 
-	for _, concatCol := range scyllaTable.keyConcatenated {
+	for _, concatCol := range scyllaTable.KeyConcatenated {
 		found := false
 		for statementIndex := range statements {
 			statement := statements[statementIndex]
@@ -493,7 +477,7 @@ func buildKeyConcatenatedStatements(statements []ColumnStatement, scyllaTable Sc
 
 	var rewrittenStatement ColumnStatement
 	if rangeStatement == nil {
-		if len(prefixValues) == len(scyllaTable.keyConcatenated) {
+		if len(prefixValues) == len(scyllaTable.KeyConcatenated) {
 			rewrittenStatement = ColumnStatement{Col: keyCol.GetName(), Operator: "=", Value: prefixValueText}
 		} else {
 			rewrittenStatement = ColumnStatement{
@@ -557,7 +541,7 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 			break
 		}
 	}
-	if hasKeyColQuery || len(scyllaTable.keyIntPacking) == 0 {
+	if hasKeyColQuery || len(scyllaTable.KeyIntPacking) == 0 {
 		return nil, false
 	}
 
@@ -565,7 +549,7 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 	var rangeStatement *ColumnStatement
 	handledColumns := map[string]bool{}
 
-	for _, packedCol := range scyllaTable.keyIntPacking {
+	for _, packedCol := range scyllaTable.KeyIntPacking {
 		colName := packedCol.GetName()
 		if colName == "autoincrement_placeholder" {
 			break
@@ -603,10 +587,10 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 	// The pinned prefix spans one contiguous block of the key; the bounds are inclusive and go
 	// straight into a BETWEEN.
 	makePackedRange := func(values []any, rangeStatement *ColumnStatement) (int64, int64, bool) {
-		slotBits := scyllaTable.keyIntPackingSlotBits
+		slotBits := scyllaTable.KeyIntPackingSlotBits
 		prefix := make([]int64, 0, len(slotBits))
 		for _, value := range values {
-			prefix = append(prefix, convertToInt64(value))
+			prefix = append(prefix, db.ConvertToInt64(value))
 		}
 		if len(prefix) == len(slotBits) {
 			packedKey := int64(db.PackSlotValues(prefix, slotBits))
@@ -616,11 +600,11 @@ func buildKeyIntPackingStatements(statements []ColumnStatement, scyllaTable Scyl
 		fromPrefix, toPrefix := prefix, prefix
 		if rangeStatement != nil {
 			if rangeStatement.Operator == "BETWEEN" {
-				fromPrefix = append(slices.Clone(prefix), convertToInt64(rangeStatement.From[0].Value))
-				toPrefix = append(slices.Clone(prefix), convertToInt64(rangeStatement.To[0].Value))
+				fromPrefix = append(slices.Clone(prefix), db.ConvertToInt64(rangeStatement.From[0].Value))
+				toPrefix = append(slices.Clone(prefix), db.ConvertToInt64(rangeStatement.To[0].Value))
 			} else {
 				// Any other range operator scans the block of its own value.
-				fromPrefix = append(slices.Clone(prefix), convertToInt64(rangeStatement.Value))
+				fromPrefix = append(slices.Clone(prefix), db.ConvertToInt64(rangeStatement.Value))
 				toPrefix = fromPrefix
 			}
 		}
@@ -664,24 +648,6 @@ const maxFixedValueFanoutPerColumn = 8
 // so a fanned-out read never queues against itself.
 const maxFixedValueFanoutQueries = 8
 
-// narrowInt64ToColumnWidth returns value as the column's own Go integer type. The synthesized
-// values come from the schema as int64, but they end up bound straight into CQL and, on hash views,
-// fed to HashInt — which writes each width differently, so an int64 1 would not match the int8 1
-// the row was written with.
-func narrowInt64ToColumnWidth(value int64, column IColInfo) any {
-	switch column.GetType().FieldType {
-	case "int8":
-		return int8(value)
-	case "int16":
-		return int16(value)
-	case "int32":
-		return int32(value)
-	case "int":
-		return int(value)
-	}
-	return value
-}
-
 // buildFixedValueFanoutStatements synthesizes an IN predicate for every unconstrained column whose
 // FixedValues enumerate a small, closed set.
 //
@@ -691,7 +657,7 @@ func narrowInt64ToColumnWidth(value int64, column IColInfo) any {
 // caller allows filtering — a query pinning only the trailing half of a delta view's keys being the
 // motivating case.
 func buildFixedValueFanoutStatements(statements []ColumnStatement, scyllaTable ScyllaTable) []ColumnStatement {
-	if len(scyllaTable.fixedValueRanges) == 0 {
+	if len(scyllaTable.FixedValueRanges) == 0 {
 		return nil
 	}
 
@@ -712,17 +678,17 @@ func buildFixedValueFanoutStatements(statements []ColumnStatement, scyllaTable S
 		if constrainedColumns[columnName] {
 			continue
 		}
-		valueRange, isDeclared := scyllaTable.fixedValueRanges[columnName]
-		if !isDeclared || len(valueRange.declaredValues) == 0 ||
-			len(valueRange.declaredValues) > maxFixedValueFanoutPerColumn ||
-			plannedQueryCount*len(valueRange.declaredValues) > maxFixedValueFanoutQueries {
+		valueRange, isDeclared := scyllaTable.FixedValueRanges[columnName]
+		if !isDeclared || len(valueRange.DeclaredValues) == 0 ||
+			len(valueRange.DeclaredValues) > maxFixedValueFanoutPerColumn ||
+			plannedQueryCount*len(valueRange.DeclaredValues) > maxFixedValueFanoutQueries {
 			continue
 		}
-		plannedQueryCount *= len(valueRange.declaredValues)
+		plannedQueryCount *= len(valueRange.DeclaredValues)
 
-		fanoutValues := make([]any, 0, len(valueRange.declaredValues))
-		for _, declaredValue := range valueRange.declaredValues {
-			fanoutValues = append(fanoutValues, narrowInt64ToColumnWidth(declaredValue, column))
+		fanoutValues := make([]any, 0, len(valueRange.DeclaredValues))
+		for _, declaredValue := range valueRange.DeclaredValues {
+			fanoutValues = append(fanoutValues, db.NarrowInt64ToColumnWidth(declaredValue, column))
 		}
 		fanoutStatements = append(fanoutStatements, ColumnStatement{
 			Col: columnName, Operator: "IN", Values: fanoutValues,
@@ -789,7 +755,7 @@ func applyFixedValueFanout(statements []ColumnStatement, baseCapability *QueryCa
 	fanoutStatements := []ColumnStatement{}
 	fanoutColumnNames := []string{}
 	for _, candidateStatement := range candidateStatements {
-		if slices.Contains(fannedCapability.Source.columns, candidateStatement.Col) {
+		if slices.Contains(fannedCapability.Source.Columns, candidateStatement.Col) {
 			fanoutStatements = append(fanoutStatements, candidateStatement)
 			fanoutColumnNames = append(fanoutColumnNames, candidateStatement.Col)
 		}
@@ -902,13 +868,13 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 			isProjectedView := selectedView.Type >= 6 && canUseProjectedView(columnNames, selectedView)
 
 			if isProjectedView {
-				viewTableName = selectedView.name
+				viewTableName = selectedView.Name
 				if selectedView.Type == 9 {
 					compiledStatement.requiresDeduplication = true
 				}
 				// The view's first clustering column drives ORDER BY in the view table, not the base ID.
-				if selectedView.column != nil && !selectedView.column.IsNil() {
-					compiledStatement.orderColumnName = selectedView.column.GetName()
+				if selectedView.Column != nil && !selectedView.Column.IsNil() {
+					compiledStatement.orderColumnName = selectedView.Column.GetName()
 				}
 			}
 
@@ -917,14 +883,14 @@ func compileSelectStatement(tableInfo *TableInfo, scyllaTable ScyllaTable) (*Sel
 				remainingStatementIndexes := []int{}
 
 				for statementIndex, statement := range statements {
-					if slices.Contains(selectedView.columns, statement.Col) {
+					if slices.Contains(selectedView.Columns, statement.Col) {
 						selectedStatementIndexes = append(selectedStatementIndexes, statementIndex)
 						continue
 					}
 					if len(statement.From) > 0 {
 						isIncluded := true
 						for _, betweenStatement := range statement.From {
-							if !slices.Contains(selectedView.columns, betweenStatement.Col) {
+							if !slices.Contains(selectedView.Columns, betweenStatement.Col) {
 								isIncluded = false
 								break
 							}
@@ -991,7 +957,7 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 		if len(whereStatements) == 0 {
 			// A view that cannot bind the predicates would otherwise yield zero bound statements,
 			// which reads as an empty result set instead of a planning failure.
-			return nil, fmt.Errorf(`view "%v" cannot serve this query's predicates`, e.sourceView.name)
+			return nil, fmt.Errorf(`view "%v" cannot serve this query's predicates`, e.sourceView.Name)
 		}
 	case selectRouteKeyConcatenated:
 		rewrittenStatements, canRewrite := buildKeyConcatenatedStatements(statements, scyllaTable)
@@ -1035,7 +1001,7 @@ func (e *SelectStatement) Compute(tableInfo *TableInfo, scyllaTable ScyllaTable)
 			orderColumnName = groupByPlan.OrderColumn.GetName()
 		}
 	}
-	if err := rejectComputedStatements(scyllaTable, remainingStatements); err != nil {
+	if err := scyllaTable.RejectComputedStatements(remainingStatements); err != nil {
 		return nil, err
 	}
 

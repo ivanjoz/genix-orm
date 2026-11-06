@@ -1,27 +1,25 @@
-package scylla
+package db
 
 import (
 	"fmt"
 	"reflect"
 	"slices"
 	"unsafe"
-
-	"github.com/ivanjoz/genix-orm/db"
 )
 
-// computedColumnInfo is one TableSchema.Computed column: fromIdx are the stored columns it is
+// ComputedColumnInfo is one TableSchema.Computed column: FromIdx are the stored columns it is
 // derived from, so an update that writes any of them rehashes its index groups.
-type computedColumnInfo struct {
-	column  IColInfo
-	fromIdx []int16
+type ComputedColumnInfo struct {
+	Column  IColInfo
+	FromIdx []int16
 }
 
-// configureComputedColumns binds the table-struct columns that have no record field
+// ConfigureComputedColumns binds the table-struct columns that have no record field
 // (pendingColumns, by name) to their TableSchema.Computed declaration. The column goes into
 // ColumnsMap, where the index groups and the query planner find it by name, but never into
 // Columns, so no insert, update, select or deploy sees it.
-func configureComputedColumns(dbTable *ScyllaTable, schema TableSchema, structRefValue reflect.Value,
-	pendingColumns map[string]columnInfo,
+func (dbTable *TableCore) ConfigureComputedColumns(schema TableSchema, structRefValue reflect.Value,
+	pendingColumns map[string]ColumnInfo,
 ) {
 	fail := func(format string, args ...any) {
 		panic(fmt.Sprintf(`Table "%v": `+format, append([]any{dbTable.Name}, args...)...))
@@ -41,13 +39,13 @@ func configureComputedColumns(dbTable *ScyllaTable, schema TableSchema, structRe
 		delete(pendingColumns, columnName)
 
 		if computed.Value == nil {
-			fail(`Computed column "%v" needs a Value: db.Compute((*Record).Method)`, columnName)
+			fail(`Computed column "%v" needs a Value: Compute((*Record).Method)`, columnName)
 		}
 		if recordType != nil && computed.Value.RecordType != recordType {
 			fail(`Computed column "%v" reads a method of %v, the table's record is %v`,
 				columnName, computed.Value.RecordType, recordType)
 		}
-		if valueType := db.GetColTypeByGoType(computed.Value.ValueType); valueType.Type != column.Type {
+		if valueType := GetColTypeByGoType(computed.Value.ValueType); valueType.Type != column.Type {
 			fail(`Computed column "%v" is declared as %v but its method returns %v`,
 				columnName, column.FieldType, computed.Value.ValueType)
 		}
@@ -81,21 +79,21 @@ func configureComputedColumns(dbTable *ScyllaTable, schema TableSchema, structRe
 
 		computedColumn := &column
 		dbTable.ColumnsMap[columnName] = computedColumn
-		dbTable.computedColumns = append(dbTable.computedColumns, computedColumnInfo{column: computedColumn, fromIdx: fromIdx})
+		dbTable.ComputedColumns = append(dbTable.ComputedColumns, ComputedColumnInfo{Column: computedColumn, FromIdx: fromIdx})
 	}
 
 	for columnName := range pendingColumns {
 		fail(`column "%v" has no field in the record struct. Add the field, or declare it in Computed`, columnName)
 	}
 
-	rejectComputedColumnUses(dbTable, schema)
+	dbTable.rejectComputedColumnUses(schema)
 }
 
 // rejectComputedColumnUses fails the compile when a computed column is named anywhere that needs it
 // stored. A multi-column TypeCacheGroup is the one use allowed: it stores hashes computed from the
 // record in memory. A single-column group indexes the column itself.
-func rejectComputedColumnUses(dbTable *ScyllaTable, schema TableSchema) {
-	if len(dbTable.computedColumns) == 0 {
+func (dbTable *TableCore) rejectComputedColumnUses(schema TableSchema) {
+	if len(dbTable.ComputedColumns) == 0 {
 		return
 	}
 	storedUses := []Coln{schema.Partition, schema.SequenceColumn, schema.CounterColumn, schema.SequencePartCol,
@@ -133,43 +131,43 @@ func rejectComputedColumnUses(dbTable *ScyllaTable, schema TableSchema) {
 	}
 }
 
-// includeComputedColumns adds to an update's included columns every computed column whose From
+// IncludeComputedColumns adds to an update's included columns every computed column whose From
 // columns the update writes, so the index groups hashed from it are rewritten too.
-func includeComputedColumns(scyllaTable *ScyllaTable, columnsIncluded []int16) []int16 {
-	for _, computed := range scyllaTable.computedColumns {
-		if slices.ContainsFunc(computed.fromIdx, func(idx int16) bool { return slices.Contains(columnsIncluded, idx) }) {
-			columnsIncluded = append(columnsIncluded, computed.column.GetInfo().Idx)
+func (core *TableCore) IncludeComputedColumns(columnsIncluded []int16) []int16 {
+	for _, computed := range core.ComputedColumns {
+		if slices.ContainsFunc(computed.FromIdx, func(idx int16) bool { return slices.Contains(columnsIncluded, idx) }) {
+			columnsIncluded = append(columnsIncluded, computed.Column.GetInfo().Idx)
 		}
 	}
 	return columnsIncluded
 }
 
-// storedColumnsOf is what has to be read from the table to know a column's value: the column itself,
+// StoredColumnsOf is what has to be read from the table to know a column's value: the column itself,
 // or the From columns of a computed one.
-func storedColumnsOf(scyllaTable *ScyllaTable, column IColInfo) []IColInfo {
+func (core *TableCore) StoredColumnsOf(column IColInfo) []IColInfo {
 	if !column.GetInfo().IsComputed {
 		return []IColInfo{column}
 	}
-	for _, computed := range scyllaTable.computedColumns {
-		if computed.column.GetName() != column.GetName() {
+	for _, computed := range core.ComputedColumns {
+		if computed.Column.GetName() != column.GetName() {
 			continue
 		}
-		storedColumns := make([]IColInfo, 0, len(computed.fromIdx))
-		for _, fromIdx := range computed.fromIdx {
-			storedColumns = append(storedColumns, scyllaTable.ColumnsIdxMap[fromIdx])
+		storedColumns := make([]IColInfo, 0, len(computed.FromIdx))
+		for _, fromIdx := range computed.FromIdx {
+			storedColumns = append(storedColumns, core.ColumnsIdxMap[fromIdx])
 		}
 		return storedColumns
 	}
 	return nil
 }
 
-// rejectComputedStatements fails a query whose predicates on a computed column were not taken by an
+// RejectComputedStatements fails a query whose predicates on a computed column were not taken by an
 // index group: there is no stored column for a WHERE to filter.
-func rejectComputedStatements(scyllaTable ScyllaTable, remainingStatements []ColumnStatement) error {
+func (core *TableCore) RejectComputedStatements(remainingStatements []ColumnStatement) error {
 	for _, statement := range remainingStatements {
-		if column := scyllaTable.ColumnsMap[statement.Col]; column != nil && !column.IsNil() && column.GetInfo().IsComputed {
+		if column := core.ColumnsMap[statement.Col]; column != nil && !column.IsNil() && column.GetInfo().IsComputed {
 			return fmt.Errorf(`table "%v": computed column "%v" can only be queried through a TypeCacheGroup that names it, with every Key of that index`,
-				scyllaTable.Name, statement.Col)
+				core.Name, statement.Col)
 		}
 	}
 	return nil

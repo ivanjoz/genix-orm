@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,5 +92,17 @@ func DecodeRecordSnapshot(content []byte) (RecordSnapshot, error) {
 //
 //	cache-group/<table>/<partition>/<index id>/<group hash>.cb
 func CacheGroupSnapshotKey(tableName string, partition int64, indexID int16, groupHash int32) string {
-	return fmt.Sprintf("cache-group/%s/%d/%d/%d.cb", tableName, partition, indexID, groupHash)
+	return fmt.Sprintf("%s%s/%d/%d/%d.cb", cacheGroupSnapshotKeyPrefix, tableName, partition, indexID, groupHash)
+}
+
+const (
+	cacheGroupSnapshotKeyPrefix = "cache-group/"
+	deltaSnapshotKeyPrefix      = "delta-snapshot/"
+)
+
+// IsRecordSnapshotKey says the key is a snapshot file (DeltaSnapshotKey, CacheGroupSnapshotKey):
+// a cache of a database read, which a store may keep anywhere or drop at any time. Every other key
+// — the delta logs, the by-IDs slot files — is part of the sync protocol and must be durable.
+func IsRecordSnapshotKey(key string) bool {
+	return strings.HasPrefix(key, deltaSnapshotKeyPrefix) || strings.HasPrefix(key, cacheGroupSnapshotKeyPrefix)
 }

@@ -2,6 +2,7 @@ package scylla
 
 import (
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"runtime"
 	"testing"
 	"unsafe"
@@ -568,10 +569,12 @@ func TestMapMemoryOverhead(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		view := &viewInfo{
-			name: fmt.Sprintf("index_%d", i),
-			Type: 1,
+			IndexSource: &db.IndexSource{
+				Name: fmt.Sprintf("index_%d", i),
+				Type: 1,
+			},
 		}
-		stringToViewInfo[view.name] = view
+		stringToViewInfo[view.Name] = view
 	}
 
 	runtime.GC()

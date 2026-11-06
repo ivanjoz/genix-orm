@@ -210,8 +210,8 @@ func TestPartitionOverrideMovesViewPartition(t *testing.T) {
 	if compiledStatement.sourceView == nil {
 		t.Fatal("expected the compiled statement to keep the selected view")
 	}
-	if !slices.Equal(compiledStatement.sourceView.columns, []string{"id"}) {
-		t.Fatalf("expected the view to be keyed by id alone, got %v", compiledStatement.sourceView.columns)
+	if !slices.Equal(compiledStatement.sourceView.Columns, []string{"id"}) {
+		t.Fatalf("expected the view to be keyed by id alone, got %v", compiledStatement.sourceView.Columns)
 	}
 	if !strings.Contains(compiledStatement.queryTemplate, "FROM genix_test.relocated_partition_records__id_view") {
 		t.Fatalf("expected query to target the id view, got %q", compiledStatement.queryTemplate)

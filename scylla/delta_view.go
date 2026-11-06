@@ -3,7 +3,6 @@ package scylla
 import (
 	"cmp"
 	"fmt"
-	"math/bits"
 	"reflect"
 	"slices"
 	"strings"
@@ -47,42 +46,10 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
-	// deltaUpdatedSlotBits holds a positive int32 SUnixTime, the trailing slot of the packed key.
-	deltaUpdatedSlotBits = 31
 	// deltaViewGCGraceSeconds is low because every update moves the view row (its key holds
 	// updated): a resurrected stale row only fails a window hash, which resends the prefix.
 	deltaViewGCGraceSeconds = 86400
 )
-
-// deltaIndexInfo is one compiled TypeDelta index.
-type deltaIndexInfo struct {
-	// tag names the index: its Keys' column names joined by "_", "all" when keyless. It names the
-	// view and the index's rows in the moves table.
-	tag string
-	// pinned are every declared Key, in order: each is a slot of the packed key, so one combination of
-	// their values (a prefix) is one contiguous span ordered by updated. A read names the value of
-	// each, or fans out over its FixedValues (resolveDeltaPrefixes).
-	pinned         []IColInfo
-	pinnedSlotBits []int64
-	// packedColumn packs the pinned values and updated (updated alone on a keyless index): the
-	// view's clustering key.
-	packedColumn *columnInfo
-	viewName     string
-	// replaceThreshold is how many changed or moved records a sync answers before it answers a replace.
-	replaceThreshold int
-}
-
-func (deltaIndex deltaIndexInfo) slotBits() []int64 {
-	return append(slices.Clone(deltaIndex.pinnedSlotBits), deltaUpdatedSlotBits)
-}
-
-// packedKeyValue is the stored value of the packed column for pinned values and an updated.
-func (deltaIndex deltaIndexInfo) packedKeyValue(tableName string, pinnedValues []int64, updated int64) int64 {
-	sourceColumns := append(slices.Clone(deltaIndex.pinned), deltaIndex.packedColumn)
-	packed := packRowValues(tableName, deltaIndex.packedColumn.GetName(), sourceColumns,
-		append(slices.Clone(pinnedValues), updated), deltaIndex.slotBits())
-	return storeVirtualPacked(packed, false).(int64)
-}
 
 /* Compile */
 
@@ -109,7 +76,7 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 	if replaceThreshold <= 0 {
 		replaceThreshold = cache.DefaultDeltaReplaceThreshold
 	}
-	deltaIndex := deltaIndexInfo{tag: "all", replaceThreshold: replaceThreshold}
+	deltaIndex := db.DeltaIndexInfo{Tag: "all", ReplaceThreshold: replaceThreshold}
 
 	declaredColumns := make([]IColInfo, 0, len(indexCfg.Keys))
 	declaredKeyNames := make([]string, 0, len(indexCfg.Keys))
@@ -119,7 +86,7 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 			panic(fmt.Sprintf(`Table "%v": TypeDelta column "%v" was not found`, dbTable.Name, declaredKey.GetInfo().Name))
 		}
 		if column.GetType().IsComplexType || column.GetType().IsSlice ||
-			!isSupportedPackedIndexNumericFieldType(column.GetType().FieldType) {
+			!db.IsSupportedPackedIndexNumericFieldType(column.GetType().FieldType) {
 			panic(fmt.Sprintf(`Table "%v": TypeDelta key "%v" must be a scalar integer. Found: %v`,
 				dbTable.Name, column.GetName(), column.GetType().FieldType))
 		}
@@ -130,16 +97,16 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 		declaredKeyNames = append(declaredKeyNames, column.GetName())
 	}
 	if len(declaredColumns) > 0 {
-		deltaIndex.tag = strings.Join(declaredKeyNames, "_")
-		deltaIndex.pinned = declaredColumns
+		deltaIndex.Tag = strings.Join(declaredKeyNames, "_")
+		deltaIndex.Pinned = declaredColumns
 	}
-	deltaIndex.viewName = fmt.Sprintf("%v__dlt_%v_view", dbTable.Name, deltaIndex.tag)
+	deltaIndex.ViewName = fmt.Sprintf("%v__dlt_%v_view", dbTable.Name, deltaIndex.Tag)
 
 	// A keyless index packs updated alone: every delta view keys on one packed column.
-	deltaIndex.pinnedSlotBits = planDeltaPinnedSlots(dbTable, deltaIndex.pinned, indexCfg)
+	deltaIndex.PinnedSlotBits = dbTable.PlanDeltaPinnedSlots(deltaIndex.Pinned, indexCfg)
 	packedColumnSuffix := managedUpdatedColumnName
-	if len(deltaIndex.pinned) > 0 {
-		packedColumnSuffix = deltaIndex.tag
+	if len(deltaIndex.Pinned) > 0 {
+		packedColumnSuffix = deltaIndex.Tag
 	}
 	packedColumn := &columnInfo{
 		ColInfo: colInfo{IsVirtual: true, Idx: dbTable.MaxColIdx},
@@ -148,88 +115,61 @@ func compileSchemaDeltaView(dbTable *ScyllaTable, indexCfg Index) {
 	packedColumn.GetInfo().Name = "zz_dlt_" + packedColumnSuffix
 	dbTable.MaxColIdx++
 	dbTable.ColumnsMap[packedColumn.GetName()] = packedColumn
-	deltaIndex.packedColumn = packedColumn
+	deltaIndex.PackedColumn = packedColumn
 
 	// An insert carries every pinned value on the record, so this is exact there. An update binds
 	// the value stampDeltaWrites computed from the stored pinned values instead (managedWriteValues).
 	tableName, updatedColumn, compiledIndex := dbTable.Name, dbTable.UpdatedCol, deltaIndex
 	packedColumn.GetValueFn = func(recordPointer unsafe.Pointer) any {
-		pinnedValues := make([]int64, len(compiledIndex.pinned))
-		for i, pinnedColumn := range compiledIndex.pinned {
-			pinnedValues[i] = convertToInt64(pinnedColumn.GetValue(recordPointer))
+		pinnedValues := make([]int64, len(compiledIndex.Pinned))
+		for i, pinnedColumn := range compiledIndex.Pinned {
+			pinnedValues[i] = db.ConvertToInt64(pinnedColumn.GetValue(recordPointer))
 		}
-		return compiledIndex.packedKeyValue(tableName, pinnedValues, convertToInt64(updatedColumn.GetValue(recordPointer)))
+		return deltaPackedStoredValue(compiledIndex, tableName, pinnedValues, db.ConvertToInt64(updatedColumn.GetValue(recordPointer)))
 	}
 
-	for _, registered := range dbTable.deltaIndexes {
-		if registered.viewName == deltaIndex.viewName {
-			panic(fmt.Sprintf(`Table "%v": two TypeDelta indexes declare the same Keys (%v)`, dbTable.Name, deltaIndex.tag))
+	for _, registered := range dbTable.DeltaIndexes {
+		if registered.ViewName == deltaIndex.ViewName {
+			panic(fmt.Sprintf(`Table "%v": two TypeDelta indexes declare the same Keys (%v)`, dbTable.Name, deltaIndex.Tag))
 		}
 	}
-	dbTable.deltaIndexes = append(dbTable.deltaIndexes, deltaIndex)
-	dbTable.views[deltaIndex.viewName] = makeDeltaViewInfo(dbTable, deltaIndex)
+	dbTable.DeltaIndexes = append(dbTable.DeltaIndexes, deltaIndex)
+	dbTable.views[deltaIndex.ViewName] = makeDeltaViewInfo(dbTable, deltaIndex)
 	if ShouldLog() {
-		fmt.Printf("Delta index registered: table=%s view=%s pinnedSlotBits=%v\n", dbTable.Name, deltaIndex.viewName, deltaIndex.pinnedSlotBits)
+		fmt.Printf("Delta index registered: table=%s view=%s pinnedSlotBits=%v\n", dbTable.Name, deltaIndex.ViewName, deltaIndex.PinnedSlotBits)
 	}
-}
-
-// planDeltaPinnedSlots sizes each pinned column's slot: an explicit Size(), else its FixedValues
-// range. One pinned column with neither takes every bit the others and updated leave of the bigint.
-func planDeltaPinnedSlots(dbTable *ScyllaTable, pinned []IColInfo, indexCfg Index) []int64 {
-	slotBits := make([]int64, len(pinned))
-	elasticIndex := -1
-	for i, pinnedColumn := range pinned {
-		if declaredBits := int64(indexCfg.Keys[i].GetInfo().SlotBits); declaredBits > 0 {
-			slotBits[i] = declaredBits
-		} else if valueRange, isDeclared := dbTable.fixedValueRanges[pinnedColumn.GetName()]; isDeclared {
-			slotBits[i] = max(1, int64(bits.Len64(uint64(valueRange.maxValue))))
-		} else if elasticIndex >= 0 {
-			panic(fmt.Sprintf(`Table "%v": TypeDelta pinned keys "%v" and "%v" both lack a FixedValues entry and a Size; only one can take the remaining bits`,
-				dbTable.Name, pinned[elasticIndex].GetName(), pinnedColumn.GetName()))
-		} else {
-			elasticIndex = i
-		}
-	}
-	remainingBits := packedVirtualInt64Bits - deltaUpdatedSlotBits - sumSlotBits(slotBits, 0)
-	if elasticIndex >= 0 {
-		slotBits[elasticIndex] = remainingBits
-		remainingBits = 0
-	}
-	if remainingBits < 0 || (elasticIndex >= 0 && slotBits[elasticIndex] < 1) {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta pinned keys take more than the %v bits a bigint leaves beside updated. Narrow a FixedValues range.`,
-			dbTable.Name, packedVirtualInt64Bits-deltaUpdatedSlotBits))
-	}
-	return slotBits
 }
 
 // makeDeltaViewInfo registers an index's view in the query planner as a range view on
 // [partition, pinned…, updated]: an equality on the pinned values is one span of the packed column,
 // and an updated range narrows it.
-func makeDeltaViewInfo(dbTable *ScyllaTable, deltaIndex deltaIndexInfo) *viewInfo {
+func makeDeltaViewInfo(dbTable *ScyllaTable, deltaIndex db.DeltaIndexInfo) *viewInfo {
 	partitionColumn := dbTable.GetPartKey()
-	sourceColumns := append(slices.Clone(deltaIndex.pinned), dbTable.UpdatedCol)
+	sourceColumns := append(slices.Clone(deltaIndex.Pinned), dbTable.UpdatedCol)
 	sourceNames := make([]string, len(sourceColumns))
 	for i, sourceColumn := range sourceColumns {
 		sourceNames[i] = sourceColumn.GetName()
 	}
 	view := &viewInfo{
-		Type:                    8,
-		isDeltaView:             true,
-		name:                    deltaIndex.viewName,
-		column:                  deltaIndex.packedColumn,
-		columns:                 append([]string{partitionColumn.GetName()}, sourceNames...),
-		columnsNoPart:           sourceNames,
-		packedSourceColumns:     sourceColumns,
-		packedSlotBitsPerColumn: deltaIndex.slotBits(),
+		IndexSource: &db.IndexSource{
+			Type:                    8,
+			IsDeltaView:             true,
+			Name:                    deltaIndex.ViewName,
+			Column:                  deltaIndex.PackedColumn,
+			Columns:                 append([]string{partitionColumn.GetName()}, sourceNames...),
+			ColumnsNoPart:           sourceNames,
+			PackedSourceColumns:     sourceColumns,
+			PackedSlotBitsPerColumn: deltaIndex.SlotBits(),
+		},
 	}
-	compilePackedRangeAccessors(view, sourceColumns, deltaIndex.slotBits(), false, partitionColumn)
+	compilePackedRangeAccessors(view, sourceColumns, deltaIndex.SlotBits(), false, partitionColumn)
 
 	storedColumns := deltaViewStoredColumns(dbTable)
 	for _, storedColumn := range storedColumns {
-		view.availableColumns = append(view.availableColumns, storedColumn.GetName())
+		view.AvailableColumns = append(view.AvailableColumns, storedColumn.GetName())
 	}
 	view.getExpectedColumns = func() []viewExpectedColumn {
-		return makeViewExpectedColumns(append(slices.Clone(storedColumns), deltaIndex.packedColumn))
+		return makeViewExpectedColumns(append(slices.Clone(storedColumns), deltaIndex.PackedColumn))
 	}
 	view.getCreateScript = func() string { return deltaViewCreateScript(*dbTable, deltaIndex, storedColumns) }
 	return view
@@ -250,9 +190,9 @@ func deltaViewStoredColumns(dbTable *ScyllaTable) []IColInfo {
 
 // deltaViewCreateScript is the CREATE of an index's view. The view is ordered newest first: a sync
 // reads the recent end of its prefix.
-func deltaViewCreateScript(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, storedColumns []IColInfo) string {
+func deltaViewCreateScript(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, storedColumns []IColInfo) string {
 	partitionName, keyName := scyllaTable.GetPartKey().GetName(), scyllaTable.Keys[0].GetName()
-	packedName := deltaIndex.packedColumn.GetName()
+	packedName := deltaIndex.PackedColumn.GetName()
 	selectNames := []string{packedName}
 	for _, storedColumn := range storedColumns {
 		selectNames = append(selectNames, storedColumn.GetName())
@@ -263,7 +203,7 @@ func deltaViewCreateScript(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, s
 		PRIMARY KEY ((%v), %v, %v)
 		WITH CLUSTERING ORDER BY (%v DESC, %v ASC)
 		AND gc_grace_seconds = %d;`,
-		resolveKeyspace(scyllaTable), deltaIndex.viewName, strings.Join(selectNames, ", "), scyllaTable.GetFullName(),
+		resolveKeyspace(scyllaTable), deltaIndex.ViewName, strings.Join(selectNames, ", "), scyllaTable.GetFullName(),
 		partitionName, packedName, keyName,
 		partitionName, packedName, keyName,
 		packedName, keyName, deltaViewGCGraceSeconds)
@@ -273,7 +213,7 @@ func deltaMovesTableName(scyllaTable ScyllaTable) string { return scyllaTable.Na
 
 // hasDeltaMoves reports whether any TypeDelta index pins a column, so its records can move.
 func hasDeltaMoves(scyllaTable ScyllaTable) bool {
-	return slices.ContainsFunc(scyllaTable.deltaIndexes, func(deltaIndex deltaIndexInfo) bool { return len(deltaIndex.pinned) > 0 })
+	return slices.ContainsFunc(scyllaTable.DeltaIndexes, func(deltaIndex db.DeltaIndexInfo) bool { return len(deltaIndex.Pinned) > 0 })
 }
 
 // deltaMovesCreateScript is the CREATE of the moves table: one row per record that left a pinned
@@ -309,8 +249,8 @@ type deltaMove struct {
 // deltaPinnedColumns are the columns whose stored value a write needs: every pinned column.
 func deltaPinnedColumns(scyllaTable ScyllaTable) []IColInfo {
 	pinnedColumns := []IColInfo{}
-	for _, deltaIndex := range scyllaTable.deltaIndexes {
-		for _, pinnedColumn := range deltaIndex.pinned {
+	for _, deltaIndex := range scyllaTable.DeltaIndexes {
+		for _, pinnedColumn := range deltaIndex.Pinned {
 			if !slices.ContainsFunc(pinnedColumns, func(column IColInfo) bool { return column.GetName() == pinnedColumn.GetName() }) {
 				pinnedColumns = append(pinnedColumns, pinnedColumn)
 			}
@@ -330,14 +270,14 @@ type storedRows map[[2]int64]map[string]any
 // final (after handlePreInsert).
 func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (storedRows, error) {
 	var columns []IColInfo
-	if len(scyllaTable.deltaIndexes) > 0 {
+	if len(scyllaTable.DeltaIndexes) > 0 {
 		columns = append(columns, scyllaTable.VersionCol)
 		columns = append(columns, deltaPinnedColumns(scyllaTable)...)
 	}
 	if scyllaTable.dataFrames != nil {
 		columns = append(columns, scyllaTable.dataFrames.storedColumns...)
 	}
-	if len(scyllaTable.indexGroups) > 0 && scyllaTable.indexUpdatedTable != nil {
+	if len(scyllaTable.IndexGroups) > 0 && scyllaTable.indexUpdatedTable != nil {
 		columns = append(columns, indexGroupStoredColumns(&scyllaTable)...)
 	}
 	if len(columns) == 0 {
@@ -348,8 +288,8 @@ func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (stored
 	for _, phase := range phases {
 		for i := range phase.records.len() {
 			recordPointer := phase.records.at(i)
-			partition := convertToInt64(partitionColumn.GetRawValue(recordPointer))
-			idsOfPartition[partition] = append(idsOfPartition[partition], convertToInt64(keyColumn.GetRawValue(recordPointer)))
+			partition := db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer))
+			idsOfPartition[partition] = append(idsOfPartition[partition], db.ConvertToInt64(keyColumn.GetRawValue(recordPointer)))
 		}
 	}
 	return readStoredRows(scyllaTable, idsOfPartition, columns)
@@ -359,7 +299,7 @@ func readStoredWrittenRows(scyllaTable ScyllaTable, phases []writePhase) (stored
 // packed column values its CQL binds (by column name, one per record), and the moves to write once
 // the rows landed.
 func stampDeltaWrites(scyllaTable ScyllaTable, phases []writePhase, stored storedRows) ([]map[string][]any, []deltaMove) {
-	if len(scyllaTable.deltaIndexes) == 0 {
+	if len(scyllaTable.DeltaIndexes) == 0 {
 		return make([]map[string][]any, len(phases)), nil
 	}
 	partitionColumn, keyColumn := scyllaTable.GetPartKey(), scyllaTable.Keys[0]
@@ -375,9 +315,9 @@ func stampDeltaWrites(scyllaTable ScyllaTable, phases []writePhase, stored store
 		packedValuesByPhase[phaseIndex] = map[string][]any{}
 		for i := range phase.records.len() {
 			recordPointer := phase.records.at(i)
-			partition := convertToInt64(partitionColumn.GetRawValue(recordPointer))
-			recordID := convertToInt64(keyColumn.GetRawValue(recordPointer))
-			updated := convertToInt64(scyllaTable.UpdatedCol.GetValue(recordPointer))
+			partition := db.ConvertToInt64(partitionColumn.GetRawValue(recordPointer))
+			recordID := db.ConvertToInt64(keyColumn.GetRawValue(recordPointer))
+			updated := db.ConvertToInt64(scyllaTable.UpdatedCol.GetValue(recordPointer))
 			storedRow, isStored := stored[[2]int64{partition, recordID}]
 			version := cache.NextVersion(storedIntegerOf(storedRow, managedVersionColumnName))
 			scyllaTable.VersionCol.SetValue(recordPointer, coerceManagedIntegerValue(scyllaTable.VersionCol, version))
@@ -386,27 +326,27 @@ func stampDeltaWrites(scyllaTable ScyllaTable, phases []writePhase, stored store
 			finalValues := map[string]int64{}
 			for _, column := range pinnedColumns {
 				if isWritten[column.GetName()] || !isStored {
-					finalValues[column.GetName()] = convertToInt64(column.GetRawValue(recordPointer))
+					finalValues[column.GetName()] = db.ConvertToInt64(column.GetRawValue(recordPointer))
 				} else {
 					finalValues[column.GetName()] = storedIntegerOf(storedRow, column.GetName())
 				}
 			}
-			for _, deltaIndex := range scyllaTable.deltaIndexes {
-				finalPinned := pinnedValuesOf(deltaIndex, finalValues)
-				columnName := deltaIndex.packedColumn.GetName()
+			for _, deltaIndex := range scyllaTable.DeltaIndexes {
+				finalPinned := deltaIndex.PinnedValuesOf(finalValues)
+				columnName := deltaIndex.PackedColumn.GetName()
 				packedValuesByPhase[phaseIndex][columnName] = append(packedValuesByPhase[phaseIndex][columnName],
-					deltaIndex.packedKeyValue(scyllaTable.Name, finalPinned, updated))
+					deltaPackedStoredValue(deltaIndex, scyllaTable.Name, finalPinned, updated))
 				if !isStored {
 					continue
 				}
-				storedPinned := make([]int64, len(deltaIndex.pinned))
-				for pinnedIndex, pinnedColumn := range deltaIndex.pinned {
+				storedPinned := make([]int64, len(deltaIndex.Pinned))
+				for pinnedIndex, pinnedColumn := range deltaIndex.Pinned {
 					storedPinned[pinnedIndex] = storedIntegerOf(storedRow, pinnedColumn.GetName())
 				}
 				if !slices.Equal(storedPinned, finalPinned) {
 					moves = append(moves, deltaMove{
-						partition: partition, recordID: recordID, updated: updated, indexTag: deltaIndex.tag,
-						pinnedPrefix: deltaIndex.packedKeyValue(scyllaTable.Name, storedPinned, 0),
+						partition: partition, recordID: recordID, updated: updated, indexTag: deltaIndex.Tag,
+						pinnedPrefix: deltaPackedStoredValue(deltaIndex, scyllaTable.Name, storedPinned, 0),
 					})
 				}
 			}
@@ -415,18 +355,10 @@ func stampDeltaWrites(scyllaTable ScyllaTable, phases []writePhase, stored store
 	return packedValuesByPhase, moves
 }
 
-func pinnedValuesOf(deltaIndex deltaIndexInfo, valuesByColumn map[string]int64) []int64 {
-	pinnedValues := make([]int64, len(deltaIndex.pinned))
-	for i, pinnedColumn := range deltaIndex.pinned {
-		pinnedValues[i] = valuesByColumn[pinnedColumn.GetName()]
-	}
-	return pinnedValues
-}
-
 // storedIntegerOf is an integer column of a stored row: 0 for a null column or a record not stored.
 func storedIntegerOf(storedRow map[string]any, columnName string) int64 {
 	if storedValue, isSet := storedRow[columnName]; isSet {
-		return convertToInt64(storedValue)
+		return db.ConvertToInt64(storedValue)
 	}
 	return 0
 }
@@ -460,7 +392,7 @@ func readStoredRows(scyllaTable ScyllaTable, idsOfPartition map[int64][]int64, c
 						storedRow[columnName] = storedValue
 					}
 				}
-				stored[[2]int64{partition, convertToInt64(row[columnNames[0]])}] = storedRow
+				stored[[2]int64{partition, db.ConvertToInt64(row[columnNames[0]])}] = storedRow
 			}
 			return iterator.Close()
 		})
@@ -497,22 +429,22 @@ func writeDeltaMoves(scyllaTable ScyllaTable, moves []deltaMove) error {
 // value its FixedValues enumerates; their combinations are the prefixes. ok is false when a column
 // has none of them, or when the enumerated fan-out passes maxFixedValueFanoutQueries.
 // equalityCount is how many pinned columns the query's own equalities fixed.
-func resolveDeltaPrefixes(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, equalityValues map[string]any, deltaValues []int64) (prefixes [][]int64, equalityCount int, ok bool) {
-	if len(deltaValues) > 0 && len(deltaIndex.pinned) == 0 {
+func resolveDeltaPrefixes(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, equalityValues map[string]any, deltaValues []int64) (prefixes [][]int64, equalityCount int, ok bool) {
+	if len(deltaValues) > 0 && len(deltaIndex.Pinned) == 0 {
 		return nil, 0, false // a keyless index has no column for the values to name
 	}
 	prefixes = [][]int64{{}}
 	enumeratedQueries := 1
-	for pinnedIndex, pinnedColumn := range deltaIndex.pinned {
+	for pinnedIndex, pinnedColumn := range deltaIndex.Pinned {
 		var columnValues []int64
-		isLastPinned := pinnedIndex == len(deltaIndex.pinned)-1
+		isLastPinned := pinnedIndex == len(deltaIndex.Pinned)-1
 		if equalityValue, hasEquality := equalityValues[pinnedColumn.GetName()]; hasEquality {
-			columnValues = []int64{convertToInt64(equalityValue)}
+			columnValues = []int64{db.ConvertToInt64(equalityValue)}
 			equalityCount++
 		} else if isLastPinned && len(deltaValues) > 0 {
 			columnValues = deltaValues
-		} else if valueRange, isDeclared := scyllaTable.fixedValueRanges[pinnedColumn.GetName()]; isDeclared && len(valueRange.declaredValues) > 0 {
-			columnValues = valueRange.declaredValues
+		} else if valueRange, isDeclared := scyllaTable.FixedValueRanges[pinnedColumn.GetName()]; isDeclared && len(valueRange.DeclaredValues) > 0 {
+			columnValues = valueRange.DeclaredValues
 			enumeratedQueries *= len(columnValues)
 		} else {
 			return nil, 0, false
@@ -533,11 +465,11 @@ func resolveDeltaPrefixes(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, eq
 
 // selectDeltaIndex picks the TypeDelta index a Delta() read runs on: of those whose prefixes
 // resolve, the one the query's equalities fix most, then the one with fewest prefixes.
-func selectDeltaIndex(scyllaTable ScyllaTable, equalityValues map[string]any, deltaValues []int64) (deltaIndexInfo, [][]int64, error) {
+func selectDeltaIndex(scyllaTable ScyllaTable, equalityValues map[string]any, deltaValues []int64) (db.DeltaIndexInfo, [][]int64, error) {
 	selectedPosition, isAmbiguous := -1, false
 	var selectedPrefixes [][]int64
 	selectedEqualityCount := -1
-	for position, deltaIndex := range scyllaTable.deltaIndexes {
+	for position, deltaIndex := range scyllaTable.DeltaIndexes {
 		prefixes, equalityCount, ok := resolveDeltaPrefixes(scyllaTable, deltaIndex, equalityValues, deltaValues)
 		if !ok {
 			continue
@@ -551,13 +483,13 @@ func selectDeltaIndex(scyllaTable ScyllaTable, equalityValues map[string]any, de
 		}
 	}
 	if selectedPosition < 0 {
-		return deltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() found no TypeDelta index whose Keys all resolve: each needs an equality, the Delta() values (the last one), or an enumerable FixedValues (at most %d queries)`,
+		return db.DeltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() found no TypeDelta index whose Keys all resolve: each needs an equality, the Delta() values (the last one), or an enumerable FixedValues (at most %d queries)`,
 			scyllaTable.Name, maxFixedValueFanoutQueries)
 	}
 	if isAmbiguous {
-		return deltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() fits several TypeDelta indexes equally: pin one more Keys column, or drop an index`, scyllaTable.Name)
+		return db.DeltaIndexInfo{}, nil, fmt.Errorf(`table %q: Delta() fits several TypeDelta indexes equally: pin one more Keys column, or drop an index`, scyllaTable.Name)
 	}
-	return scyllaTable.deltaIndexes[selectedPosition], selectedPrefixes, nil
+	return scyllaTable.DeltaIndexes[selectedPosition], selectedPrefixes, nil
 }
 
 // deltaViewRow is the (ID, updated, version) of one row of a delta view.
@@ -568,17 +500,17 @@ type deltaViewRow struct {
 }
 
 // deltaViewUpdatedMax is the highest updated a view slot holds: an upper bound meaning "up to now".
-var deltaViewUpdatedMax = int64(db.SlotMaxValue(deltaUpdatedSlotBits))
+var deltaViewUpdatedMax = int64(db.SlotMaxValue(db.DeltaUpdatedSlotBits))
 
 // deltaViewRange is the WHERE of a prefix's view rows with updated in [fromUpdated, toUpdated]: one
 // span of the packed column, read newest first.
-func deltaViewRange(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partition int64, pinnedValues []int64, fromUpdated, toUpdated int64) (string, []any) {
-	packedName := deltaIndex.packedColumn.GetName()
+func deltaViewRange(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, pinnedValues []int64, fromUpdated, toUpdated int64) (string, []any) {
+	packedName := deltaIndex.PackedColumn.GetName()
 	return fmt.Sprintf("%v = ? AND %v >= ? AND %v <= ?", scyllaTable.GetPartKey().GetName(), packedName, packedName),
 		[]any{
 			coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition),
-			deltaIndex.packedKeyValue(scyllaTable.Name, pinnedValues, fromUpdated),
-			deltaIndex.packedKeyValue(scyllaTable.Name, pinnedValues, toUpdated),
+			deltaPackedStoredValue(deltaIndex, scyllaTable.Name, pinnedValues, fromUpdated),
+			deltaPackedStoredValue(deltaIndex, scyllaTable.Name, pinnedValues, toUpdated),
 		}
 }
 
@@ -586,7 +518,7 @@ func deltaViewRange(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partitio
 // [fromUpdated, toUpdated], newest first. rowLimit > 0 stops the read there. columnNames projects
 // the read; nil reads every stored column.
 func readDeltaViewRecords(
-	sink recordSink, scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partition int64, pinnedValues []int64,
+	sink recordSink, scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, pinnedValues []int64,
 	fromUpdated, toUpdated int64, rowLimit int, columnNames []string,
 ) error {
 	if toUpdated < fromUpdated {
@@ -601,7 +533,7 @@ func readDeltaViewRecords(
 	}
 	whereClause, queryValues := deltaViewRange(scyllaTable, deltaIndex, partition, pinnedValues, fromUpdated, toUpdated)
 	queryString := fmt.Sprintf("SELECT %v FROM %v.%v WHERE %v", strings.Join(columnNames, ", "),
-		resolveKeyspace(scyllaTable), deltaIndex.viewName, whereClause)
+		resolveKeyspace(scyllaTable), deltaIndex.ViewName, whereClause)
 	if rowLimit > 0 {
 		queryString += fmt.Sprintf(" LIMIT %d", rowLimit)
 	}
@@ -612,7 +544,7 @@ func readDeltaViewRecords(
 // readDeltaViewRows reads the (ID, updated, version) of a prefix's view rows with updated in
 // [fromUpdated, toUpdated], newest first: what the window hash needs, not the records.
 func readDeltaViewRows(
-	scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partition int64, pinnedValues []int64,
+	scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, pinnedValues []int64,
 	fromUpdated, toUpdated int64,
 ) ([]deltaViewRow, error) {
 	if toUpdated < fromUpdated {
@@ -621,7 +553,7 @@ func readDeltaViewRows(
 	keyName := scyllaTable.Keys[0].GetName()
 	whereClause, queryValues := deltaViewRange(scyllaTable, deltaIndex, partition, pinnedValues, fromUpdated, toUpdated)
 	queryString := fmt.Sprintf("SELECT %v, %v, %v FROM %v.%v WHERE %v", keyName, managedUpdatedColumnName, managedVersionColumnName,
-		resolveKeyspace(scyllaTable), deltaIndex.viewName, whereClause)
+		resolveKeyspace(scyllaTable), deltaIndex.ViewName, whereClause)
 
 	var viewRows []deltaViewRow
 	iterator := getScyllaConnection().Query(queryString, queryValues...).Consistency(gocql.LocalQuorum).Iter()
@@ -631,24 +563,24 @@ func readDeltaViewRows(
 			break
 		}
 		viewRows = append(viewRows, deltaViewRow{
-			recordID: convertToInt64(row[keyName]),
-			updated:  convertToInt64(row[managedUpdatedColumnName]),
-			version:  int16(convertToInt64(row[managedVersionColumnName])),
+			recordID: db.ConvertToInt64(row[keyName]),
+			updated:  db.ConvertToInt64(row[managedUpdatedColumnName]),
+			version:  int16(db.ConvertToInt64(row[managedVersionColumnName])),
 		})
 	}
 	if err := iterator.Close(); err != nil {
-		return nil, fmt.Errorf("table %q: reading the delta view %v: %w", scyllaTable.Name, deltaIndex.viewName, err)
+		return nil, fmt.Errorf("table %q: reading the delta view %v: %w", scyllaTable.Name, deltaIndex.ViewName, err)
 	}
 	return viewRows, nil
 }
 
 // readDeltaMovedIDs reads the IDs that left a prefix with updated ≥ fromUpdated, up to rowLimit.
-func readDeltaMovedIDs(scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partition int64, pinnedValues []int64, fromUpdated int64, rowLimit int) ([]int64, error) {
+func readDeltaMovedIDs(scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, pinnedValues []int64, fromUpdated int64, rowLimit int) ([]int64, error) {
 	queryString := fmt.Sprintf("SELECT id FROM %v.%v WHERE partition_id = ? AND index_tag = ? AND pinned_prefix = ? AND updated >= ? LIMIT %d",
 		resolveKeyspace(scyllaTable), deltaMovesTableName(scyllaTable), rowLimit)
 	iterator := getScyllaConnection().Query(queryString,
-		coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition), deltaIndex.tag,
-		deltaIndex.packedKeyValue(scyllaTable.Name, pinnedValues, 0), int32(fromUpdated)).Consistency(gocql.LocalQuorum).Iter()
+		coerceManagedIntegerValue(scyllaTable.GetPartKey(), partition), deltaIndex.Tag,
+		deltaPackedStoredValue(deltaIndex, scyllaTable.Name, pinnedValues, 0), int32(fromUpdated)).Consistency(gocql.LocalQuorum).Iter()
 	var movedIDs []int64
 	var movedID int64
 	for iterator.Scan(&movedID) {
@@ -695,18 +627,18 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 	}
 	deltaValues := make([]int64, len(deltaRead.LastKeyValues))
 	for i, deltaValue := range deltaRead.LastKeyValues {
-		deltaValues[i] = convertToInt64(deltaValue)
+		deltaValues[i] = db.ConvertToInt64(deltaValue)
 	}
 	deltaIndex, prefixes, err := selectDeltaIndex(scyllaTable, equalityValues, deltaValues)
 	if err != nil {
 		return err
 	}
-	partition := convertToInt64(partitionValue)
+	partition := db.ConvertToInt64(partitionValue)
 
 	// The client hashes the records it holds whose last pinned value is one the read covered.
 	metadata := cache.DeltaWindowMetadata{}
-	if len(deltaIndex.pinned) > 0 {
-		lastPinned := deltaIndex.pinned[len(deltaIndex.pinned)-1]
+	if len(deltaIndex.Pinned) > 0 {
+		lastPinned := deltaIndex.Pinned[len(deltaIndex.Pinned)-1]
 		metadata.FilterField = deltaFieldJSONName(sink, lastPinned)
 		for _, prefix := range prefixes {
 			if lastValue := prefix[len(prefix)-1]; !slices.Contains(metadata.FilterValues, lastValue) {
@@ -724,17 +656,17 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 	metadata.IsReplace = cursor.Updated == 0
 	projection := deltaProjection(tableInfo, scyllaTable, deltaIndex)
 	recordIDOf := func(recordPointer unsafe.Pointer) int64 {
-		return convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+		return db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 	}
 	updatedOf := func(recordPointer unsafe.Pointer) int64 {
-		return convertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))
+		return db.ConvertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))
 	}
 
 	// The changed records and the moves of each prefix. A sync needs at most threshold + 1 of each
 	// per prefix to know it is a replace: the view lists newest first, so an old cursor costs no more
 	// than a recent one.
 	reads := make([]deltaPrefixRead, len(prefixes))
-	decisionLimit := deltaIndex.replaceThreshold + 1
+	decisionLimit := deltaIndex.ReplaceThreshold + 1
 	if !metadata.IsReplace {
 		err := readDeltaPrefixes(prefixes, reads, func(prefix []int64, read *deltaPrefixRead) error {
 			if err := readDeltaViewRecords(sink.collectInto(&read.records), scyllaTable, deltaIndex, partition, prefix,
@@ -742,7 +674,7 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 				return err
 			}
 			var err error
-			if len(deltaIndex.pinned) > 0 {
+			if len(deltaIndex.Pinned) > 0 {
 				read.movedIDs, err = readDeltaMovedIDs(scyllaTable, deltaIndex, partition, prefix, int64(plan.MovesFrom), decisionLimit)
 			}
 			return err
@@ -755,7 +687,7 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 			changedCount += len(read.records)
 			movedCount += len(read.movedIDs)
 		}
-		metadata.IsReplace = changedCount > deltaIndex.replaceThreshold || movedCount > deltaIndex.replaceThreshold
+		metadata.IsReplace = changedCount > deltaIndex.ReplaceThreshold || movedCount > deltaIndex.ReplaceThreshold
 	}
 
 	if metadata.IsReplace {
@@ -841,13 +773,13 @@ func execDelta(sink recordSink, tableInfo *TableInfo, scyllaTable ScyllaTable) e
 
 // deltaProjection is the caller's Select() projection plus what the client's window hash reads: the
 // key, updated, version and the pinned columns. nil (every column) without a projection.
-func deltaProjection(tableInfo *TableInfo, scyllaTable ScyllaTable, deltaIndex deltaIndexInfo) []string {
+func deltaProjection(tableInfo *TableInfo, scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo) []string {
 	if len(tableInfo.ColumnsInclude) == 0 && len(tableInfo.ColumnsExclude) == 0 {
 		return nil
 	}
 	columnNames, _, _ := buildSelectProjection(tableInfo, scyllaTable)
 	requiredNames := []string{scyllaTable.GetPartKey().GetName(), scyllaTable.Keys[0].GetName(), managedUpdatedColumnName, managedVersionColumnName}
-	for _, pinnedColumn := range deltaIndex.pinned {
+	for _, pinnedColumn := range deltaIndex.Pinned {
 		requiredNames = append(requiredNames, pinnedColumn.GetName())
 	}
 	for _, requiredName := range requiredNames {
@@ -884,4 +816,11 @@ func deltaMetadataRecord(sink recordSink, scyllaTable ScyllaTable, metadataText 
 	keyColumn := scyllaTable.Keys[0]
 	keyColumn.SetValue(record, coerceManagedIntegerValue(keyColumn, -1))
 	return record, nil
+}
+
+// deltaPackedStoredValue is the value stored in a delta view's packed column. The layout is the
+// shared unsigned one (db.DeltaIndexInfo.PackedKey); Scylla compares the column as signed, so the
+// top bit is flipped.
+func deltaPackedStoredValue(deltaIndex db.DeltaIndexInfo, tableName string, pinnedValues []int64, updated int64) int64 {
+	return storeVirtualPacked(deltaIndex.PackedKey(tableName, pinnedValues, updated), false).(int64)
 }

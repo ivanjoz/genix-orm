@@ -21,104 +21,25 @@ type ScyllaTable struct {
 	hasTableBackedViews bool
 	indexViews          []*viewInfo
 	ViewsExcluded       []string
-	keyConcatenated     []IColInfo
-	keyIntPacking       []IColInfo
-	// keyIntPackingSlotBits is the resolved bit layout of keyIntPacking (db.KeyIntPackingSlotBits).
-	keyIntPackingSlotBits []int64
-	// packedIndexes stores metadata for packed indexes declared in schema (local and global).
-	packedIndexes []*packedIndexInfo
-	// fixedValueRanges holds the schema's FixedValues per column name, which is what lets a
-	// TypeDelta view size each key's bit slot without a .Size() decorator.
-	fixedValueRanges map[string]columnValueRange
-	// deltaIndexes are the compiled TypeDelta indexes (delta_view.go); their views are also in views.
-	deltaIndexes []deltaIndexInfo
 	// readConsistency overrides the cluster's LocalOne on the copy of the table one read runs with:
 	// the cache reads use LocalQuorum. Zero keeps the session default.
-	readConsistency gocql.Consistency
-	capabilities    []QueryCapability
-	// Composite bucket metadata is used to materialize virtual hash sets and plan range+contains reads.
-	compositeBucketIndexes []compositeBucketIndex
-	indexGroups            []indexGroupInfo
-	// computedColumns are the TableSchema.Computed columns (computed_columns.go).
-	computedColumns []computedColumnInfo
-	// indexGroupIDs prevents per-table collisions when logical IndexGroup names hash to the same int16.
-	indexGroupIDs     map[int16]string
+	readConsistency   gocql.Consistency
+	capabilities      []QueryCapability
 	indexUpdatedTable *indexUpdatedTableInfo
-	textSearchIndex   *textSearchIndexInfo
 	// dataFrames is nil unless the schema declares DataFrames (data_frame.go).
 	dataFrames *dataFrameInfo
 	// selectStatementCache is shared across copied ScyllaTable values, so it must stay behind a pointer.
 	selectStatementCache *selectPlanCache
 }
 
-// compositeBucketIndex stores the source columns and generated virtual bucket columns for one composite-bucket index.
-type compositeBucketIndex struct {
-	name          string
-	sourceColumns []IColInfo
-	bucketColumn  IColInfo
-	// bucketIsWeek keeps schema-level week semantics for custom week-code arithmetic in bucketing and range planning.
-	bucketIsWeek         bool
-	bucketSizes          []int8
-	virtualColumnsBySize map[int8]IColInfo
-}
-
-type indexGroupInfo struct {
-	name                 string
-	indexID              int16
-	sourceColumns        []indexGroupSourceColumn
-	virtualColumn        IColInfo
-	usesCollectionValues bool
-	// inheritFromKey routes grouped fetches through KeyIntPacking primary-key ranges instead of a secondary index.
-	inheritFromKey bool
-	// snapshotInS3 (TypeCacheGroupS3) keeps each settled group in the file store (cache_group_snapshot.go).
-	snapshotInS3 bool
-}
-
 type indexUpdatedTableInfo struct {
 	name string
 }
 
-type textSearchIndexInfo struct {
-	// columns hold the indexed text, in order.
-	columns []IColInfo
-	// statusColumn marks a record inactive (0), which takes it out of the index; nil means every
-	// record is active.
-	statusColumn IColInfo
-	// manual: writes do not touch the index, only the controller's reindex does.
-	manual bool
-	// The record-ID column is always the table's single key (keys[0]) and the partition is
-	// always partKey, so both are read from the ScyllaTable directly rather than cached here.
-}
-
-type indexGroupSourceColumn struct {
-	column IColInfo
-}
-
+// viewInfo is the Scylla materialization of a compiled index: the neutral db.IndexSource the
+// planner matches against, plus how the index exists in CQL.
 type viewInfo struct {
-	/* 1 = Global index, 2 = Local index, 3 = Hash index, 4 = view*/
-	Type          int8
-	name          string
-	idx           int8
-	column        IColInfo
-	columns       []string
-	columnsNoPart []string
-	columnsIdx    []int16
-	// availableColumns tracks the real base-table columns that can be selected from the MV.
-	// Rationale: projected views cannot satisfy default "select all columns" reads.
-	availableColumns []string
-	// packedSourceColumns keeps the original key columns behind packed range views so grouped scans can decompose them back.
-	packedSourceColumns []IColInfo
-	// packedSlotBitsPerColumn mirrors packedSourceColumns and is reused for prefix-range planning and scan decomposition.
-	packedSlotBitsPerColumn []int64
-	// packedIsInt32 tells which storage encoding (storeVirtualPacked) the packed column uses.
-	packedIsInt32 bool
-	Operators     []string
-	// RequiresPostFilter indicates the index/view can overfetch and should be exact-filtered in memory.
-	// Keep this for hash-style plans that intentionally trade exact routing for bounded overfetch.
-	RequiresPostFilter bool
-	// isDeltaView marks a TypeDelta view: its packed column is always rewritten by the write path
-	// (stampDeltaWrites), so the "columns updated together" check skips it.
-	isDeltaView           bool
+	*db.IndexSource
 	getStatementPrepared  func(statements ...ColumnStatement) []boundWhereClause
 	decomposeVirtualValue func(rawValue any) []any
 	getCreateScript       func() string
@@ -126,16 +47,8 @@ type viewInfo struct {
 	// against the live catalog: a column added to the base table does not reach a derived view on
 	// its own, and the view then breaks every read or write that touches it.
 	getExpectedColumns  func() []viewExpectedColumn
-	fanoutColumnName    string
-	tableColumns        []viewTableColumnInfo
-	tableKeyColumns     []viewTableColumnInfo
 	maintenanceIDColumn IColInfo
 	rebuildColumnNames  map[string]bool
-}
-
-type viewTableColumnInfo struct {
-	SourceColumn     IColInfo
-	UsesSliceElement bool
 }
 
 // viewExpectedColumn is one column a compiled view must have in the DB, with the CQL type the view

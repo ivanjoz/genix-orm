@@ -1,6 +1,10 @@
 package scylla
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ivanjoz/genix-orm/db"
+)
 
 func TestQueryIndexGroupStoresCachedGroupsInTableInfo(t *testing.T) {
 	groupedRecords := []RecordGroup[indexGroupRecord]{}
@@ -31,11 +35,11 @@ func TestBuildIndexGroupSelectPlanAllowsSingleColumnRawGroup(t *testing.T) {
 		t.Fatalf("buildIndexGroupSelectPlan returned error: %v", err)
 	}
 
-	if queryPlan.indexGroup.name != "date" {
-		t.Fatalf("expected single-column index group, got %q", queryPlan.indexGroup.name)
+	if queryPlan.indexGroup.Name != "date" {
+		t.Fatalf("expected single-column index group, got %q", queryPlan.indexGroup.Name)
 	}
-	if queryPlan.indexGroup.virtualColumn != nil && !queryPlan.indexGroup.virtualColumn.IsNil() {
-		t.Fatalf("single-column index group should not require a virtual column, got %s", queryPlan.indexGroup.virtualColumn.GetName())
+	if queryPlan.indexGroup.VirtualColumn != nil && !queryPlan.indexGroup.VirtualColumn.IsNil() {
+		t.Fatalf("single-column index group should not require a virtual column, got %s", queryPlan.indexGroup.VirtualColumn.GetName())
 	}
 	if len(queryPlan.hashGroups) != 3 {
 		t.Fatalf("expected 3 hash groups, got %+v", queryPlan.hashGroups)
@@ -66,10 +70,10 @@ func TestBuildIndexGroupFetchQueryUsesSourceColumnForSingleColumnGroup(t *testin
 	scyllaTable := MakeScyllaTable[indexGroupRecord, indexGroupSchema]()
 	queryPlan := &indexGroupSelectPlan{
 		partitionValue: 7,
-		indexGroup:     scyllaTable.indexGroups[0],
+		indexGroup:     scyllaTable.IndexGroups[0],
 	}
 	fetchState := indexGroupFetchState{
-		hashValue:        HashInt64(18754),
+		hashValue:        db.HashInt64(18754),
 		indexGroupValues: []int64{18754},
 	}
 

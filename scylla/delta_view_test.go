@@ -1,6 +1,7 @@
 package scylla
 
 import (
+	"github.com/ivanjoz/genix-orm/db"
 	"slices"
 	"strings"
 	"testing"
@@ -52,28 +53,28 @@ func TestDeltaIndexCompilesAFullViewInThePlanner(t *testing.T) {
 
 	scyllaTable := MakeScyllaTable[deltaStockRecord, deltaStockSchema]()
 	scyllaTable.Namespace = "genix_test"
-	warehouseIndex, statusIndex := scyllaTable.deltaIndexes[0], scyllaTable.deltaIndexes[1]
+	warehouseIndex, statusIndex := scyllaTable.DeltaIndexes[0], scyllaTable.DeltaIndexes[1]
 	// Every Key is a pinned slot: Status (FixedValues 0..1) takes 1 bit after the warehouse's 17.
-	if warehouseIndex.tag != "warehouse_id_status" ||
-		!slices.EqualFunc(warehouseIndex.pinned, []string{"warehouse_id", "status"}, func(column IColInfo, name string) bool { return column.GetName() == name }) ||
-		!slices.Equal(warehouseIndex.pinnedSlotBits, []int64{17, 1}) ||
-		warehouseIndex.packedColumn.GetName() != "zz_dlt_warehouse_id_status" || warehouseIndex.replaceThreshold != 3 {
+	if warehouseIndex.Tag != "warehouse_id_status" ||
+		!slices.EqualFunc(warehouseIndex.Pinned, []string{"warehouse_id", "status"}, func(column IColInfo, name string) bool { return column.GetName() == name }) ||
+		!slices.Equal(warehouseIndex.PinnedSlotBits, []int64{17, 1}) ||
+		warehouseIndex.PackedColumn.GetName() != "zz_dlt_warehouse_id_status" || warehouseIndex.ReplaceThreshold != 3 {
 		t.Fatalf("unexpected warehouse index %+v", warehouseIndex)
 	}
-	if statusIndex.packedColumn.GetName() != "zz_dlt_status" || !slices.Equal(statusIndex.pinnedSlotBits, []int64{1}) ||
-		statusIndex.replaceThreshold != cache.DefaultDeltaReplaceThreshold {
+	if statusIndex.PackedColumn.GetName() != "zz_dlt_status" || !slices.Equal(statusIndex.PinnedSlotBits, []int64{1}) ||
+		statusIndex.ReplaceThreshold != cache.DefaultDeltaReplaceThreshold {
 		t.Fatalf("unexpected status index %+v", statusIndex)
 	}
 
 	// Both views are planner range views on [partition, pinned…, updated] holding every stored column.
-	warehouseView := scyllaTable.views[warehouseIndex.viewName]
-	if warehouseView == nil || warehouseView.Type != 8 || !warehouseView.isDeltaView ||
-		!slices.Equal(warehouseView.columns, []string{"company_id", "warehouse_id", "status", "updated"}) ||
-		!slices.Contains(warehouseView.availableColumns, "name") {
+	warehouseView := scyllaTable.views[warehouseIndex.ViewName]
+	if warehouseView == nil || warehouseView.Type != 8 || !warehouseView.IsDeltaView ||
+		!slices.Equal(warehouseView.Columns, []string{"company_id", "warehouse_id", "status", "updated"}) ||
+		!slices.Contains(warehouseView.AvailableColumns, "name") {
 		t.Fatalf("unexpected warehouse view %+v", warehouseView)
 	}
-	statusView := scyllaTable.views[statusIndex.viewName]
-	if statusView == nil || !slices.Equal(statusView.columns, []string{"company_id", "status", "updated"}) {
+	statusView := scyllaTable.views[statusIndex.ViewName]
+	if statusView == nil || !slices.Equal(statusView.Columns, []string{"company_id", "status", "updated"}) {
 		t.Fatalf("unexpected status view %+v", statusView)
 	}
 	// A plain read on Status is one span of the status view; one on the warehouse, a prefix of its view.
@@ -84,7 +85,7 @@ func TestDeltaIndexCompilesAFullViewInThePlanner(t *testing.T) {
 		if !slices.ContainsFunc(scyllaTable.capabilities, func(capability QueryCapability) bool {
 			return capability.Source == served.view && capability.Signature == served.signature
 		}) {
-			t.Fatalf("expected %s served by %s", served.signature, served.view.name)
+			t.Fatalf("expected %s served by %s", served.signature, served.view.Name)
 		}
 	}
 
@@ -111,9 +112,9 @@ func TestDeltaIndexCompilesAFullViewInThePlanner(t *testing.T) {
 func TestDeltaPackedKeyOrdersAPrefixByUpdated(t *testing.T) {
 	resetORMTableCachesForTesting()
 
-	warehouseIndex := MakeScyllaTable[deltaStockRecord, deltaStockSchema]().deltaIndexes[0]
+	warehouseIndex := MakeScyllaTable[deltaStockRecord, deltaStockSchema]().DeltaIndexes[0]
 	packed := func(warehouseID, status, updated int64) int64 {
-		return warehouseIndex.packedKeyValue("delta_stock_records", []int64{warehouseID, status}, updated)
+		return deltaPackedStoredValue(warehouseIndex, "delta_stock_records", []int64{warehouseID, status}, updated)
 	}
 	if !(packed(42, 0, 0) < packed(42, 0, 100) && packed(42, 0, 1<<31-1) < packed(42, 1, 0) &&
 		packed(42, 1, 1<<31-1) < packed(43, 0, 0)) {
@@ -127,7 +128,7 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 	resetORMTableCachesForTesting()
 
 	scyllaTable := MakeScyllaTable[deltaStockRecord, deltaStockSchema]()
-	warehouseIndex := scyllaTable.deltaIndexes[0]
+	warehouseIndex := scyllaTable.DeltaIndexes[0]
 	stored := storedRows{
 		{7, 1}: {"version": int16(3), "warehouse_id": int32(41), "status": int8(1)},
 		{7, 2}: {"version": int16(9), "warehouse_id": int32(41), "status": int8(1)},
@@ -144,7 +145,7 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 		{records: makeRecordSlice(&records), writtenColumns: nameOnly},
 	}, stored)
 	packedValues := packedByPhase[1]["zz_dlt_warehouse_id_status"]
-	if packedValues[0] != warehouseIndex.packedKeyValue(scyllaTable.Name, []int64{41, 1}, 500) {
+	if packedValues[0] != deltaPackedStoredValue(warehouseIndex, scyllaTable.Name, []int64{41, 1}, 500) {
 		t.Fatal("expected the unwritten pinned columns to keep their stored warehouse 41 and status 1")
 	}
 	if records[0].Version != 4 || records[1].Version != 10 || len(moves) != 0 {
@@ -158,7 +159,7 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 	// Record 1 writes warehouse 0 and record 2 warehouse 42: both leave [41, 1]. Status is not written,
 	// so the status index moves nothing.
 	if len(moves) != 2 || moves[1].recordID != 2 || moves[1].indexTag != "warehouse_id_status" ||
-		moves[1].pinnedPrefix != warehouseIndex.packedKeyValue(scyllaTable.Name, []int64{41, 1}, 0) || moves[1].updated != 500 {
+		moves[1].pinnedPrefix != deltaPackedStoredValue(warehouseIndex, scyllaTable.Name, []int64{41, 1}, 0) || moves[1].updated != 500 {
 		t.Fatalf("expected both records to leave warehouse 41, got %+v", moves)
 	}
 
@@ -168,8 +169,8 @@ func TestStampDeltaWritesKeepsStoredPinnedValuesAndRecordsMoves(t *testing.T) {
 		{records: makeRecordSlice(&[]deltaStockRecord{}), writtenColumns: nil},
 		{records: makeRecordSlice(&records), writtenColumns: []IColInfo{scyllaTable.ColumnsMap["status"], scyllaTable.UpdatedCol}},
 	}, stored)
-	statusIndex := scyllaTable.deltaIndexes[1]
-	if len(moves) != 2 || moves[1].indexTag != "status" || moves[1].pinnedPrefix != statusIndex.packedKeyValue(scyllaTable.Name, []int64{1}, 0) {
+	statusIndex := scyllaTable.DeltaIndexes[1]
+	if len(moves) != 2 || moves[1].indexTag != "status" || moves[1].pinnedPrefix != deltaPackedStoredValue(statusIndex, scyllaTable.Name, []int64{1}, 0) {
 		t.Fatalf("expected the soft delete to leave [41, 1] and [1], got %+v", moves)
 	}
 }
@@ -222,9 +223,9 @@ func (e deltaElasticPinSchema) GetSchema() TableSchema {
 func TestDeltaElasticPinnedKeyTakesTheBitsUpdatedLeaves(t *testing.T) {
 	resetORMTableCachesForTesting()
 
-	deltaIndex := MakeScyllaTable[deltaElasticPinRecord, deltaElasticPinSchema]().deltaIndexes[0]
-	if expectedListBits := int64(64 - deltaUpdatedSlotBits - 1); !slices.Equal(deltaIndex.pinnedSlotBits, []int64{expectedListBits, 1}) {
-		t.Fatalf("expected %d bits for list_id and 1 for status, got %v", expectedListBits, deltaIndex.pinnedSlotBits)
+	deltaIndex := MakeScyllaTable[deltaElasticPinRecord, deltaElasticPinSchema]().DeltaIndexes[0]
+	if expectedListBits := int64(64 - db.DeltaUpdatedSlotBits - 1); !slices.Equal(deltaIndex.PinnedSlotBits, []int64{expectedListBits, 1}) {
+		t.Fatalf("expected %d bits for list_id and 1 for status, got %v", expectedListBits, deltaIndex.PinnedSlotBits)
 	}
 }
 
@@ -246,10 +247,10 @@ func TestSelectDeltaIndexPicksTheMostSpecificFit(t *testing.T) {
 		{map[string]any{"company_id": int32(7)}, nil, "status", [][]int64{{0}, {1}}},
 	} {
 		deltaIndex, prefixes, err := selectDeltaIndex(scyllaTable, selection.equalities, selection.deltaValues)
-		if err != nil || deltaIndex.tag != selection.expectedTag ||
+		if err != nil || deltaIndex.Tag != selection.expectedTag ||
 			!slices.EqualFunc(prefixes, selection.expectedPrefixes, slices.Equal[[]int64]) {
 			t.Fatalf("%v %v: expected %s %v, got %s %v err %v", selection.equalities, selection.deltaValues,
-				selection.expectedTag, selection.expectedPrefixes, deltaIndex.tag, prefixes, err)
+				selection.expectedTag, selection.expectedPrefixes, deltaIndex.Tag, prefixes, err)
 		}
 	}
 }

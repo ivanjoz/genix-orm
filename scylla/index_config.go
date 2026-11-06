@@ -1,6 +1,10 @@
 package scylla
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/ivanjoz/genix-orm/db"
+)
 
 func hasCompositeBucketing(indexCfg Index) bool {
 	for _, key := range indexCfg.Keys {
@@ -24,90 +28,50 @@ func resolveSchemaIndexType(indexCfg Index) int8 {
 	return TypeLocalIndex
 }
 
+// registerSchemaLocalIndex and registerSchemaGlobalIndex describe the index in db (the neutral
+// half) and materialize it as a Scylla secondary index.
 func registerSchemaLocalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
-	if len(indexCfg.Keys) == 1 {
-		colCfg := indexCfg.Keys[0]
-		colInfo := colCfg.GetInfo()
-		column := dbTable.ColumnsMap[colInfo.Name]
-		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.Name, colInfo.Name))
-		}
-		// Scylla rejects a local index on a collection ("not implemented yet"): fail here, not on deploy.
-		if column.GetType().IsSlice {
-			panic(fmt.Sprintf(`Table "%v": column "%v" is a slice and Scylla has no local index on a collection; use TypeGlobalIndex, or a TypeCacheGroup of two or more Keys`,
-				dbTable.Name, column.GetName()))
-		}
-
-		indexName := fmt.Sprintf(`%v__%v_index_1`, dbTable.Name, column.GetName())
-		if _, exists := dbTable.indexes[indexName]; exists {
-			return
-		}
-
-		index := &viewInfo{
-			Type:    2,
-			name:    indexName,
-			idx:     *idxCount,
-			column:  column,
-			columns: []string{dbTable.GetPartKey().GetName(), column.GetName()},
-		}
-		index.getCreateScript = func() string {
-			return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`,
-				indexName, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), column.GetName())
-		}
-
-		*idxCount = *idxCount + 1
-		dbTable.indexes[index.name] = index
-		return
+	if source := dbTable.DescribeLocalIndex(idxCount, indexCfg); source != nil {
+		dbTable.indexes[source.Name] = materializeIndexSource(dbTable, source)
 	}
-
-	registerPackedIndex(dbTable, idxCount, indexCfg.Keys, packedIndexBuildConfig{
-		scope:               packedIndexScopeLocal,
-		schemaFieldName:     "Indexes",
-		virtualColumnPrefix: "zz_ixp_",
-		indexType:           2,
-		requireInOnlyFirst:  false,
-	})
 }
 
 func registerSchemaGlobalIndex(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
-	if len(indexCfg.Keys) == 1 {
-		colCfg := indexCfg.Keys[0]
-		colInfo := colCfg.GetInfo()
-		column := dbTable.ColumnsMap[colInfo.Name]
-		if column == nil {
-			panic(fmt.Sprintf(`Table "%v": Indexes column "%v" was not found`, dbTable.Name, colInfo.Name))
-		}
+	if source := dbTable.DescribeGlobalIndex(idxCount, indexCfg); source != nil {
+		dbTable.indexes[source.Name] = materializeIndexSource(dbTable, source)
+	}
+}
 
-		indexName := fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, column.GetName())
-		if _, exists := dbTable.indexes[indexName]; exists {
-			return
-		}
+// materializeIndexSource wraps a described index in the CQL that creates and queries it.
+func materializeIndexSource(dbTable *ScyllaTable, source *db.IndexSource) *viewInfo {
+	view := &viewInfo{IndexSource: source}
+	switch source.Kind {
+	case db.IndexKindSingleColumn:
+		materializeSingleColumnIndex(dbTable, view)
+	case db.IndexKindPacked:
+		materializePackedIndex(dbTable, view)
+	default:
+		panic(fmt.Sprintf(`Table "%v": index %v has kind %d, which this driver does not materialize`, dbTable.Name, source.Name, source.Kind))
+	}
+	return view
+}
 
-		index := &viewInfo{
-			Type:    1,
-			name:    indexName,
-			idx:     *idxCount,
-			column:  column,
-			columns: []string{column.GetName()},
+// materializeSingleColumnIndex: a local index is keyed on (partition, column); a global index on a
+// slice column indexes its VALUES.
+func materializeSingleColumnIndex(dbTable *ScyllaTable, view *viewInfo) {
+	indexName, column := view.Name, view.Column
+	if view.Type == 2 {
+		view.getCreateScript = func() string {
+			return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`,
+				indexName, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), column.GetName())
 		}
-		index.getCreateScript = func() string {
-			colName := column.GetName()
-			if column.GetType().IsSlice {
-				colName = fmt.Sprintf("VALUES(%v)", colName)
-			}
-			return fmt.Sprintf(`CREATE INDEX %v ON %v (%v)`, indexName, dbTable.GetFullName(), colName)
-		}
-
-		*idxCount = *idxCount + 1
-		dbTable.indexes[index.name] = index
 		return
 	}
-
-	registerPackedIndex(dbTable, idxCount, indexCfg.Keys, packedIndexBuildConfig{
-		scope:               packedIndexScopeGlobal,
-		schemaFieldName:     "Indexes",
-		virtualColumnPrefix: "zz_gixp_",
-		indexType:           1,
-		requireInOnlyFirst:  true,
-	})
+	view.getCreateScript = func() string {
+		colName := column.GetName()
+		if column.GetType().IsSlice {
+			colName = fmt.Sprintf("VALUES(%v)", colName)
+		}
+		return fmt.Sprintf(`CREATE INDEX %v ON %v (%v)`, indexName, dbTable.GetFullName(), colName)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"github.com/ivanjoz/genix-orm/db"
 	"reflect"
 	"slices"
 	"unsafe"
@@ -18,10 +19,11 @@ import (
 
 // readDeltaPrefixReplace fills read.records with every record of one prefix, newest first up to
 // limit: from the prefix's snapshot when it is still good, else from the view, which then rewrites
-// the snapshot. A projected read (projection != nil) always reads the view and writes nothing.
+// the snapshot. A projected read (projection != nil) has its own file, and merges the changes read
+// with the same projection, so it never serves a column it excluded.
 // readTime is the server clock taken before any read of this sync: the V a written snapshot keeps.
 func readDeltaPrefixReplace(
-	sink recordSink, scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partition int64, prefix []int64,
+	sink recordSink, scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, prefix []int64,
 	limit int32, projection []string, readTime int32, read *deltaPrefixRead,
 ) error {
 	readFromView := func() error {
@@ -29,7 +31,7 @@ func readDeltaPrefixReplace(
 			0, deltaViewUpdatedMax, int(limit), projection)
 	}
 	fileStore := cache.FileStore()
-	if fileStore == nil || projection != nil || !cache.RecordSnapshotsEnabled() {
+	if fileStore == nil || !cache.RecordSnapshotsEnabled() {
 		return readFromView()
 	}
 	recordType := sinkRecordType(sink)
@@ -38,7 +40,7 @@ func readDeltaPrefixReplace(
 		return readFromView()
 	}
 
-	snapshotKey := cache.DeltaSnapshotKey(scyllaTable.Name, partition, deltaIndex.tag, prefix, limit)
+	snapshotKey := cache.DeltaSnapshotKey(scyllaTable.Name, partition, deltaIndex.Tag, prefix, limit, projection)
 	content, etag, err := fileStore.GetFile(snapshotKey)
 	switch {
 	case errors.Is(err, utils.ErrFileNotFound):
@@ -48,7 +50,7 @@ func readDeltaPrefixReplace(
 		fmt.Println("Delta snapshot: reading", snapshotKey, "failed, reading the view:", err)
 		return readFromView()
 	default:
-		mergedRecords, isServed, err := serveDeltaSnapshot(sink, scyllaTable, deltaIndex, partition, prefix, limit, codec, recordType, readTime, content, snapshotKey)
+		mergedRecords, isServed, err := serveDeltaSnapshot(sink, scyllaTable, deltaIndex, partition, prefix, limit, projection, codec, recordType, readTime, content, snapshotKey)
 		if err != nil {
 			return err
 		}
@@ -71,37 +73,39 @@ func readDeltaPrefixReplace(
 // cache.RecordSnapshotMaxAgeTicks at readTime, more than the threshold of changes or moves, a hash
 // mismatch, a cut at limit that a removal opened): the caller reads the view instead.
 func serveDeltaSnapshot(
-	sink recordSink, scyllaTable ScyllaTable, deltaIndex deltaIndexInfo, partition int64, prefix []int64,
-	limit int32, codec recordSnapshotCodec, recordType reflect.Type, readTime int32, content []byte, snapshotKey string,
+	sink recordSink, scyllaTable ScyllaTable, deltaIndex db.DeltaIndexInfo, partition int64, prefix []int64,
+	limit int32, projection []string, codec recordSnapshotCodec, recordType reflect.Type, readTime int32, content []byte, snapshotKey string,
 ) (mergedRecords []unsafe.Pointer, isServed bool, err error) {
 	snapshot, snapshotRecords, isUsable := decodeRecordSnapshotFile(content, codec, recordType, readTime, snapshotKey)
 	if !isUsable {
 		return nil, false, nil
 	}
 	recordIDOf := func(recordPointer unsafe.Pointer) int64 {
-		return convertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
+		return db.ConvertToInt64(scyllaTable.Keys[0].GetRawValue(recordPointer))
 	}
 	updatedOf := func(recordPointer unsafe.Pointer) int64 {
-		return convertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))
+		return db.ConvertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer))
 	}
 
 	// The sync a client holding the snapshot would run: changed records, moves, the unsettled slice's rows.
 	plan := cache.PlanDeltaSync(cache.DeltaWindowCursor{Updated: snapshot.Cursor, ReadTime: snapshot.ReadTime})
-	decisionLimit := deltaIndex.replaceThreshold + 1
+	decisionLimit := deltaIndex.ReplaceThreshold + 1
+	// Read with the snapshot's projection: a changed record replaces its old copy whole, so a wider
+	// read would put columns the caller excluded into the response.
 	var changedRecords []unsafe.Pointer
 	if err := readDeltaViewRecords(sink.collectInto(&changedRecords), scyllaTable, deltaIndex, partition, prefix,
-		int64(plan.ChangedFrom), deltaViewUpdatedMax, decisionLimit, nil); err != nil {
+		int64(plan.ChangedFrom), deltaViewUpdatedMax, decisionLimit, projection); err != nil {
 		return nil, false, err
 	}
-	if len(changedRecords) > deltaIndex.replaceThreshold {
+	if len(changedRecords) > deltaIndex.ReplaceThreshold {
 		return nil, false, nil
 	}
 	var movedIDs []int64
-	if len(deltaIndex.pinned) > 0 {
+	if len(deltaIndex.Pinned) > 0 {
 		if movedIDs, err = readDeltaMovedIDs(scyllaTable, deltaIndex, partition, prefix, int64(plan.MovesFrom), decisionLimit); err != nil {
 			return nil, false, err
 		}
-		if len(movedIDs) > deltaIndex.replaceThreshold {
+		if len(movedIDs) > deltaIndex.ReplaceThreshold {
 			return nil, false, nil
 		}
 	}
@@ -135,7 +139,7 @@ func serveDeltaSnapshot(
 		heldRows[index] = cache.DeltaHashRow{
 			ID:      recordIDOf(recordPointer),
 			Updated: int32(updatedOf(recordPointer)),
-			Version: int16(convertToInt64(scyllaTable.VersionCol.GetRawValue(recordPointer))),
+			Version: int16(db.ConvertToInt64(scyllaTable.VersionCol.GetRawValue(recordPointer))),
 		}
 	}
 	if cache.DeltaHeldWindowHash(heldRows, plan.WindowFrom, plan.WindowTo, excludedIDs) != serverHash {
@@ -185,7 +189,7 @@ func writeDeltaSnapshot(
 	}
 	cursor := int64(0)
 	for _, recordPointer := range records {
-		cursor = max(cursor, convertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer)))
+		cursor = max(cursor, db.ConvertToInt64(scyllaTable.UpdatedCol.GetRawValue(recordPointer)))
 	}
 	writeRecordSnapshotFile(fileStore, snapshotKey, etag, codec, recordType, int32(cursor), readTime, records)
 }

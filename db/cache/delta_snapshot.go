@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 )
@@ -29,8 +30,9 @@ import (
 //     database instead (and that read writes a new snapshot).
 //   - A snapshot older than RecordSnapshotMaxAgeTicks (2 h) is read from the
 //     database again: past the slice, nothing checks it any more.
-//   - A projected read (Select) never reads or writes one: the file holds whole
-//     records.
+//   - A projected read (Select / Exclude) has its own file, named by its column
+//     list: the file holds the records as that projection reads them, and the
+//     changes merged into it are read with the same projection.
 //   - The file names the record type's colbin schema; a struct change makes every
 //     older file a miss.
 //
@@ -40,10 +42,12 @@ import (
 
 // DeltaSnapshotKey is the file of one prefix of a TypeDelta index, under the store's root:
 //
-//	delta-snapshot/<table>/<partition>/<index tag>/<prefix values joined by _ | all>.l<limit>.cb
+//	delta-snapshot/<table>/<partition>/<index tag>/<prefix values joined by _ | all>.l<limit>[.p<projection hash>].cb
 //
-// The read's Limit is part of the name: a snapshot cut at one Limit cannot answer another.
-func DeltaSnapshotKey(tableName string, partition int64, indexTag string, prefix []int64, limit int32) string {
+// The read's Limit is part of the name: a snapshot cut at one Limit cannot answer another. So is
+// its projection (nil = every column): a file of projected records cannot answer a read of more
+// columns, nor one of fewer without sending what that read excluded.
+func DeltaSnapshotKey(tableName string, partition int64, indexTag string, prefix []int64, limit int32, projection []string) string {
 	prefixName := "all"
 	if len(prefix) > 0 {
 		prefixValues := make([]string, len(prefix))
@@ -52,7 +56,13 @@ func DeltaSnapshotKey(tableName string, partition int64, indexTag string, prefix
 		}
 		prefixName = strings.Join(prefixValues, "_")
 	}
-	return fmt.Sprintf("delta-snapshot/%s/%d/%s/%s.l%d.cb", tableName, partition, indexTag, prefixName, limit)
+	projectionName := ""
+	if projection != nil {
+		projectionHash := fnv.New64a()
+		projectionHash.Write([]byte(strings.Join(projection, ",")))
+		projectionName = fmt.Sprintf(".p%016x", projectionHash.Sum64())
+	}
+	return fmt.Sprintf("%s%s/%d/%s/%s.l%d%s.cb", deltaSnapshotKeyPrefix, tableName, partition, indexTag, prefixName, limit, projectionName)
 }
 
 // DeltaHashRow is the part of a held record the window hash reads.

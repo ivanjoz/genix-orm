@@ -56,6 +56,28 @@ type TableCore struct {
 	// MaxColIdx is the highest column index handed out, including virtual columns,
 	// so drivers can keep allocating unique indexes as they add their own.
 	MaxColIdx int16
+
+	// Index state compiled from the schema (compiled_state.go). Every driver builds it the same way
+	// because it decides what an index entry contains.
+	KeyConcatenated []IColInfo
+	KeyIntPacking   []IColInfo
+	// KeyIntPackingSlotBits is the resolved bit layout of KeyIntPacking (KeyIntPackingSlotBits).
+	KeyIntPackingSlotBits []int64
+	// FixedValueRanges holds the schema's FixedValues per column name.
+	FixedValueRanges       map[string]ColumnValueRange
+	PackedIndexes          []*PackedIndexInfo
+	DeltaIndexes           []DeltaIndexInfo
+	CompositeBucketIndexes []CompositeBucketIndex
+	IndexGroups            []IndexGroupInfo
+	// IndexGroupIDs prevents per-table collisions when logical IndexGroup names hash to the same int16.
+	IndexGroupIDs map[int16]string
+	// ComputedColumns are the TableSchema.Computed columns (computed_columns.go).
+	ComputedColumns []ComputedColumnInfo
+	// TextSearchIndex is nil unless the schema declares TextSearch (text_search_info.go).
+	TextSearchIndex *TextSearchIndexInfo
+	// IndexSources are every compiled index and view, in compile order (describe_index.go). A
+	// driver materializes each one its own way.
+	IndexSources []*IndexSource
 }
 
 func (e TableCore) GetName() string {

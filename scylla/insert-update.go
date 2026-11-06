@@ -87,7 +87,7 @@ func coerceManagedIntegerValue(column IColInfo, value int64) any {
 // resolveCreatedValue keeps a created value the caller already set, the write time otherwise.
 func resolveCreatedValue(column IColInfo, ptr unsafe.Pointer, writeTime int64) any {
 	if currentValue := column.GetRawValue(ptr); currentValue != nil {
-		if currentValueInt := convertToInt64(currentValue); currentValueInt > 0 {
+		if currentValueInt := db.ConvertToInt64(currentValue); currentValueInt > 0 {
 			return coerceManagedIntegerValue(column, currentValueInt)
 		}
 	}
@@ -157,12 +157,12 @@ func fetchAutoincrementCounterStarts(
 
 		partitionValue := int32(0)
 		if partitionColumn != nil {
-			partitionValue = int32(convertToInt64(partitionColumn.GetRawValue(ptr)))
+			partitionValue = int32(db.ConvertToInt64(partitionColumn.GetRawValue(ptr)))
 		}
 
 		autoPartVal := int64(0)
 		if scyllaTable.AutoincrementPart != nil {
-			autoPartVal = convertToInt64(scyllaTable.AutoincrementPart.GetRawValue(ptr))
+			autoPartVal = db.ConvertToInt64(scyllaTable.AutoincrementPart.GetRawValue(ptr))
 		}
 
 		key := fmt.Sprintf("%d|%v", partitionValue, autoPartVal)
@@ -175,7 +175,7 @@ func fetchAutoincrementCounterStarts(
 		for _, ptr := range group {
 			// A virtual TableStruct.Autoincrement() column has no field and reads nil: it always needs a value.
 			rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr)
-			if rawAutoincrementValue == nil || convertToInt64(rawAutoincrementValue) <= 0 {
+			if rawAutoincrementValue == nil || db.ConvertToInt64(rawAutoincrementValue) <= 0 {
 				recordsNeedingAutoincrement++
 			}
 		}
@@ -209,13 +209,13 @@ func handlePreInsert(
 		// Get partition key value
 		partitionValue := int32(0)
 		if partitionColumn != nil {
-			partitionValue = int32(convertToInt64(partitionColumn.GetRawValue(ptr)))
+			partitionValue = int32(db.ConvertToInt64(partitionColumn.GetRawValue(ptr)))
 		}
 
 		// Get autoincrement part value (0 if not defined)
 		autoPartVal := int64(0)
 		if scyllaTable.AutoincrementPart != nil {
-			autoPartVal = convertToInt64(scyllaTable.AutoincrementPart.GetRawValue(ptr))
+			autoPartVal = db.ConvertToInt64(scyllaTable.AutoincrementPart.GetRawValue(ptr))
 		}
 
 		// Group key is concatenation of partition value + autoincrementPart value
@@ -234,7 +234,7 @@ func handlePreInsert(
 			// A virtual TableStruct.Autoincrement() column reads nil and stays at 0: it always needs a value.
 			if scyllaTable.AutoincrementCol != nil {
 				if rawAutoincrementValue := scyllaTable.AutoincrementCol.GetRawValue(ptr); rawAutoincrementValue != nil {
-					autoincrementColumnValue = convertToInt64(rawAutoincrementValue)
+					autoincrementColumnValue = db.ConvertToInt64(rawAutoincrementValue)
 				}
 			}
 
@@ -264,23 +264,23 @@ func handlePreInsert(
 				}
 
 				// If not packing, set directly
-				if len(scyllaTable.keyIntPacking) == 0 {
+				if len(scyllaTable.KeyIntPacking) == 0 {
 					scyllaTable.AutoincrementCol.SetValue(ptr, currentAutoVal)
 				}
 			}
 
-			if len(scyllaTable.keyIntPacking) > 0 {
-				componentValues := make([]int64, len(scyllaTable.keyIntPacking))
-				for i, col := range scyllaTable.keyIntPacking {
+			if len(scyllaTable.KeyIntPacking) > 0 {
+				componentValues := make([]int64, len(scyllaTable.KeyIntPacking))
+				for i, col := range scyllaTable.KeyIntPacking {
 					if col == scyllaTable.AutoincrementCol {
 						componentValues[i] = currentAutoVal
 					} else {
-						componentValues[i] = convertToInt64(col.GetRawValue(ptr))
+						componentValues[i] = db.ConvertToInt64(col.GetRawValue(ptr))
 					}
 				}
 				// Set into the only key. The 63-bit layout keeps the ID a positive int64.
-				packedKey := packRowValues(scyllaTable.Name, scyllaTable.Keys[0].GetName(),
-					scyllaTable.keyIntPacking, componentValues, scyllaTable.keyIntPackingSlotBits)
+				packedKey := db.PackRowValues(scyllaTable.Name, scyllaTable.Keys[0].GetName(),
+					scyllaTable.KeyIntPacking, componentValues, scyllaTable.KeyIntPackingSlotBits)
 				scyllaTable.Keys[0].SetValue(ptr, int64(packedKey))
 			}
 		}
@@ -940,7 +940,7 @@ func executeInsertUpdateBatchErased(params erasedInsertUpdateParams) error {
 		})
 	}
 
-	if scyllaTable.textSearchIndex != nil {
+	if scyllaTable.TextSearchIndex != nil {
 		dataSyncGroup.Go(func() error {
 			// Both phases go in one call so each partition gets a single index write.
 			err := syncTextSearchAfterWrite(&scyllaTable,
@@ -1095,21 +1095,21 @@ func resolveUpdateColumnsForWrite(
 	if pk != nil && !pk.IsNil() {
 		columnsIncluded = append(columnsIncluded, pk.GetInfo().Idx)
 	}
-	columnsIncluded = includeComputedColumns(&scyllaTable, columnsIncluded)
+	columnsIncluded = scyllaTable.IncludeComputedColumns(columnsIncluded)
 
 	// Revisa si hay columnas que deben actualizarse juntas para los índices calculados.
 	for _, indexViews := range scyllaTable.indexViews {
-		if indexViews.column.GetInfo().IsVirtual {
+		if indexViews.Column.GetInfo().IsVirtual {
 			// A delta view's packed column is always written, from the stored pinned values a partial
 			// update leaves out (stampDeltaWrites): nothing has to be updated together.
-			if indexViews.Type == 3 || indexViews.isDeltaView {
+			if indexViews.Type == 3 || indexViews.IsDeltaView {
 				// Index groups own their own validation and virtual-column recomputation below.
 				continue
 			}
 			includedCols := []int16{}
 			notIncludedCols := []int16{}
 
-			for _, colIdx := range indexViews.columnsIdx {
+			for _, colIdx := range indexViews.ColumnsIdx {
 				if slices.Contains(columnsIncluded, colIdx) {
 					includedCols = append(includedCols, colIdx)
 				} else {
@@ -1119,7 +1119,7 @@ func resolveUpdateColumnsForWrite(
 
 			if len(includedCols) > 0 && len(notIncludedCols) > 0 {
 				colnames := []string{}
-				for _, colname := range indexViews.columns {
+				for _, colname := range indexViews.Columns {
 					if pk != nil && !pk.IsNil() && pk.GetName() == colname {
 						continue
 					}
@@ -1134,7 +1134,7 @@ func resolveUpdateColumnsForWrite(
 				msg := fmt.Sprintf(`Table "%v": A composit index/view requires the columns %v be updated together. Not Included: %v`, scyllaTable.Name, strings.Join(colnames, ", "), strings.Join(includedColsNames, ", "))
 				panic(msg)
 			} else if len(includedCols) > 0 {
-				columnsToUpdate = append(columnsToUpdate, indexViews.column)
+				columnsToUpdate = append(columnsToUpdate, indexViews.Column)
 			}
 		}
 	}
@@ -1145,12 +1145,12 @@ func resolveUpdateColumnsForWrite(
 		columnsToUpdateByName[col.GetName()] = col
 	}
 
-	for _, compositeBucketIndex := range scyllaTable.compositeBucketIndexes {
+	for _, compositeBucketIndex := range scyllaTable.CompositeBucketIndexes {
 		// Composite bucket hashes become inconsistent if only part of the source tuple is updated.
 		includedCols := []string{}
 		notIncludedCols := []string{}
 
-		for _, sourceColumn := range compositeBucketIndex.sourceColumns {
+		for _, sourceColumn := range compositeBucketIndex.SourceColumns {
 			if slices.Contains(columnsIncluded, sourceColumn.GetInfo().Idx) {
 				includedCols = append(includedCols, sourceColumn.GetName())
 			} else {
@@ -1161,7 +1161,7 @@ func resolveUpdateColumnsForWrite(
 		if len(includedCols) > 0 && len(notIncludedCols) > 0 {
 			panic(fmt.Sprintf(`Table "%v": CompositeBucketing index "%v" requires updating all source columns together. Included: %v | Missing: %v`,
 				scyllaTable.Name,
-				compositeBucketIndex.name,
+				compositeBucketIndex.Name,
 				strings.Join(includedCols, ", "),
 				strings.Join(notIncludedCols, ", "),
 			))
@@ -1169,7 +1169,7 @@ func resolveUpdateColumnsForWrite(
 
 		if len(includedCols) > 0 {
 			// Recompute all generated bucket columns whenever any source tuple is updated.
-			for _, virtualColumn := range compositeBucketIndex.virtualColumnsBySize {
+			for _, virtualColumn := range compositeBucketIndex.VirtualColumnsBySize {
 				if _, exists := columnsToUpdateByName[virtualColumn.GetName()]; !exists {
 					columnsToUpdate = append(columnsToUpdate, virtualColumn)
 					columnsToUpdateByName[virtualColumn.GetName()] = virtualColumn
@@ -1178,15 +1178,15 @@ func resolveUpdateColumnsForWrite(
 		}
 	}
 
-	for _, indexGroup := range scyllaTable.indexGroups {
+	for _, indexGroup := range scyllaTable.IndexGroups {
 		includedSourceColumns := []string{}
 		missingSourceColumns := []string{}
 
-		for _, sourceColumn := range indexGroup.sourceColumns {
-			if slices.Contains(columnsIncluded, sourceColumn.column.GetInfo().Idx) {
-				includedSourceColumns = append(includedSourceColumns, sourceColumn.column.GetName())
+		for _, sourceColumn := range indexGroup.SourceColumns {
+			if slices.Contains(columnsIncluded, sourceColumn.Column.GetInfo().Idx) {
+				includedSourceColumns = append(includedSourceColumns, sourceColumn.Column.GetName())
 			} else {
-				missingSourceColumns = append(missingSourceColumns, sourceColumn.column.GetName())
+				missingSourceColumns = append(missingSourceColumns, sourceColumn.Column.GetName())
 			}
 		}
 
@@ -1195,19 +1195,19 @@ func resolveUpdateColumnsForWrite(
 				recordPointer := recordPointerAt(recordIndex)
 				missingValuesInStruct := []string{}
 
-				for _, sourceColumn := range indexGroup.sourceColumns {
-					if slices.Contains(columnsIncluded, sourceColumn.column.GetInfo().Idx) {
+				for _, sourceColumn := range indexGroup.SourceColumns {
+					if slices.Contains(columnsIncluded, sourceColumn.Column.GetInfo().Idx) {
 						continue
 					}
-					if !hasUsableIndexSourceValue(sourceColumn.column.GetRawValue(recordPointer)) {
-						missingValuesInStruct = append(missingValuesInStruct, sourceColumn.column.GetName())
+					if !hasUsableIndexSourceValue(sourceColumn.Column.GetRawValue(recordPointer)) {
+						missingValuesInStruct = append(missingValuesInStruct, sourceColumn.Column.GetName())
 					}
 				}
 
 				if len(missingValuesInStruct) > 0 {
 					panic(fmt.Sprintf(`Table "%v": IndexGroup "%v" needs struct values for omitted source columns. Included in update: %v | Missing in struct: %v`,
 						scyllaTable.Name,
-						indexGroup.name,
+						indexGroup.Name,
 						strings.Join(includedSourceColumns, ", "),
 						strings.Join(missingValuesInStruct, ", "),
 					))
@@ -1215,18 +1215,18 @@ func resolveUpdateColumnsForWrite(
 			}
 		}
 
-		if len(includedSourceColumns) > 0 && indexGroup.virtualColumn != nil && !indexGroup.virtualColumn.IsNil() {
-			if _, exists := columnsToUpdateByName[indexGroup.virtualColumn.GetName()]; !exists {
-				columnsToUpdate = append(columnsToUpdate, indexGroup.virtualColumn)
-				columnsToUpdateByName[indexGroup.virtualColumn.GetName()] = indexGroup.virtualColumn
+		if len(includedSourceColumns) > 0 && indexGroup.VirtualColumn != nil && !indexGroup.VirtualColumn.IsNil() {
+			if _, exists := columnsToUpdateByName[indexGroup.VirtualColumn.GetName()]; !exists {
+				columnsToUpdate = append(columnsToUpdate, indexGroup.VirtualColumn)
+				columnsToUpdateByName[indexGroup.VirtualColumn.GetName()] = indexGroup.VirtualColumn
 			}
 		}
 	}
 
 	// A TypeDelta packed column holds updated, which every update writes, so it is always rewritten,
 	// from the pinned values the record keeps (managedWriteValues.deltaPackedValues).
-	for _, deltaIndex := range scyllaTable.deltaIndexes {
-		columnsToUpdate = append(columnsToUpdate, deltaIndex.packedColumn)
+	for _, deltaIndex := range scyllaTable.DeltaIndexes {
+		columnsToUpdate = append(columnsToUpdate, deltaIndex.PackedColumn)
 	}
 
 	if onlyVirtual {

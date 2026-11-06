@@ -55,10 +55,10 @@ func canUseViewForAggregateColumns(aggregateColumns []columnInfo, view *viewInfo
 		return false
 	}
 	for _, aggregateColumn := range aggregateColumns {
-		if !slices.Contains(view.availableColumns, aggregateColumn.GetName()) {
+		if !slices.Contains(view.AvailableColumns, aggregateColumn.GetName()) {
 			if ShouldLog() {
 				fmt.Printf("GroupBy aggregate view rejected: view=%s missing_column=%s available=%v\n",
-					view.name, aggregateColumn.GetName(), view.availableColumns)
+					view.Name, aggregateColumn.GetName(), view.AvailableColumns)
 			}
 			return false
 		}
@@ -77,7 +77,7 @@ func makeGroupByAggregateProjection(column columnInfo) (string, error) {
 }
 
 func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement, scyllaTable ScyllaTable) ([]boundWhereClause, error) {
-	if view == nil || len(view.packedSourceColumns) == 0 || len(view.packedSlotBitsPerColumn) == 0 {
+	if view == nil || len(view.PackedSourceColumns) == 0 || len(view.PackedSlotBitsPerColumn) == 0 {
 		return nil, fmt.Errorf("packed GroupBy requires a packed view")
 	}
 
@@ -87,16 +87,16 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 	if partitionColumn != nil && !partitionColumn.IsNil() {
 		allowedColumns[partitionColumn.GetName()] = true
 	}
-	for _, sourceColumn := range view.packedSourceColumns {
+	for _, sourceColumn := range view.PackedSourceColumns {
 		allowedColumns[sourceColumn.GetName()] = true
 	}
 
 	for _, statement := range statements {
 		if !allowedColumns[statement.Col] {
-			return nil, fmt.Errorf(`GroupBy packed view "%v" does not support filtering by column "%v"`, view.name, statement.Col)
+			return nil, fmt.Errorf(`GroupBy packed view "%v" does not support filtering by column "%v"`, view.Name, statement.Col)
 		}
 		if _, exists := statementByColumn[statement.Col]; exists {
-			return nil, fmt.Errorf(`GroupBy packed view "%v" does not support repeated filters for column "%v"`, view.name, statement.Col)
+			return nil, fmt.Errorf(`GroupBy packed view "%v" does not support repeated filters for column "%v"`, view.Name, statement.Col)
 		}
 		statementByColumn[statement.Col] = statement
 	}
@@ -105,7 +105,7 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 	if partitionColumn != nil && !partitionColumn.IsNil() {
 		partitionStatement, exists := statementByColumn[partitionColumn.GetName()]
 		if !exists || partitionStatement.Operator != "=" {
-			return nil, fmt.Errorf(`GroupBy packed view "%v" requires partition equality on "%v"`, view.name, partitionColumn.GetName())
+			return nil, fmt.Errorf(`GroupBy packed view "%v" requires partition equality on "%v"`, view.Name, partitionColumn.GetName())
 		}
 		partitionClause = &boundWhereClause{
 			Clause: fmt.Sprintf("%v = ?", partitionColumn.GetName()),
@@ -133,10 +133,10 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 	}
 
 	prefixValueGroups := [][]int64{{}}
-	rangeStatementIndex := len(view.packedSourceColumns)
+	rangeStatementIndex := len(view.PackedSourceColumns)
 	var rangeStatement *ColumnStatement
 
-	for sourceIndex, sourceColumn := range view.packedSourceColumns {
+	for sourceIndex, sourceColumn := range view.PackedSourceColumns {
 		statement, exists := statementByColumn[sourceColumn.GetName()]
 		if !exists {
 			rangeStatementIndex = sourceIndex
@@ -147,17 +147,17 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 		case "=":
 			nextGroups := [][]int64{}
 			for _, prefixValues := range prefixValueGroups {
-				nextGroups = append(nextGroups, append(slices.Clone(prefixValues), convertToInt64(statement.Value)))
+				nextGroups = append(nextGroups, append(slices.Clone(prefixValues), db.ConvertToInt64(statement.Value)))
 			}
 			prefixValueGroups = nextGroups
 		case "IN":
 			if len(statement.Values) == 0 {
-				return nil, fmt.Errorf(`GroupBy packed view "%v" received an empty IN for column "%v"`, view.name, sourceColumn.GetName())
+				return nil, fmt.Errorf(`GroupBy packed view "%v" received an empty IN for column "%v"`, view.Name, sourceColumn.GetName())
 			}
 			nextGroups := [][]int64{}
 			for _, prefixValues := range prefixValueGroups {
 				for _, rawValue := range statement.Values {
-					nextGroups = append(nextGroups, append(slices.Clone(prefixValues), convertToInt64(rawValue)))
+					nextGroups = append(nextGroups, append(slices.Clone(prefixValues), db.ConvertToInt64(rawValue)))
 				}
 			}
 			prefixValueGroups = nextGroups
@@ -165,7 +165,7 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 			rangeStatementIndex = sourceIndex
 			rangeStatement = &statement
 		default:
-			return nil, fmt.Errorf(`GroupBy packed view "%v" does not support operator "%v" for column "%v"`, view.name, statement.Operator, sourceColumn.GetName())
+			return nil, fmt.Errorf(`GroupBy packed view "%v" does not support operator "%v" for column "%v"`, view.Name, statement.Operator, sourceColumn.GetName())
 		}
 
 		if rangeStatement != nil {
@@ -173,14 +173,14 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 		}
 	}
 
-	for trailingIndex := rangeStatementIndex + 1; trailingIndex < len(view.packedSourceColumns); trailingIndex++ {
-		trailingColumnName := view.packedSourceColumns[trailingIndex].GetName()
+	for trailingIndex := rangeStatementIndex + 1; trailingIndex < len(view.PackedSourceColumns); trailingIndex++ {
+		trailingColumnName := view.PackedSourceColumns[trailingIndex].GetName()
 		if _, exists := statementByColumn[trailingColumnName]; exists {
-			return nil, fmt.Errorf(`GroupBy packed view "%v" requires filters to follow the packed key order. Column "%v" is out of place`, view.name, trailingColumnName)
+			return nil, fmt.Errorf(`GroupBy packed view "%v" requires filters to follow the packed key order. Column "%v" is out of place`, view.Name, trailingColumnName)
 		}
 	}
 
-	packedColumnName := view.column.GetName()
+	packedColumnName := view.Column.GetName()
 	whereStatements := []boundWhereClause{}
 
 	// packedBound packs the prefix (plus the range value, if any) with every later slot at zero or at
@@ -188,8 +188,8 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 	// every bound inclusive, so no bound needs a +1 that could overflow a slot.
 	packedBound := func(prefixValues []int64, fillWithMax bool, rangeValue ...int64) any {
 		boundPrefix := append(slices.Clone(prefixValues), rangeValue...)
-		packed := db.PackSlotPrefixBound(boundPrefix, view.packedSlotBitsPerColumn, fillWithMax)
-		return storeVirtualPacked(packed, view.packedIsInt32)
+		packed := db.PackSlotPrefixBound(boundPrefix, view.PackedSlotBitsPerColumn, fillWithMax)
+		return storeVirtualPacked(packed, view.PackedIsInt32)
 	}
 	singleBoundClause := func(operator string, value any) boundWhereClause {
 		return appendPartitionClause(boundWhereClause{
@@ -207,7 +207,7 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 	switch {
 	case rangeStatement == nil && rangeStatementIndex == 0:
 		whereStatements = append(whereStatements, appendPartitionClause())
-	case rangeStatement == nil && rangeStatementIndex >= len(view.packedSourceColumns):
+	case rangeStatement == nil && rangeStatementIndex >= len(view.PackedSourceColumns):
 		for _, prefixValues := range prefixValueGroups {
 			whereStatements = append(whereStatements, singleBoundClause("=", packedBound(prefixValues, false)))
 		}
@@ -220,24 +220,24 @@ func buildPackedPrefixRangeClauses(view *viewInfo, statements []ColumnStatement,
 			switch rangeStatement.Operator {
 			case "BETWEEN":
 				if len(rangeStatement.From) == 0 || len(rangeStatement.To) == 0 {
-					return nil, fmt.Errorf(`GroupBy packed view "%v" received an invalid BETWEEN for column "%v"`, view.name, rangeStatement.Col)
+					return nil, fmt.Errorf(`GroupBy packed view "%v" received an invalid BETWEEN for column "%v"`, view.Name, rangeStatement.Col)
 				}
-				fromValue := packedBound(prefixValues, false, convertToInt64(rangeStatement.From[0].Value))
-				toValue := packedBound(prefixValues, true, convertToInt64(rangeStatement.To[0].Value))
+				fromValue := packedBound(prefixValues, false, db.ConvertToInt64(rangeStatement.From[0].Value))
+				toValue := packedBound(prefixValues, true, db.ConvertToInt64(rangeStatement.To[0].Value))
 				whereStatements = append(whereStatements, closedRangeClause(fromValue, toValue))
 			case ">", "<=":
 				// Everything under the value's own block sits at or below its max-filled bound.
-				rangeValue := convertToInt64(rangeStatement.Value)
+				rangeValue := db.ConvertToInt64(rangeStatement.Value)
 				whereStatements = append(whereStatements, singleBoundClause(rangeStatement.Operator, packedBound(prefixValues, true, rangeValue)))
 			case ">=", "<":
-				rangeValue := convertToInt64(rangeStatement.Value)
+				rangeValue := db.ConvertToInt64(rangeStatement.Value)
 				whereStatements = append(whereStatements, singleBoundClause(rangeStatement.Operator, packedBound(prefixValues, false, rangeValue)))
 			}
 		}
 	}
 
 	if len(whereStatements) == 0 {
-		return nil, fmt.Errorf(`GroupBy packed view "%v" could not build a packed where clause`, view.name)
+		return nil, fmt.Errorf(`GroupBy packed view "%v" could not build a packed where clause`, view.Name)
 	}
 
 	return whereStatements, nil
@@ -297,13 +297,13 @@ func buildNativeGroupByPlan(
 	}
 
 	for _, view := range scyllaTable.indexViews {
-		if view.Type != 8 || len(view.columnsNoPart) != len(groupedColumnNames) {
+		if view.Type != 8 || len(view.ColumnsNoPart) != len(groupedColumnNames) {
 			continue
 		}
-		if !slices.Equal(view.columnsNoPart, groupedColumnNames) {
+		if !slices.Equal(view.ColumnsNoPart, groupedColumnNames) {
 			if ShouldLog() {
 				fmt.Printf("GroupBy packed view skipped: view=%s expected=%v got=%v\n",
-					view.name, groupedColumnNames, view.columnsNoPart)
+					view.Name, groupedColumnNames, view.ColumnsNoPart)
 			}
 			continue
 		}
@@ -313,12 +313,12 @@ func buildNativeGroupByPlan(
 
 		whereStatements, err := buildPackedPrefixRangeClauses(view, statements, scyllaTable)
 		if err != nil {
-			fmt.Printf("GroupBy packed view rejected: view=%s err=%v\n", view.name, err)
+			fmt.Printf("GroupBy packed view rejected: view=%s err=%v\n", view.Name, err)
 			return nil, err
 		}
 
-		selectExpressionsPacked := []string{view.column.GetName()}
-		scanColumnsPacked := []selectScanColumn{{ColumnName: view.column.GetName(), DecomposeView: view}}
+		selectExpressionsPacked := []string{view.Column.GetName()}
+		scanColumnsPacked := []selectScanColumn{{ColumnName: view.Column.GetName(), DecomposeView: view}}
 		for _, aggregateColumn := range aggregateColumns {
 			selectExpression, err := makeGroupByAggregateProjection(aggregateColumn)
 			if err != nil {
@@ -329,15 +329,15 @@ func buildNativeGroupByPlan(
 		}
 
 		if ShouldLog() {
-			fmt.Printf("Native GroupBy packed view selected: view=%s groups=%v aggregates=%d\n", view.name, groupedColumnNames, len(aggregateColumns))
+			fmt.Printf("Native GroupBy packed view selected: view=%s groups=%v aggregates=%d\n", view.Name, groupedColumnNames, len(aggregateColumns))
 		}
 		return &nativeGroupByPlan{
-			ViewTableName:     view.name,
+			ViewTableName:     view.Name,
 			SelectExpressions: selectExpressionsPacked,
 			ScanColumns:       scanColumnsPacked,
-			GroupByColumns:    []string{view.column.GetName()},
+			GroupByColumns:    []string{view.Column.GetName()},
 			WhereStatements:   whereStatements,
-			OrderColumn:       view.column,
+			OrderColumn:       view.Column,
 		}, nil
 	}
 
@@ -422,9 +422,9 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 	for _, idx := range dbTable.indexes {
 		if idx.Type == 2 { // Local Index
 			pkName := dbTable.GetPartKey().GetName()
-			colName := idx.column.GetName()
+			colName := idx.Column.GetName()
 			// Use slice-aware operator token so generated index signatures match CONTAINS queries.
-			colOp := capabilityDefaultOpForColumn(idx.column)
+			colOp := capabilityDefaultOpForColumn(idx.Column)
 			// Equality
 			caps = append(caps, QueryCapability{
 				Signature: fmt.Sprintf("%v|=|%v|%v", pkName, colName, colOp),
@@ -438,9 +438,9 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				Priority:  110,
 			})
 		} else if idx.Type == 1 { // Global Index
-			colName := idx.column.GetName()
+			colName := idx.Column.GetName()
 			// Global set indexes must advertise CONTAINS-compatible signatures.
-			colOp := capabilityDefaultOpForColumn(idx.column)
+			colOp := capabilityDefaultOpForColumn(idx.Column)
 			caps = append(caps, QueryCapability{
 				Signature: fmt.Sprintf("%v|%v", colName, colOp),
 				Source:    idx,
@@ -454,26 +454,26 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 	// - local:  CREATE INDEX ... ON table ((partition), packed_column)
 	// - global: CREATE INDEX ... ON table (packed_column)
 	// but capabilities must match on the source predicates (status/updated/etc).
-	if len(dbTable.packedIndexes) > 0 {
-		for _, packedIndex := range dbTable.packedIndexes {
-			if len(packedIndex.sourceColumnNames) == 0 {
+	if len(dbTable.PackedIndexes) > 0 {
+		for _, packedIndex := range dbTable.PackedIndexes {
+			if len(packedIndex.SourceColumnNames) == 0 {
 				continue
 			}
 
-			source := dbTable.indexes[packedIndex.indexName]
+			source := dbTable.indexes[packedIndex.IndexName]
 			if source == nil {
 				continue
 			}
 
 			signatureParts := []string{}
-			isLocal := packedIndex.partitionColumnName != ""
+			isLocal := packedIndex.PartitionColumnName != ""
 			if isLocal {
-				signatureParts = append(signatureParts, packedIndex.partitionColumnName, "=")
+				signatureParts = append(signatureParts, packedIndex.PartitionColumnName, "=")
 			}
 
 			// Single-column packed index: match equality/range directly on that source column (plus pk if local).
-			if len(packedIndex.sourceColumnNames) == 1 {
-				colName := packedIndex.sourceColumnNames[0]
+			if len(packedIndex.SourceColumnNames) == 1 {
+				colName := packedIndex.SourceColumnNames[0]
 				sigPrefix := strings.Join(signatureParts, "|")
 				if sigPrefix != "" {
 					sigPrefix += "|"
@@ -493,8 +493,8 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 
 			// Composite: equality on all prefix columns + (range/equality) on last column.
 			// Note: IN is normalized to "=" in capabilityOpForStatement, so it matches these signatures.
-			for i, colName := range packedIndex.sourceColumnNames {
-				if i < len(packedIndex.sourceColumnNames)-1 {
+			for i, colName := range packedIndex.SourceColumnNames {
+				if i < len(packedIndex.SourceColumnNames)-1 {
 					signatureParts = append(signatureParts, colName, "=")
 					continue
 				}
@@ -513,7 +513,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				caps = append(caps, QueryCapability{
 					Signature: signaturePrefix + colName + "|=",
 					Source:    source,
-					Priority:  priorityBase + len(packedIndex.sourceColumnNames)*20,
+					Priority:  priorityBase + len(packedIndex.SourceColumnNames)*20,
 				})
 				// Global secondary indexes are not reliable for range scans; Scylla can demand ALLOW FILTERING.
 				// We only advertise "~" for local packed indexes (partition-scoped index table supports range on packed col).
@@ -521,7 +521,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					caps = append(caps, QueryCapability{
 						Signature: signaturePrefix + colName + "|~",
 						Source:    source,
-						Priority:  priorityBase - 20 + len(packedIndex.sourceColumnNames)*20,
+						Priority:  priorityBase - 20 + len(packedIndex.SourceColumnNames)*20,
 					})
 				}
 			}
@@ -539,7 +539,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 		sigBase := ""
 		if view.Type == 7 || view.Type == 3 { // Hash / Index-Group
 			cols := []string{}
-			for _, col := range view.columns {
+			for _, col := range view.Columns {
 				column := dbTable.ColumnsMap[col]
 				// Hash view signatures inherit source column operator semantics.
 				cols = append(cols, col+"|"+capabilityDefaultOpForColumn(column))
@@ -548,18 +548,18 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			caps = append(caps, QueryCapability{
 				Signature: sigBase,
 				Source:    view,
-				Priority:  300 + len(view.columns)*20,
+				Priority:  300 + len(view.Columns)*20,
 			})
 
 			// Index groups support BETWEEN on each non-slice source column by
 			// enumerating discrete values and computing one hash per value.
-			for rangeColIdx, col := range view.columns {
+			for rangeColIdx, col := range view.Columns {
 				colInfo := dbTable.ColumnsMap[col]
 				if colInfo != nil && colInfo.GetType().IsSlice {
 					continue // slice columns only support CONTAINS, not range
 				}
-				rangeSigParts := make([]string, 0, len(view.columns)*2)
-				for i, c := range view.columns {
+				rangeSigParts := make([]string, 0, len(view.Columns)*2)
+				for i, c := range view.Columns {
 					ci := dbTable.ColumnsMap[c]
 					if i == rangeColIdx {
 						rangeSigParts = append(rangeSigParts, c, "~")
@@ -570,12 +570,12 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 				caps = append(caps, QueryCapability{
 					Signature: strings.Join(rangeSigParts, "|"),
 					Source:    view,
-					Priority:  280 + len(view.columns)*20, // slightly lower than full equality
+					Priority:  280 + len(view.Columns)*20, // slightly lower than full equality
 				})
 			}
 		} else if view.Type == 6 { // Simple View
 			currentSig := ""
-			for i, col := range view.columns {
+			for i, col := range view.Columns {
 				if i > 0 {
 					currentSig += "|"
 				}
@@ -604,7 +604,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			}
 		} else if view.Type == 9 { // Table-backed view
 			currentSig := ""
-			for i, col := range view.columns {
+			for i, col := range view.Columns {
 				if i > 0 {
 					currentSig += "|"
 				}
@@ -641,7 +641,7 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 			// is more selective than a broad prefix scan — without that gap the planner would prefer
 			// this view and leave the narrow predicate as an unservable leftover filter.
 			cols := []string{}
-			for i, col := range view.columns {
+			for i, col := range view.Columns {
 				if i == 0 {
 					// The partition alone is served better by the base table.
 					cols = append(cols, col+"|=")
@@ -653,8 +653,8 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 					sigPrefix += "|"
 				}
 
-				equalityPriority := 360 + len(view.columns)*20
-				if i < len(view.columns)-1 {
+				equalityPriority := 360 + len(view.Columns)*20
+				if i < len(view.Columns)-1 {
 					// Longer prefixes still outrank shorter ones; MatchQueryCapability ranks by covered
 					// predicates first anyway, so the cap only orders prefixes of equal coverage.
 					equalityPriority = min(101+i*2, 108)
@@ -677,13 +677,13 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 	}
 
 	// 4. KeyIntPacking
-	if len(dbTable.keyIntPacking) > 0 {
+	if len(dbTable.KeyIntPacking) > 0 {
 		pk := dbTable.PartKey
 		if pk != nil && !pk.IsNil() {
 			pkName := pk.GetName()
 			currentSig := fmt.Sprintf("%v|=", pkName)
 
-			for i, col := range dbTable.keyIntPacking {
+			for i, col := range dbTable.KeyIntPacking {
 				colName := col.GetName()
 				if colName == "autoincrement_placeholder" {
 					continue
@@ -709,19 +709,19 @@ func (dbTable *ScyllaTable) ComputeCapabilities() []QueryCapability {
 	}
 
 	// 5. KeyConcatenated
-	if len(dbTable.keyConcatenated) > 0 {
+	if len(dbTable.KeyConcatenated) > 0 {
 		pk := dbTable.PartKey
 		if pk != nil && !pk.IsNil() {
 			pkName := pk.GetName()
 			currentSig := fmt.Sprintf("%v|=", pkName)
 
-			for i, col := range dbTable.keyConcatenated {
+			for i, col := range dbTable.KeyConcatenated {
 				colName := col.GetName()
 				// Equality on this prefix maps to a range or equality on the actual PK
 				// If it's the last column of KeyConcatenated, it's equality on PK
 				// Otherwise it's a range prefix search on PK.
 
-				isLast := i == len(dbTable.keyConcatenated)-1
+				isLast := i == len(dbTable.KeyConcatenated)-1
 
 				// Equality
 				caps = append(caps, QueryCapability{
@@ -820,7 +820,7 @@ func MatchQueryCapability(statements []ColumnStatement, capabilities []QueryCapa
 	if bestMatch != nil && ShouldLog() {
 		sourceName := "base-key"
 		if bestMatch.Source != nil {
-			sourceName = bestMatch.Source.name
+			sourceName = bestMatch.Source.Name
 		}
 		fmt.Printf("Capability selected: signature=%s priority=%d source=%s isKey=%v\n",
 			bestMatch.Signature, bestMatch.Priority, sourceName, bestMatch.IsKey)

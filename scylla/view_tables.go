@@ -15,7 +15,7 @@ type viewTableDeleteRow struct {
 	keyValues []any
 }
 
-func appendUniqueViewTableColumn(target []viewTableColumnInfo, column viewTableColumnInfo) []viewTableColumnInfo {
+func appendUniqueViewTableColumn(target []db.ViewTableColumnInfo, column db.ViewTableColumnInfo) []db.ViewTableColumnInfo {
 	// ViewTable physical columns are derived from source columns, so source-name uniqueness is enough.
 	for _, existingColumn := range target {
 		if existingColumn.SourceColumn.GetName() == column.SourceColumn.GetName() {
@@ -50,13 +50,13 @@ func getViewTableColumnType(sourceColumn IColInfo, useSliceElement bool) colType
 	return physicalType
 }
 
-func getViewTableColumnName(column viewTableColumnInfo) string {
+func getViewTableColumnName(column db.ViewTableColumnInfo) string {
 	return column.SourceColumn.GetName()
 }
 
-func makeViewTableColumn(sourceColumn IColInfo, useSliceElement bool) viewTableColumnInfo {
+func makeViewTableColumn(sourceColumn IColInfo, useSliceElement bool) db.ViewTableColumnInfo {
 	// Keep only the source column reference plus the fan-out flag; name/type are derived on demand.
-	return viewTableColumnInfo{
+	return db.ViewTableColumnInfo{
 		SourceColumn:     sourceColumn,
 		UsesSliceElement: useSliceElement,
 	}
@@ -64,18 +64,18 @@ func makeViewTableColumn(sourceColumn IColInfo, useSliceElement bool) viewTableC
 
 func getViewTableFanoutColumn(view *viewInfo) IColInfo {
 	// Slice-backed views fan out on the declared slice key; scalar-only views still iterate once on the first key column.
-	for _, keyColumn := range view.tableKeyColumns {
-		if view.fanoutColumnName != "" && keyColumn.SourceColumn.GetName() == view.fanoutColumnName {
+	for _, keyColumn := range view.TableKeyColumns {
+		if view.FanoutColumnName != "" && keyColumn.SourceColumn.GetName() == view.FanoutColumnName {
 			return keyColumn.SourceColumn
 		}
 	}
-	if len(view.tableKeyColumns) == 0 {
+	if len(view.TableKeyColumns) == 0 {
 		return nil
 	}
-	return view.tableKeyColumns[0].SourceColumn
+	return view.TableKeyColumns[0].SourceColumn
 }
 
-func getViewTableColumnWriteValue(view *viewInfo, column viewTableColumnInfo, recordPointer unsafe.Pointer, fanoutValue any) any {
+func getViewTableColumnWriteValue(view *viewInfo, column db.ViewTableColumnInfo, recordPointer unsafe.Pointer, fanoutValue any) any {
 	fanoutColumn := getViewTableFanoutColumn(view)
 	if fanoutColumn != nil && fanoutColumn.GetName() == column.SourceColumn.GetName() {
 		// The selected fan-out source column always binds from fanoutValue so scalar and slice paths share one insert flow.
@@ -132,8 +132,8 @@ func getViewTableFanoutValues(view *viewInfo, recordPointer unsafe.Pointer) []an
 
 func getViewTableKeyValues(view *viewInfo, recordPointer unsafe.Pointer, fanoutValue any) []any {
 	// Build the derived clustering key exactly as it will be inserted so delete filtering can compare full row identity.
-	keyValues := make([]any, 0, len(view.tableKeyColumns))
-	for _, keyColumn := range view.tableKeyColumns {
+	keyValues := make([]any, 0, len(view.TableKeyColumns))
+	for _, keyColumn := range view.TableKeyColumns {
 		keyValues = append(keyValues, getViewTableColumnWriteValue(view, keyColumn, recordPointer, fanoutValue))
 	}
 	return keyValues
@@ -152,14 +152,14 @@ func makeViewTableRowKey(partValue int64, idValue int64, keyValues []any) string
 }
 
 func getViewTableMaintenanceIndexName(view *viewInfo) string {
-	return fmt.Sprintf(`%v__%v_index_0`, view.name, view.maintenanceIDColumn.GetName())
+	return fmt.Sprintf(`%v__%v_index_0`, view.Name, view.maintenanceIDColumn.GetName())
 }
 
 func getViewTableMaintenanceIndexCreateScript(view *viewInfo, scyllaTable ScyllaTable) string {
 	// Maintenance reads are always scoped by partition + base ID, so the helper derives the one required local index.
 	partKey := scyllaTable.GetPartKey()
 	return fmt.Sprintf(`CREATE INDEX %v ON %v.%v ((%v), %v)`,
-		getViewTableMaintenanceIndexName(view), scyllaTable.Namespace, view.name, partKey.GetName(), view.maintenanceIDColumn.GetName())
+		getViewTableMaintenanceIndexName(view), scyllaTable.Namespace, view.Name, partKey.GetName(), view.maintenanceIDColumn.GetName())
 }
 
 func makeNumericQueryValue(column IColInfo, value int64) any {
@@ -186,8 +186,8 @@ func fetchExistingViewTableDeleteRows(
 	}
 
 	// Fetch stale candidates in one indexed pass per partition so updates do not issue one SELECT per base record.
-	selectColumnNames := make([]string, 0, len(view.tableKeyColumns)+1)
-	for _, keyColumn := range view.tableKeyColumns {
+	selectColumnNames := make([]string, 0, len(view.TableKeyColumns)+1)
+	for _, keyColumn := range view.TableKeyColumns {
 		selectColumnNames = append(selectColumnNames, getViewTableColumnName(keyColumn))
 	}
 	selectColumnNames = append(selectColumnNames, view.maintenanceIDColumn.GetName())
@@ -203,7 +203,7 @@ func fetchExistingViewTableDeleteRows(
 	query := fmt.Sprintf(`SELECT %v FROM %v.%v WHERE %v = ? AND %v IN (%v)`,
 		strings.Join(selectColumnNames, ", "),
 		scyllaTable.Namespace,
-		view.name,
+		view.Name,
 		scyllaTable.GetPartKey().GetName(),
 		view.maintenanceIDColumn.GetName(),
 		strings.Join(idPlaceholders, ", "),
@@ -223,12 +223,12 @@ func fetchExistingViewTableDeleteRows(
 			return nil, err
 		}
 
-		keyValues := make([]any, 0, len(view.tableKeyColumns))
-		for valueIndex := range view.tableKeyColumns {
+		keyValues := make([]any, 0, len(view.TableKeyColumns))
+		for valueIndex := range view.TableKeyColumns {
 			keyValues = append(keyValues, normalizeScannedValue(rowValues[valueIndex]))
 		}
 		deleteRows = append(deleteRows, viewTableDeleteRow{
-			idValue:   convertToInt64(normalizeScannedValue(rowValues[len(view.tableKeyColumns)])),
+			idValue:   db.ConvertToInt64(normalizeScannedValue(rowValues[len(view.TableKeyColumns)])),
 			keyValues: keyValues,
 		})
 	}
@@ -261,7 +261,7 @@ func executeViewTableSyncChunk(
 		if len(keyValues) == 0 {
 			continue
 		}
-		idValue := convertToInt64(keyValues[0])
+		idValue := db.ConvertToInt64(keyValues[0])
 
 		groupRows := deleteGroups[partValue]
 		if groupRows == nil {
@@ -288,7 +288,7 @@ func executeViewTableSyncChunk(
 		// Read current derived rows first, then delete only the ones not covered by the new fan-out payload.
 		deleteRows, err := fetchExistingViewTableDeleteRows(view, *scyllaTable, partValue, idValues)
 		if err != nil {
-			return fmt.Errorf("view table fetch existing rows %s: %w", view.name, err)
+			return fmt.Errorf("view table fetch existing rows %s: %w", view.Name, err)
 		}
 
 		for _, deleteRow := range deleteRows {
@@ -299,7 +299,7 @@ func executeViewTableSyncChunk(
 
 			whereColumnNames := []string{partColumn.GetName()}
 			whereArguments := []any{makeNumericQueryValue(partColumn, partValue)}
-			for keyIndex, keyColumn := range view.tableKeyColumns {
+			for keyIndex, keyColumn := range view.TableKeyColumns {
 				whereColumnNames = append(whereColumnNames, getViewTableColumnName(keyColumn))
 				whereArguments = append(whereArguments, deleteRow.keyValues[keyIndex])
 			}
@@ -314,7 +314,7 @@ func executeViewTableSyncChunk(
 			// Deletes target the full derived primary key so only stale fan-out rows are removed.
 			deleteQuery := fmt.Sprintf(`DELETE FROM %v.%v WHERE %v`,
 				scyllaTable.Namespace,
-				view.name,
+				view.Name,
 				strings.Join(whereClauses, " AND "),
 			)
 			batch.Query(deleteQuery, whereArguments...)
@@ -322,9 +322,9 @@ func executeViewTableSyncChunk(
 		}
 	}
 
-	columnNames := make([]string, 0, len(view.tableColumns))
-	columnPlaceholders := make([]string, 0, len(view.tableColumns))
-	for _, column := range view.tableColumns {
+	columnNames := make([]string, 0, len(view.TableColumns))
+	columnPlaceholders := make([]string, 0, len(view.TableColumns))
+	for _, column := range view.TableColumns {
 		columnNames = append(columnNames, getViewTableColumnName(column))
 		columnPlaceholders = append(columnPlaceholders, "?")
 	}
@@ -332,7 +332,7 @@ func executeViewTableSyncChunk(
 	// Reuse one insert statement shape per chunk; only the bound values vary across fan-out rows.
 	insertQuery := fmt.Sprintf(`INSERT INTO %v.%v (%v) VALUES (%v)`,
 		scyllaTable.Namespace,
-		view.name,
+		view.Name,
 		strings.Join(columnNames, ", "),
 		strings.Join(columnPlaceholders, ", "),
 	)
@@ -342,15 +342,15 @@ func executeViewTableSyncChunk(
 		fanoutValues := getViewTableFanoutValues(view, recordPointer)
 		if len(fanoutValues) == 0 {
 			if DebugFull {
-				fmt.Printf("ViewTable sync skipped empty fanout: table=%s view=%s\n", scyllaTable.Name, view.name)
+				fmt.Printf("ViewTable sync skipped empty fanout: table=%s view=%s\n", scyllaTable.Name, view.Name)
 			}
 			continue
 		}
 
 		// Insert every derived row from the current source payload after stale rows have been cleared.
 		for _, fanoutValue := range fanoutValues {
-			values := make([]any, 0, len(view.tableColumns))
-			for _, column := range view.tableColumns {
+			values := make([]any, 0, len(view.TableColumns))
+			for _, column := range view.TableColumns {
 				values = append(values, getViewTableColumnWriteValue(view, column, recordPointer, fanoutValue))
 			}
 			batch.Query(insertQuery, values...)
@@ -364,12 +364,12 @@ func executeViewTableSyncChunk(
 
 	if DebugFull {
 		fmt.Printf("ViewTable sync batch: base_table=%s view=%s deletes=%d inserts=%d records=%d\n",
-			scyllaTable.Name, view.name, deleteStatementsCount, insertStatementsCount, recordCount)
+			scyllaTable.Name, view.Name, deleteStatementsCount, insertStatementsCount, recordCount)
 	}
 
 	// Stale deletes and current inserts no longer target the same derived key, so one batch is enough.
 	if err := session.ExecuteBatch(batch); err != nil {
-		return fmt.Errorf("view table sync %s: %w", view.name, err)
+		return fmt.Errorf("view table sync %s: %w", view.Name, err)
 	}
 
 	return nil
