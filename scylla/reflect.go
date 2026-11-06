@@ -1,7 +1,6 @@
 package scylla
 
 import (
-	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -30,351 +29,48 @@ type statementRangeGroup struct {
 	betweenTo *ColumnStatement
 }
 
-func isManagedIntFieldType(fieldType string) bool {
-	// Managed audit columns are shared scalar values written back into one numeric column.
-	switch fieldType {
-	case "int", "int8", "int16", "int32", "int64":
-		return true
-	}
-	return false
-}
-
-func ensureManagedIntColumn(dbTable *ScyllaTable, columnName string) IColInfo {
-	if currentColumn := dbTable.ColumnsMap[columnName]; currentColumn != nil {
-		if currentColumn.GetType().IsSlice || !isManagedIntFieldType(currentColumn.GetType().FieldType) {
-			panic(fmt.Sprintf(`Table "%v": managed column "%v" must be an integer scalar. Found: %v`,
-				dbTable.Name, columnName, currentColumn.GetType().FieldType))
-		}
-		return currentColumn
-	}
-
-	dbTable.MaxColIdx++
-	managedColumn := &columnInfo{
-		ColInfo: colInfo{
-			Name:      columnName,
-			FieldName: columnName,
-			Idx:       dbTable.MaxColIdx,
-			RefType:   reflect.TypeOf(int32(0)),
-		},
-		ColType: db.GetColTypeByID(3),
-		// DB-only managed columns exist in Scylla even when a record struct does not expose them.
-		GetRawValueFn:       func(ptr unsafe.Pointer) any { return nil },
-		GetStatementValueFn: func(ptr unsafe.Pointer) any { return nil },
-		GetValueFn:          func(ptr unsafe.Pointer) any { return nil },
-	}
-	dbTable.ColumnsMap[columnName] = managedColumn
-	return managedColumn
-}
-
-func hasDeltaIndex(schema TableSchema) bool {
-	return slices.ContainsFunc(schema.Indexes, func(index Index) bool { return index.Type == TypeDelta })
-}
-
-func bindManagedAuditColumns(dbTable *ScyllaTable, schema TableSchema) {
-	// A column already in ColumnsMap was declared by the table struct, so it is backed by a record
-	// field and reaches the client: the cache protocols need both of these there.
-	if _, isDeclared := dbTable.ColumnsMap[managedUpdatedColumnName]; schema.CacheByIDs && !isDeclared {
-		panic(fmt.Sprintf(`Table "%v": CacheByIDs returns each record's slot tick in its Updated. `+
-			`Declare the field "Updated int32" with the json tag "upd,omitempty" in the record struct, `+
-			`and "Updated db.Col[...]" in the table struct.`, dbTable.Name))
-	}
-	// The delta key packs the record's Updated and a Delta() read hands it to the client as the cursor:
-	// a DB-only column reads nil from the record, so every key would pack updated = 0.
-	if _, isDeclared := dbTable.ColumnsMap[managedUpdatedColumnName]; hasDeltaIndex(schema) && !isDeclared {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta packs each record's Updated into its key and returns it as the cursor. `+
-			`Declare the field "Updated int32" with the json tag "upd" in the record struct, `+
-			`and "Updated db.Col[...]" in the table struct.`, dbTable.Name))
-	}
-	if _, isDeclared := dbTable.ColumnsMap[managedVersionColumnName]; hasDeltaIndex(schema) && !isDeclared {
-		panic(fmt.Sprintf(`Table "%v": TypeDelta logs each write's Version and the client compares it. `+
-			`Declare the field "Version int16" with the json tag "ver,omitempty" in the record struct, `+
-			`and "Version db.Col[...]" in the table struct.`, dbTable.Name))
-	}
-
-	if !schema.DisableDefaultColumns || schema.CacheByIDs {
-		dbTable.CreatedCol = ensureManagedIntColumn(dbTable, managedCreatedColumnName)
-		dbTable.UpdatedCol = ensureManagedIntColumn(dbTable, managedUpdatedColumnName)
-	}
-	// The version costs a read per write (delta_log.go), so only a table with a delta log keeps it.
-	if hasDeltaIndex(schema) {
-		dbTable.VersionCol = ensureManagedIntColumn(dbTable, managedVersionColumnName)
-	}
-}
-
 // makeTable is deliberately NOT generic. It is 400+ lines that work purely through the schema
 // and reflection, so a type parameter here would stencil the whole body once per table type —
 // it cost ~850 KB of binary across 54 tables. The caller does the two lines of type-specific
 // work (GetSchema, reflect.ValueOf) and hands the results in.
 func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable {
-
-	if len(schema.Keys) == 0 {
-		panic("No se ha especificado una PrimaryKey")
-	}
-
-	// Claiming the ID here validates its range and rejects duplicates the first time each table is
-	// compiled, which is well before any cached slot version could be written under a wrong key.
-	db.ClaimTableID(schema.ID, schema.Name)
-
 	dbTable := ScyllaTable{
-		TableCore: db.TableCore{
-			Namespace:     schema.Namespace,
-			Name:          schema.Name,
-			ID:            schema.ID,
-			CacheByIDs:    schema.CacheByIDs,
-			ColumnsMap:    map[string]IColInfo{},
-			ColumnsIdxMap: map[int16]IColInfo{},
-			UseSequences:  schema.UseSequences,
-			MaxColIdx:     int16(structRefValue.NumField()) + 1,
-		},
 		indexes:              map[string]*viewInfo{},
 		views:                map[string]*viewInfo{},
 		selectStatementCache: newSelectPlanCache(),
 	}
-
+	// db compiles what the table means to every driver; below are the parts only CQL has.
+	dbTable.CompileFromSchema(schema, structRefValue)
 	if dbTable.Namespace == "" {
 		dbTable.Namespace = connParams.Keyspace
 	}
-
-	sequenceColumn := ""
+	for _, column := range dbTable.ColumnsMap {
+		if columnMetadata, isColumnInfo := column.(*columnInfo); isColumnInfo {
+			assertColumnIsEncodable(dbTable.Name, columnMetadata)
+		}
+	}
 	if schema.SequenceColumn != nil {
-		sequenceColumn = schema.SequenceColumn.GetName()
+		dbTable.ColumnsMap[schema.SequenceColumn.GetName()].GetType().DBType = "counter"
 	}
-
-	computedPendingColumns := map[string]columnInfo{}
-
-	// New implementation: iterate over struct fields and process Col[T,E] fields
-	for i := 0; i < structRefValue.NumField(); i++ {
-		field := structRefValue.Field(i)
-
-		// Skip if field cannot be addressed or interfaced
-		if !field.CanAddr() || !field.Addr().CanInterface() {
-			panic("No es un interface!: " + field.Type().Name())
-		}
-
-		// Check if field implements Coln interface
-		fieldAddr := field.Addr()
-		colInterface, ok := fieldAddr.Interface().(Coln)
-		fieldName := field.Type().Name()
-
-		if !ok {
-			if !(len(fieldName) > 12 && fieldName[0:12] == "TableStruct[") {
-				fmt.Println("No es una columna:", fieldName)
-			}
-			continue
-		}
-
-		// Get column info from the field
-		column := colInterface.GetInfo()
-		// fmt.Printf("DEBUG: makeTable field=%s, GetInfo().Name=%s, Type=%T\n", fieldName, column.Name, colInterface)
-		if column.Name == "" {
-			fmt.Printf("DEBUG: makeTable EMPTY NAME for field=%s! columnInfo=%+v\n", fieldName, column)
-			panic("El nombre de la columna no está seteada.")
-		}
-
-		if DebugFull {
-			offset := uintptr(0)
-			if column.GetInfo().Field != nil {
-				offset = column.GetInfo().Field.Offset
-			}
-			fmt.Printf("Mapped Table Column: %-20s | Field: %-20s | Type: %-10s | Offset: %d\n", column.GetName(), column.GetInfo().FieldName, column.FieldType, offset)
-		}
-
-		// No record field: configureComputedColumns binds it to its TableSchema.Computed declaration.
-		if column.IsComputed {
-			computedPendingColumns[column.GetName()] = column
-			continue
-		}
-
-		if sequenceColumn == column.GetName() {
-			column.DBType = "counter"
-		} /* else if column.DBType == "" {
-			column.GetType().IsComplexType = true
-			column.Type = 9
-			column.GetType().IsSlice = false
-			column.DBType = "blob"
-		} else if column.GetType().IsSlice && column.DBType[0:3] != "set" {
-			column.DBType = fmt.Sprintf("set<%v>", column.DBType)
-		} */
-
-		assertColumnIsEncodable(dbTable.Name, &column)
-
-		if _, ok := dbTable.ColumnsMap[column.GetName()]; ok {
-			panic("The following column name is repeated:" + column.GetName())
-		} else {
-			column.GetInfo().Idx = int16(column.GetInfo().FieldIdx) + 1
-			// Idx follows the record's field order, which can hold more fields than the table
-			// struct: the generated columns numbered from MaxColIdx must start past every one.
-			dbTable.MaxColIdx = max(dbTable.MaxColIdx, column.GetInfo().Idx+1)
-			dbTable.ColumnsMap[column.GetName()] = &column
-			if DebugFull {
-				// fmt.Printf("Mapped Col: %s, Field: %s, Offset: %d\n", column.GetName(), column.GetInfo().FieldName, column.GetInfo().Field.Offset)
-			}
+	if len(dbTable.KeyConcatenated) > 0 {
+		// A concatenated key is bound as a quoted CQL text literal.
+		keyColumn := dbTable.Keys[0].(*columnInfo)
+		keyColumn.GetValueFn = func(ptr unsafe.Pointer) any {
+			return "'" + strings.ReplaceAll(keyColumn.GetRawValueFn(ptr).(string), "'", "''") + "'"
 		}
 	}
-
-	// Default audit columns are added unless the schema explicitly opts out.
-	bindManagedAuditColumns(&dbTable, schema)
-	dbTable.ConfigureComputedColumns(schema, structRefValue, computedPendingColumns)
-
-	// Resolve declared value ranges before any index compiles, since TypeDelta sizes its bit
-	// slots from them.
-	dbTable.FixedValueRanges = dbTable.ResolveFixedValueRanges(schema.FixedValues)
-
-	if schema.Partition != nil {
-		dbTable.PartKey = dbTable.ColumnsMap[schema.Partition.GetInfo().Name]
-		if dbTable.PartKey != nil && !dbTable.PartKey.IsNil() {
-			dbTable.KeysIdx = append(dbTable.KeysIdx, dbTable.PartKey.GetInfo().Idx)
-		}
-	}
-
-	for _, key := range schema.Keys {
-		col := dbTable.ColumnsMap[key.GetInfo().Name]
-		dbTable.Keys = append(dbTable.Keys, col)
-		dbTable.KeysIdx = append(dbTable.KeysIdx, col.GetInfo().Idx)
-
-		// Transfer AutoincrementRandBits from Key to the actual column in columnsMap
-		// This enables autoincrement functionality when a Key is marked with .Autoincrement()
-		// Valid values: -1 (no random suffix) or >0 (with random suffix)
-		// Default value 0 means .Autoincrement() was never called
-		keyInfo := key.GetInfo()
-		if keyInfo.AutoincrementRandBits != 0 {
-			col.SetAutoincrementRandSize(keyInfo.AutoincrementRandBits)
-			if keyInfo.AutoincrementFirstID > 0 {
-				col.(*columnInfo).AutoincrementFirstID = keyInfo.AutoincrementFirstID
-			}
-
-			// Set autoincrementCol if not already set
-			if dbTable.AutoincrementCol == nil {
-				dbTable.AutoincrementCol = col
-			} else if dbTable.AutoincrementCol != col {
-				panic(fmt.Sprintf(`Table "%v": Multiple autoincrement columns are not supported. Found autoincrement on both "%v" and "%v"`,
-					dbTable.Name, dbTable.AutoincrementCol.GetName(), col.GetName()))
-			}
-		}
-	}
-
-	if schema.AutoincrementPart != nil {
-		dbTable.AutoincrementPart = dbTable.ColumnsMap[schema.AutoincrementPart.GetInfo().Name]
-	}
-
-	dbTable.ConfigureTextSearchIndex(schema)
 	configureDataFrames(&dbTable, schema, structRefValue)
-
-	// Identify autoincrement column from direct column definitions (backward compatibility)
-	// Only set if not already set during Keys processing
-	for _, col := range dbTable.ColumnsMap {
-		if c, ok := col.(*columnInfo); ok {
-			// Important: default is 0 (meaning "not autoincrement"). Valid autoincrement values are:
-			// -1  : autoincrement with no random suffix (Col.Autoincrement(0) normalizes to -1)
-			// > 0 : autoincrement with random suffix of that size
-			// The previous condition `>= 0` incorrectly treated the default 0 as autoincrement and
-			// caused tables without Autoincrement() to still query `sequences` on insert.
-			if c.AutoincrementRandBits != 0 && dbTable.AutoincrementCol == nil {
-				dbTable.AutoincrementCol = col
-			}
-		}
-	}
-
-	if len(schema.KeyIntPacking) > 0 {
-		if len(dbTable.Keys) != 1 {
-			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires exactly one column in Keys. Found: %v`, dbTable.Name, len(dbTable.Keys)))
-		}
-
-		keyCol := dbTable.Keys[0].(*columnInfo)
-		if keyCol.Type != 2 { // 2 = int64
-			panic(fmt.Sprintf(`Table "%v": KeyIntPacking requires the key column to be an int64. Found: %v`, dbTable.Name, keyCol.FieldType))
-		}
-
-		for _, col := range schema.KeyIntPacking {
-			packedCol := dbTable.ColumnsMap[col.GetName()]
-			if packedCol == nil {
-				info := col.GetInfo()
-				if info.AutoincrementRandBits >= 0 {
-					// It's an autoincrement placeholder
-					placeholder := &columnInfo{
-						ColInfo: colInfo{
-							Name:      "autoincrement_placeholder",
-							IsVirtual: true,
-						},
-						AutoincrementRandBits: info.AutoincrementRandBits,
-						SlotBits:              info.SlotBits,
-					}
-					packedCol = placeholder
-					dbTable.AutoincrementCol = placeholder
-				} else {
-					panic(fmt.Sprintf(`Table "%v": Column "%v" in KeyIntPacking not found`, dbTable.Name, col.GetName()))
-				}
-			} else {
-				// If it's a real column, ensure SlotBits is transferred if set in KeyIntPacking
-				info := col.GetInfo()
-				if info.SlotBits > 0 {
-					packedCol.SetSlotBits(info.SlotBits)
-				}
-			}
-			dbTable.KeyIntPacking = append(dbTable.KeyIntPacking, packedCol)
-		}
-		dbTable.KeyIntPackingSlotBits = db.KeyIntPackingSlotBits(dbTable.Name, schema.KeyIntPacking)
-	}
-
-	if len(schema.KeyConcatenated) > 0 {
-		if len(dbTable.Keys) != 1 {
-			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires exactly one column in Keys. Found: %v`, dbTable.Name, len(dbTable.Keys)))
-		}
-		keyCol := dbTable.Keys[0].(*columnInfo)
-		if keyCol.Type != 1 { // 1 = string
-			panic(fmt.Sprintf(`Table "%v": KeyConcatenated requires the key column to be a string. Found: %v`, dbTable.Name, keyCol.FieldType))
-		}
-
-		concatCols := []IColInfo{}
-		for _, col := range schema.KeyConcatenated {
-			concatCol := dbTable.ColumnsMap[col.GetName()]
-			concatCols = append(concatCols, concatCol)
-			dbTable.KeyConcatenated = append(dbTable.KeyConcatenated, concatCol)
-		}
-
-		keyCol.GetRawValueFn = func(ptr unsafe.Pointer) any {
-			values := []any{}
-			for _, col := range concatCols {
-				values = append(values, col.GetRawValue(ptr))
-			}
-			return MakeKeyConcat(values...)
-		}
-
-		keyCol.GetValueFn = func(ptr unsafe.Pointer) any {
-			return "'" + strings.ReplaceAll(keyCol.GetRawValueFn(ptr).(string), "'", "''") + "'"
-		}
-	}
-
-	idxCount := int8(1)
-
-	if schema.SequencePartCol != nil {
-		gi := schema.SequencePartCol.GetInfo()
-		dbTable.SequencePartCol = &gi
-	}
 
 	// db describes every declared index (neutral: columns, layouts, validation); the driver then
 	// materializes each described source as the CQL that creates and queries it.
+	idxCount := int8(1)
 	for _, source := range dbTable.DescribeIndexes(&idxCount, schema.Indexes) {
 		registerMaterializedIndex(&dbTable, source)
 	}
 	if len(dbTable.IndexGroups) > 0 && dbTable.indexUpdatedTable == nil {
 		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
 	}
-
-	for _, col := range dbTable.ColumnsMap {
-		if columnMetadata, isColumnInfo := col.(*columnInfo); isColumnInfo {
-			// Compile fast accessors once per table build so row scan/write paths avoid generic branching.
-			columnMetadata.CompileFastAccessors()
-		}
-	}
-
-	for _, col := range dbTable.ColumnsMap {
-		dbTable.ColumnsIdxMap[col.GetInfo().Idx] = col
-		// Columns is what every write, read and deploy walks: a computed column has no storage.
-		if !col.GetInfo().IsComputed {
-			dbTable.Columns = append(dbTable.Columns, col)
-		}
-	}
+	dbTable.FinalizeColumns()
 
 	for _, e := range dbTable.indexes {
 		dbTable.indexViews = append(dbTable.indexViews, e)

@@ -85,6 +85,9 @@ var IndexTypeNames = map[int8]string{
 // resolved by name rather than declared, so the query side and the drivers share one spelling.
 const ColumnNameUpdated = "updated"
 
+// ColumnNameCreated is the column the ORM maintains as every record's creation timestamp.
+const ColumnNameCreated = "created"
+
 // ColumnNameVersion is the column the ORM maintains as every record's write count on a table with a
 // TypeDelta index: 1 on insert, one more on every write, 1 again after cache.MaxVersion. Dynamo's
 // delta log carries it and the client skips a logged write whose version it already holds; Scylla's
