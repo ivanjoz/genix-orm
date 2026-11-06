@@ -2,14 +2,14 @@ package ydbdriver
 
 import "github.com/ivanjoz/genix-orm/db"
 
-// YdbController is the db.Controller of one table (docs/YDB_PLAN.md §12). Step 1: every method
-// answers errNotImplemented; GetTable panics because a table cannot be compiled before Step P.
+// YdbController is the db.Controller of one table (docs/YDB_PLAN.md §12). GetTable compiles it (Step
+// 2); every other method answers errNotImplemented until its step lands.
 type YdbController[RecordT db.TableBaseInterface[TableT, RecordT], TableT db.TableSchemaInterface[TableT]] struct {
 	Schema db.TableSchema
 }
 
 func (controller *YdbController[RecordT, TableT]) GetTable() db.Table {
-	return Exec[TableT, RecordT]{}.CompileTable(nil)
+	return compiledTableOf[TableT, RecordT]()
 }
 
 func (controller *YdbController[RecordT, TableT]) GetTableName() string {

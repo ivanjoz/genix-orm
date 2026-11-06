@@ -53,11 +53,7 @@ func createTableStatement(spec tableSpec) string {
 	}
 	definitions = append(definitions, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(spec.primaryKey, ", ")))
 	for _, index := range spec.indexes {
-		definition := fmt.Sprintf("INDEX %s GLOBAL ASYNC ON (%s)", index.name, strings.Join(index.keyColumns, ", "))
-		if len(index.coverColumns) > 0 {
-			definition += fmt.Sprintf(" COVER (%s)", strings.Join(index.coverColumns, ", "))
-		}
-		definitions = append(definitions, definition)
+		definitions = append(definitions, indexDefinition(index))
 	}
 	definitions = append(definitions, `FAMILY default (COMPRESSION = "lz4")`)
 
@@ -66,6 +62,25 @@ func createTableStatement(spec tableSpec) string {
 		tableOptions += fmt.Sprintf(`, TTL = Interval("PT0S") ON %s AS SECONDS`, spec.expireAtColumn)
 	}
 	return fmt.Sprintf("CREATE TABLE `%s` (\n    %s\n) WITH (%s)", spec.path, strings.Join(definitions, ",\n    "), tableOptions)
+}
+
+// indexDefinition is one GLOBAL ASYNC index (Y6), as CREATE TABLE and ADD INDEX both write it.
+func indexDefinition(index nativeIndexSpec) string {
+	definition := fmt.Sprintf("INDEX %s GLOBAL ASYNC ON (%s)", index.name, strings.Join(index.keyColumns, ", "))
+	if len(index.coverColumns) > 0 {
+		definition += fmt.Sprintf(" COVER (%s)", strings.Join(index.coverColumns, ", "))
+	}
+	return definition
+}
+
+// addIndexStatement adds an index to a populated table; YDB builds it in the background and the
+// statement returns once the build is done.
+func addIndexStatement(tablePath string, index nativeIndexSpec) string {
+	return fmt.Sprintf("ALTER TABLE `%s` ADD %s", tablePath, indexDefinition(index))
+}
+
+func dropIndexStatement(tablePath, indexName string) string {
+	return fmt.Sprintf("ALTER TABLE `%s` DROP INDEX %s", tablePath, indexName)
 }
 
 // alterIndexPartitioningStatement applies Y20 to an index table, which does not inherit the table's

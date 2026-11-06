@@ -72,10 +72,8 @@ func (Exec[TableT, RecordT]) QueryFrameChanged(request db.FrameRequest, heldGene
 	return nil, errNotImplemented("QueryFrameChanged")
 }
 
-// CompileTable needs the neutral compile entry point of docs/YDB_PLAN.md §4 (Step P). Until it exists
-// a table cannot be compiled, and saying so beats returning a half-filled table.
 func (Exec[TableT, RecordT]) CompileTable(schema *TableT) db.Table {
-	panic(errNotImplemented("CompileTable"))
+	return getOrCompileYdbTable(schema)
 }
 
 // TableStruct is what tables embed to default to this driver: the same shape as scylla.TableStruct,
@@ -84,6 +82,7 @@ type TableStruct[TableT db.TableSchemaInterface[TableT], RecordT db.TableBaseInt
 
 func init() {
 	db.DBTypeResolver = func(typeID int8) string { return ydbTypeNames[typeID] }
+	db.SetCodec(ydbValueCodec{})
 	db.GetAutoincrementID = GetAutoincrementID
 	db.QueryCachedGenericByIDs = func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[db.GenericRecord], error) {
 		return nil, errNotImplemented("QueryCachedGenericByIDs")

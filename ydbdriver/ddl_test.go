@@ -106,6 +106,13 @@ func TestAlterStatements(t *testing.T) {
 	if got := alterFamilyCompressionStatement("genix/products"); got != "ALTER TABLE `genix/products` ALTER FAMILY default SET COMPRESSION \"lz4\"" {
 		t.Fatal(got)
 	}
+	added := addIndexStatement("genix/products", nativeIndexSpec{name: "ix_category", keyColumns: []string{"company_id", "category_id"}, coverColumns: []string{"name"}})
+	if added != "ALTER TABLE `genix/products` ADD INDEX ix_category GLOBAL ASYNC ON (company_id, category_id) COVER (name)" {
+		t.Fatal(added)
+	}
+	if got := dropIndexStatement("genix/products", "ix_category"); got != "ALTER TABLE `genix/products` DROP INDEX ix_category" {
+		t.Fatal(got)
+	}
 }
 
 func TestMoreThanTwentyIndexesPanics(t *testing.T) {
