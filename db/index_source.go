@@ -58,6 +58,8 @@ type IndexSource struct {
 	// PackedIndex is set on an IndexKindPacked index: the layout of its packed virtual column.
 	// It is deliberately not PackedSourceColumns, which marks a range view to the planner.
 	PackedIndex *PackedIndexInfo
+	// IndexGroup is set on an IndexKindGroupHash index: the group whose hash column it indexes.
+	IndexGroup *IndexGroupInfo
 }
 
 // IndexKind names the compiler an IndexSource came from.
@@ -68,6 +70,9 @@ const (
 	IndexKindSingleColumn IndexKind = iota + 1
 	// IndexKindPacked is a local or global index on a generated column packing several integers.
 	IndexKindPacked
+	// IndexKindGroupHash is a cache group over several columns (or a slice): a generated hash column
+	// the group's grouped reads key on. Its IndexGroup holds the group.
+	IndexKindGroupHash
 )
 
 // IndexSourceNamed returns the compiled index with that name, or nil.

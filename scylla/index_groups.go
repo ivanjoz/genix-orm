@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 	"unsafe"
 
 	"github.com/gocql/gocql"
@@ -100,140 +99,46 @@ func persistIndexUpdatedRowsBatch(keyspace string, tableName string, rows []inde
 	return session.ExecuteBatch(batch)
 }
 
+// registerIndexGroup describes a cache group in db and materializes the index it needs, if any.
 func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
-	sourceColumnNames := make([]string, 0, len(indexCfg.Keys))
-	for _, key := range indexCfg.Keys {
-		sourceColumnNames = append(sourceColumnNames, key.GetName())
+	if source := dbTable.DescribeIndexGroup(idxCount, indexCfg); source != nil {
+		dbTable.indexes[source.Name] = materializeIndexSource(dbTable, source)
 	}
-	indexID := dbTable.AllocateIndexGroupID(sourceColumnNames)
-	if len(indexCfg.Cols) > 0 || indexCfg.UseHash {
-		panic(fmt.Sprintf(`Table "%v": a cache group on %v takes Keys only (no Cols, no UseHash)`, dbTable.Name, sourceColumnNames))
+	if dbTable.indexUpdatedTable == nil {
+		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
 	}
+}
 
-	if indexCfg.Type == TypeCacheGroupFromKey {
-		registerInheritFromKeyIndexGroup(dbTable, indexCfg, indexID, sourceColumnNames)
-		return
-	}
+// materializeGroupHashIndex gives a group's hash column its CQL. A scalar hash is indexed locally,
+// one partition's index answering a grouped read; Scylla has no local index on a collection
+// ("not implemented yet"), so the hashes of a slice key are a set<int> with a global index and are
+// bound as a collection literal.
+func materializeGroupHashIndex(dbTable *ScyllaTable, view *viewInfo) {
+	indexGroup := view.IndexGroup
+	sourceColumns := indexGroup.SourceColumns
+	usesCollectionValues := indexGroup.UsesCollectionValues
+	virtualColumn := view.Column.(*columnInfo)
+	virtualColumnName := virtualColumn.GetName()
 
-	if len(indexCfg.Keys) == 1 {
-		singleKeyIndex := Index{Type: TypeLocalIndex, Keys: indexCfg.Keys}
-		registerSchemaLocalIndex(dbTable, idxCount, singleKeyIndex)
-		dbTable.IndexGroups = append(dbTable.IndexGroups, db.IndexGroupInfo{
-			Name:    indexCfg.Keys[0].GetName(),
-			IndexID: indexID,
-			SourceColumns: []db.IndexGroupSourceColumn{{
-				Column: dbTable.ColumnsMap[indexCfg.Keys[0].GetName()],
-			}},
-			SnapshotInS3: indexCfg.Type == TypeCacheGroupS3,
-		})
-		if dbTable.indexUpdatedTable == nil {
-			dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
-		}
-		return
-	}
-
-	sourceColumns := make([]db.IndexGroupSourceColumn, 0, len(indexCfg.Keys))
-	usesCollectionValues := false
-	for _, key := range indexCfg.Keys {
-		baseColumn := dbTable.ColumnsMap[key.GetName()]
-		if baseColumn == nil || baseColumn.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": IndexGroup column "%v" was not found`, dbTable.Name, key.GetName()))
-		}
-		sourceColumns = append(sourceColumns, db.IndexGroupSourceColumn{Column: baseColumn})
-		if baseColumn.GetType().IsSlice {
-			usesCollectionValues = true
-		}
-	}
-
-	virtualColumnName := db.MakeIndexGroupVirtualColumnName(sourceColumnNames, usesCollectionValues)
-	if _, exists := dbTable.ColumnsMap[virtualColumnName]; exists {
-		panic(fmt.Sprintf(`Table "%v": generated IndexGroup column already exists: %v`, dbTable.Name, virtualColumnName))
-	}
-
-	virtualColumn := &columnInfo{
-		ColInfo: colInfo{
-			Name:      virtualColumnName,
-			FieldName: virtualColumnName,
-			IsVirtual: true,
-			Idx:       dbTable.MaxColIdx,
-		},
-		ColType: db.GetColTypeByName("int32"),
-	}
 	if usesCollectionValues {
-		virtualColumn.ColType = colType{
-			Type:      13,
-			FieldType: "[]int32",
-			DBType:    "set<int>",
-			IsSlice:   true,
+		describedHashes := virtualColumn.GetValueFn
+		virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
+			return makeSignedIntCollectionLiteral(virtualColumn.DBType, describedHashes(ptr).([]int32))
 		}
 	}
 
-	sourceColumnsLocal := slices.Clone(sourceColumns)
-	virtualColumn.GetRawValueFn = func(ptr unsafe.Pointer) any {
-		hashes := db.ComputeIndexGroupHashes(ptr, sourceColumnsLocal)
+	view.getCreateScript = func() string {
 		if usesCollectionValues {
-			return hashes
+			return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, view.Name, dbTable.GetFullName(), virtualColumnName)
 		}
-		if len(hashes) == 0 {
-			return int32(0)
-		}
-		return hashes[0]
-	}
-	virtualColumn.GetStatementValueFn = func(ptr unsafe.Pointer) any {
-		hashes := db.ComputeIndexGroupHashes(ptr, sourceColumnsLocal)
-		if usesCollectionValues {
-			return hashes
-		}
-		if len(hashes) == 0 {
-			return int32(0)
-		}
-		return hashes[0]
-	}
-	virtualColumn.GetValueFn = func(ptr unsafe.Pointer) any {
-		hashes := db.ComputeIndexGroupHashes(ptr, sourceColumnsLocal)
-		if usesCollectionValues {
-			return makeSignedIntCollectionLiteral(virtualColumn.DBType, hashes)
-		}
-		if len(hashes) == 0 {
-			return int32(0)
-		}
-		return hashes[0]
+		return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`, view.Name, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), virtualColumnName)
 	}
 
-	dbTable.MaxColIdx++
-	dbTable.ColumnsMap[virtualColumn.GetName()] = virtualColumn
-
-	// Every grouped read pins the partition, so the hash is indexed locally: one partition's index
-	// answers it. Scylla has no local index on a collection ("not implemented yet"), so a set<int>
-	// hash (a slice Key) keeps a global index. The suffix names the kind, so a change recreates it.
-	indexName := fmt.Sprintf(`%v__%v_index_1`, dbTable.Name, virtualColumnName)
-	if usesCollectionValues {
-		indexName = fmt.Sprintf(`%v__%v_index_0`, dbTable.Name, virtualColumnName)
-	}
-	index := &viewInfo{
-		IndexSource: &db.IndexSource{
-			Type:               3,
-			Name:               indexName,
-			Idx:                *idxCount,
-			Column:             virtualColumn,
-			Columns:            slices.Clone(sourceColumnNames),
-			RequiresPostFilter: false,
-		},
-	}
-	index.getCreateScript = func() string {
-		if usesCollectionValues {
-			return fmt.Sprintf(`CREATE INDEX %v ON %v (VALUES(%v))`, index.Name, dbTable.GetFullName(), virtualColumnName)
-		}
-		return fmt.Sprintf(`CREATE INDEX %v ON %v ((%v),%v)`, index.Name, dbTable.GetFullName(), dbTable.GetPartKey().GetName(), virtualColumnName)
-	}
-
-	virtualColumnNameLocal := virtualColumnName
-	usesCollectionLocal := usesCollectionValues
-	index.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
+	view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
 		// Build all hash input combinations using resolveIndexGroupQueryValues, which handles
 		// =, CONTAINS, IN, and BETWEEN (BETWEEN is expanded into one value per step in range).
 		valuesGroups := [][]int64{{}}
-		for _, sourceColumn := range sourceColumnsLocal {
+		for _, sourceColumn := range sourceColumns {
 			st, err := findIndexGroupStatement(sourceColumn.Column.GetName(), statements)
 			if err != nil {
 				return nil
@@ -261,72 +166,13 @@ func registerIndexGroup(dbTable *ScyllaTable, idxCount *int8, indexCfg Index) {
 				continue
 			}
 			seen[hashValue] = struct{}{}
-			clause := fmt.Sprintf("%v = ?", virtualColumnNameLocal)
-			if usesCollectionLocal {
-				clause = fmt.Sprintf("%v CONTAINS ?", virtualColumnNameLocal)
+			clause := fmt.Sprintf("%v = ?", virtualColumnName)
+			if usesCollectionValues {
+				clause = fmt.Sprintf("%v CONTAINS ?", virtualColumnName)
 			}
-			clauses = append(clauses, boundWhereClause{
-				Clause: clause,
-				Values: []any{hashValue},
-			})
+			clauses = append(clauses, boundWhereClause{Clause: clause, Values: []any{hashValue}})
 		}
 		return clauses
-	}
-	*idxCount = *idxCount + 1
-	dbTable.indexes[index.Name] = index
-	dbTable.IndexGroups = append(dbTable.IndexGroups, db.IndexGroupInfo{
-		Name:                 strings.Join(sourceColumnNames, "_"),
-		IndexID:              indexID,
-		SourceColumns:        sourceColumns,
-		VirtualColumn:        virtualColumn,
-		UsesCollectionValues: usesCollectionValues,
-		SnapshotInS3:         indexCfg.Type == TypeCacheGroupS3,
-	})
-
-	if dbTable.indexUpdatedTable == nil {
-		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
-	}
-}
-
-func registerInheritFromKeyIndexGroup(dbTable *ScyllaTable, indexCfg Index, indexID int16, sourceColumnNames []string) {
-	if len(dbTable.KeyIntPacking) == 0 {
-		panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey requires KeyIntPacking on the table`, dbTable.Name))
-	}
-	if len(indexCfg.Keys) > len(dbTable.KeyIntPacking) {
-		panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey index has %d keys but KeyIntPacking only declares %d columns`,
-			dbTable.Name, len(indexCfg.Keys), len(dbTable.KeyIntPacking)))
-	}
-	for columnIndex, key := range indexCfg.Keys {
-		packedColumnName := dbTable.KeyIntPacking[columnIndex].GetName()
-		if key.GetName() != packedColumnName {
-			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey keys must be a prefix of KeyIntPacking. Position %d expected "%v" but got "%v"`,
-				dbTable.Name, columnIndex, packedColumnName, key.GetName()))
-		}
-		baseColumn := dbTable.ColumnsMap[key.GetName()]
-		if baseColumn == nil || baseColumn.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey column "%v" was not found`, dbTable.Name, key.GetName()))
-		}
-		if baseColumn.GetType().IsSlice {
-			panic(fmt.Sprintf(`Table "%v": TypeCacheGroupFromKey does not support slice column "%v"`, dbTable.Name, key.GetName()))
-		}
-	}
-
-	sourceColumns := make([]db.IndexGroupSourceColumn, 0, len(indexCfg.Keys))
-	for _, key := range indexCfg.Keys {
-		sourceColumns = append(sourceColumns, db.IndexGroupSourceColumn{
-			Column: dbTable.ColumnsMap[key.GetName()],
-		})
-	}
-
-	dbTable.IndexGroups = append(dbTable.IndexGroups, db.IndexGroupInfo{
-		Name:           strings.Join(sourceColumnNames, "_"),
-		IndexID:        indexID,
-		SourceColumns:  sourceColumns,
-		InheritFromKey: true,
-	})
-
-	if dbTable.indexUpdatedTable == nil {
-		dbTable.indexUpdatedTable = &indexUpdatedTableInfo{name: dbTable.Name + "__index_updated"}
 	}
 }
 

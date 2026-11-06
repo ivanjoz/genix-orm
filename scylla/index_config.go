@@ -50,6 +50,8 @@ func materializeIndexSource(dbTable *ScyllaTable, source *db.IndexSource) *viewI
 		materializeSingleColumnIndex(dbTable, view)
 	case db.IndexKindPacked:
 		materializePackedIndex(dbTable, view)
+	case db.IndexKindGroupHash:
+		materializeGroupHashIndex(dbTable, view)
 	default:
 		panic(fmt.Sprintf(`Table "%v": index %v has kind %d, which this driver does not materialize`, dbTable.Name, source.Name, source.Kind))
 	}
