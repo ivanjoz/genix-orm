@@ -9,167 +9,18 @@ import (
 	"github.com/ivanjoz/genix-orm/db"
 )
 
-// indexPartitionColumnName returns the name of the partition override declared on an
-// index, or "" when the index keeps the base table partition.
-func indexPartitionColumnName(indexCfg Index) string {
-	if indexCfg.Partition == nil {
-		return ""
-	}
-	return indexCfg.Partition.GetInfo().Name
-}
-
-// resolveIndexPartitionColumn resolves the Partition override against the base table.
-// Returns nil when no override is declared, meaning the view keeps the base partition.
-func resolveIndexPartitionColumn(dbTable *ScyllaTable, viewCfg Index) IColInfo {
-	partitionColumnName := indexPartitionColumnName(viewCfg)
-	if partitionColumnName == "" {
-		return nil
-	}
-	column := dbTable.ColumnsMap[partitionColumnName]
-	if column == nil || column.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": Partition column "%v" was not found`, dbTable.Name, partitionColumnName))
-	}
-	if column.GetInfo().IsVirtual || column.GetType().IsComplexType || column.GetType().IsSlice {
-		panic(fmt.Sprintf(`Table "%v": Partition column "%v" cannot be virtual, a slice or a struct`, dbTable.Name, column.GetName()))
-	}
-	return column
-}
-
+// compileSchemaViewTable describes a TypeViewTable in db and gives it the CQL that creates and
+// queries its table.
 func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
-	if indexPartitionColumnName(viewCfg) != "" {
-		panic(fmt.Sprintf(`Table "%v": ViewTables always keep the base partition; remove Partition`, dbTable.Name))
-	}
-	if viewCfg.UseHash {
-		panic(fmt.Sprintf(`Table "%v": ViewTables does not support UseHash`, dbTable.Name))
-	}
-	if len(viewCfg.Keys) == 0 {
-		panic(fmt.Sprintf(`Table "%v": ViewTables entry must declare at least one key column`, dbTable.Name))
-	}
-	if len(dbTable.Keys) != 1 {
-		panic(fmt.Sprintf(`Table "%v": ViewTables currently requires exactly one base key column for ID maintenance`, dbTable.Name))
-	}
+	view := &viewInfo{IndexSource: dbTable.DescribeViewTable(viewCfg)}
+	materializeViewTable(dbTable, view)
+	dbTable.views[view.Name] = view
+}
 
+// materializeViewTable attaches the CQL of a view table: its WHERE rendering, the columns deploy
+// expects and the CREATE TABLE script. Everything it needs is on the IndexSource.
+func materializeViewTable(dbTable *ScyllaTable, view *viewInfo) {
 	partKey := dbTable.GetPartKey()
-	if partKey == nil || partKey.IsNil() {
-		panic(fmt.Sprintf(`Table "%v": ViewTables requires a partition column`, dbTable.Name))
-	}
-
-	declaredColumns := []IColInfo{}
-	keyColumnNames := []string{}
-	physicalColumns := []db.ViewTableColumnInfo{
-		makeViewTableColumn(partKey, false),
-	}
-	physicalKeyColumns := []db.ViewTableColumnInfo{}
-	rebuildColumnNames := map[string]bool{}
-	fanoutColumnName := ""
-	sliceKeyCount := 0
-
-	for _, declaredColumn := range viewCfg.Keys {
-		column := dbTable.ColumnsMap[declaredColumn.GetInfo().Name]
-		if column == nil || column.IsNil() {
-			panic(fmt.Sprintf(`Table "%v": ViewTables column "%v" was not found`, dbTable.Name, declaredColumn.GetInfo().Name))
-		}
-		if column.GetType().IsComplexType {
-			panic(fmt.Sprintf(`Table "%v": ViewTables column "%v" cannot be a complex type`, dbTable.Name, column.GetName()))
-		}
-		if column.GetInfo().Name == dbTable.Keys[0].GetName() {
-			panic(fmt.Sprintf(`Table "%v": ViewTables key "%v" must not repeat the base ID column`, dbTable.Name, column.GetName()))
-		}
-
-		useSliceElement := column.GetType().IsSlice
-		if useSliceElement {
-			sliceKeyCount++
-			fanoutColumnName = column.GetName()
-		}
-
-		keyColumnNames = append(keyColumnNames, column.GetName())
-		declaredColumns = append(declaredColumns, column)
-		rebuildColumnNames[column.GetName()] = true
-
-		physicalColumn := makeViewTableColumn(column, useSliceElement)
-		physicalColumns = appendUniqueViewTableColumn(physicalColumns, physicalColumn)
-		physicalKeyColumns = append(physicalKeyColumns, physicalColumn)
-	}
-
-	if sliceKeyCount > 1 {
-		panic(fmt.Sprintf(`Table "%v": ViewTables currently supports only one slice-backed key column`, dbTable.Name))
-	}
-
-	idColumn := dbTable.Keys[0]
-	physicalColumns = appendUniqueViewTableColumn(physicalColumns, makeViewTableColumn(idColumn, false))
-
-	projectedColumns := []IColInfo{}
-	if len(viewCfg.Cols) == 0 {
-		for _, baseColumn := range dbTable.ColumnsMap {
-			if baseColumn.GetInfo().IsVirtual {
-				continue
-			}
-			if baseColumn.GetName() == fanoutColumnName {
-				continue
-			}
-			projectedColumns = append(projectedColumns, baseColumn)
-		}
-	} else {
-		for _, declaredProjectedColumn := range viewCfg.Cols {
-			projectedColumn := dbTable.ColumnsMap[declaredProjectedColumn.GetInfo().Name]
-			if projectedColumn == nil || projectedColumn.IsNil() {
-				panic(fmt.Sprintf(`Table "%v": ViewTables projected column "%v" wasn't found`, dbTable.Name, declaredProjectedColumn.GetInfo().Name))
-			}
-			if projectedColumn.GetInfo().IsVirtual {
-				panic(fmt.Sprintf(`Table "%v": ViewTables projected column "%v" cannot be virtual`, dbTable.Name, projectedColumn.GetName()))
-			}
-			if projectedColumn.GetName() == fanoutColumnName {
-				continue
-			}
-			projectedColumns = append(projectedColumns, projectedColumn)
-		}
-	}
-
-	for _, projectedColumn := range projectedColumns {
-		physicalColumns = appendUniqueViewTableColumn(physicalColumns, makeViewTableColumn(projectedColumn, false))
-		rebuildColumnNames[projectedColumn.GetName()] = true
-	}
-
-	viewColumns := append([]string{partKey.GetName()}, keyColumnNames...)
-	viewName := fmt.Sprintf(`%v__%v_view`, dbTable.Name, strings.Join(keyColumnNames, "_"))
-	view := &viewInfo{
-		IndexSource: &db.IndexSource{
-			Type:             9,
-			Name:             viewName,
-			Columns:          viewColumns,
-			ColumnsNoPart:    append([]string{}, keyColumnNames...),
-			Column:           declaredColumns[0],
-			AvailableColumns: []string{},
-			Operators:        []string{"=", "IN", "CONTAINS"},
-			FanoutColumnName: fanoutColumnName,
-			TableColumns:     physicalColumns,
-			TableKeyColumns:  physicalKeyColumns,
-		},
-		maintenanceIDColumn: idColumn,
-		rebuildColumnNames:  rebuildColumnNames,
-	}
-
-	selectableColumnNames := map[string]bool{}
-	selectableColumnNames[partKey.GetName()] = true
-	selectableColumnNames[idColumn.GetName()] = true
-	for _, declaredColumn := range declaredColumns {
-		if declaredColumn.GetName() == fanoutColumnName {
-			continue
-		}
-		selectableColumnNames[declaredColumn.GetName()] = true
-	}
-	for _, projectedColumn := range projectedColumns {
-		if projectedColumn.GetName() == fanoutColumnName {
-			continue
-		}
-		selectableColumnNames[projectedColumn.GetName()] = true
-	}
-	for selectableColumnName := range selectableColumnNames {
-		view.AvailableColumns = append(view.AvailableColumns, selectableColumnName)
-	}
-	slices.Sort(view.AvailableColumns)
-
-	viewPtr := view
 	view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
 		whereClauses := []boundWhereClause{}
 		for _, statement := range statements {
@@ -190,7 +41,7 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 			}
 
 			operator := statement.Operator
-			if viewPtr.FanoutColumnName == statement.Col && operator == "CONTAINS" {
+			if view.FanoutColumnName == statement.Col && operator == "CONTAINS" {
 				operator = "="
 			}
 			if operator == "IN" {
@@ -223,8 +74,8 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		return []boundWhereClause{combinedClause}
 	}
 	view.getExpectedColumns = func() []viewExpectedColumn {
-		expectedColumns := make([]viewExpectedColumn, 0, len(viewPtr.TableColumns))
-		for _, column := range viewPtr.TableColumns {
+		expectedColumns := make([]viewExpectedColumn, 0, len(view.TableColumns))
+		for _, column := range view.TableColumns {
 			expectedColumns = append(expectedColumns, viewExpectedColumn{
 				name:   getViewTableColumnName(column),
 				dbType: getViewTableColumnType(column.SourceColumn, column.UsesSliceElement).DBType,
@@ -233,28 +84,26 @@ func compileSchemaViewTable(dbTable *ScyllaTable, viewCfg Index) {
 		return expectedColumns
 	}
 	view.getCreateScript = func() string {
-		columnDefinitions := make([]string, 0, len(viewPtr.TableColumns))
-		for _, column := range viewPtr.getExpectedColumns() {
+		columnDefinitions := make([]string, 0, len(view.TableColumns))
+		for _, column := range view.getExpectedColumns() {
 			columnDefinitions = append(columnDefinitions, fmt.Sprintf("%v %v", column.name, column.dbType))
 		}
 
-		primaryKeyColumns := append([]string{}, keyColumnNames...)
-		primaryKeyColumns = append(primaryKeyColumns, idColumn.GetName())
+		primaryKeyColumns := append([]string{}, view.ColumnsNoPart...)
+		primaryKeyColumns = append(primaryKeyColumns, view.MaintenanceIDColumn.GetName())
 		return fmt.Sprintf(`CREATE TABLE %v.%v (
 			%v,
 			PRIMARY KEY ((%v), %v)
 		)
 		%v;`,
 			dbTable.Namespace,
-			viewPtr.Name,
+			view.Name,
 			strings.Join(columnDefinitions, ", "),
 			partKey.GetName(),
 			strings.Join(primaryKeyColumns, ", "),
 			makeStatementWith,
 		)
 	}
-
-	dbTable.views[view.Name] = view
 }
 
 // compileSchemaView builds the materialized view backing one TypeView declaration. A packed view
@@ -304,7 +153,7 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 	if basePartCol != nil && basePartCol.IsNil() {
 		basePartCol = nil
 	}
-	viewPartCol := resolveIndexPartitionColumn(dbTable, viewCfg)
+	viewPartCol := dbTable.ResolveIndexPartitionColumn(viewCfg)
 	keepsBasePart := viewPartCol == nil ||
 		(basePartCol != nil && viewPartCol.GetName() == basePartCol.GetName())
 	if viewPartCol == nil {

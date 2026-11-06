@@ -46,9 +46,7 @@ type viewInfo struct {
 	// getExpectedColumns reports the columns this view must hold in the DB. Deploy compares it
 	// against the live catalog: a column added to the base table does not reach a derived view on
 	// its own, and the view then breaks every read or write that touches it.
-	getExpectedColumns  func() []viewExpectedColumn
-	maintenanceIDColumn IColInfo
-	rebuildColumnNames  map[string]bool
+	getExpectedColumns func() []viewExpectedColumn
 }
 
 // viewExpectedColumn is one column a compiled view must have in the DB, with the CQL type the view

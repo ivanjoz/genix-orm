@@ -15,16 +15,6 @@ type viewTableDeleteRow struct {
 	keyValues []any
 }
 
-func appendUniqueViewTableColumn(target []db.ViewTableColumnInfo, column db.ViewTableColumnInfo) []db.ViewTableColumnInfo {
-	// ViewTable physical columns are derived from source columns, so source-name uniqueness is enough.
-	for _, existingColumn := range target {
-		if existingColumn.SourceColumn.GetName() == column.SourceColumn.GetName() {
-			return target
-		}
-	}
-	return append(target, column)
-}
-
 func getViewTableColumnType(sourceColumn IColInfo, useSliceElement bool) colType {
 	columnType := sourceColumn.GetType()
 	physicalType := *columnType
@@ -52,14 +42,6 @@ func getViewTableColumnType(sourceColumn IColInfo, useSliceElement bool) colType
 
 func getViewTableColumnName(column db.ViewTableColumnInfo) string {
 	return column.SourceColumn.GetName()
-}
-
-func makeViewTableColumn(sourceColumn IColInfo, useSliceElement bool) db.ViewTableColumnInfo {
-	// Keep only the source column reference plus the fan-out flag; name/type are derived on demand.
-	return db.ViewTableColumnInfo{
-		SourceColumn:     sourceColumn,
-		UsesSliceElement: useSliceElement,
-	}
 }
 
 func getViewTableFanoutColumn(view *viewInfo) IColInfo {
@@ -152,14 +134,14 @@ func makeViewTableRowKey(partValue int64, idValue int64, keyValues []any) string
 }
 
 func getViewTableMaintenanceIndexName(view *viewInfo) string {
-	return fmt.Sprintf(`%v__%v_index_0`, view.Name, view.maintenanceIDColumn.GetName())
+	return fmt.Sprintf(`%v__%v_index_0`, view.Name, view.MaintenanceIDColumn.GetName())
 }
 
 func getViewTableMaintenanceIndexCreateScript(view *viewInfo, scyllaTable ScyllaTable) string {
 	// Maintenance reads are always scoped by partition + base ID, so the helper derives the one required local index.
 	partKey := scyllaTable.GetPartKey()
 	return fmt.Sprintf(`CREATE INDEX %v ON %v.%v ((%v), %v)`,
-		getViewTableMaintenanceIndexName(view), scyllaTable.Namespace, view.Name, partKey.GetName(), view.maintenanceIDColumn.GetName())
+		getViewTableMaintenanceIndexName(view), scyllaTable.Namespace, view.Name, partKey.GetName(), view.MaintenanceIDColumn.GetName())
 }
 
 func makeNumericQueryValue(column IColInfo, value int64) any {
@@ -190,14 +172,14 @@ func fetchExistingViewTableDeleteRows(
 	for _, keyColumn := range view.TableKeyColumns {
 		selectColumnNames = append(selectColumnNames, getViewTableColumnName(keyColumn))
 	}
-	selectColumnNames = append(selectColumnNames, view.maintenanceIDColumn.GetName())
+	selectColumnNames = append(selectColumnNames, view.MaintenanceIDColumn.GetName())
 
 	idPlaceholders := make([]string, 0, len(idValues))
 	queryArguments := make([]any, 0, len(idValues)+1)
 	queryArguments = append(queryArguments, makeNumericQueryValue(scyllaTable.GetPartKey(), partValue))
 	for _, idValue := range idValues {
 		idPlaceholders = append(idPlaceholders, "?")
-		queryArguments = append(queryArguments, makeNumericQueryValue(view.maintenanceIDColumn, idValue))
+		queryArguments = append(queryArguments, makeNumericQueryValue(view.MaintenanceIDColumn, idValue))
 	}
 
 	query := fmt.Sprintf(`SELECT %v FROM %v.%v WHERE %v = ? AND %v IN (%v)`,
@@ -205,7 +187,7 @@ func fetchExistingViewTableDeleteRows(
 		scyllaTable.Namespace,
 		view.Name,
 		scyllaTable.GetPartKey().GetName(),
-		view.maintenanceIDColumn.GetName(),
+		view.MaintenanceIDColumn.GetName(),
 		strings.Join(idPlaceholders, ", "),
 	)
 
@@ -303,8 +285,8 @@ func executeViewTableSyncChunk(
 				whereColumnNames = append(whereColumnNames, getViewTableColumnName(keyColumn))
 				whereArguments = append(whereArguments, deleteRow.keyValues[keyIndex])
 			}
-			whereColumnNames = append(whereColumnNames, view.maintenanceIDColumn.GetName())
-			whereArguments = append(whereArguments, makeNumericQueryValue(view.maintenanceIDColumn, deleteRow.idValue))
+			whereColumnNames = append(whereColumnNames, view.MaintenanceIDColumn.GetName())
+			whereArguments = append(whereArguments, makeNumericQueryValue(view.MaintenanceIDColumn, deleteRow.idValue))
 
 			whereClauses := make([]string, 0, len(whereColumnNames))
 			for _, whereColumnName := range whereColumnNames {

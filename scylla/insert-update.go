@@ -547,7 +547,7 @@ func syncTableBackedViews(
 		if len(affectedColumns) > 0 {
 			shouldSyncCurrentView := false
 			for _, affectedColumn := range affectedColumns {
-				if view.rebuildColumnNames[affectedColumn.GetName()] {
+				if view.RebuildColumnNames[affectedColumn.GetName()] {
 					shouldSyncCurrentView = true
 					break
 				}

@@ -360,7 +360,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		}
 		// Only views materialize their own partition, so an override is meaningless elsewhere.
 		schemaIndexType := resolveSchemaIndexType(indexCfg)
-		if indexPartitionColumnName(indexCfg) != "" && schemaIndexType != TypeView {
+		if db.IndexPartitionColumnName(indexCfg) != "" && schemaIndexType != TypeView {
 			panic(fmt.Sprintf(`Table "%v": Partition is only supported on TypeView indexes`, dbTable.Name))
 		}
 		if schemaIndexType == TypeCacheGroup || schemaIndexType == TypeCacheGroupS3 || schemaIndexType == TypeCacheGroupFromKey {

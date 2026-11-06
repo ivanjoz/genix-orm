@@ -42,6 +42,10 @@ type IndexSource struct {
 	FanoutColumnName string
 	TableColumns     []ViewTableColumnInfo
 	TableKeyColumns  []ViewTableColumnInfo
+	// MaintenanceIDColumn is the base-row ID a view table is rebuilt by, and RebuildColumnNames the
+	// base columns whose change forces its rows to be rebuilt.
+	MaintenanceIDColumn IColInfo
+	RebuildColumnNames  map[string]bool
 	// PackedIndex is set on an IndexKindPacked index: the layout of its packed virtual column.
 	// It is deliberately not PackedSourceColumns, which marks a range view to the planner.
 	PackedIndex *PackedIndexInfo
