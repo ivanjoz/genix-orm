@@ -42,6 +42,15 @@ type IndexSource struct {
 	FanoutColumnName string
 	TableColumns     []ViewTableColumnInfo
 	TableKeyColumns  []ViewTableColumnInfo
+	// DeclaredColumns, ProjectedColumns and SelectableColumns describe a TypeView: the declared keys,
+	// the Cols projection (empty = every stored column) and every real column the view can serve.
+	// PartitionColumn is the partition the view is keyed on (the base partition unless overridden) and
+	// KeepsBasePartition says whether it is the base table's.
+	DeclaredColumns    []IColInfo
+	ProjectedColumns   []IColInfo
+	SelectableColumns  []IColInfo
+	PartitionColumn    IColInfo
+	KeepsBasePartition bool
 	// MaintenanceIDColumn is the base-row ID a view table is rebuilt by, and RebuildColumnNames the
 	// base columns whose change forces its rows to be rebuilt.
 	MaintenanceIDColumn IColInfo

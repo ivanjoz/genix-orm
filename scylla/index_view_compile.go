@@ -106,332 +106,119 @@ func materializeViewTable(dbTable *ScyllaTable, view *viewInfo) {
 	}
 }
 
-// compileSchemaView builds the materialized view backing one TypeView declaration. A packed view
-// takes its bit layout from .Size() hints, or from FixedValues when no key has a hint
-// (planFixedValueViewSlots).
+// compileSchemaView describes a TypeView in db and gives it the materialized view that serves it.
 func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
-	appendUniqueColumn := func(target []IColInfo, column IColInfo) []IColInfo {
-		if column == nil || column.IsNil() {
-			return target
+	view := &viewInfo{IndexSource: dbTable.DescribeView(viewCfg)}
+	materializeView(dbTable, view)
+	dbTable.views[view.Name] = view
+}
+
+// materializeView attaches the CQL of a described view: the encoding of its virtual column, its
+// WHERE rendering and the CREATE MATERIALIZED VIEW script.
+func materializeView(dbTable *ScyllaTable, view *viewInfo) {
+	switch view.Type {
+	case 6:
+		// Simple MVs keep their source columns, so predicates bind without key rewriting and the
+		// generic batcher applies as-is: an IN on the view's clustering key is split into several
+		// queries rather than one the node would reject.
+		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
+			return buildRemainingWhereClauseBatches(statements)
 		}
-		for _, existingColumn := range target {
-			if existingColumn.GetName() == column.GetName() {
-				return target
+	case 7:
+		materializeHashView(view)
+	case 8:
+		// The described value is the unsigned layout; Scylla compares integers signed, so it is
+		// stored with the top bit flipped (storeVirtualPacked).
+		packedColumn := view.Column.(*columnInfo)
+		describedValue, isInt32 := packedColumn.GetValueFn, view.PackedIsInt32
+		packedColumn.GetValueFn = func(ptr unsafe.Pointer) any {
+			return storeVirtualPacked(describedValue(ptr).(uint64), isInt32)
+		}
+		compilePackedRangeAccessors(view, view.PackedSourceColumns, view.PackedSlotBitsPerColumn, isInt32, view.PartitionColumn)
+	}
+	materializeViewCreateScript(dbTable, view)
+}
+
+// materializeHashView binds the equality / IN predicates of a hash view to its hash column.
+func materializeHashView(view *viewInfo) {
+	viewCols := view.DeclaredColumns
+	viewPartCol := view.PartitionColumn
+	view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
+		valuesGroups := [][]any{{}}
+		for _, e := range viewCols {
+			for _, st := range statements {
+				if st.Col == e.GetName() {
+					if len(st.Values) >= 2 {
+						valuesGroupsCurrent := valuesGroups
+						valuesGroups = [][]any{}
+						for _, vg := range valuesGroupsCurrent {
+							for _, value := range st.Values {
+								valuesGroups = append(valuesGroups, append(vg, value))
+							}
+						}
+					} else {
+						if len(st.Values) == 1 {
+							st.Value = st.Values[0]
+						}
+						for i := range valuesGroups {
+							valuesGroups[i] = append(valuesGroups[i], st.Value)
+						}
+					}
+					break
+				}
 			}
 		}
-		return append(target, column)
-	}
-	orderColumnsBySchemaIndex := func(columns []IColInfo) []IColInfo {
-		orderedColumns := slices.Clone(columns)
-		slices.SortFunc(orderedColumns, func(leftColumn, rightColumn IColInfo) int {
-			if idxDiff := int(leftColumn.GetInfo().Idx - rightColumn.GetInfo().Idx); idxDiff != 0 {
-				return idxDiff
-			}
-			return strings.Compare(leftColumn.GetName(), rightColumn.GetName())
-		})
-		return orderedColumns
-	}
 
-	colNames := []string{}
-	declaredColumns := []IColInfo{}
-	columns := []IColInfo{}
-	viewColumnsConfig := make([]columnInfo, 0, len(viewCfg.Keys))
-	packedViewHintFound := false
-	for _, declaredColumn := range viewCfg.Keys {
-		columnConfig := declaredColumn.GetInfo()
-		viewColumnsConfig = append(viewColumnsConfig, columnConfig)
-		if columnConfig.SlotBits > 0 || columnConfig.UseInt32Packing {
-			packedViewHintFound = true
+		hashValues := make([]any, 0, len(valuesGroups))
+		for _, values := range valuesGroups {
+			hashValues = append(hashValues, db.HashInt(values...))
 		}
+
+		whereStatements := buildChunkedInWhereClauses(view.Column.GetName(), hashValues)
+
+		if viewPartCol != nil {
+			for _, st := range statements {
+				if st.Col == viewPartCol.GetName() {
+					for i, whereStatement := range whereStatements {
+						whereStatements[i] = boundWhereClause{
+							Clause: fmt.Sprintf("%v = ? AND %v", st.Col, whereStatement.Clause),
+							Values: append([]any{st.Value}, whereStatement.Values...),
+						}
+					}
+					break
+				}
+			}
+		}
+		return whereStatements
 	}
+}
 
-	fixedValueSlots := dbTable.PlanFixedValueViewSlots(viewCfg)
-	isRangeView := len(viewCfg.Keys) > 1 && (packedViewHintFound || fixedValueSlots != nil)
-
-	// Views keep the base table partition unless the schema declares another column.
+// materializeViewCreateScript attaches the CREATE MATERIALIZED VIEW script and the expected-column
+// set. Both read the layout from resolveShape, so the script and deploy's drift check agree.
+func materializeViewCreateScript(dbTable *ScyllaTable, view *viewInfo) {
 	basePartCol := dbTable.GetPartKey()
 	if basePartCol != nil && basePartCol.IsNil() {
 		basePartCol = nil
 	}
-	viewPartCol := dbTable.ResolveIndexPartitionColumn(viewCfg)
-	keepsBasePart := viewPartCol == nil ||
-		(basePartCol != nil && viewPartCol.GetName() == basePartCol.GetName())
-	if viewPartCol == nil {
-		viewPartCol = basePartCol
-	}
+	viewPartCol, keepsBasePart := view.PartitionColumn, view.KeepsBasePartition
+	declaredColumns, projectedColumns, selectableColumns := view.DeclaredColumns, view.ProjectedColumns, view.SelectableColumns
 
-	for _, colInfo := range viewCfg.Keys {
-		column := dbTable.ColumnsMap[colInfo.GetInfo().Name]
-		if column.GetType().IsComplexType {
-			panic("No puede usar un struct como columna de una view.")
-		}
-		colNames = append(colNames, column.GetName())
-		declaredColumns = append(declaredColumns, column)
-		columns = append(columns, column)
-	}
-
-	colNamesNoPart := colNames
-	declaredColumnCount := len(declaredColumns)
-	isSingleDeclaredSimpleView := declaredColumnCount == 1 && !isRangeView
-
-	colNamesJoined := strings.Join(colNames, "_")
-	if viewPartCol != nil {
-		if keepsBasePart {
-			colNames = append([]string{viewPartCol.GetName()}, colNames...)
-			colNamesJoined = "pk_" + colNamesJoined
-		} else {
-			// The override leads the view key; it must not be repeated as a clustering column.
-			partColName := viewPartCol.GetName()
-			if isRangeView && slices.Contains(colNames, partColName) {
-				panic(fmt.Sprintf(`Table "%v": the Partition column "%v" cannot also be a packed view key`,
-					dbTable.Name, partColName))
-			}
-			clusteringColNames := make([]string, 0, len(colNames))
-			for _, colName := range colNames {
-				if colName != partColName {
-					clusteringColNames = append(clusteringColNames, colName)
-				}
-			}
-			colNames = append([]string{partColName}, clusteringColNames...)
-			colNamesJoined = strings.Join(colNames, "_")
-		}
-	}
-	if isRangeView {
-		colNamesJoined = colNamesJoined + "_rng"
-	}
-
-	view := &viewInfo{
-		IndexSource: &db.IndexSource{
-			Type:          6,
-			Name:          fmt.Sprintf(`%v__%v_view`, dbTable.Name, colNamesJoined),
-			Columns:       colNames,
-			ColumnsNoPart: colNamesNoPart,
-		},
-	}
-
-	if len(columns) > 1 {
-		view.Column = &columnInfo{
-			ColInfo: colInfo{
-				IsVirtual: true,
-				Idx:       dbTable.MaxColIdx,
-			},
-			ColType: colType{
-				FieldType: "int32", DBType: "int",
-			},
-		}
-		view.Column.GetInfo().Name = fmt.Sprintf(`zz_%v`, colNamesJoined)
-		dbTable.MaxColIdx++
-		dbTable.ColumnsMap[view.Column.GetName()] = view.Column
-	}
-
-	if isSingleDeclaredSimpleView {
-		view.Column = declaredColumns[0]
-		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
-			// Simple MVs keep their source columns, so predicates bind without key rewriting
-			// and the generic batcher applies as-is: an IN on the view's clustering key is
-			// split into several queries rather than one the node would reject.
-			return buildRemainingWhereClauseBatches(statements)
-		}
-	} else if len(columns) == 1 {
-		view.Column = columns[0]
-	} else if isRangeView {
-		view.Type = 8
-		view.Column.GetType().FieldType = "int64"
-		view.Column.GetType().DBType = "bigint"
-
-		if len(columns) < 2 {
-			panic(fmt.Sprintf(`The view "%v" in "%v" requires at least 2 columns for Size() packed range views`, view.Name, dbTable.Name))
-		}
-
-		isInt32PackedView := false
-		slotBitsPerColumn := make([]int64, 0, len(viewColumnsConfig))
-
-		if fixedValueSlots != nil {
-			// Every slot comes from FixedValues: the leading column carries a real width instead of
-			// absorbing the bit remainder.
-			isInt32PackedView = fixedValueSlots.UseInt32
-			slotBitsPerColumn = append(slotBitsPerColumn, fixedValueSlots.SlotBitsPerColumn...)
-		} else {
-			if viewColumnsConfig[0].SlotBits > 0 {
-				panic(fmt.Sprintf(`The view "%v" in "%v" cannot set Size() on the first column; it takes the bits the remaining columns leave`, view.Name, dbTable.Name))
-			}
-
-			isInt32PackedView = viewColumnsConfig[0].UseInt32Packing
-			slotBitsPerColumn = append(slotBitsPerColumn, 0) // the first slot is set once the trailing ones are summed
-			for columnIndex := 1; columnIndex < len(viewColumnsConfig); columnIndex++ {
-				slotBits := int64(viewColumnsConfig[columnIndex].SlotBits)
-				if slotBits <= 0 {
-					panic(fmt.Sprintf(`The view "%v" in "%v" must set Size() on column "%v" (only the first column can be inferred)`,
-						view.Name, dbTable.Name, columns[columnIndex].GetName()))
-				}
-				slotBitsPerColumn = append(slotBitsPerColumn, slotBits)
-			}
-
-			budgetBits := db.PackedVirtualBudgetBits(isInt32PackedView)
-			slotBitsPerColumn[0] = budgetBits - db.SumSlotBits(slotBitsPerColumn, 1)
-			if slotBitsPerColumn[0] <= 0 {
-				panic(fmt.Sprintf(`The view "%v" in "%v": the trailing Size() slots take all %v bits, leaving none for "%v"`,
-					view.Name, dbTable.Name, budgetBits, columns[0].GetName()))
-			}
-		}
-
-		if isInt32PackedView {
-			view.Column.GetType().FieldType = "int32"
-			view.Column.GetType().DBType = "int"
-		}
-		view.PackedSourceColumns = append([]IColInfo{}, columns...)
-		view.PackedSlotBitsPerColumn = append([]int64{}, slotBitsPerColumn...)
-		view.PackedIsInt32 = isInt32PackedView
-
-		supportedTypes := []string{"int8", "int16", "int32", "int64", "int"}
-		for _, col := range columns {
-			if col.GetType().IsSlice || !slices.Contains(supportedTypes, col.GetType().FieldType) {
-				panic(fmt.Sprintf(`For view "%v" in "%v" need the column %v need to be a int type for the radix value be computed.`,
-					view.Name, dbTable.Name, col.GetName()))
-			}
-		}
-
-		viewCols := columns
-		viewNameForGuard, tableNameForGuard := view.Name, dbTable.Name
-		view.Column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
-			values := []int64{}
-			for _, col := range viewCols {
-				values = append(values, db.ConvertToInt64(col.GetValue(ptr)))
-			}
-			packed := db.PackRowValues(tableNameForGuard, viewNameForGuard, viewCols, values, slotBitsPerColumn)
-			return storeVirtualPacked(packed, isInt32PackedView)
-		}
-
-		compilePackedRangeAccessors(view, columns, slotBitsPerColumn, isInt32PackedView, viewPartCol)
-	} else {
-		viewPtr := view
-		viewPartColPtr := viewPartCol
-		viewCols := columns
-		view.Operators = []string{"=", "IN"}
-		view.Type = 7
-		view.Column.(*columnInfo).GetValueFn = func(ptr unsafe.Pointer) any {
-			values := []any{}
-			for _, e := range viewCols {
-				values = append(values, e.GetValue(ptr))
-			}
-			return db.HashInt(values...)
-		}
-
-		view.getStatementPrepared = func(statements ...ColumnStatement) []boundWhereClause {
-			valuesGroups := [][]any{{}}
-			for _, e := range viewCols {
-				for _, st := range statements {
-					if st.Col == e.GetName() {
-						if len(st.Values) >= 2 {
-							valuesGroupsCurrent := valuesGroups
-							valuesGroups = [][]any{}
-							for _, vg := range valuesGroupsCurrent {
-								for _, value := range st.Values {
-									valuesGroups = append(valuesGroups, append(vg, value))
-								}
-							}
-						} else {
-							if len(st.Values) == 1 {
-								st.Value = st.Values[0]
-							}
-							for i := range valuesGroups {
-								valuesGroups[i] = append(valuesGroups[i], st.Value)
-							}
-						}
-						break
-					}
-				}
-			}
-
-			hashValues := make([]any, 0, len(valuesGroups))
-			for _, values := range valuesGroups {
-				hashValues = append(hashValues, db.HashInt(values...))
-			}
-
-			whereStatements := buildChunkedInWhereClauses(viewPtr.Column.GetName(), hashValues)
-
-			if viewPartColPtr != nil {
-				for _, st := range statements {
-					if st.Col == viewPartColPtr.GetName() {
-						for i, whereStatement := range whereStatements {
-							whereStatements[i] = boundWhereClause{
-								Clause: fmt.Sprintf("%v = ? AND %v", st.Col, whereStatement.Clause),
-								Values: append([]any{st.Value}, whereStatement.Values...),
-							}
-						}
-						break
-					}
-				}
-			}
-			return whereStatements
-		}
-	}
-
-	projectedColumnsConfig := viewCfg.Cols
-	projectedColumns := []IColInfo{}
-	for _, declaredProjectedColumn := range projectedColumnsConfig {
-		projectedColumn := dbTable.ColumnsMap[declaredProjectedColumn.GetInfo().Name]
-		if projectedColumn == nil || projectedColumn.IsNil() {
-			panic(fmt.Sprintf(`The projected column "%v" for view "%v" in "%v" wasn't found.`,
-				declaredProjectedColumn.GetInfo().Name, view.Name, dbTable.Name))
-		}
-		if projectedColumn.GetInfo().IsVirtual {
-			panic(fmt.Sprintf(`The projected column "%v" for view "%v" in "%v" cannot be virtual.`,
-				projectedColumn.GetName(), view.Name, dbTable.Name))
-		}
-		projectedColumns = appendUniqueColumn(projectedColumns, projectedColumn)
-	}
-
-	selectableColumns := []IColInfo{}
-	if len(projectedColumns) == 0 {
-		for _, baseColumn := range dbTable.ColumnsMap {
-			if baseColumn.GetInfo().IsVirtual {
-				continue
-			}
-			selectableColumns = appendUniqueColumn(selectableColumns, baseColumn)
-		}
-	} else {
-		selectableColumns = appendUniqueColumn(selectableColumns, basePartCol)
-		// A relocated partition column must always travel with the projected view.
-		selectableColumns = appendUniqueColumn(selectableColumns, viewPartCol)
-		if view.Type == 6 {
-			for _, declaredViewColumn := range declaredColumns {
-				selectableColumns = appendUniqueColumn(selectableColumns, declaredViewColumn)
-			}
-		}
-		for _, keyColumn := range dbTable.Keys {
-			selectableColumns = appendUniqueColumn(selectableColumns, keyColumn)
-		}
-		if view.Column != nil && !view.Column.IsNil() && !view.Column.GetInfo().IsVirtual {
-			selectableColumns = appendUniqueColumn(selectableColumns, view.Column)
-		}
-		for _, projectedColumn := range projectedColumns {
-			selectableColumns = appendUniqueColumn(selectableColumns, projectedColumn)
-		}
-	}
-	for _, selectableColumn := range selectableColumns {
-		view.AvailableColumns = append(view.AvailableColumns, selectableColumn.GetName())
-	}
-
-	viewPtr := view
-	// The CREATE script and deploy's column-drift check must agree on what the view contains, so
-	// both read the layout from here instead of each deriving it.
 	resolveShape := func() materializedViewShape {
 		whereCols := []IColInfo{}
-		if viewPtr.Type == 6 && !viewPtr.Column.GetInfo().IsVirtual {
+		if view.Type == 6 && !view.Column.GetInfo().IsVirtual {
 			for _, declaredViewColumn := range declaredColumns {
-				whereCols = appendUniqueColumn(whereCols, declaredViewColumn)
+				whereCols = db.AppendUniqueColumn(whereCols, declaredViewColumn)
 			}
 		} else {
-			whereCols = appendUniqueColumn(whereCols, viewPtr.Column)
+			whereCols = db.AppendUniqueColumn(whereCols, view.Column)
 		}
 		wherePartCol := viewPartCol
 		if !keepsBasePart {
 			// The base partition becomes a clustering column of the relocated view.
-			whereCols = appendUniqueColumn(whereCols, basePartCol)
+			whereCols = db.AppendUniqueColumn(whereCols, basePartCol)
 		}
 		for _, keyColumn := range dbTable.Keys {
-			whereCols = appendUniqueColumn(whereCols, keyColumn)
+			whereCols = db.AppendUniqueColumn(whereCols, keyColumn)
 		}
 		if wherePartCol != nil {
 			whereCols = slices.DeleteFunc(whereCols, func(column IColInfo) bool {
@@ -466,10 +253,10 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 		selectColumns := slices.Clone(selectableColumns)
 		for _, whereColumn := range whereCols {
 			if whereColumn != nil && !whereColumn.IsNil() && whereColumn.GetInfo().IsVirtual {
-				selectColumns = appendUniqueColumn(selectColumns, whereColumn)
+				selectColumns = db.AppendUniqueColumn(selectColumns, whereColumn)
 			}
 		}
-		shape.selectColumns = orderColumnsBySchemaIndex(selectColumns)
+		shape.selectColumns = db.OrderColumnsBySchemaIndex(selectColumns)
 		return shape
 	}
 
@@ -492,11 +279,9 @@ func compileSchemaView(dbTable *ScyllaTable, viewCfg Index) {
 			WHERE %v
 			PRIMARY KEY (%v)
 			%v;`,
-			dbTable.Namespace, viewPtr.Name, strings.Join(selectColumnNames, ", "), dbTable.GetFullName(),
+			dbTable.Namespace, view.Name, strings.Join(selectColumnNames, ", "), dbTable.GetFullName(),
 			strings.Join(shape.notNullClauses, " AND "), shape.primaryKeyClause, makeStatementWith)
 	}
-
-	dbTable.views[view.Name] = view
 }
 
 // materializedViewShape is the column layout of one compiled materialized view, derived once and
