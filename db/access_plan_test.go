@@ -156,3 +156,41 @@ func TestGroupHashStepsDeduplicateAndReadCollectionsByElement(t *testing.T) {
 		t.Fatalf("steps = %+v", steps)
 	}
 }
+
+// A hash view over (status, date): a BETWEEN on date is one hash per day, each hashed with the
+// bound's own type, and an open range or a too wide one is refused rather than read as one hash.
+func TestHashViewStepsEnumerateABetween(t *testing.T) {
+	source := &IndexSource{
+		Name: "t__pk_status_date_view", Type: 7, Column: accessTestColumn("zz_pk_status_date"),
+		PartitionColumn: accessTestColumn("company_id"),
+		DeclaredColumns: []IColInfo{accessTestColumn("status"), accessTestColumn("date")},
+	}
+	partition := ColumnStatement{Col: "company_id", Operator: "=", Value: int32(2)}
+	status := ColumnStatement{Col: "status", Operator: "=", Value: int8(1)}
+	between := func(from, to int16) ColumnStatement {
+		return ColumnStatement{Col: "date", Operator: "BETWEEN",
+			From: []ColumnStatement{{Col: "date", Value: from}}, To: []ColumnStatement{{Col: "date", Value: to}}}
+	}
+
+	steps, _, err := PlanSourceSteps(source, []ColumnStatement{partition, status, between(101, 103)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []AccessStep{{Range: &KeyRange{EqualPrefix: []KeyValues{
+		{Column: "company_id", Values: []any{int32(2)}},
+		{Column: "zz_pk_status_date", Values: []any{
+			HashInt(int8(1), int16(101)), HashInt(int8(1), int16(102)), HashInt(int8(1), int16(103))}},
+	}}}}
+	if !reflect.DeepEqual(steps, expected) {
+		t.Fatalf("steps = %+v, want %+v", *steps[0].Range, *expected[0].Range)
+	}
+
+	for name, dateStatement := range map[string]ColumnStatement{
+		"open range":   {Col: "date", Operator: ">=", Value: int16(101)},
+		"wide BETWEEN": between(0, MaxHashViewHashes),
+	} {
+		if _, _, err := PlanSourceSteps(source, []ColumnStatement{partition, status, dateStatement}); err == nil {
+			t.Errorf("%s: expected the hash view to refuse it", name)
+		}
+	}
+}

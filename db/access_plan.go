@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 )
 
@@ -83,7 +84,8 @@ func PlanSourceSteps(source *IndexSource, statements []ColumnStatement) ([]Acces
 		steps, err := planGroupHashSteps(source, statements)
 		return steps, nil, err
 	case source.Type == 7:
-		return planHashViewSteps(source, statements), nil, nil
+		steps, err := planHashViewSteps(source, statements)
+		return steps, nil, err
 	case source.Type == 8:
 		steps, err := planPackedRangeSteps(source, statements)
 		return steps, nil, err
@@ -189,25 +191,28 @@ func expandValueGroups[T any](valueGroups [][]T, values []T) [][]T {
 	return expandedGroups
 }
 
-// planHashViewSteps serves a hash view (Type 7): the declared columns' equality / IN values are
-// hashed together, one hash per combination, read as one value list on the hash column.
-func planHashViewSteps(source *IndexSource, statements []ColumnStatement) []AccessStep {
+// MaxHashViewHashes caps how many hashes one hash-view read sends: a BETWEEN on one of its columns
+// is enumerated value by value, since a hash has no order, and every combination is one more value
+// in the read's IN list.
+const MaxHashViewHashes = 100
+
+// planHashViewSteps serves a hash view (Type 7): the declared columns' values are hashed together,
+// one hash per combination, read as one value list on the hash column. A BETWEEN is enumerated into
+// its integer values; an open range (>, <) has no finite value set and is refused.
+func planHashViewSteps(source *IndexSource, statements []ColumnStatement) ([]AccessStep, error) {
 	valueGroups := [][]any{{}}
 	for _, declaredColumn := range source.DeclaredColumns {
 		for _, statement := range statements {
 			if statement.Col != declaredColumn.GetName() {
 				continue
 			}
-			if len(statement.Values) >= 2 {
-				valueGroups = expandValueGroups(valueGroups, statement.Values)
-			} else {
-				value := statement.Value
-				if len(statement.Values) == 1 {
-					value = statement.Values[0]
-				}
-				for groupIndex := range valueGroups {
-					valueGroups[groupIndex] = append(valueGroups[groupIndex], value)
-				}
+			columnValues, err := hashViewStatementValues(statement)
+			if err != nil {
+				return nil, fmt.Errorf(`hash view "%v": %w`, source.Name, err)
+			}
+			valueGroups = expandValueGroups(valueGroups, columnValues)
+			if len(valueGroups) > MaxHashViewHashes {
+				return nil, fmt.Errorf(`hash view "%v": the predicates select more than %d value combinations`, source.Name, MaxHashViewHashes)
 			}
 			break
 		}
@@ -227,7 +232,34 @@ func planHashViewSteps(source *IndexSource, statements []ColumnStatement) []Acce
 		}
 	}
 	keyRange.EqualPrefix = append(keyRange.EqualPrefix, KeyValues{Column: source.Column.GetName(), Values: hashValues})
-	return []AccessStep{rangeStep(keyRange)}
+	return []AccessStep{rangeStep(keyRange)}, nil
+}
+
+// hashViewStatementValues lists the values one statement selects on a hash view column, each of the
+// bound's own type: the hash of an int16 and of an int32 with the same value differ.
+func hashViewStatementValues(statement ColumnStatement) ([]any, error) {
+	switch {
+	case len(statement.Values) > 0:
+		return statement.Values, nil
+	case statement.Operator == "=":
+		return []any{statement.Value}, nil
+	case len(statement.From) == 1 && len(statement.To) == 1:
+		fromValue, toValue := reflect.ValueOf(statement.From[0].Value), reflect.ValueOf(statement.To[0].Value)
+		if !fromValue.CanInt() || fromValue.Type() != toValue.Type() {
+			return nil, fmt.Errorf(`a BETWEEN on "%v" needs integer bounds of one type, got %T and %T`,
+				statement.Col, statement.From[0].Value, statement.To[0].Value)
+		}
+		from, to := fromValue.Int(), toValue.Int()
+		if to-from >= MaxHashViewHashes {
+			return nil, fmt.Errorf(`a BETWEEN on "%v" spans more than %d values`, statement.Col, MaxHashViewHashes)
+		}
+		values := []any{}
+		for value := from; value <= to; value++ {
+			values = append(values, reflect.ValueOf(value).Convert(fromValue.Type()).Interface())
+		}
+		return values, nil
+	}
+	return nil, fmt.Errorf(`operator %v on "%v" has no finite value set to hash`, statement.Operator, statement.Col)
 }
 
 // statementRangePair is the lower statement of a column and, for a BETWEEN, its upper bound.

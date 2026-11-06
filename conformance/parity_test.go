@@ -151,11 +151,16 @@ func TestIndexReads(t *testing.T) {
 		run.read("global index on email", readIndexed(func(query *indexedSchema) { query.Email.Equals("a@x.pe") }))
 		run.read("local index on client_id", readIndexed(func(query *indexedSchema) { query.CompanyID.Equals(2).ClientID.Equals(10) }))
 		run.read("global index on the tags slice", readIndexed(func(query *indexedSchema) { query.Tags.Contains(2) }))
-		// The hash view is read by equality only: a range on one of its columns is planned onto it but
-		// read as a single hash (a Scylla bug, not yet fixed), which no driver should reproduce.
 		run.read("view on status and date", readIndexed(func(query *indexedSchema) {
 			query.CompanyID.Equals(2).Status.Equals(1).Date.Equals(101)
 		}))
+		// A hash has no order: a BETWEEN is one hash per value, and an open range is refused.
+		run.read("view on status and a date range", readIndexed(func(query *indexedSchema) {
+			query.CompanyID.Equals(2).Status.Equals(1).Date.Between(101, 103)
+		}))
+		openRangeRecords := []indexedRecord{}
+		openRangeErr := db.Query(&openRangeRecords).CompanyID.Equals(2).Status.Equals(1).Date.GreaterEqual(101).Exec()
+		run.observe("an open range on the view is refused", openRangeErr != nil)
 		run.read("descending key order with a limit", func() (any, error) {
 			records := []indexedRecord{}
 			return records, db.Query(&records).CompanyID.Equals(2).OrderDesc().Limit(2).Exec()
@@ -174,6 +179,9 @@ func TestIndexReads(t *testing.T) {
 		}))
 		run.read("view on the old status and date after the update", readIndexed(func(query *indexedSchema) {
 			query.CompanyID.Equals(2).Status.Equals(1).Date.Equals(100)
+		}))
+		run.read("view on status and a date range after the update", readIndexed(func(query *indexedSchema) {
+			query.CompanyID.Equals(2).Status.Equals(1).Date.Between(100, 102)
 		}))
 	})
 }

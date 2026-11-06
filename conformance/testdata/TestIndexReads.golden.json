@@ -127,6 +127,39 @@
     ]
   },
   {
+    "step": "view on status and a date range",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 2,
+        "Email": "b@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 101,
+        "Name": "dos",
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 2,
+        "ID": 4,
+        "Email": "d@x.pe",
+        "ClientID": 11,
+        "Tags": [],
+        "Status": 1,
+        "Date": 103,
+        "Name": "cuatro",
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "an open range on the view is refused",
+    "value": true
+  },
+  {
     "step": "descending key order with a limit",
     "value": [
       {
@@ -225,5 +258,36 @@
   {
     "step": "view on the old status and date after the update",
     "value": []
+  },
+  {
+    "step": "view on status and a date range after the update",
+    "value": [
+      {
+        "CompanyID": 2,
+        "ID": 1,
+        "Email": "z@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          3
+        ],
+        "Status": 1,
+        "Date": 102,
+        "Name": "uno",
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 2,
+        "ID": 2,
+        "Email": "b@x.pe",
+        "ClientID": 10,
+        "Tags": [
+          2
+        ],
+        "Status": 1,
+        "Date": 101,
+        "Name": "dos",
+        "upd": 380000000
+      }
+    ]
   }
 ]

@@ -182,7 +182,8 @@ func (core *TableCore) ComputeCapabilities() []QueryCapability {
 }
 
 // hashSourceCapabilities: a hash view or cache group answers its full column set by equality, and a
-// cache group also a range on any one non-slice column (enumerated into one hash per value).
+// range on any one non-slice column, enumerated into one hash per value. Only a BETWEEN can be
+// enumerated: the source's planner refuses an open range (planHashViewSteps).
 func (core *TableCore) hashSourceCapabilities(source *IndexSource) []QueryCapability {
 	equalityParts := []string{}
 	for _, columnName := range source.Columns {
