@@ -1,0 +1,273 @@
+[
+  {
+    "step": "product 7",
+    "value": [
+      {
+        "ig": -7723,
+        "id": 1597503036,
+        "igVal": [
+          100,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "ClientID": 5,
+            "Lines": [
+              7,
+              8
+            ],
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "ClientID": 6,
+            "Lines": [
+              7
+            ],
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "product 8",
+    "value": [
+      {
+        "ig": -7723,
+        "id": -2011703752,
+        "igVal": [
+          101,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 101,
+            "ClientID": 5,
+            "Lines": [
+              8,
+              9
+            ],
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -7723,
+        "id": 1211448545,
+        "igVal": [
+          100,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "ClientID": 5,
+            "Lines": [
+              7,
+              8
+            ],
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "client 5, product 8",
+    "value": [
+      {
+        "ig": -12497,
+        "id": -500396066,
+        "igVal": [
+          100,
+          5,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "ClientID": 5,
+            "Lines": [
+              7,
+              8
+            ],
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -12497,
+        "id": 1013717909,
+        "igVal": [
+          101,
+          5,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 101,
+            "ClientID": 5,
+            "Lines": [
+              8,
+              9
+            ],
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "after the updates: product 8",
+    "value": [
+      {
+        "ig": -7723,
+        "id": -2011703752,
+        "igVal": [
+          101,
+          8
+        ],
+        "records": [],
+        "lw": 380000018
+      },
+      {
+        "ig": -7723,
+        "id": -1276904701,
+        "igVal": [
+          102,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 102,
+            "ClientID": 5,
+            "Lines": [
+              8,
+              9
+            ],
+            "upd": 380000018
+          }
+        ],
+        "lw": 380000018
+      },
+      {
+        "ig": -7723,
+        "id": 1211448545,
+        "igVal": [
+          100,
+          8
+        ],
+        "records": [],
+        "lw": 380000018
+      }
+    ]
+  },
+  {
+    "step": "after the updates: client 6, product 7",
+    "value": [
+      {
+        "ig": -12497,
+        "id": 785111800,
+        "igVal": [
+          100,
+          6,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "ClientID": 6,
+            "Lines": [
+              7
+            ],
+            "upd": 380000018
+          },
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "ClientID": 6,
+            "Lines": [
+              7
+            ],
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000018
+      }
+    ]
+  },
+  {
+    "step": "after the updates: client 5, product 8",
+    "value": [
+      {
+        "ig": -12497,
+        "id": -500396066,
+        "igVal": [
+          100,
+          5,
+          8
+        ],
+        "records": [],
+        "lw": 380000018
+      },
+      {
+        "ig": -12497,
+        "id": 84604084,
+        "igVal": [
+          102,
+          5,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 102,
+            "ClientID": 5,
+            "Lines": [
+              8,
+              9
+            ],
+            "upd": 380000018
+          }
+        ],
+        "lw": 380000018
+      },
+      {
+        "ig": -12497,
+        "id": 1013717909,
+        "igVal": [
+          101,
+          5,
+          8
+        ],
+        "records": [],
+        "lw": 380000018
+      }
+    ]
+  }
+]

@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"math/bits"
 	"slices"
 	"strings"
 	"unsafe"
@@ -41,6 +42,7 @@ func (core *TableCore) DescribeIndexGroup(idxCount *int8, indexCfg Index) *Index
 			IndexID:       indexID,
 			SourceColumns: []IndexGroupSourceColumn{{Column: core.ColumnsMap[indexCfg.Keys[0].GetName()]}},
 			SnapshotInS3:  indexCfg.Type == TypeCacheGroupS3,
+			PackBits:      core.indexGroupPackBits(indexCfg.Keys),
 		})
 		return localIndexSource
 	}
@@ -102,6 +104,7 @@ func (core *TableCore) DescribeIndexGroup(idxCount *int8, indexCfg Index) *Index
 		VirtualColumn:        virtualColumn,
 		UsesCollectionValues: usesCollectionValues,
 		SnapshotInS3:         indexCfg.Type == TypeCacheGroupS3,
+		PackBits:             core.indexGroupPackBits(indexCfg.Keys),
 	}
 	core.IndexGroups = append(core.IndexGroups, indexGroup)
 	return core.addIndexSource(idxCount, &IndexSource{
@@ -132,6 +135,7 @@ func (core *TableCore) describeNoIndexGroup(indexCfg Index, indexID int16, sourc
 		Name:          strings.Join(sourceColumnNames, "_"),
 		IndexID:       indexID,
 		SourceColumns: sourceColumns,
+		PackBits:      core.indexGroupPackBits(indexCfg.Keys),
 		// Placeholder until resolveNoIndexBaseGroups names the real one: it marks the group as no-index.
 		BaseGroup: &IndexGroupInfo{},
 	})
@@ -200,5 +204,42 @@ func (core *TableCore) describeInheritFromKeyIndexGroup(indexCfg Index, indexID 
 		IndexID:        indexID,
 		SourceColumns:  sourceColumns,
 		InheritFromKey: true,
+		PackBits:       core.indexGroupPackBits(indexCfg.Keys),
 	})
+}
+
+// indexGroupPackBits sizes each key's slot in the group's packed value: Size() on the key wins, then
+// the bits of its FixedValues maximum, then its integer type's width (an int32 takes 31). The slots
+// must fit the 64 bits of the packed value; a wide group sizes its keys with Size().
+func (core *TableCore) indexGroupPackBits(keys []Coln) []int64 {
+	typeBits := map[string]int64{"int64": 63, "int32": 31, "int16": 15, "int8": 7}
+	packBits := make([]int64, len(keys))
+	for position, key := range keys {
+		keyInfo := key.GetInfo()
+		column := core.ColumnsMap[keyInfo.Name]
+		if column == nil || column.IsNil() {
+			panic(fmt.Sprintf(`Table "%v": cache group column "%v" was not found`, core.Name, keyInfo.Name))
+		}
+		elementType := strings.TrimPrefix(strings.TrimPrefix(column.GetType().FieldType, "*"), "[]")
+		if valueRange, isDeclared := core.FixedValueRanges[keyInfo.Name]; keyInfo.SlotBits > 0 {
+			packBits[position] = int64(keyInfo.SlotBits)
+		} else if isDeclared {
+			packBits[position] = max(1, int64(bits.Len64(uint64(valueRange.MaxValue))))
+		} else if packBits[position] = typeBits[elementType]; packBits[position] == 0 {
+			panic(fmt.Sprintf(`Table "%v": cache group column "%v" is a %v: a group key must be an integer`, core.Name, keyInfo.Name, elementType))
+		}
+	}
+	if totalBits := SumSlotBits(packBits, 0); totalBits > PackedVirtualInt64Bits {
+		panic(fmt.Sprintf(`Table "%v": the cache group on %v packs into %v bits %v, over the %v of its packed value: narrow its keys with Size()`,
+			core.Name, keysNames(keys), totalBits, packBits, PackedVirtualInt64Bits))
+	}
+	return packBits
+}
+
+func keysNames(keys []Coln) []string {
+	names := make([]string, len(keys))
+	for position, key := range keys {
+		names[position] = key.GetName()
+	}
+	return names
 }

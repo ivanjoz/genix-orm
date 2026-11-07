@@ -266,6 +266,13 @@ func (q ColSlice[T, E]) GetInfo() ColumnInfo {
 	return q.colCore.resolveSliceInfo(reflect.TypeFor[E]().String())
 }
 
+// Size declares the bit width each element takes inside a packed key (a cache group's packed value):
+// every element must stay below 2^bits. An element that does not fit panics on write.
+func (q ColSlice[T, E]) Size(bits int8) Coln {
+	q.setSize(bits)
+	return colRef{q.GetInfo()}
+}
+
 func (q *ColSlice[T, E]) GetInfoPointer() *ColumnInfo {
 	if q.info.Type == 0 {
 		q.info = q.colCore.resolveSliceInfo(reflect.TypeFor[E]().String())

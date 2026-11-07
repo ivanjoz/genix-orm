@@ -104,7 +104,7 @@ func (e indexGroupSchema) GetSchema() TableSchema {
 			},
 			{
 				Type: TypeCacheGroup,
-				Keys: Cols(e.Date, e.ClientID, e.ProductIDs),
+				Keys: Cols(e.Date, e.ClientID.Size(26), e.ProductIDs.Size(23)),
 			},
 		},
 	}

@@ -10,6 +10,11 @@ import (
 // unsettled group is always fetched and labelled 0.
 const IndexGroupSettleTicks = 8
 
+// SQLIndexGroupSettleTicks (8 s) is the settle window of a SQL driver. Its marks are stamped in the
+// last statements before the COMMIT (deferred group marks) and a lock wait is capped by the session's
+// lock timeout, so a mark lands within seconds of its stamp, well inside the window.
+const SQLIndexGroupSettleTicks = 4
+
 // IndexGroupHash is one group a grouped read covers: its hash and the source-column values hashed.
 type IndexGroupHash struct {
 	HashValue        int32
@@ -206,6 +211,12 @@ func (plan *IndexGroupReadPlan) BaseGroupHashes() (baseHashByGroupHash map[int32
 // fetched and labelled 0; a settled group whose last_write the client holds is cached.
 func SplitIndexGroupFetches(hashGroups []IndexGroupHash, serverFreshnessByHash, cachedIndexGroups map[int32]int32,
 	nowTime int32) (fetchStates, cachedStates []IndexGroupFetchState) {
+	return SplitIndexGroupFetchesSettledAfter(hashGroups, serverFreshnessByHash, cachedIndexGroups, nowTime, IndexGroupSettleTicks)
+}
+
+// SplitIndexGroupFetchesSettledAfter is SplitIndexGroupFetches with the driver's settle window.
+func SplitIndexGroupFetchesSettledAfter(hashGroups []IndexGroupHash, serverFreshnessByHash, cachedIndexGroups map[int32]int32,
+	nowTime, settleTicks int32) (fetchStates, cachedStates []IndexGroupFetchState) {
 
 	fetchStates = make([]IndexGroupFetchState, 0, len(hashGroups))
 	cachedStates = make([]IndexGroupFetchState, 0, len(hashGroups))
@@ -217,7 +228,7 @@ func SplitIndexGroupFetches(hashGroups []IndexGroupHash, serverFreshnessByHash, 
 		groupState := IndexGroupFetchState{
 			HashValue: hashGroup.HashValue, IndexGroupValues: slices.Clone(hashGroup.IndexGroupValues), LastWrite: lastWrite,
 		}
-		if nowTime-lastWrite < IndexGroupSettleTicks {
+		if nowTime-lastWrite < settleTicks {
 			groupState.LastWrite = 0
 			fetchStates = append(fetchStates, groupState)
 			continue

@@ -189,6 +189,10 @@ type TableSchema struct {
 	// its partition's slot file, and QueryCachedIDs skips reading rows whose slot did not move. The
 	// table needs one integer key and the record an `Updated int32 json:"upd"` field.
 	CacheByIDs bool
+	// ColumnStore keeps the table in rows and in columns (OceanBase's hybrid store: WITH COLUMN
+	// GROUP(all columns, each column)), for a table read mostly by scans and aggregations. Drivers
+	// without a column store ignore it.
+	ColumnStore bool
 	// GenericRecord maps this table's columns onto the flat shape returned by
 	// QueryCachedGenericByIDs, so a single endpoint can resolve labels for any table by name.
 	GenericRecord GenericRecordSchema

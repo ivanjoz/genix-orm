@@ -103,12 +103,12 @@ func TestAutoincrementKeys(t *testing.T) {
 			{CompanyID: 3, Date: 20000, WarehouseID: 2, Kind: 2, Name: "b"},
 			{CompanyID: 3, Date: 20001, WarehouseID: 1, Kind: 1, Name: "c"},
 		}
-		run.must("Insert packed", db.Insert(&packedRecords))
+		run.must("Insert packed", db.Upsert(&packedRecords))
 		run.observe("packed keys assigned", packedRecords)
 
 		sequenceRecords := []indexedRecord{{CompanyID: 3, Name: "uno"}, {CompanyID: 3, Name: "dos"}, {CompanyID: 4, Name: "otro"}}
-		run.must("Insert sequenced", db.Insert(&sequenceRecords))
-		run.must("Insert sequenced", db.Insert(&[]indexedRecord{{CompanyID: 3, Name: "tres"}}))
+		run.must("Insert sequenced", db.Upsert(&sequenceRecords))
+		run.must("Insert sequenced", db.Upsert(&[]indexedRecord{{CompanyID: 3, Name: "tres"}}))
 		run.read("sequence keys of company 3", func() (any, error) {
 			records := []indexedRecord{}
 			err := db.Query(&records).CompanyID.Equals(3).Exec()
@@ -131,7 +131,7 @@ func TestAutoincrementKeys(t *testing.T) {
 // limit.
 func TestIndexReads(t *testing.T) {
 	runConformance(t, []db.Controller{makeController[indexedRecord, indexedSchema]()}, func(run *conformanceRun) {
-		run.must("Insert", db.Insert(&[]indexedRecord{
+		run.must("Insert", db.Upsert(&[]indexedRecord{
 			{CompanyID: 2, ID: 1, Email: "a@x.pe", ClientID: 10, Tags: []int32{1, 2}, Status: 1, Date: 100, Name: "uno"},
 			{CompanyID: 2, ID: 2, Email: "b@x.pe", ClientID: 10, Tags: []int32{2}, Status: 1, Date: 101, Name: "dos"},
 			{CompanyID: 2, ID: 3, Email: "c@x.pe", ClientID: 11, Tags: []int32{3}, Status: 0, Date: 101, Name: "tres"},

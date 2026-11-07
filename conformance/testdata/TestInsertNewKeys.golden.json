@@ -1,0 +1,22 @@
+[
+  {
+    "step": "after the insert",
+    "value": [
+      [
+        7,
+        7,
+        2
+      ]
+    ]
+  },
+  {
+    "step": "after the overwrite",
+    "value": [
+      [
+        7,
+        54,
+        2
+      ]
+    ]
+  }
+]

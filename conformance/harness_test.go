@@ -110,6 +110,15 @@ func runConformance(t *testing.T, controllers []db.Controller, body func(run *co
 	}
 }
 
+// groupSettleTicks is the driver's cache-group settle window: a SQL driver stamps its marks right
+// before the COMMIT, so it settles sooner than Scylla.
+func groupSettleTicks() int32 {
+	if driverName == "postgres" || driverName == "mariadb" {
+		return db.SQLIndexGroupSettleTicks
+	}
+	return db.IndexGroupSettleTicks
+}
+
 // setClock puts the managed clock (the stamps writes get, and the read time of cache reads) at
 // clockStart + offset ticks. One tick is 2 seconds.
 func (run *conformanceRun) setClock(offset int32) {

@@ -112,7 +112,7 @@ func TestControllerPaths(t *testing.T) {
 		})
 		run.must("ExportRecordsColbin", err)
 		run.observe("ExportRecordsColbin rows and batches", []int{int(exported), len(batches)})
-		run.must("insert the stray record", db.Insert(&[]controllerRecord{{CompanyID: 5, ID: 9, Name: "stray"}}))
+		run.must("insert the stray record", db.Upsert(&[]controllerRecord{{CompanyID: 5, ID: 9, Name: "stray"}}))
 		restored := 0
 		for batchIndex, encoded := range batches {
 			count, err := controller.RestoreRecordsColbin(5, encoded, batchIndex == 0)
@@ -139,7 +139,7 @@ func TestControllerPaths(t *testing.T) {
 // goes through onInsert, and what the insert stamped reaches the caller's slice.
 func TestMerge(t *testing.T) {
 	runConformance(t, []db.Controller{makeController[controllerRecord, controllerSchema]()}, func(run *conformanceRun) {
-		run.must("Insert", db.Insert(&[]controllerRecord{
+		run.must("Insert", db.Upsert(&[]controllerRecord{
 			{CompanyID: 6, ID: 1, Name: "uno"},
 			{CompanyID: 6, ID: 2, Name: "dos"},
 		}))
@@ -168,7 +168,7 @@ func TestMerge(t *testing.T) {
 // writes only the included column.
 func TestInsertUpdateInclude(t *testing.T) {
 	runConformance(t, []db.Controller{makeController[controllerRecord, controllerSchema]()}, func(run *conformanceRun) {
-		run.must("Insert", db.Insert(&[]controllerRecord{{CompanyID: 4, ID: 1, Name: "uno", Tags: []string{"a"}}}))
+		run.must("Insert", db.Upsert(&[]controllerRecord{{CompanyID: 4, ID: 1, Name: "uno", Tags: []string{"a"}}}))
 
 		run.setClock(10)
 		table := db.TableOf[controllerRecord]()

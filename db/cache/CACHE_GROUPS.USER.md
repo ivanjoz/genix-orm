@@ -290,6 +290,28 @@ is no S3 variant of it.
  └─ (TypeCacheGroupS3) cache-group/<table>/<company>/<index>/<hash>.cb
 ```
 
+### On PostgreSQL and MariaDB
+
+The protocol with the browser is the same (hash labels, `lw`, settled groups). The server side
+differs in three ways:
+
+- **Marks and snapshots are keyed by the group's packed value**, not its hash: the group's values
+  packed into 64 bits, collision-free. Each key takes `Size()` bits, else the bits of its
+  `FixedValues` maximum, else its integer type's width (an `int32` takes 31). A group over 64 bits
+  fails at schema compile, so a wide group sizes its keys:
+  `db.Cols(e.Date, e.ClientID.Size(26), e.DetailProductIDs.Size(23))`. A value outside its slot panics
+  on write.
+- **Every cache group is snapshotted in the database** (`TypeCacheGroup` and `TypeCacheGroupS3`
+  alike; no file store). The first read of a settled group stores its records, colbin-encoded, in
+  `<table>__group_data` with `built_write` = the group's `last_write` at that read. A later read serves
+  the snapshot while the mark still holds that value. A write moves the mark (it is stamped at least
+  the settle window after the snapshot's label), so a stale snapshot is never served, and the write
+  path never touches `__group_data`. PostgreSQL creates it `UNLOGGED` (no WAL, emptied after a
+  crash, rebuilt by the next reads); MariaDB keeps it in InnoDB.
+- **The settle window is 8 s** (`db.SQLIndexGroupSettleTicks`), not 16. A write stamps its marks in
+  the last statements before its COMMIT, and the session's lock timeout (3 s) caps any lock wait, so a
+  mark lands within seconds of its stamp, however long the transaction ran before it.
+
 ---
 
 ## 10. Limits to know
@@ -311,6 +333,8 @@ is no S3 variant of it.
 | Constant | Value | Where |
 |---|---|---|
 | `indexGroupSettleTicks` | 8 ticks = 16 s | `scylla/index_groups.go` |
+| `db.SQLIndexGroupSettleTicks` | 4 ticks = 8 s (PostgreSQL, MariaDB) | `db/index_group_plan.go` |
+| Lock timeout | 3 s (`lock_timeout`, `innodb_lock_wait_timeout`) | `pgdriver/driver.go`, `mariadbdriver/driver.go` |
 | `RecordSnapshotMaxAgeTicks` | 3600 ticks = 2 h | `db/cache/record_snapshot.go` |
 | `cacheGroupSnapshotConcurrency` | 16 parallel group reads | `scylla/cache_group_snapshot.go` |
 | Tick | 2 seconds (SUnixTime) | project convention |

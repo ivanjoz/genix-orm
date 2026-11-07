@@ -115,7 +115,7 @@ func TestCacheProtocols(t *testing.T) {
 	withMemoryFileStore(t)
 	runConformance(t, cacheControllers(), func(run *conformanceRun) {
 		table := db.TableOf[cacheRecord]()
-		run.must("Insert", db.Insert(&[]cacheRecord{
+		run.must("Insert", db.Upsert(&[]cacheRecord{
 			{CompanyID: 7, ID: 1, WarehouseID: 5, Name: "uno", Status: 1},
 			{CompanyID: 7, ID: 2, WarehouseID: 5, Name: "dos", Status: 1},
 			{CompanyID: 7, ID: 3, WarehouseID: 5, Name: "tres", Status: 0},
@@ -240,7 +240,7 @@ func TestDeltaSnapshotServesTheNextReplace(t *testing.T) {
 			run.observe(step, map[string]any{"cursor": snapshot.Cursor, "readTime": snapshot.ReadTime, "records": sortedByID(snapshotRecords, cacheRecordID)})
 		}
 
-		run.must("Insert", db.Insert(&[]cacheRecord{
+		run.must("Insert", db.Upsert(&[]cacheRecord{
 			{CompanyID: 7, ID: 1, WarehouseID: 5, Name: "uno", Status: 1},
 			{CompanyID: 7, ID: 2, WarehouseID: 5, Name: "dos", Status: 1},
 			{CompanyID: 7, ID: 3, WarehouseID: 5, Name: "tres", Status: 1},
@@ -282,7 +282,7 @@ func TestDeltaSnapshotOfAProjectedRead(t *testing.T) {
 	store := withMemoryFileStore(t)
 	runConformance(t, cacheControllers(), func(run *conformanceRun) {
 		table := db.TableOf[cacheRecord]()
-		run.must("Insert", db.Insert(&[]cacheRecord{
+		run.must("Insert", db.Upsert(&[]cacheRecord{
 			{CompanyID: 7, ID: 1, WarehouseID: 5, Name: "uno", Status: 1},
 			{CompanyID: 7, ID: 2, WarehouseID: 5, Name: "dos", Status: 1},
 		}))
@@ -323,7 +323,7 @@ func TestDeltaReplacesPastTheThreshold(t *testing.T) {
 		for index := range insertedRecords {
 			insertedRecords[index] = cacheRecord{CompanyID: 7, ID: int32(index + 1), WarehouseID: 5, Name: "nuevo", Status: 1}
 		}
-		run.must("Insert", db.Insert(&insertedRecords))
+		run.must("Insert", db.Upsert(&insertedRecords))
 		recordsFrom := func(firstID, lastID int, warehouseID int32) *[]cacheRecord {
 			updatedRecords := []cacheRecord{}
 			for id := firstID; id <= lastID; id++ {

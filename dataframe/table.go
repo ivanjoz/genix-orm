@@ -37,11 +37,14 @@ var frameNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // Column is one value of a frame's lines, as the backend describes it: its name, for messages, a
 // stable id (genix-orm's cb tag or field position; a frame struct's field position) that names it in
-// the frame's shape, and whether it is a float.
+// the frame's shape, and whether it is a float. Bits is a Keys or Rows column's width in the packed
+// key of the SQL aggregate tables (aggregate_table.go): declared in the tag (frame:"row,20"), its
+// integer type's non-negative range otherwise.
 type Column struct {
 	FieldName string
 	ColumnID  int
 	IsFloat   bool
+	Bits      int
 }
 
 // Line is one row a record puts in a frame: its Keys values (the file), its Rows values (the row) and

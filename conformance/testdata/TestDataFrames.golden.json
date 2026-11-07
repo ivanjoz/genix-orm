@@ -1,0 +1,73 @@
+[
+  {
+    "step": "after the insert",
+    "value": [
+      {
+        "Year": 2025,
+        "ProductID": 7,
+        "Sums": [
+          6,
+          1
+        ]
+      },
+      {
+        "Year": 2026,
+        "ProductID": 7,
+        "Sums": [
+          7,
+          2
+        ]
+      },
+      {
+        "Year": 2026,
+        "ProductID": 8,
+        "Sums": [
+          5,
+          1
+        ]
+      }
+    ]
+  },
+  {
+    "step": "after the updates",
+    "value": [
+      {
+        "Year": 2025,
+        "ProductID": 7,
+        "Sums": [
+          6,
+          1
+        ]
+      },
+      {
+        "Year": 2026,
+        "ProductID": 7,
+        "Sums": [
+          13,
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "step": "after a rebuild",
+    "value": [
+      {
+        "Year": 2025,
+        "ProductID": 7,
+        "Sums": [
+          6,
+          1
+        ]
+      },
+      {
+        "Year": 2026,
+        "ProductID": 7,
+        "Sums": [
+          13,
+          2
+        ]
+      }
+    ]
+  }
+]

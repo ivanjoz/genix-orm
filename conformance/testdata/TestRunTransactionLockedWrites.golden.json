@@ -1,0 +1,127 @@
+[
+  {
+    "step": "by date and product 7",
+    "value": [
+      {
+        "ig": 20647,
+        "id": 1597503036,
+        "igVal": [
+          100,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 12,
+            "ID": 2,
+            "Date": 100,
+            "Status": 2,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 4,
+            "upd": 380000010
+          }
+        ],
+        "lw": 380000010
+      }
+    ]
+  },
+  {
+    "step": "by date and product 8",
+    "value": [
+      {
+        "ig": 20647,
+        "id": 1211448545,
+        "igVal": [
+          100,
+          8
+        ],
+        "records": [
+          {
+            "CompanyID": 12,
+            "ID": 1,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 8,
+            "Type": 1,
+            "Quantity": 3,
+            "upd": 380000010
+          }
+        ],
+        "lw": 380000010
+      }
+    ]
+  },
+  {
+    "step": "by date and product 9",
+    "value": [
+      {
+        "ig": 20647,
+        "id": -1453287637,
+        "igVal": [
+          101,
+          9
+        ],
+        "records": [
+          {
+            "CompanyID": 12,
+            "ID": 4,
+            "Date": 101,
+            "Status": 1,
+            "ProductID": 9,
+            "Type": 1,
+            "Quantity": 6,
+            "upd": 380000010
+          }
+        ],
+        "lw": 380000010
+      },
+      {
+        "ig": 20647,
+        "id": 653032430,
+        "igVal": [
+          100,
+          9
+        ],
+        "records": [
+          {
+            "CompanyID": 12,
+            "ID": 3,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 9,
+            "Type": 2,
+            "Quantity": 5,
+            "upd": 380000010
+          }
+        ],
+        "lw": 380000010
+      }
+    ]
+  },
+  {
+    "step": "by date and status 2",
+    "value": [
+      {
+        "ig": -22084,
+        "id": -77745309,
+        "igVal": [
+          100,
+          2
+        ],
+        "records": [
+          {
+            "CompanyID": 12,
+            "ID": 2,
+            "Date": 100,
+            "Status": 2,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 4,
+            "upd": 380000010
+          }
+        ],
+        "lw": 380000010
+      }
+    ]
+  }
+]

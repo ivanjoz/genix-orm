@@ -3,6 +3,8 @@ package dataframe
 import (
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -62,7 +64,8 @@ func ProjectionOf[R any, F any](method func(*R, []F) []F) *Projection {
 	var keyFields, rowFields, sumFields []projectedField
 	for i := range frameType.NumField() {
 		field := frameType.Field(i)
-		role := field.Tag.Get("frame")
+		// frame:"<role>" or frame:"<role>,<bits>": a Keys or Rows field may declare its packed-key width.
+		role, declaredBits, hasBits := strings.Cut(field.Tag.Get("frame"), ",")
 		if role == "" {
 			continue
 		}
@@ -71,8 +74,16 @@ func ProjectionOf[R any, F any](method func(*R, []F) []F) *Projection {
 		if !isFloat && !isIntegerKind(kind) {
 			panic(fmt.Sprintf("dataframe: %v field %s must be an integer or a float, not %v", frameType, field.Name, field.Type))
 		}
+		bits := IntegerKindBits(kind)
+		if hasBits {
+			parsedBits, err := strconv.Atoi(declaredBits)
+			if err != nil || parsedBits < 1 || parsedBits > MaxPackedKeyBits || role == "sum" {
+				panic(fmt.Sprintf(`dataframe: %v field %s has frame:%q: a key or row takes "<role>,<bits>", bits 1 to %d`, frameType, field.Name, field.Tag.Get("frame"), MaxPackedKeyBits))
+			}
+			bits = parsedBits
+		}
 		// The field position names the column in the frame's shape: moving a field rebuilds the frame.
-		column := Column{FieldName: field.Name, ColumnID: i + 1, IsFloat: isFloat}
+		column := Column{FieldName: field.Name, ColumnID: i + 1, IsFloat: isFloat, Bits: bits}
 		projected := projectedField{name: field.Name, offset: field.Offset, kind: kind}
 		switch role {
 		case "key":
@@ -142,6 +153,28 @@ func ProjectionOf[R any, F any](method func(*R, []F) []F) *Projection {
 		}
 	}
 	return projection
+}
+
+// IntegerKindBits is the non-negative range of an integer kind in bits (an int16 holds 0..2^15-1): a
+// Keys or Rows column's packed-key width when it declares none. 0 for a float.
+func IntegerKindBits(kind reflect.Kind) int {
+	switch kind {
+	case reflect.Int8:
+		return 7
+	case reflect.Uint8:
+		return 8
+	case reflect.Int16:
+		return 15
+	case reflect.Uint16:
+		return 16
+	case reflect.Int32:
+		return 31
+	case reflect.Uint32:
+		return 32
+	case reflect.Int, reflect.Int64:
+		return 63
+	}
+	return 0
 }
 
 func isIntegerKind(kind reflect.Kind) bool {

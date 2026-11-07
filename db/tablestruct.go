@@ -72,11 +72,11 @@ func (e *TableStruct[D, T, E]) ExecScan(scanHandler func(record *E) bool) error 
 	return e.Executor().Select(e.schemaStruct, e.tableInfo, dst, scanHandler)
 }
 
-func (e *TableStruct[D, T, E]) Insert(records *[]E, columnsToExclude ...Coln) error {
+func (e *TableStruct[D, T, E]) Upsert(records *[]E, columnsToExclude ...Coln) error {
 	return e.Executor().Insert(records, columnsToExclude...)
 }
 
-func (e *TableStruct[D, T, E]) InsertOne(record E, columnsToExclude ...Coln) error {
+func (e *TableStruct[D, T, E]) UpsertOne(record E, columnsToExclude ...Coln) error {
 	return e.Executor().Insert(&[]E{record}, columnsToExclude...)
 }
 

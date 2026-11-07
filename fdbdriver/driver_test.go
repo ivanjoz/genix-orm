@@ -187,7 +187,7 @@ func TestWritesReadsAndDeltaOnFDB(t *testing.T) {
 			Tags: []int32{int32(index)}, Lines: []fixtureLine{{ProductID: int32(index), Quantity: 1}},
 		})
 	}
-	if err := db.Insert(&records); err != nil {
+	if err := db.Upsert(&records); err != nil {
 		t.Fatal(err)
 	}
 	for _, record := range records {

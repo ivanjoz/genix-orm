@@ -1,4 +1,4 @@
-//go:build !fdb && !ydb
+//go:build !fdb && !ydb && !oceanbase && !postgres && !mariadb
 
 package conformance
 
@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/scylla"
@@ -56,4 +57,9 @@ func makeController[RecordT scylla.RecordOf[TableT, RecordT], TableT db.TableSch
 		Table:     scylla.MakeScyllaTable[RecordT](),
 		Schema:    schema,
 	}
+}
+
+// setFrameLock installs the lock a DataFrame compaction takes.
+func setFrameLock(acquire func(lockName string, wait, lease time.Duration) (release func(), isTaken bool, err error)) {
+	scylla.AcquireFrameLock = acquire
 }

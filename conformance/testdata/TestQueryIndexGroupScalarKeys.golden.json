@@ -1,0 +1,275 @@
+[
+  {
+    "step": "by date",
+    "value": [
+      {
+        "ig": -9127,
+        "id": -111042848,
+        "igVal": [
+          101
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 4,
+            "Date": 101,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 6,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -9127,
+        "id": 447373267,
+        "igVal": [
+          100
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 3,
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "Status": 2,
+            "ProductID": 7,
+            "Type": 2,
+            "Quantity": 4,
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 9,
+            "Type": 1,
+            "Quantity": 5,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "by date and status",
+    "value": [
+      {
+        "ig": -22084,
+        "id": -1625649261,
+        "igVal": [
+          101,
+          1
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 4,
+            "Date": 101,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 6,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -22084,
+        "id": 480670806,
+        "igVal": [
+          100,
+          1
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 3,
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 9,
+            "Type": 1,
+            "Quantity": 5,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "by date and product",
+    "value": [
+      {
+        "ig": 20647,
+        "id": 1597503036,
+        "igVal": [
+          100,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 1,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 3,
+            "upd": 380000000
+          },
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "Status": 2,
+            "ProductID": 7,
+            "Type": 2,
+            "Quantity": 4,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": 20647,
+        "id": 1724847429,
+        "igVal": [
+          101,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 4,
+            "Date": 101,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 6,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  },
+  {
+    "step": "after the update: by date and status",
+    "value": [
+      {
+        "ig": -22084,
+        "id": -1625649261,
+        "igVal": [
+          101,
+          1
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 4,
+            "Date": 101,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 6,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      },
+      {
+        "ig": -22084,
+        "id": 480670806,
+        "igVal": [
+          100,
+          1
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 3,
+            "Date": 100,
+            "Status": 1,
+            "ProductID": 9,
+            "Type": 1,
+            "Quantity": 5,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000018
+      }
+    ]
+  },
+  {
+    "step": "after the update: by date and product",
+    "value": [
+      {
+        "ig": 20647,
+        "id": 1597503036,
+        "igVal": [
+          100,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 2,
+            "Date": 100,
+            "Status": 2,
+            "ProductID": 7,
+            "Type": 2,
+            "Quantity": 4,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000018
+      },
+      {
+        "ig": 20647,
+        "id": 1724847429,
+        "igVal": [
+          101,
+          7
+        ],
+        "records": [
+          {
+            "CompanyID": 8,
+            "ID": 4,
+            "Date": 101,
+            "Status": 1,
+            "ProductID": 7,
+            "Type": 1,
+            "Quantity": 6,
+            "upd": 380000000
+          }
+        ],
+        "lw": 380000000
+      }
+    ]
+  }
+]

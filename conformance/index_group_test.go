@@ -41,7 +41,7 @@ func (e indexGroupSchema) GetSchema() db.TableSchema {
 // its current label comes back empty.
 func TestQueryIndexGroup(t *testing.T) {
 	runConformance(t, []db.Controller{makeController[indexGroupRecord, indexGroupSchema]()}, func(run *conformanceRun) {
-		run.must("Insert", db.Insert(&[]indexGroupRecord{
+		run.must("Insert", db.Upsert(&[]indexGroupRecord{
 			{CompanyID: 8, ID: 1, Date: 100, Name: "a"},
 			{CompanyID: 8, ID: 2, Date: 100, Name: "b"},
 			{CompanyID: 8, ID: 3, Date: 101, Name: "c"},
@@ -64,10 +64,10 @@ func TestQueryIndexGroup(t *testing.T) {
 			}
 		}
 
-		run.setClock(db.IndexGroupSettleTicks - 1)
+		run.setClock(groupSettleTicks() - 1)
 		run.read("still settling", readGroups())
 
-		run.setClock(db.IndexGroupSettleTicks)
+		run.setClock(groupSettleTicks())
 		settledGroups := []db.RecordGroup[indexGroupRecord]{}
 		run.read("settled", func() (any, error) {
 			groups, err := readGroups()()

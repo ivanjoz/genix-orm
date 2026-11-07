@@ -1,0 +1,50 @@
+[
+  {
+    "step": "locked records",
+    "value": [
+      {
+        "CompanyID": 41,
+        "ID": 1,
+        "name": "a",
+        "nameUpper": "A",
+        "tags": [
+          "x"
+        ],
+        "upd": 380000000
+      }
+    ]
+  },
+  {
+    "step": "after the transaction",
+    "value": [
+      {
+        "CompanyID": 41,
+        "ID": 1,
+        "name": "a2",
+        "nameUpper": "A",
+        "tags": [
+          "x"
+        ],
+        "upd": 380000010
+      },
+      {
+        "CompanyID": 41,
+        "ID": 2,
+        "name": "b",
+        "nameUpper": "B",
+        "tags": [
+          "y"
+        ],
+        "upd": 380000000
+      },
+      {
+        "CompanyID": 41,
+        "ID": 3,
+        "name": "c",
+        "nameUpper": "C",
+        "tags": null,
+        "upd": 380000010
+      }
+    ]
+  }
+]

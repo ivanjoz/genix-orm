@@ -12,13 +12,39 @@ func executorFor[RecordT any, TableT any, D Executor[TableT, RecordT]]() Executo
 	return declaredDefault
 }
 
+// Insert writes new records: the caller promises no record is stored under their keys. A driver that
+// can (newRecordsInserter: pgdriver, mariadbdriver) writes them without reading first, and a key
+// already stored fails the write. The others write them as Upsert does, without checking the promise.
 func Insert[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
+	records *[]RecordT, columnsToExclude ...Coln,
+) error {
+	executor := executorFor[RecordT, TableT, D]()
+	if inserter, isNewRecordsInserter := executor.(newRecordsInserter[RecordT]); isNewRecordsInserter {
+		return inserter.InsertNew(records, columnsToExclude...)
+	}
+	return executor.Insert(records, columnsToExclude...)
+}
+
+func InsertOne[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
+	record RecordT, columnsToExclude ...Coln,
+) error {
+	return Insert[RecordT, TableT, D](&[]RecordT{record}, columnsToExclude...)
+}
+
+// newRecordsInserter is a driver that writes records whose keys the caller promises are new.
+type newRecordsInserter[RecordT any] interface {
+	InsertNew(records *[]RecordT, columnsToExclude ...Coln) error
+}
+
+// Upsert writes records whether or not they are stored: a stored record is overwritten (on the SQL
+// drivers, after reading it to keep its indexes, groups and frames right).
+func Upsert[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
 	records *[]RecordT, columnsToExclude ...Coln,
 ) error {
 	return executorFor[RecordT, TableT, D]().Insert(records, columnsToExclude...)
 }
 
-func InsertOne[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
+func UpsertOne[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchemaInterface[TableT], D Executor[TableT, RecordT]](
 	record RecordT, columnsToExclude ...Coln,
 ) error {
 	return executorFor[RecordT, TableT, D]().Insert(&[]RecordT{record}, columnsToExclude...)

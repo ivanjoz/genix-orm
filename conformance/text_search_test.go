@@ -132,7 +132,7 @@ func TestTextSearch(t *testing.T) {
 
 	runConformance(t, []db.Controller{controller}, func(run *conformanceRun) {
 		table := db.TableOf[textSearchRecord]()
-		run.must("Insert", db.Insert(&[]textSearchRecord{
+		run.must("Insert", db.Upsert(&[]textSearchRecord{
 			{CompanyID: 1, ID: 10, Name: "Polo", Brand: "Nike", Status: 1},
 			{CompanyID: 1, ID: 11, Name: "Gorra", Brand: "Puma", Status: 1},
 			{CompanyID: 1, ID: 12, Name: "Casaca", Brand: "Adidas", Status: 0},

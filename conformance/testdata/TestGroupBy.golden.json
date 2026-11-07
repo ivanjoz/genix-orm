@@ -1,0 +1,82 @@
+[
+  {
+    "step": "sums per date, product and status",
+    "value": [
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 100,
+        "ProductID": 7,
+        "Status": 1,
+        "Units": 5,
+        "Amount": 50
+      },
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 100,
+        "ProductID": 8,
+        "Status": 1,
+        "Units": 1,
+        "Amount": 15
+      },
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 101,
+        "ProductID": 7,
+        "Status": 2,
+        "Units": 5,
+        "Amount": 50
+      }
+    ]
+  },
+  {
+    "step": "after a status change",
+    "value": [
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 100,
+        "ProductID": 7,
+        "Status": 1,
+        "Units": 2,
+        "Amount": 20
+      },
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 100,
+        "ProductID": 7,
+        "Status": 2,
+        "Units": 3,
+        "Amount": 30
+      },
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 100,
+        "ProductID": 8,
+        "Status": 1,
+        "Units": 1,
+        "Amount": 15
+      },
+      {
+        "CompanyID": 0,
+        "SaleID": 0,
+        "Line": 0,
+        "Date": 101,
+        "ProductID": 7,
+        "Status": 2,
+        "Units": 5,
+        "Amount": 50
+      }
+    ]
+  }
+]

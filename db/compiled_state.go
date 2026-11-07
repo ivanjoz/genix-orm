@@ -48,6 +48,30 @@ type IndexGroupInfo struct {
 	// BaseGroup (TypeCacheGroupNoIndex) is the FromKey group whose primary-key range this group reads
 	// and whose last_write it carries. A group with a BaseGroup writes no index and no marks.
 	BaseGroup *IndexGroupInfo
+	// PackBits is the slot width of each source column in the group's packed value (PackedValue),
+	// the key a SQL driver stores the group's mark and snapshot under.
+	PackBits []int64
+}
+
+// PackedValue packs a group's values (in SourceColumns order) into its collision-free key. A value
+// outside its slot panics naming the column, as every packed key does.
+func (group IndexGroupInfo) PackedValue(tableName string, groupValues []int64) uint64 {
+	sourceColumns := make([]IColInfo, len(group.SourceColumns))
+	for position, sourceColumn := range group.SourceColumns {
+		sourceColumns[position] = sourceColumn.Column
+	}
+	return PackRowValues(tableName, group.Name, sourceColumns, groupValues, group.PackBits)
+}
+
+// LookupPackedValue is PackedValue for a read: isPackable is false when a value is outside its slot,
+// a group no write can have marked.
+func (group IndexGroupInfo) LookupPackedValue(groupValues []int64) (packedValue uint64, isPackable bool) {
+	for position, value := range groupValues {
+		if value < 0 || uint64(value) > SlotMaxValue(group.PackBits[position]) {
+			return 0, false
+		}
+	}
+	return PackSlotValues(groupValues, group.PackBits), true
 }
 
 // BaseGroupValues picks, out of this group's values (in SourceColumns order), the values of its
@@ -309,6 +333,22 @@ func MakeIndexGroupVirtualColumnName(sourceColumnNames []string, usesCollection 
 // ComputeIndexGroupHashes hashes every combination of the record's source values, one hash per group
 // the record belongs to.
 func ComputeIndexGroupHashes(ptr unsafe.Pointer, sourceColumns []IndexGroupSourceColumn) []int32 {
+	uniqueHashes := map[int32]struct{}{}
+	for _, combination := range ComputeIndexGroupValueCombinations(ptr, sourceColumns) {
+		uniqueHashes[HashInt64(combination...)] = struct{}{}
+	}
+
+	hashes := make([]int32, 0, len(uniqueHashes))
+	for hashValue := range uniqueHashes {
+		hashes = append(hashes, hashValue)
+	}
+	slices.Sort(hashes)
+	return hashes
+}
+
+// ComputeIndexGroupValueCombinations lists the groups a record belongs to: one value per source
+// column, a slice column expanding into one group per element. nil when a source column is empty.
+func ComputeIndexGroupValueCombinations(ptr unsafe.Pointer, sourceColumns []IndexGroupSourceColumn) [][]int64 {
 	combinations := [][]int64{{}}
 
 	for _, sourceColumn := range sourceColumns {
@@ -326,18 +366,7 @@ func ComputeIndexGroupHashes(ptr unsafe.Pointer, sourceColumns []IndexGroupSourc
 		}
 		combinations = nextCombinations
 	}
-
-	uniqueHashes := map[int32]struct{}{}
-	for _, combination := range combinations {
-		uniqueHashes[HashInt64(combination...)] = struct{}{}
-	}
-
-	hashes := make([]int32, 0, len(uniqueHashes))
-	for hashValue := range uniqueHashes {
-		hashes = append(hashes, hashValue)
-	}
-	slices.Sort(hashes)
-	return hashes
+	return combinations
 }
 
 // BuildIndexGroupHashValues hashes the values a query pins on the group's source columns; nil when a

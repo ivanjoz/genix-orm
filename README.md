@@ -245,14 +245,15 @@ err = db.Query(&products).Status.Equals(1).ExecScan(func(p *Product) bool {
 // table struct with no read destination.
 q := db.TableOf[Product]()
 
-err = db.Insert(&products)
+err = db.Insert(&products)                            // new records: a stored key fails (SQL drivers)
+err = db.Upsert(&products)                            // overwrites a stored record
 err = db.Update(&products, q.Nombre, q.Updated)      // only these columns
 err = db.UpdateExclude(&products, q.Tags)            // everything but these
 err = db.Merge(&products, db.Cols(q.EmpresaID), onUpdate, onInsert)
 ```
 
 Available operations: `Query`, `QueryIndexGroup`, `QueryCachedIDs`, `TableOf`,
-`Insert`, `InsertOne`, `Update`, `UpdateOne`, `UpdateExclude`, `InsertUpdate`,
+`Insert`, `InsertOne`, `Upsert`, `UpsertOne`, `Update`, `UpdateOne`, `UpdateExclude`, `InsertUpdate`,
 `InsertUpdateInclude`, `InsertUpdateExclude`, `Merge`, `SearchText`,
 `SearchTextIDs`, `MakeTable`, `MakeSchema`.
 

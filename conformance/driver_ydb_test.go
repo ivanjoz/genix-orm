@@ -1,10 +1,11 @@
-//go:build ydb && !fdb
+//go:build ydb && !fdb && !oceanbase
 
 package conformance
 
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/ivanjoz/genix-orm/db"
 	"github.com/ivanjoz/genix-orm/ydbdriver"
@@ -37,4 +38,8 @@ func resetAndDeploy(t *testing.T, controllers ...db.Controller) {
 
 func makeController[RecordT db.TableBaseInterface[TableT, RecordT], TableT db.TableSchemaInterface[TableT]]() db.Controller {
 	return &ydbdriver.YdbController[RecordT, TableT]{Schema: db.MakeSchema[RecordT]()}
+}
+
+// setFrameLock: this driver keeps no DataFrames yet.
+func setFrameLock(acquire func(lockName string, wait, lease time.Duration) (release func(), isTaken bool, err error)) {
 }

@@ -24,6 +24,7 @@ type Executor[TableT any, RecordT any] interface {
 	// The destination lives in ti.RefSlice because its element type is
 	// RecordGroup[RecordT], not RecordT.
 	SelectGrouped(schema *TableT, ti *TableInfo) error
+	// Insert writes records as db.Upsert does: a stored record is overwritten.
 	Insert(records *[]RecordT, columnsToExclude ...Coln) error
 	Update(records *[]RecordT, columnsToInclude ...Coln) error
 	UpdateExclude(records *[]RecordT, columnsToExclude ...Coln) error
