@@ -98,8 +98,9 @@ func sharedConnection() (*sql.DB, error) {
 		return nil, fmt.Errorf("pgdriver: opening %s:%d: %w", connParams.Host, connParams.Port, err)
 	}
 	maxConns := connParams.MaxConns
+	// 16 is what the load tests measured on 2 vCPUs: more connections only queue on the server's cores.
 	if maxConns <= 0 {
-		maxConns = 32
+		maxConns = 16
 	}
 	pool.SetMaxOpenConns(maxConns)
 	pool.SetMaxIdleConns(maxConns)

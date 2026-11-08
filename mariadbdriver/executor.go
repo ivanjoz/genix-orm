@@ -214,6 +214,9 @@ func init() {
 	db.DBTypeResolver = func(typeID int8) string { return mariaTypeNames[typeID] }
 	db.SetCodec(mariaValueCodec{})
 	db.GetAutoincrementID = GetAutoincrementID
+	db.GetBlockAutoincrementID = func(key string, recordsSize int) (int64, error) {
+		return reserveTableKeys(connParams.Database, key, recordsSize)
+	}
 	db.QueryCachedGenericByIDs = func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[db.GenericRecord], error) {
 		return nil, errNotImplemented("QueryCachedGenericByIDs")
 	}

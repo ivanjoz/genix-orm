@@ -17,6 +17,7 @@ func init() {
 	// These two take a counter key or a table name rather than table types, so they
 	// cannot be generic Executor methods; the driver installs them instead.
 	db.GetAutoincrementID = GetAutoincrementID
+	db.GetBlockAutoincrementID = GetAutoincrementID
 	db.QueryCachedGenericByIDs = QueryCachedGenericByIDs
 	db.SetDebugLogging = SetDebugLogging
 }

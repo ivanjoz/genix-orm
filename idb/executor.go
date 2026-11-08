@@ -111,6 +111,7 @@ type TableStruct[TableT db.TableSchemaInterface[TableT], RecordT db.TableBaseInt
 // The hooks keyed by name instead of table types; scylla installs its own in the same place.
 func init() {
 	db.GetAutoincrementID = func(key string, recordsSize int) (int64, error) { return 0, errNotImplemented }
+	db.GetBlockAutoincrementID = db.GetAutoincrementID
 	db.QueryCachedGenericByIDs = func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[db.GenericRecord], error) {
 		return nil, errNotImplemented
 	}

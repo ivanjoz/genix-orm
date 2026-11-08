@@ -126,8 +126,13 @@ func MakeTable[RecordT RecordWithExecutor[TableT, RecordT, D], TableT TableSchem
 // Driver-bound entry points that take a table *name* rather than its types cannot be
 // generic, so the active driver installs them at registration time.
 var (
-	// GetAutoincrementID reserves recordsSize consecutive IDs for an arbitrary counter key.
+	// GetAutoincrementID reserves recordsSize consecutive IDs for an arbitrary counter key, exactly:
+	// the counter never skips a value. For counters that must be gapless (invoice correlativos).
 	GetAutoincrementID func(key string, recordsSize int) (int64, error)
+	// GetBlockAutoincrementID is GetAutoincrementID served from the process's block of the counter
+	// when the server reserves keys in blocks (UseTableKeyBlocks): one database write per block. A
+	// restart leaves the rest of the block as a gap. A driver without blocks reserves exactly.
+	GetBlockAutoincrementID func(key string, recordsSize int) (int64, error)
 	// QueryCachedGenericByIDs resolves IDs to the flat GenericRecord shape for any table
 	// that opted in through TableSchema.GenericRecord.
 	QueryCachedGenericByIDs func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[GenericRecord], error)

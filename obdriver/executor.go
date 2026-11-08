@@ -157,6 +157,7 @@ func init() {
 	db.DBTypeResolver = func(typeID int8) string { return obTypeNames[typeID] }
 	db.SetCodec(obValueCodec{})
 	db.GetAutoincrementID = GetAutoincrementID
+	db.GetBlockAutoincrementID = GetAutoincrementID
 	db.QueryCachedGenericByIDs = func(tableName string, request cache.CachedIDsRequest) ([]cache.CachedPartition[db.GenericRecord], error) {
 		return nil, errNotImplemented("QueryCachedGenericByIDs")
 	}
