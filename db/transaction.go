@@ -16,7 +16,7 @@ import (
 // an upsert), and the loser's rerun finds the winner's record (by LockByKeys, or by a read through a
 // TypeUniqueIndex) and works on it.
 //
-// A driver without transactions (Scylla and the others) runs the body as it is: each call is its own
+// A driver without transactions (fdb, ydb, dynamo) runs the body as it is: each call is its own
 // write, and LockByKeys is a plain read by key. The body is the same on every driver.
 
 // Transaction is the transaction a RunTransaction body writes through.

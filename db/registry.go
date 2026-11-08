@@ -145,7 +145,7 @@ type Controller interface {
 // Controllers, unlike tables, cannot be compiled from metadata alone: one carries the record type
 // as a type parameter, so only the code that named that type can build it. This registry is how a
 // caller holding just a name reaches the full data surface, and it is populated by whoever owns
-// the table list (in genix, app/exec from MakeScyllaControllers).
+// the table list (in genix, app/exec from MakeControllers).
 var (
 	controllerFactoriesByName = map[string]func() Controller{}
 	controllerFactoriesMutex  sync.RWMutex

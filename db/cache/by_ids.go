@@ -22,9 +22,9 @@ import (
 //
 //	key = ids-cache/<cycle year>/<base pk>   256 × uint24 LE, slot i at [3i, 3i+3); missing = zeros
 //
-// The scylla driver doesn't use the files: it keeps each slot's full Updated in a
-// table (scylla/cache_by_ids.go) and converts it to the current cycle's tick on read
-// (YearTickOfUpdated, PlanCachedIDs). Clients see the same ticks from both.
+// A driver may keep each slot's full Updated in a table instead of the files and convert
+// it to the current cycle's tick on read (YearTickOfUpdated, PlanCachedIDs), as the
+// deleted Scylla driver did. Clients see the same ticks from both.
 //
 // A year cycle starts on January 1 at 07:00 UTC. A year tick counts 2 seconds
 // from it, one Updated (SUnixTime) unit (a leap year is 15,811,200 ticks, under
@@ -209,7 +209,7 @@ func RaiseSlotTicks(key string, ticksBySlot map[uint8]uint32) error {
 }
 
 // SlotTicks are a partition's 256 slot ticks in the current year cycle, 0 for a slot with no write in
-// it. A driver builds them from wherever it keeps its slots: the slot files, or scylla's slots table.
+// it. A driver builds them from wherever it keeps its slots: the slot files or a slots table.
 type SlotTicks [256]uint32
 
 // YearTickOfUpdated is the tick of a slot whose last write was stamped updated, in the cycle starting
