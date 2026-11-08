@@ -20,7 +20,6 @@ require (
 	github.com/ivanjoz/colbin v0.9.2
 	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/db v0.0.0
-	github.com/ivanjoz/genix-orm/fdb v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0
 	github.com/kr/pretty v0.1.0
 	github.com/viant/xunsafe v0.11.0
@@ -35,5 +34,3 @@ replace github.com/ivanjoz/genix-orm/db => ./db
 replace github.com/ivanjoz/genix-orm/utils => ./utils
 
 replace github.com/ivanjoz/genix-orm/dataframe => ./dataframe
-
-replace github.com/ivanjoz/genix-orm/fdb => ./fdb

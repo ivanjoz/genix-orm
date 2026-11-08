@@ -4,7 +4,7 @@ package db
 // declaration into an IndexSource (plus any generated column it needs) and appends it to
 // TableCore.IndexSources. Nothing here knows how a database stores an index; a driver
 // materializes every IndexSource afterwards (the Scylla driver adds CREATE scripts and WHERE
-// rendering, the FDB driver writes index entries).
+// rendering, the SQL drivers create indexes).
 
 import (
 	"fmt"

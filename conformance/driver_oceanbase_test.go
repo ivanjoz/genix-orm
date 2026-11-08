@@ -1,4 +1,4 @@
-//go:build oceanbase && !fdb && !ydb
+//go:build oceanbase
 
 package conformance
 

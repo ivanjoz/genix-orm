@@ -1,4 +1,4 @@
-//go:build !fdb && !ydb && !oceanbase && !postgres && !mariadb
+//go:build !oceanbase && !postgres && !mariadb
 
 package conformance
 

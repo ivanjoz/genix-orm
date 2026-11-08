@@ -8,13 +8,13 @@ import (
 
 // AccessPlan is what a query resolves to before any storage syntax exists: which source answers
 // it, the reads against that source, and what is left to filter. Each driver renders the steps
-// in its own syntax (CQL, FDB key ranges, YQL); none of them re-derives the range math.
+// in its own syntax (CQL, SQL); none of them re-derives the range math.
 type AccessPlan struct {
 	Source *IndexSource // nil = the table's primary key
 	// Steps are read independently and their rows unioned (deduplicated when Source can repeat a row).
 	Steps []AccessStep
 	// Filter holds predicates the source key cannot serve. A driver may push them to the server
-	// (Scylla ALLOW FILTERING, a YQL WHERE) or apply them in memory: either answer is exact.
+	// (Scylla ALLOW FILTERING, a SQL WHERE) or apply them in memory: either answer is exact.
 	Filter []ColumnStatement
 	// PostFilter holds predicates that must be re-checked in memory even after the read, because the
 	// source overfetches (hash collisions, a one-sided packed bound spilling into the next prefix).

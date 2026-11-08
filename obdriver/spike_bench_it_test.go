@@ -8,7 +8,7 @@ import (
 )
 
 // Step 0 microbenchmark (docs/OCEANBASE_PLAN.md §16), gated by GENIX_OCEANBASE_BENCH=1 on top of
-// GENIX_OCEANBASE_IT=1. Same workloads as YDB Step 0: one point get, a 1,000-row range, a 1,000-row
+// GENIX_OCEANBASE_IT=1. Workloads: one point get, a 1,000-row range, a 1,000-row
 // commit, at concurrency 1 and 64. Every statement is parameterized (server-side prepared).
 func TestSpikeMicrobenchmark(t *testing.T) {
 	if os.Getenv("GENIX_OCEANBASE_BENCH") != "1" {

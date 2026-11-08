@@ -9,7 +9,7 @@ import (
 	"unsafe"
 )
 
-// Write preparation (docs/FOUNDATIONDB_PLAN.md §7.2): everything a write does to its records and
+// Write preparation: everything a write does to its records and
 // its column set before any driver builds a statement or a mutation. Every driver calls these, so a
 // write means the same on each: the same managed stamps, the same generated keys, the same columns
 // written, and the same refusals.

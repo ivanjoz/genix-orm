@@ -7,7 +7,7 @@ import "fmt"
 // whether its answer needs an exact post-filter. The query planner matches statements against
 // IndexSources, so every driver picks the same index for the same query. A driver wraps it with
 // its own materialization (the Scylla driver's viewInfo adds the CQL create script and WHERE
-// rendering; the FDB driver writes index entries).
+// rendering; the SQL drivers create indexes).
 type IndexSource struct {
 	// Kind says which compiler described the index, so a driver knows how to materialize it.
 	Kind IndexKind

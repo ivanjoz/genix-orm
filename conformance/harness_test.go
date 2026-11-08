@@ -1,12 +1,10 @@
 // Package conformance runs one set of tests against whichever driver the build tag selects (none:
-// Scylla, -tags fdb, -tags ydb) and compares what each test observes with golden files recorded on
+// Scylla, -tags mariadb, -tags postgres, -tags oceanbase) and compares what each test observes with golden files recorded on
 // Scylla. The drivers cannot share a binary (each installs process-wide codecs and column metadata
 // in init), so the comparison goes through testdata/ instead of running both side by side.
 //
 //	GENIX_CONFORMANCE=1 GENIX_ORM_SCYLLA_TEST=127.0.0.2:9042 go test .
 //	GENIX_CONFORMANCE=1 GENIX_CONFORMANCE_UPDATE=1 GENIX_ORM_SCYLLA_TEST=... go test .   # re-record
-//	GENIX_CONFORMANCE=1 FDBGATE_SOCKET=... go test -tags fdb .
-//	GENIX_CONFORMANCE=1 go test -tags ydb .
 //
 // A driver that answers "not implemented" fails the test with a message starting with
 // "not implemented:", so the gaps of a driver in progress are one rg away.
