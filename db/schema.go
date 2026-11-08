@@ -72,6 +72,17 @@ const (
 	// carries the base group's last_write. A write to a base group therefore refreshes every group
 	// built on it (Scylla only).
 	TypeCacheGroupNoIndex int8 = 13
+	// TypeUniqueIndex is a native unique index on (partition, Keys…) on PostgreSQL and MariaDB: two
+	// records of one partition can never share the Keys' values, so a natural key (a lot's date,
+	// supplier and name) is enforced by the database instead of a lookup before the insert. Reads
+	// with an equality on a prefix of the Keys route through it.
+	//
+	// Its records are created with Insert (or an autoincrement Upsert, which mints new keys): a
+	// duplicate fails the write, and inside db.RunTransaction it reruns the body, which then finds the
+	// winner's record. A write that may overwrite a stored row (an Update, an Upsert of given keys)
+	// may not write the Keys: MariaDB's ON DUPLICATE KEY UPDATE would resolve a clash on the unique
+	// index by updating the other row. Other drivers refuse it.
+	TypeUniqueIndex int8 = 14
 )
 
 // IndexTypeNames labels index kinds for logs and deploy output.
@@ -86,6 +97,7 @@ var IndexTypeNames = map[int8]string{
 	TypeCacheGroup:        "Cache Group",
 	TypeCacheGroupS3:      "Cache Group S3",
 	TypeCacheGroupNoIndex: "Cache Group No Index",
+	TypeUniqueIndex:       "Unique Index",
 }
 
 // ColumnNameUpdated is the column the ORM maintains as every record's last-write timestamp. It is

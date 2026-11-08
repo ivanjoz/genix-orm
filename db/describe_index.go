@@ -66,6 +66,29 @@ func (core *TableCore) DescribeGlobalIndex(idxCount *int8, indexCfg Index) *Inde
 	})
 }
 
+// DescribeUniqueIndex describes a TypeUniqueIndex: the partition then the declared Keys, each a
+// stored scalar column. A SQL driver creates it as a native unique index on those columns.
+func (core *TableCore) DescribeUniqueIndex(idxCount *int8, indexCfg Index) *IndexSource {
+	partitionColumn := core.GetPartKey()
+	if partitionColumn == nil || partitionColumn.IsNil() {
+		panic(fmt.Sprintf(`Table "%v": TypeUniqueIndex requires a Partition column`, core.Name))
+	}
+	columnNames := []string{partitionColumn.GetName()}
+	for _, declared := range indexCfg.Keys {
+		column := core.indexedColumn(declared)
+		if column.GetInfo().IsVirtual || column.GetType().IsSlice || column.GetType().IsComplexType {
+			panic(fmt.Sprintf(`Table "%v": TypeUniqueIndex column "%v" must be a stored scalar column`, core.Name, column.GetName()))
+		}
+		columnNames = append(columnNames, column.GetName())
+	}
+	return core.addIndexSource(idxCount, &IndexSource{
+		Kind:    IndexKindUnique,
+		Type:    TypeUniqueIndex,
+		Name:    fmt.Sprintf(`%v__%v_unique`, core.Name, strings.Join(columnNames[1:], "_")),
+		Columns: columnNames,
+	})
+}
+
 func (core *TableCore) indexedColumn(declared Coln) IColInfo {
 	columnName := declared.GetInfo().Name
 	column := core.ColumnsMap[columnName]

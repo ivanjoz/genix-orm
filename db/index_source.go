@@ -1,5 +1,7 @@
 package db
 
+import "fmt"
+
 // IndexSource is what a compiled index IS, independent of how a storage engine materializes it:
 // which columns it is keyed on, how a packed key is laid out, which operators it answers and
 // whether its answer needs an exact post-filter. The query planner matches statements against
@@ -81,7 +83,34 @@ const (
 	IndexKindDelta
 	// IndexKindCompositeBucket is a global index on one bucket-size hash column of a composite-bucketing index.
 	IndexKindCompositeBucket
+	// IndexKindUnique is a TypeUniqueIndex: Columns are the partition then the declared Keys, all
+	// stored columns, so it has no generated Column.
+	IndexKindUnique
 )
+
+// UniqueIndexKeyColumnNames are the declared Keys of every TypeUniqueIndex, without the partition:
+// the columns a write that may overwrite a stored row must leave out.
+func (core *TableCore) UniqueIndexKeyColumnNames() []string {
+	columnNames := []string{}
+	for _, source := range core.IndexSources {
+		if source.Kind == IndexKindUnique {
+			columnNames = append(columnNames, source.Columns[1:]...)
+		}
+	}
+	return columnNames
+}
+
+// RefuseUniqueIndexOverwrite fails a write that may overwrite a stored row and writes a unique
+// index's Keys (see TypeUniqueIndex). writtenColumnNames are the stored columns the write sets.
+func (core *TableCore) RefuseUniqueIndexOverwrite(writtenColumnNames map[string]bool) error {
+	for _, columnName := range core.UniqueIndexKeyColumnNames() {
+		if writtenColumnNames[columnName] {
+			return fmt.Errorf(`table "%v": column "%v" is a unique index key: only an Insert of new records may write it, not an Update or an Upsert of given keys`,
+				core.Name, columnName)
+		}
+	}
+	return nil
+}
 
 // IndexSourceNamed returns the compiled index with that name, or nil.
 func (core *TableCore) IndexSourceNamed(name string) *IndexSource {

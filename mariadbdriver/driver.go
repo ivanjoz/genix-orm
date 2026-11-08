@@ -59,7 +59,7 @@ func SetConnection(params ConnParams) {
 	sharedPool, sharedWritePool = nil, nil
 	// db.RunTransaction runs its body in one of this driver's transactions.
 	db.SetTransactionRunner(func(body func(driverTransaction any) error) error {
-		return runTransaction(func(transaction *writeTransaction) error { return body(transaction) })
+		return runBodyTransaction(func(transaction *writeTransaction) error { return body(transaction) })
 	})
 }
 
@@ -183,6 +183,17 @@ const transactionAttempts = 5
 // commits it. A deadlock (1213) or lock-wait timeout (1205) rolls back and runs body again, which
 // re-reads whatever it locks, so the retry works on the state that won.
 func runTransaction(body func(transaction *writeTransaction) error) error {
+	return runTransactionRetrying(body, false)
+}
+
+// runBodyTransaction is runTransaction for a db.RunTransaction body, which also reruns on a duplicate
+// key (1062). Two bodies that both found a record missing both insert it; the loser's rerun finds the
+// winner's record and works on it. A plain write is not rerun: it would only fail the same way again.
+func runBodyTransaction(body func(transaction *writeTransaction) error) error {
+	return runTransactionRetrying(body, true)
+}
+
+func runTransactionRetrying(body func(transaction *writeTransaction) error, retriesDuplicateKey bool) error {
 	pool, err := sharedWriteConnection()
 	if err != nil {
 		return err
@@ -190,7 +201,12 @@ func runTransaction(body func(transaction *writeTransaction) error) error {
 	for attempt := 1; ; attempt++ {
 		err := runTransactionOnce(pool, body)
 		var serverError *mysql.MySQLError
-		if err == nil || attempt >= transactionAttempts || !errors.As(err, &serverError) || (serverError.Number != 1213 && serverError.Number != 1205) {
+		if err == nil || attempt >= transactionAttempts || !errors.As(err, &serverError) {
+			return err
+		}
+		isRetried := serverError.Number == 1213 || serverError.Number == 1205 ||
+			(retriesDuplicateKey && serverError.Number == 1062)
+		if !isRetried {
 			return err
 		}
 	}

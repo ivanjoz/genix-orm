@@ -158,6 +158,13 @@ func writePhases(table *MariaTable, phases []writePhase, runChunk func(body func
 		}
 		stamps := table.StampManagedColumns(phase.records, phase.isInsert, int64(db.ManagedUnixTime()))
 		table.resolveWrittenColumns(phase)
+		// Anything but a plain INSERT is an ON DUPLICATE KEY UPDATE, which a clash on a unique index
+		// would resolve by updating the other row.
+		if !phase.hasOnlyNewKeys {
+			if err := table.RefuseUniqueIndexOverwrite(phase.writtenColumnNames()); err != nil {
+				return err
+			}
+		}
 		chunkRecords := min(writeChunkRecords, maxStatementPlaceholders/len(phase.writtenColumns))
 		for chunkStart := 0; chunkStart < phase.records.Len(); chunkStart += chunkRecords {
 			chunkEnd := min(chunkStart+chunkRecords, phase.records.Len())
@@ -186,6 +193,14 @@ func (table *MariaTable) syncPhasesTextSearch(phases []writePhase) error {
 		}
 	}
 	return table.syncTextSearchAfterWrite(textSearchWrites)
+}
+
+func (phase writePhase) writtenColumnNames() map[string]bool {
+	names := make(map[string]bool, len(phase.writtenColumns))
+	for _, stored := range phase.writtenColumns {
+		names[stored.name] = true
+	}
+	return names
 }
 
 // writesAnyOf tells whether the phase writes one of columns.

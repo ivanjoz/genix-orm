@@ -39,7 +39,7 @@ func capabilityDefaultOpForColumn(column IColInfo) string {
 
 // isStandaloneIndexKind tells the indexes (as opposed to views) among the IndexSources.
 func isStandaloneIndexKind(kind IndexKind) bool {
-	return kind != IndexKindView && kind != IndexKindViewTable && kind != IndexKindDelta
+	return kind != IndexKindView && kind != IndexKindViewTable && kind != IndexKindDelta && kind != IndexKindUnique
 }
 
 // ComputeCapabilities lists every predicate shape the table's primary key and IndexSources serve.
@@ -139,6 +139,11 @@ func (core *TableCore) ComputeCapabilities() []QueryCapability {
 	sourcesByName := slices.Clone(core.IndexSources)
 	slices.SortFunc(sourcesByName, func(left, right *IndexSource) int { return cmp.Compare(left.Name, right.Name) })
 	for _, source := range sourcesByName {
+		// A unique index is a plain composite B-tree on (partition, Keys…): it answers every key prefix.
+		if source.Kind == IndexKindUnique {
+			capabilities = append(capabilities, core.keyPrefixSourceCapabilities(source)...)
+			continue
+		}
 		switch source.Type {
 		case 3, 7:
 			capabilities = append(capabilities, core.hashSourceCapabilities(source)...)

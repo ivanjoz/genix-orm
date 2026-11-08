@@ -37,6 +37,8 @@ type indexKeyPart struct {
 type indexSpec struct {
 	name     string
 	keyParts []indexKeyPart
+	// isUnique is a TypeUniqueIndex: the database refuses two rows with the same key parts.
+	isUnique bool
 }
 
 type tableSpec struct {
@@ -95,7 +97,11 @@ func (index indexSpec) columnNames() []string {
 
 // indexDefinition is one index as CREATE TABLE and ADD INDEX both write it.
 func indexDefinition(index indexSpec) string {
-	return fmt.Sprintf("INDEX %s (%s)", quoteName(index.name), quotedNames(index.columnNames()))
+	indexKeyword := "INDEX"
+	if index.isUnique {
+		indexKeyword = "UNIQUE INDEX"
+	}
+	return fmt.Sprintf("%s %s (%s)", indexKeyword, quoteName(index.name), quotedNames(index.columnNames()))
 }
 
 func columnDefinition(column columnSpec) string {

@@ -96,9 +96,10 @@ func (core *TableCore) ChooseAccessRoute(statements []ColumnStatement, capabilit
 	// A cache-group hash (Type 3) is a column of the base table; a view (Type >= 6) is read from
 	// its own table, which it can only do when it holds every selected column.
 	isIndexGroupSource := source.Type == 3 && HasAccessPlanner(source)
-	isProjectedView := source.Type >= 6 && CanReadProjectionFrom(source, selectedColumnNames)
+	// A unique index is an index of the base table, never a table of its own.
+	isProjectedView := source.Type >= 6 && source.Kind != IndexKindUnique && CanReadProjectionFrom(source, selectedColumnNames)
 	if !isIndexGroupSource && !isProjectedView {
-		if source.Type == 1 || source.Type == 2 {
+		if source.Type == 1 || source.Type == 2 || source.Kind == IndexKindUnique {
 			// The database applies its own secondary index to the base-table predicates.
 			route.Kind, route.Source = AccessRouteNativeIndex, source
 		}

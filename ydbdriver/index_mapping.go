@@ -51,7 +51,7 @@ func mapTableObjects(table *YdbTable, hasDataFrames bool) (tableSpec, []tableSpe
 	sideTables := []tableSpec{}
 	for _, source := range table.IndexSources {
 		switch source.Kind {
-		case db.IndexKindViewTable, db.IndexKindCompositeBucket:
+		case db.IndexKindViewTable, db.IndexKindCompositeBucket, db.IndexKindUnique:
 			panic(fmt.Sprintf(`ydbdriver: table "%v" index "%v": %v indexes are not implemented on YDB yet`,
 				table.Name, source.Name, kindName(source.Kind)))
 		}
@@ -189,6 +189,8 @@ func kindName(kind db.IndexKind) string {
 		return "TypeViewTable"
 	case db.IndexKindCompositeBucket:
 		return "composite-bucketing"
+	case db.IndexKindUnique:
+		return "TypeUniqueIndex"
 	}
 	return fmt.Sprintf("kind %d", kind)
 }

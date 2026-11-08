@@ -116,7 +116,7 @@ func mapTableObjects(table *MariaTable) (tableSpec, []tableSpec, []elementIndex,
 		if isGroupOverSlice(source) {
 			continue
 		}
-		index := indexSpec{name: boundedIdentifier("ix_" + source.Name), keyParts: indexKeyParts[sourceIndex]}
+		index := indexSpec{name: boundedIdentifier("ix_" + source.Name), keyParts: indexKeyParts[sourceIndex], isUnique: source.Kind == db.IndexKindUnique}
 		if index.isElementSet() {
 			built := elementIndexTableSpec(table.Namespace, table.Name, index, primaryKey, columnTypeByName)
 			built.sourceName = source.Name

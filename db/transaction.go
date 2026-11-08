@@ -11,6 +11,11 @@ import (
 // LockByKeys locked reuses what it read instead of reading them again. A deadlock reruns the whole body, so the body must
 // derive what it writes from what it reads inside it.
 //
+// A duplicate key reruns the body too. A record that does not exist yet cannot be locked, so two
+// bodies can both find it missing and both insert it: insert it with InsertIn (a plain INSERT, never
+// an upsert), and the loser's rerun finds the winner's record (by LockByKeys, or by a read through a
+// TypeUniqueIndex) and works on it.
+//
 // A driver without transactions (Scylla and the others) runs the body as it is: each call is its own
 // write, and LockByKeys is a plain read by key. The body is the same on every driver.
 

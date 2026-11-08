@@ -101,7 +101,7 @@ func mapTableObjects(table *PgTable) (tableSpec, []tableSpec) {
 	}
 
 	for sourceIndex, source := range table.IndexSources {
-		index := indexSpec{name: indexNameOf(table, source), keyParts: indexKeyParts[sourceIndex]}
+		index := indexSpec{name: indexNameOf(table, source), keyParts: indexKeyParts[sourceIndex], isUnique: source.Kind == db.IndexKindUnique}
 		if (source.Kind == db.IndexKindView || source.Kind == db.IndexKindDelta) && !index.isElementSet() {
 			keyColumnNames := make([]string, len(index.keyParts))
 			for partIndex, part := range index.keyParts {

@@ -48,6 +48,8 @@ var (
 	connParams      ConnParams
 	connectionMutex sync.Mutex
 	sharedPool      *sql.DB
+	// sharedTransactionPool is the pool transactions run on (sharedTransactionConnection).
+	sharedTransactionPool *sql.DB
 	connectTimeout  = 15 * time.Second
 )
 
@@ -56,26 +58,52 @@ func SetConnection(params ConnParams) {
 	connectionMutex.Lock()
 	defer connectionMutex.Unlock()
 	connParams = params
-	if sharedPool != nil {
-		_ = sharedPool.Close()
-		sharedPool = nil
+	for _, pool := range []*sql.DB{sharedPool, sharedTransactionPool} {
+		if pool != nil {
+			_ = pool.Close()
+		}
 	}
+	sharedPool, sharedTransactionPool = nil, nil
 	// db.RunTransaction runs its body in one of this driver's transactions.
 	db.SetTransactionRunner(func(body func(driverTransaction any) error) error {
-		return runTransaction(func(transaction *writeTransaction) error { return body(transaction) })
+		return runBodyTransaction(func(transaction *writeTransaction) error { return body(transaction) })
 	})
 }
 
 // Database is the default schema (keyspace) SetConnection received.
 func Database() string { return connParams.Database }
 
-// sharedConnection opens the process-wide pool once.
+// sharedConnection opens the process-wide pool once: reads, single statements and ID reservations.
 func sharedConnection() (*sql.DB, error) {
 	connectionMutex.Lock()
 	defer connectionMutex.Unlock()
-	if sharedPool != nil {
-		return sharedPool, nil
+	if sharedPool == nil {
+		var err error
+		if sharedPool, err = openPool(); err != nil {
+			return nil, err
+		}
+		serverIsCockroach = nil
 	}
+	return sharedPool, nil
+}
+
+// sharedTransactionConnection opens the pool transactions run on, once, apart from sharedConnection's
+// (as mariadbdriver does). A transaction holds its connection while its body reads and reserves IDs
+// through the shared pool: on one pool, as many concurrent transactions as connections would each
+// wait for a connection that none of them frees.
+func sharedTransactionConnection() (*sql.DB, error) {
+	connectionMutex.Lock()
+	defer connectionMutex.Unlock()
+	if sharedTransactionPool == nil {
+		var err error
+		if sharedTransactionPool, err = openPool(); err != nil {
+			return nil, err
+		}
+	}
+	return sharedTransactionPool, nil
+}
+
+func openPool() (*sql.DB, error) {
 	if connParams.Host == "" || connParams.User == "" {
 		return nil, errors.New("pgdriver: no host/user configured (SetConnection)")
 	}
@@ -104,9 +132,7 @@ func sharedConnection() (*sql.DB, error) {
 	}
 	pool.SetMaxOpenConns(maxConns)
 	pool.SetMaxIdleConns(maxConns)
-	sharedPool = pool
-	serverIsCockroach = nil
-	return sharedPool, nil
+	return pool, nil
 }
 
 // serverIsCockroach caches whether the server is CockroachDB (nil: not asked yet on this pool).
@@ -164,14 +190,32 @@ var retriedErrorCodes = map[string]bool{"40001": true, "40P01": true, "55P03": t
 // commits it. A deadlock rolls back and runs body again, which re-reads whatever it locks, so the
 // retry works on the state that won.
 func runTransaction(body func(transaction *writeTransaction) error) error {
-	pool, err := sharedConnection()
+	return runTransactionRetrying(body, false)
+}
+
+// uniqueViolationCode is the SQLSTATE of a duplicate key.
+const uniqueViolationCode = "23505"
+
+// runBodyTransaction is runTransaction for a db.RunTransaction body, which also reruns on a duplicate
+// key. Two bodies that both found a record missing both insert it; the loser's rerun finds the
+// winner's record and works on it. A plain write is not rerun: it would only fail the same way again.
+func runBodyTransaction(body func(transaction *writeTransaction) error) error {
+	return runTransactionRetrying(body, true)
+}
+
+func runTransactionRetrying(body func(transaction *writeTransaction) error, retriesDuplicateKey bool) error {
+	pool, err := sharedTransactionConnection()
 	if err != nil {
 		return err
 	}
 	for attempt := 1; ; attempt++ {
 		err := runTransactionOnce(pool, body)
 		var serverError *pgconn.PgError
-		if err == nil || attempt >= transactionAttempts || !errors.As(err, &serverError) || !retriedErrorCodes[serverError.Code] {
+		if err == nil || attempt >= transactionAttempts || !errors.As(err, &serverError) {
+			return err
+		}
+		isRetried := retriedErrorCodes[serverError.Code] || (retriesDuplicateKey && serverError.Code == uniqueViolationCode)
+		if !isRetried {
 			return err
 		}
 	}

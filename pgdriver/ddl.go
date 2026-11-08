@@ -28,6 +28,8 @@ type indexSpec struct {
 	name            string
 	keyParts        []indexKeyPart
 	includedColumns []string
+	// isUnique is a TypeUniqueIndex: the database refuses two rows with the same key parts.
+	isUnique bool
 }
 
 type tableSpec struct {
@@ -100,7 +102,11 @@ func createIndexStatement(spec tableSpec, index indexSpec) string {
 	for partIndex, part := range index.keyParts {
 		columns[partIndex] = part.column
 	}
-	statement := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)", quoteName(index.name), spec.qualifiedName(), quotedNames(columns))
+	indexKeyword := "INDEX"
+	if index.isUnique {
+		indexKeyword = "UNIQUE INDEX"
+	}
+	statement := fmt.Sprintf("CREATE %s IF NOT EXISTS %s ON %s (%s)", indexKeyword, quoteName(index.name), spec.qualifiedName(), quotedNames(columns))
 	if len(index.includedColumns) > 0 {
 		statement += fmt.Sprintf(" INCLUDE (%s)", quotedNames(index.includedColumns))
 	}

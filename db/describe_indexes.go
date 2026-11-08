@@ -64,6 +64,8 @@ func (core *TableCore) DescribeIndexes(idxCount *int8, indexes []Index) []*Index
 			core.DescribeView(indexCfg)
 		case TypeDelta:
 			core.DescribeDelta(indexCfg)
+		case TypeUniqueIndex:
+			core.DescribeUniqueIndex(idxCount, indexCfg)
 		default:
 			panic(fmt.Sprintf(`Table "%v": unsupported index type %d`, core.Name, schemaIndexType))
 		}
