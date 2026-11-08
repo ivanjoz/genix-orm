@@ -34,6 +34,9 @@ type ConnParams struct {
 	Password string
 	Database string
 	MaxConns int
+	// Socket, when set, is the server's Unix socket: dialed instead of Host:Port, which skips the
+	// loopback TCP stack on every statement when the database shares the host.
+	Socket string
 }
 
 var (
@@ -72,6 +75,9 @@ func connectionConfig(params ConnParams) *mysql.Config {
 	config := mysql.NewConfig()
 	config.Net = "tcp"
 	config.Addr = net.JoinHostPort(params.Host, strconv.Itoa(params.Port))
+	if params.Socket != "" {
+		config.Net, config.Addr = "unix", params.Socket
+	}
 	config.User = params.User
 	config.Passwd = params.Password
 	// utf8mb4_bin compares bytes like Scylla (plan O16); the server default is case-insensitive.
@@ -137,8 +143,8 @@ func sharedWriteConnection() (*sql.DB, error) {
 }
 
 func openPool(isTransactional bool) (*sql.DB, error) {
-	if connParams.Host == "" || connParams.User == "" {
-		return nil, errors.New("mariadbdriver: no host/user configured (SetConnection)")
+	if (connParams.Host == "" && connParams.Socket == "") || connParams.User == "" {
+		return nil, errors.New("mariadbdriver: no host/socket and user configured (SetConnection)")
 	}
 	config := connectionConfig(connParams)
 	if isTransactional {
@@ -146,7 +152,7 @@ func openPool(isTransactional bool) (*sql.DB, error) {
 	}
 	connector, err := mysql.NewConnector(config)
 	if err != nil {
-		return nil, fmt.Errorf("mariadbdriver: connector for %s:%d: %w", connParams.Host, connParams.Port, err)
+		return nil, fmt.Errorf("mariadbdriver: connector for %s: %w", config.Addr, err)
 	}
 	maxConns := connParams.MaxConns
 	// 16 is what the load tests measured on 2 vCPUs: more connections only queue on the server's cores.
