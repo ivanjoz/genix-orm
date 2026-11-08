@@ -47,6 +47,25 @@ type tableSpec struct {
 	columns    []columnSpec
 	primaryKey []string
 	indexes    []indexSpec
+	// logRetentionSeconds > 0 is a db.TableSchema.Log table: MyRocks, with that TTL (logTableOptions).
+	logRetentionSeconds int64
+}
+
+// logStorageEngine keeps the db.TableSchema.Log tables. Every other table takes the server's default.
+const logStorageEngine = "ROCKSDB"
+
+func (spec tableSpec) isLog() bool { return spec.logRetentionSeconds > 0 }
+
+// logTableComment is MyRocks' TTL: a row older than ttl_duration seconds, counted from its write, is
+// hidden from reads and dropped by the next compaction of its files.
+func (spec tableSpec) logTableComment() string {
+	return fmt.Sprintf("ttl_duration=%d;", spec.logRetentionSeconds)
+}
+
+// logTableOptions are what a Log table adds to tableOptions. Compression is the column family's (the
+// server's rocksdb_default_cf_options; Snappy unless configured), so no option here asks for it.
+func (spec tableSpec) logTableOptions() string {
+	return fmt.Sprintf("ENGINE = %s COMMENT = '%s'", logStorageEngine, spec.logTableComment())
 }
 
 func quoteName(name string) string { return "`" + name + "`" }
@@ -121,7 +140,17 @@ func createTableStatement(spec tableSpec) string {
 	for _, index := range spec.indexes {
 		definitions = append(definitions, indexDefinition(index))
 	}
-	return fmt.Sprintf("CREATE TABLE %s (\n    %s\n) %s", spec.qualifiedName(), strings.Join(definitions, ",\n    "), tableOptions)
+	options := tableOptions
+	if spec.isLog() {
+		options = spec.logTableOptions() + " " + tableOptions
+	}
+	return fmt.Sprintf("CREATE TABLE %s (\n    %s\n) %s", spec.qualifiedName(), strings.Join(definitions, ",\n    "), options)
+}
+
+// logStorageStatement moves an existing Log table to MyRocks and/or its retention. ALTER TABLE
+// ENGINE copies the rows, which is fine for a log; a changed COMMENT alone only rewrites the TTL.
+func logStorageStatement(spec tableSpec) string {
+	return fmt.Sprintf("ALTER TABLE %s %s", spec.qualifiedName(), spec.logTableOptions())
 }
 
 func createDatabaseStatement(database string) string {

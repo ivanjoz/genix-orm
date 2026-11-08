@@ -3,6 +3,7 @@ package mariadbdriver
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -52,6 +53,9 @@ func Deploy(controllers ...db.Controller) error {
 		}
 	}
 
+	if err := requireLogStorageEngine(pool, tableSpecsByDatabase); err != nil {
+		return err
+	}
 	tableCount, createdCount, alteredCount := 0, 0, 0
 	for database, tableSpecs := range tableSpecsByDatabase {
 		if err := executeDeployStatements(pool, []string{createDatabaseStatement(database)}); err != nil {
@@ -100,6 +104,8 @@ type describedTable struct {
 	columnTypes   map[string]string // normalized, see normalizeColumnType
 	columnOrder   []string
 	collation     string
+	engine        string
+	comment       string
 	primaryKey    []string
 	indexKeyParts map[string][]string
 }
@@ -120,14 +126,15 @@ func describeDatabase(pool *sql.DB, database string) (map[string]*describedTable
 		}
 		return rows.Err()
 	}
-	err := queryRows("SELECT table_name, table_collation FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
+	err := queryRows("SELECT table_name, table_collation, engine, table_comment FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
 		func(rows *sql.Rows) error {
 			var tableName string
-			var collation sql.NullString
-			if err := rows.Scan(&tableName, &collation); err != nil {
+			var collation, engine, comment sql.NullString
+			if err := rows.Scan(&tableName, &collation, &engine, &comment); err != nil {
 				return err
 			}
-			describedTables[tableName] = &describedTable{columnTypes: map[string]string{}, collation: collation.String, indexKeyParts: map[string][]string{}}
+			describedTables[tableName] = &describedTable{columnTypes: map[string]string{}, collation: collation.String,
+				engine: engine.String, comment: comment.String, indexKeyParts: map[string][]string{}}
 			return nil
 		})
 	if err != nil {
@@ -217,6 +224,11 @@ func homologationStatements(spec tableSpec, described *describedTable) ([]string
 	}
 
 	statements := []string{}
+	// A Log table on another engine (created before it was declared one) or with another retention is
+	// moved in place: its rows are a log, copying them is cheap and nothing reads them transactionally.
+	if spec.isLog() && (!strings.EqualFold(described.engine, logStorageEngine) || described.comment != spec.logTableComment()) {
+		statements = append(statements, logStorageStatement(spec))
+	}
 	for _, column := range spec.columns {
 		describedType, isDescribed := described.columnTypes[column.name]
 		switch {
@@ -260,6 +272,33 @@ func executeDeployStatements(pool *sql.DB, statements []string) error {
 		if err != nil {
 			return fmt.Errorf("mariadbdriver: deploy: %w\nstatement: %s", err, statement)
 		}
+	}
+	return nil
+}
+
+// requireLogStorageEngine fails the deploy when a Log table is declared and the server has no MyRocks:
+// created as InnoDB instead, the table would be uncompressed and its rows would never expire.
+func requireLogStorageEngine(pool *sql.DB, tableSpecsByDatabase map[string][]tableSpec) error {
+	logTableName := ""
+	for _, tableSpecs := range tableSpecsByDatabase {
+		for _, spec := range tableSpecs {
+			if spec.isLog() {
+				logTableName = spec.qualifiedName()
+			}
+		}
+	}
+	if logTableName == "" {
+		return nil
+	}
+	var support string
+	err := pool.QueryRow("SELECT support FROM information_schema.engines WHERE engine = ?", logStorageEngine).Scan(&support)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("mariadbdriver: deploy: reading the storage engines: %w", err)
+	}
+	if support != "YES" && support != "DEFAULT" {
+		return fmt.Errorf("mariadbdriver: deploy: %s is a log table and needs the %s storage engine, which this server does not have: "+
+			"install MariaDB's RocksDB plugin (dnf install mariadb-rocksdb-engine, apt-get install mariadb-plugin-rocksdb) and restart MariaDB",
+			logTableName, logStorageEngine)
 	}
 	return nil
 }

@@ -46,7 +46,11 @@ var (
 	// sharedWritePool serves the write transactions (runTransaction): its sessions run with autocommit
 	// off, so a transaction opens with its first statement and needs no START TRANSACTION.
 	sharedWritePool *sql.DB
-	connectTimeout  = 15 * time.Second
+	// logWritePool serves the write transactions of the db.TableSchema.Log tables: sessions like the
+	// write pool's, with rocksdb_write_disable_wal on. That variable only affects MyRocks writes, but a
+	// server whose default engine is MyRocks would lose the WAL of every table, so it gets its own pool.
+	logWritePool   *sql.DB
+	connectTimeout = 15 * time.Second
 )
 
 // SetConnection records the parameters; the pools open on first use.
@@ -54,12 +58,12 @@ func SetConnection(params ConnParams) {
 	connectionMutex.Lock()
 	defer connectionMutex.Unlock()
 	connParams = params
-	for _, pool := range []*sql.DB{sharedPool, sharedWritePool} {
+	for _, pool := range []*sql.DB{sharedPool, sharedWritePool, logWritePool} {
 		if pool != nil {
 			_ = pool.Close()
 		}
 	}
-	sharedPool, sharedWritePool = nil, nil
+	sharedPool, sharedWritePool, logWritePool = nil, nil, nil
 	// db.RunTransaction runs its body in one of this driver's transactions.
 	db.SetTransactionRunner(func(body func(driverTransaction any) error) error {
 		return runBodyTransaction(func(transaction *writeTransaction) error { return body(transaction) })
@@ -142,13 +146,34 @@ func sharedWriteConnection() (*sql.DB, error) {
 	return sharedWritePool, nil
 }
 
-func openPool(isTransactional bool) (*sql.DB, error) {
+// logWriteConnection opens the pool of the Log tables' write transactions once. A few connections:
+// the writers batch their rows.
+func logWriteConnection() (*sql.DB, error) {
+	connectionMutex.Lock()
+	defer connectionMutex.Unlock()
+	if logWritePool == nil {
+		var err error
+		if logWritePool, err = openPool(true, func(config *mysql.Config) {
+			config.Params["rocksdb_write_disable_wal"] = "1"
+		}); err != nil {
+			return nil, err
+		}
+		logWritePool.SetMaxOpenConns(4)
+		logWritePool.SetMaxIdleConns(4)
+	}
+	return logWritePool, nil
+}
+
+func openPool(isTransactional bool, adjustConfig ...func(config *mysql.Config)) (*sql.DB, error) {
 	if (connParams.Host == "" && connParams.Socket == "") || connParams.User == "" {
 		return nil, errors.New("mariadbdriver: no host/socket and user configured (SetConnection)")
 	}
 	config := connectionConfig(connParams)
 	if isTransactional {
 		config.Params["autocommit"] = "0"
+	}
+	for _, adjust := range adjustConfig {
+		adjust(config)
 	}
 	connector, err := mysql.NewConnector(config)
 	if err != nil {
@@ -199,11 +224,25 @@ func runBodyTransaction(body func(transaction *writeTransaction) error) error {
 	return runTransactionRetrying(body, true)
 }
 
+// runLogTransaction is runTransaction on the Log tables' pool: the same transaction, without the
+// RocksDB write-ahead log.
+func runLogTransaction(body func(transaction *writeTransaction) error) error {
+	pool, err := logWriteConnection()
+	if err != nil {
+		return err
+	}
+	return runTransactionOn(pool, body, false)
+}
+
 func runTransactionRetrying(body func(transaction *writeTransaction) error, retriesDuplicateKey bool) error {
 	pool, err := sharedWriteConnection()
 	if err != nil {
 		return err
 	}
+	return runTransactionOn(pool, body, retriesDuplicateKey)
+}
+
+func runTransactionOn(pool *sql.DB, body func(transaction *writeTransaction) error, retriesDuplicateKey bool) error {
 	for attempt := 1; ; attempt++ {
 		err := runTransactionOnce(pool, body)
 		var serverError *mysql.MySQLError

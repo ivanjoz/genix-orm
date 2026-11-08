@@ -87,6 +87,12 @@ func compileTable(schema db.TableSchema, structRefValue reflect.Value) *MariaTab
 	table.FinalizeColumns()
 	configureDataFrames(table, schema, structRefValue)
 	table.mainTable, table.sideTables, table.elementIndexes, table.groupElementTables = mapTableObjects(table)
+	if schema.Log != nil {
+		if schema.Log.RetentionDays < 1 {
+			panic(fmt.Sprintf(`mariadbdriver: table "%v": Log.RetentionDays must be at least 1`, schema.Name))
+		}
+		table.mainTable.logRetentionSeconds = int64(schema.Log.RetentionDays) * 86_400
+	}
 
 	// Every stored column resolves to a declared column or to the generated column an index keys on.
 	generatedByName := map[string]db.IColInfo{}

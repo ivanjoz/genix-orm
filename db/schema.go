@@ -205,6 +205,9 @@ type TableSchema struct {
 	// GROUP(all columns, each column)), for a table read mostly by scans and aggregations. Drivers
 	// without a column store ignore it.
 	ColumnStore bool
+	// Log declares an append-only telemetry table: rows written once, read by range, dropped by age.
+	// Drivers without a storage suited to it ignore it.
+	Log *LogStorage
 	// GenericRecord maps this table's columns onto the flat shape returned by
 	// QueryCachedGenericByIDs, so a single endpoint can resolve labels for any table by name.
 	GenericRecord GenericRecordSchema
@@ -222,6 +225,17 @@ type TableSchema struct {
 	// the record, so a value derived from another column (the product IDs of the sale lines) can feed
 	// an index without being stored twice. See ComputedCol.
 	Computed []ComputedCol
+}
+
+// LogStorage is how a TableSchema.Log table is kept. On MariaDB it is a MyRocks table (ENGINE =
+// ROCKSDB): an LSM tree with compressed files instead of InnoDB's pages, its writes skip RocksDB's
+// write-ahead log (a crash may lose the last unflushed rows, which a log can afford), and the rows
+// older than RetentionDays are dropped by compaction (MyRocks' ttl_duration) instead of by DELETEs.
+// The server needs the RocksDB plugin; the deploy fails when it is missing rather than create the
+// table as InnoDB, where the rows would never expire.
+type LogStorage struct {
+	// RetentionDays is how long a row is kept, counted from its write. At least 1.
+	RetentionDays int
 }
 
 // ComputedCol binds a table-struct column with no record field to a record method:

@@ -115,7 +115,11 @@ func (table *MariaTable) resolveWrittenColumns(phase *writePhase) {
 }
 
 func writeRecords(table *MariaTable, phases []writePhase) error {
-	if err := writePhases(table, phases, runTransaction); err != nil {
+	runChunk := runTransaction
+	if table.mainTable.isLog() {
+		runChunk = runLogTransaction
+	}
+	if err := writePhases(table, phases, runChunk); err != nil {
 		return err
 	}
 	return table.syncPhasesTextSearch(phases)
