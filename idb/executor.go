@@ -2,7 +2,7 @@
 // GOOS=js GOARCH=wasm and run inside the browser.
 //
 // It is a skeleton: every operation reports errNotImplemented. It exists so a build can name
-// this driver in the browser build and link no server stack; the storage itself comes next
+// this driver in place of scylla and link without gocql; the storage itself comes next
 // (see genix docs/WASM_LOCAL_MODE_PLAN.md, phase 2).
 package idb
 
@@ -16,7 +16,7 @@ import (
 
 var errNotImplemented = errors.New("idb: the IndexedDB driver is not implemented yet")
 
-// Exec is the IndexedDB driver. Zero-size, like the server drivers' Exec: per-table state will live in a
+// Exec is the IndexedDB driver. Zero-size, like scylla.Exec: per-table state will live in a
 // compiled-table cache, never in the executor value.
 type Exec[TableT db.TableSchemaInterface[TableT], RecordT db.TableBaseInterface[TableT, RecordT]] struct{}
 
@@ -105,10 +105,10 @@ func (Exec[TableT, RecordT]) CompileTable(schema *TableT) db.Table {
 }
 
 // TableStruct is what tables embed to default to this driver — the same shape as
-// mariadbdriver.TableStruct, so a project switches drivers by changing one alias.
+// scylla.TableStruct, so a project switches drivers by changing one alias.
 type TableStruct[TableT db.TableSchemaInterface[TableT], RecordT db.TableBaseInterface[TableT, RecordT]] = db.TableStruct[Exec[TableT, RecordT], TableT, RecordT]
 
-// The hooks keyed by name instead of table types; every driver installs its own in the same place.
+// The hooks keyed by name instead of table types; scylla installs its own in the same place.
 func init() {
 	db.GetAutoincrementID = func(key string, recordsSize int) (int64, error) { return 0, errNotImplemented }
 	db.GetBlockAutoincrementID = db.GetAutoincrementID

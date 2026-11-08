@@ -1,12 +1,10 @@
 // Package conformance runs one set of tests against whichever driver the build tag selects (none:
-// MariaDB, -tags postgres, -tags fdb, -tags ydb) and compares what each test observes with golden
-// files recorded on MariaDB. The drivers cannot share a binary (each installs process-wide codecs and
-// column metadata in init), so the comparison goes through testdata/ instead of running both side by
-// side.
+// Scylla, -tags fdb, -tags ydb) and compares what each test observes with golden files recorded on
+// Scylla. The drivers cannot share a binary (each installs process-wide codecs and column metadata
+// in init), so the comparison goes through testdata/ instead of running both side by side.
 //
-//	GENIX_CONFORMANCE=1 go test .                                   # MariaDB, GENIX_MARIADB_PORT (3307)
-//	GENIX_CONFORMANCE=1 GENIX_CONFORMANCE_UPDATE=1 go test .        # re-record on MariaDB
-//	GENIX_CONFORMANCE=1 go test -tags postgres .                    # GENIX_POSTGRES_PORT (5433)
+//	GENIX_CONFORMANCE=1 GENIX_ORM_SCYLLA_TEST=127.0.0.2:9042 go test .
+//	GENIX_CONFORMANCE=1 GENIX_CONFORMANCE_UPDATE=1 GENIX_ORM_SCYLLA_TEST=... go test .   # re-record
 //	GENIX_CONFORMANCE=1 FDBGATE_SOCKET=... go test -tags fdb .
 //	GENIX_CONFORMANCE=1 go test -tags ydb .
 //
@@ -71,12 +69,12 @@ func runConformance(t *testing.T, controllers []db.Controller, body func(run *co
 	run := &conformanceRun{
 		t:          t,
 		goldenPath: filepath.Join("testdata", t.Name()+".golden.json"),
-		recording:  driverName == "mariadb" && os.Getenv("GENIX_CONFORMANCE_UPDATE") == "1",
+		recording:  driverName == "scylla" && os.Getenv("GENIX_CONFORMANCE_UPDATE") == "1",
 	}
 	if !run.recording {
 		content, err := os.ReadFile(run.goldenPath)
 		if err != nil {
-			t.Fatalf("no golden file (record it on MariaDB with GENIX_CONFORMANCE_UPDATE=1): %v", err)
+			t.Fatalf("no golden file (record it on Scylla with GENIX_CONFORMANCE_UPDATE=1): %v", err)
 		}
 		if err := json.Unmarshal(content, &run.expectedSteps); err != nil {
 			t.Fatalf("%s: %v", run.goldenPath, err)
@@ -113,7 +111,7 @@ func runConformance(t *testing.T, controllers []db.Controller, body func(run *co
 }
 
 // groupSettleTicks is the driver's cache-group settle window: a SQL driver stamps its marks right
-// before the COMMIT, so it settles sooner than the non-transactional drivers.
+// before the COMMIT, so it settles sooner than Scylla.
 func groupSettleTicks() int32 {
 	if driverName == "postgres" || driverName == "mariadb" {
 		return db.SQLIndexGroupSettleTicks

@@ -1,11 +1,8 @@
 # genix-orm Internals
 
 How the shared layer works, what a driver must supply, and where the type system
-stops guarding you.
-
-> The ScyllaDB driver this document often uses as its example was deleted on 2026-11-07 (git
-> history). The contracts it describes are unchanged; the live drivers are `mariadbdriver/` and
-> `pgdriver/`.
+stops guarding you. For the ScyllaDB driver's own internals — query routing, view
+compilation, the write pipeline — see `scylla/ORM_INTERNALS.md`.
 
 ---
 

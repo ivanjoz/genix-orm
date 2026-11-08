@@ -1,0 +1,1198 @@
+package scylla
+
+import (
+	"bytes"
+	"context"
+	"encoding/gob"
+	"fmt"
+	"math"
+	"reflect"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/gocql/gocql"
+	"github.com/ivanjoz/genix-orm/db"
+)
+
+type ScyllaController[T db.RecordWithExecutor[E, T, Exec[E, T]], E TableSchemaInterface[E]] struct {
+	TableName string
+	Table     ScyllaTable
+	Schema    TableSchema
+}
+
+// record is a reflect.Value rather than a T so the recalc body can stay non-generic. Keeping the
+// Value (not just the pointer) is what holds the allocation alive for the GC.
+type virtualColumnsRecalcUpdate struct {
+	record                reflect.Value
+	changedVirtualColumns []IColInfo
+}
+
+func (e *ScyllaController[T, E]) GetTable() db.Table {
+	return e.Table
+}
+
+func (e *ScyllaController[T, E]) GetTableName() string {
+	return e.Table.Name
+}
+
+// Every ScyllaController method is a one-line shim over a non-generic body that takes the
+// compiled table and, when it needs records, the record type as a reflect.Type. The controller is
+// instantiated once per table and its methods are kept alive by the db.Controller interface, so a
+// body left generic is compiled once per table. These are admin, backup and JSON paths that run
+// per call rather than per row, which is where reflection costs nothing that matters.
+
+// readTableRecords runs a read described by tableInfo into a new reflect-built []recordType and
+// returns the pointer to it. It is the same select a typed Query(...).Exec() runs.
+func readTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, tableInfo *TableInfo) (reflect.Value, error) {
+	recordsPointer := reflect.New(reflect.SliceOf(recordType))
+	// Empty rather than nil, as the []T{} the typed callers start from: JSON renders it as [].
+	recordsPointer.Elem().Set(reflect.MakeSlice(recordsPointer.Elem().Type(), 0, 0))
+	err := selectExec(makeReflectRecordSink(recordsPointer), tableInfo, *scyllaTable, nil, time.Now())
+	return recordsPointer, err
+}
+
+// readPartitionRecords reads one partition (every record when partValue is 0), from lastKey on
+// when it is set.
+func readPartitionRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, lastKey any) (reflect.Value, error) {
+	tableInfo := &TableInfo{}
+	pk := scyllaTable.GetPartKey()
+	if partValue > 0 && pk != nil && !pk.IsNil() {
+		tableInfo.SetWhere(pk.GetName(), "=", partValue)
+	}
+	// Add lastKey filter if provided (for pagination)
+	if lastKey != nil && len(scyllaTable.Keys) > 0 {
+		tableInfo.SetWhere(scyllaTable.Keys[0].GetName(), ">=", lastKey)
+	}
+	return readTableRecords(scyllaTable, recordType, tableInfo)
+}
+
+// insertTableRecords is Insert over a db.RecordSlice: the same managed write path, every managed
+// column and sync included.
+func insertTableRecords(scyllaTable *ScyllaTable, records db.RecordSlice, columnsToExclude []Coln) error {
+	return executeInsertUpdateBatchErased(erasedInsertUpdateParams{
+		insertRecords:           records,
+		compiledTable:           *scyllaTable,
+		useIncludeUpdateColumns: true,
+		columnsToExcludeInsert:  columnsToExclude,
+	})
+}
+
+func (e *ScyllaController[T, E]) GetRecords(partValue, limit int32, lastKey any) []any {
+	return getTableRecords(&e.Table, reflect.TypeFor[T](), partValue, lastKey)
+}
+
+func getTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, lastKey any) []any {
+	fmt.Println("Obteniendo registros de::", scyllaTable.Name)
+	recordsPointer, err := readPartitionRecords(scyllaTable, recordType, partValue, lastKey)
+	if err != nil {
+		fmt.Println("Error al consultar", scyllaTable.Name, ":", err)
+		return nil
+	}
+	records := recordsPointer.Elem()
+	fmt.Println("reqgistros obtenidos (1)::", records.Len())
+
+	recordsAny := make([]any, records.Len())
+	for index := range recordsAny {
+		recordsAny[index] = records.Index(index).Interface()
+	}
+	return recordsAny
+}
+
+func (e *ScyllaController[T, E]) ExportRecordsColbin(
+	partValue int32, batchSize int, emitBatch func(encoded []byte, rowsCount int32) error,
+) (int32, error) {
+	return exportToColbin(&e.Table, reflect.TypeFor[T](), partValue, batchSize, emitBatch)
+}
+
+func (e *ScyllaController[T, E]) ReloadRecords(partValue int32) error {
+	return reloadTableRecords(&e.Table, reflect.TypeFor[T](), partValue)
+}
+
+// reloadTableRecords reads a partition and writes it back through Insert, which recomputes every
+// derived value: virtual columns, views, indexes and caches.
+func reloadTableRecords(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32) error {
+	recordsPointer, err := readPartitionRecords(scyllaTable, recordType, partValue, nil)
+	if err != nil {
+		fmt.Println("Error al consultar", scyllaTable.Name, ":", err)
+		return err
+	}
+	if err := insertTableRecords(scyllaTable, db.MakeReflectRecordSlice(recordsPointer), nil); err != nil {
+		return Err("Error al re-insertar registros:", err)
+	}
+	return nil
+}
+
+// RecalcVirtualColumns is a shim over a non-generic body; T survives only as a reflect.Type used
+// to allocate one record per scanned row.
+func (e *ScyllaController[T, E]) RecalcVirtualColumns(partValue int32) error {
+	return recalcVirtualColumnsForTable(
+		getOrCompileScyllaTable(db.InitStructTable[E, T](new(E))), reflect.TypeFor[T](), partValue)
+}
+
+func recalcVirtualColumnsForTable(scyllaTable ScyllaTable, recordType reflect.Type, partValue int32) error {
+	virtualColumns := []IColInfo{}
+	selectedColumns := make([]IColInfo, 0, len(scyllaTable.Columns))
+	for _, column := range scyllaTable.Columns {
+		if column == nil || column.IsNil() {
+			continue
+		}
+		if !column.GetInfo().IsVirtual && column.GetInfo().Field == nil {
+			// Managed write-only columns are not readable from schemas that don't expose them.
+			continue
+		}
+		selectedColumns = append(selectedColumns, column)
+		// Recalc only persists generated ORM columns; physical source fields stay untouched.
+		if column.GetInfo().IsVirtual {
+			virtualColumns = append(virtualColumns, column)
+		}
+	}
+	if len(virtualColumns) == 0 {
+		return nil
+	}
+
+	// Keep query projection order stable so scanned values map back to ORM columns by position.
+	slices.SortFunc(selectedColumns, func(leftColumn, rightColumn IColInfo) int {
+		return int(leftColumn.GetInfo().Idx - rightColumn.GetInfo().Idx)
+	})
+
+	selectColumnNames := make([]string, 0, len(selectedColumns))
+	for _, selectedColumn := range selectedColumns {
+		selectColumnNames = append(selectColumnNames, selectedColumn.GetName())
+	}
+
+	queryStr := fmt.Sprintf("SELECT %v FROM %v", strings.Join(selectColumnNames, ", "), scyllaTable.GetFullName())
+	partitionColumn := scyllaTable.GetPartKey()
+	if partValue > 0 && partitionColumn != nil && !partitionColumn.IsNil() {
+		queryStr = fmt.Sprintf("%v WHERE %v = %v", queryStr, partitionColumn.GetName(), partValue)
+	}
+
+	fmt.Printf("RecalcVirtualColumns | table=%s | query=%s\n", scyllaTable.Name, queryStr)
+	queryIterator := getScyllaConnection().Query(queryStr).Iter()
+	rowData, err := queryIterator.RowData()
+	if err != nil {
+		return Err("RecalcVirtualColumns RowData failed for table", scyllaTable.Name, ":", err)
+	}
+
+	updatesToApply := []virtualColumnsRecalcUpdate{}
+	rowsScanned := 0
+	updatedRowsByVirtualColumn := map[string]int{}
+
+	scanner := queryIterator.Scanner()
+	for scanner.Next() {
+		if err := scanner.Scan(rowData.Values...); err != nil {
+			return Err("RecalcVirtualColumns scan failed for table", scyllaTable.Name, ":", err)
+		}
+		rowsScanned++
+
+		record := reflect.New(recordType).Elem()
+		recordPointer := record.Addr().UnsafePointer()
+		persistedVirtualValueByName := map[string]string{}
+
+		for valueIndex, selectedColumn := range selectedColumns {
+			rawValue := dereferenceScyllaValue(rowData.Values[valueIndex])
+			if selectedColumn.GetInfo().IsVirtual {
+				persistedVirtualValueByName[selectedColumn.GetName()] = makeVirtualValueSignature(rawValue)
+				continue
+			}
+			// Rebuild the source record from raw DB values so virtual accessors recompute from persisted inputs.
+			selectedColumn.SetValue(recordPointer, rawValue)
+		}
+
+		changedVirtualColumns := []IColInfo{}
+		for _, virtualColumn := range virtualColumns {
+			persistedValueSignature := persistedVirtualValueByName[virtualColumn.GetName()]
+			recalculatedValueSignature := makeVirtualValueSignature(virtualColumn.GetStatementValue(recordPointer))
+			if persistedValueSignature != recalculatedValueSignature {
+				changedVirtualColumns = append(changedVirtualColumns, virtualColumn)
+				updatedRowsByVirtualColumn[virtualColumn.GetName()]++
+			}
+		}
+		if len(changedVirtualColumns) == 0 {
+			continue
+		}
+
+		updatesToApply = append(updatesToApply, virtualColumnsRecalcUpdate{
+			record:                record,
+			changedVirtualColumns: changedVirtualColumns,
+		})
+	}
+
+	if err := queryIterator.Close(); err != nil {
+		return Err("RecalcVirtualColumns query close failed for table", scyllaTable.Name, ":", err)
+	}
+
+	if len(updatesToApply) == 0 {
+		fmt.Printf("RecalcVirtualColumns | table=%s | rows_scanned=%d | rows_updated=0\n", scyllaTable.Name, rowsScanned)
+		return nil
+	}
+
+	whereColumns := scyllaTable.Keys
+	if partitionColumn != nil && !partitionColumn.IsNil() {
+		whereColumns = append([]IColInfo{partitionColumn}, whereColumns...)
+	}
+	whereParts := make([]string, 0, len(whereColumns))
+	for _, whereColumn := range whereColumns {
+		whereParts = append(whereParts, fmt.Sprintf("%v = ?", whereColumn.GetName()))
+	}
+	whereClause := strings.Join(whereParts, " and ")
+
+	const maxRecalcUpdatesPerBatch = 200
+	totalChunks := (len(updatesToApply) + maxRecalcUpdatesPerBatch - 1) / maxRecalcUpdatesPerBatch
+	session := getScyllaConnection()
+	for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
+		fromIndex := chunkIndex * maxRecalcUpdatesPerBatch
+		toIndex := fromIndex + maxRecalcUpdatesPerBatch
+		if toIndex > len(updatesToApply) {
+			toIndex = len(updatesToApply)
+		}
+		chunk := updatesToApply[fromIndex:toIndex]
+
+		batch := session.NewBatch(gocql.UnloggedBatch)
+		for chunkRowIndex := range chunk {
+			updateToApply := &chunk[chunkRowIndex]
+			recordPointer := updateToApply.record.Addr().UnsafePointer()
+
+			setParts := make([]string, 0, len(updateToApply.changedVirtualColumns))
+			boundValues := make([]any, 0, len(updateToApply.changedVirtualColumns)+len(whereColumns))
+			for _, column := range updateToApply.changedVirtualColumns {
+				setParts = append(setParts, fmt.Sprintf("%v = ?", column.GetName()))
+				boundValues = append(boundValues, getNormalizedWriteValue(column, recordPointer))
+			}
+			for _, whereColumn := range whereColumns {
+				boundValues = append(boundValues, whereColumn.GetStatementValue(recordPointer))
+			}
+
+			stmt := fmt.Sprintf("UPDATE %v SET %v WHERE %v",
+				scyllaTable.GetFullName(), strings.Join(setParts, ", "), whereClause,
+			)
+			batch.Query(stmt, boundValues...)
+		}
+
+		fmt.Printf("RecalcVirtualColumns | table=%s | chunk=%d/%d | rows_in_chunk=%d\n",
+			scyllaTable.Name, chunkIndex+1, totalChunks, len(chunk))
+
+		if err := session.ExecuteBatch(batch); err != nil {
+			return Err("RecalcVirtualColumns update failed for table", scyllaTable.Name, "chunk", chunkIndex+1, "of", totalChunks, ":", err)
+		}
+	}
+
+	virtualColumnNames := make([]string, 0, len(updatedRowsByVirtualColumn))
+	for virtualColumnName := range updatedRowsByVirtualColumn {
+		virtualColumnNames = append(virtualColumnNames, virtualColumnName)
+	}
+	slices.Sort(virtualColumnNames)
+	for _, virtualColumnName := range virtualColumnNames {
+		fmt.Printf("RecalcVirtualColumns | table=%s | virtual_column=%s | rows_saved=%d\n",
+			scyllaTable.Name, virtualColumnName, updatedRowsByVirtualColumn[virtualColumnName])
+	}
+
+	fmt.Printf("RecalcVirtualColumns | table=%s | rows_scanned=%d | rows_updated=%d\n",
+		scyllaTable.Name, rowsScanned, len(updatesToApply))
+	return nil
+}
+
+// RecalcGroupIndexHashes is a shim over a non-generic body, for the same reason as
+// RecalcVirtualColumns.
+func (e *ScyllaController[T, E]) RecalcGroupIndexHashes(partValue int32) error {
+	return recalcGroupIndexHashesForTable(
+		getOrCompileScyllaTable(db.InitStructTable[E, T](new(E))), reflect.TypeFor[T](), partValue)
+}
+
+func recalcGroupIndexHashesForTable(scyllaTable ScyllaTable, recordType reflect.Type, partValue int32) error {
+	if scyllaTable.indexUpdatedTable == nil || len(scyllaTable.IndexGroups) == 0 {
+		return nil
+	}
+
+	partitionColumn := scyllaTable.GetPartKey()
+	if partitionColumn == nil || partitionColumn.IsNil() {
+		return Err("RecalcGroupIndexHashes requires a partition column for table:", scyllaTable.Name)
+	}
+	if partValue <= 0 {
+		return Err("RecalcGroupIndexHashes requires a partition value > 0 for table:", scyllaTable.Name)
+	}
+
+	selectedColumns := []IColInfo{}
+	selectedColumnNamesSeen := map[string]bool{}
+	appendSelectedColumn := func(column IColInfo) {
+		if column == nil || column.IsNil() {
+			return
+		}
+		if selectedColumnNamesSeen[column.GetName()] {
+			return
+		}
+		selectedColumnNamesSeen[column.GetName()] = true
+		selectedColumns = append(selectedColumns, column)
+	}
+
+	appendSelectedColumn(partitionColumn)
+	if scyllaTable.UpdatedCol != nil {
+		appendSelectedColumn(scyllaTable.UpdatedCol)
+	}
+	for _, indexGroup := range scyllaTable.IndexGroups {
+		for _, sourceColumn := range indexGroup.SourceColumns {
+			// A computed source has no storage: its From columns are read and it is computed from them.
+			for _, storedColumn := range scyllaTable.StoredColumnsOf(sourceColumn.Column) {
+				appendSelectedColumn(storedColumn)
+			}
+		}
+	}
+	if len(selectedColumns) == 0 {
+		return nil
+	}
+
+	slices.SortFunc(selectedColumns, func(leftColumn, rightColumn IColInfo) int {
+		return int(leftColumn.GetInfo().Idx - rightColumn.GetInfo().Idx)
+	})
+
+	selectColumnNames := make([]string, 0, len(selectedColumns))
+	for _, selectedColumn := range selectedColumns {
+		selectColumnNames = append(selectColumnNames, selectedColumn.GetName())
+	}
+
+	deleteStatement := fmt.Sprintf("DELETE FROM %v.%v WHERE partition_id = ?",
+		scyllaTable.Namespace,
+		scyllaTable.indexUpdatedTable.name,
+	)
+	if err := QueryExec(deleteStatement, partValue); err != nil {
+		return Err("RecalcGroupIndexHashes delete failed for table", scyllaTable.Name, ":", err)
+	}
+
+	queryStr := fmt.Sprintf(
+		"SELECT %v FROM %v WHERE %v = %v",
+		strings.Join(selectColumnNames, ", "),
+		scyllaTable.GetFullName(),
+		partitionColumn.GetName(),
+		partValue,
+	)
+	fmt.Printf("RecalcGroupIndexHashes | table=%s | query=%s\n", scyllaTable.Name, queryStr)
+
+	queryIterator := getScyllaConnection().Query(queryStr).Iter()
+	rowData, err := queryIterator.RowData()
+	if err != nil {
+		return Err("RecalcGroupIndexHashes RowData failed for table", scyllaTable.Name, ":", err)
+	}
+
+	rowsScanned := 0
+	rowsToPersist := []indexUpdatedRow{}
+	rowsByPartitionAndHash := map[string]indexUpdatedRow{}
+	scanner := queryIterator.Scanner()
+	for scanner.Next() {
+		if err := scanner.Scan(rowData.Values...); err != nil {
+			return Err("RecalcGroupIndexHashes scan failed for table", scyllaTable.Name, ":", err)
+		}
+		rowsScanned++
+
+		record := reflect.New(recordType).Elem()
+		recordPointer := record.Addr().UnsafePointer()
+		// Rebuilt, a group's last_write is the newest updated among its records.
+		lastWriteValue := int64(0)
+
+		for valueIndex, selectedColumn := range selectedColumns {
+			rawValue := dereferenceScyllaValue(rowData.Values[valueIndex])
+			if selectedColumn.GetName() == managedUpdatedColumnName {
+				lastWriteValue = db.ConvertToInt64(rawValue)
+				continue
+			}
+			selectedColumn.SetValue(recordPointer, rawValue)
+		}
+		if lastWriteValue == 0 {
+			continue
+		}
+
+		appendIndexUpdatedRowsForRecord(recordPointer, &scyllaTable, int32(partValue), lastWriteValue, rowsByPartitionAndHash, &rowsToPersist)
+	}
+
+	if err := queryIterator.Close(); err != nil {
+		return Err("RecalcGroupIndexHashes query close failed for table", scyllaTable.Name, ":", err)
+	}
+
+	if len(rowsToPersist) == 0 {
+		fmt.Printf("RecalcGroupIndexHashes | table=%s | partition=%d | rows_scanned=%d | rows_persisted=0\n",
+			scyllaTable.Name, partValue, rowsScanned)
+		return nil
+	}
+
+	if err := persistIndexUpdatedRows(scyllaTable.Namespace, scyllaTable.indexUpdatedTable.name, rowsToPersist); err != nil {
+		return Err("RecalcGroupIndexHashes persist failed for table", scyllaTable.Name, ":", err)
+	}
+
+	fmt.Printf("RecalcGroupIndexHashes | table=%s | partition=%d | rows_scanned=%d | rows_persisted=%d\n",
+		scyllaTable.Name, partValue, rowsScanned, len(rowsToPersist))
+	return nil
+}
+
+func dereferenceScyllaValue(value any) any {
+	if value == nil {
+		return nil
+	}
+
+	valueRef := reflect.ValueOf(value)
+	for valueRef.Kind() == reflect.Pointer {
+		if valueRef.IsNil() {
+			return nil
+		}
+		valueRef = valueRef.Elem()
+	}
+
+	return valueRef.Interface()
+}
+
+func makeVirtualValueSignature(value any) string {
+	if value == nil {
+		return "<nil>"
+	}
+
+	value = dereferenceScyllaValue(value)
+	if value == nil {
+		return "<nil>"
+	}
+
+	valueRef := reflect.ValueOf(value)
+	switch valueRef.Kind() {
+	case reflect.Slice, reflect.Array:
+		parts := make([]string, 0, valueRef.Len())
+		for valueIndex := 0; valueIndex < valueRef.Len(); valueIndex++ {
+			parts = append(parts, makeVirtualValueSignature(valueRef.Index(valueIndex).Interface()))
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return fmt.Sprintf("%d", valueRef.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return fmt.Sprintf("%d", valueRef.Uint())
+	case reflect.Float32, reflect.Float64:
+		return fmt.Sprintf("%g", valueRef.Float())
+	case reflect.Bool:
+		return fmt.Sprintf("%t", valueRef.Bool())
+	case reflect.String:
+		return valueRef.String()
+	default:
+		if byteSlice, ok := value.([]byte); ok {
+			return fmt.Sprintf("%v", byteSlice)
+		}
+		return fmt.Sprintf("%v", value)
+	}
+}
+
+// ResetCounter is a shim: the body below is non-generic so it exists once instead of once per
+// table type.
+func (e *ScyllaController[T, E]) ResetCounter(partValue any) error {
+	return resetCounterForTable(&e.Table, partValue)
+}
+
+// resetCounterForTable is a no-op that warns.
+//
+// It used to read max(key) in the partition and drive the counter to it. That was
+// wrong in three ways and only ever right for a table whose key is a bare
+// Autoincrement(0):
+//
+//   - the counter name hardcoded the autoincrement part as 0, so a table declaring
+//     AutoincrementPart (its counters are per part value) had its real counters
+//     missed and a phantom one written instead;
+//   - the target was max(key) itself, but a key is the counter *packed* with random
+//     bits and any KeyIntPacking columns, so the figure was orders of magnitude
+//     too large;
+//   - it skipped every table with no autoincrement column, which since the sale and
+//     document ids became caller-built is both of the tables anyone would want to
+//     realign.
+//
+// Rather than keep writing a wrong value confidently, it does nothing and says so.
+// A restore therefore leaves counters untouched: they keep climbing from where they
+// were, which yields gaps but never a reused id — the safe direction to fail in.
+//
+// TODO: implement it against the counter, not the key. A correct version needs the
+// counter name built the way the insert path builds it (per AutoincrementPart value,
+// which means enumerating the parts present in the partition), and a target that
+// divides out AutoincrementRandBits and any KeyIntPacking width. Callers that mint
+// ids themselves — anything using db.GetAutoincrementID with its own counter name —
+// have to be reset by name, which no table-driven walk can discover. applyCounterReset
+// below is the primitive to build on; it already routes through the allocator so a
+// live reservation is dropped in the same critical section.
+func resetCounterForTable(_ *ScyllaTable, _ any) error {
+	// Silent: a caller walks every table, so warning here would print once per table
+	// for an operation that did nothing. The warning belongs at the call site.
+	return nil
+}
+
+// applyCounterReset moves a counter to an absolute value and reports what it held before.
+//
+// An installed allocator owns the row and may be serving ids from a range it derived from the value
+// about to be replaced, so it has to do the move itself and drop that range at the same time.
+// Reading and writing the row here instead would leave it minting ids this reset just invalidated,
+// and the next range it claimed would repeat them.
+func applyCounterReset(namespace, counterName string, maxKeyValue int64) (int64, error) {
+	if SetCounterValue != nil {
+		previousCounterValue, err := SetCounterValue(namespace, counterName, maxKeyValue)
+		if err != nil {
+			return 0, Err("ResetCounter sequence assignment failed for", counterName, ":", err)
+		}
+		return previousCounterValue, nil
+	}
+
+	currentCounterValue, err := getSequenceCurrentValue(counterName)
+	if err != nil {
+		return 0, Err("ResetCounter sequence read failed for", counterName, ":", err)
+	}
+
+	// Counters are increment-only, so we apply the delta to move to the target absolute value.
+	delta := maxKeyValue - currentCounterValue
+	if delta == 0 {
+		return currentCounterValue, nil
+	}
+
+	updateStatement := fmt.Sprintf("UPDATE %v.sequences SET current_value = current_value + ? WHERE name = ?", namespace)
+	if err := getScyllaConnection().Query(updateStatement, delta, counterName).Exec(); err != nil {
+		return 0, Err("ResetCounter sequence update failed for", counterName, ":", err)
+	}
+
+	return currentCounterValue, nil
+}
+
+// ReindexTextSearch rebuilds one partition's text index from the table's active records. Writes
+// that land while it runs are kept: they reach the index after their row is stored, so the
+// backend applies them on top of what it read.
+func (e *ScyllaController[T, E]) ReindexTextSearch(partValue int32) error {
+	return reindexTextSearchForTable(&e.Table, partValue)
+}
+
+func reindexTextSearchForTable(scyllaTable *ScyllaTable, partValue int32) error {
+	return withTextSearch(scyllaTable, partValue, "ReindexTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Rebuild(context.Background(), table, partition, textSearchSource(scyllaTable, int64(partValue)))
+	})
+}
+
+// ReindexTextSearchAll rebuilds the text index of every partition that has records, one at a time.
+// It does not drop the index of a partition left with none: DropTextSearch does that.
+func (e *ScyllaController[T, E]) ReindexTextSearchAll() error {
+	return reindexTextSearchAllForTable(&e.Table)
+}
+
+func reindexTextSearchAllForTable(scyllaTable *ScyllaTable) error {
+	if scyllaTable.TextSearchIndex == nil {
+		return nil
+	}
+	partValues, err := scanPartitionValues(scyllaTable)
+	if err != nil {
+		return Err("ReindexTextSearchAll failed to list the partitions of", scyllaTable.Name, ":", err)
+	}
+	for _, partValue := range partValues {
+		if err := reindexTextSearchForTable(scyllaTable, partValue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanPartitionValues lists the partition values that have records. Text search partitions are
+// int32, which configureTextSearchIndex enforces for int columns at use: a value out of range
+// fails here instead of indexing under a wrapped number.
+func scanPartitionValues(scyllaTable *ScyllaTable) ([]int32, error) {
+	queryString := fmt.Sprintf("SELECT DISTINCT %v FROM %v", scyllaTable.PartKey.GetName(), scyllaTable.GetFullName())
+	iter := getScyllaConnection().Query(queryString).Iter()
+
+	var partValues []int32
+	var partValue int64
+	for iter.Scan(&partValue) {
+		if partValue < math.MinInt32 || partValue > math.MaxInt32 {
+			iter.Close()
+			return nil, fmt.Errorf("partition %v does not fit int32", partValue)
+		}
+		partValues = append(partValues, int32(partValue))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	slices.Sort(partValues)
+	return partValues, nil
+}
+
+// CompactTextSearch folds the partition's pending index writes, for backends with a write log.
+func (e *ScyllaController[T, E]) CompactTextSearch(partValue int32) error {
+	return withTextSearch(&e.Table, partValue, "CompactTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Compact(context.Background(), table, partition)
+	})
+}
+
+// DropTextSearch empties the partition's text index.
+func (e *ScyllaController[T, E]) DropTextSearch(partValue int32) error {
+	return dropTextSearchForTable(&e.Table, partValue)
+}
+
+func dropTextSearchForTable(scyllaTable *ScyllaTable, partValue int32) error {
+	return withTextSearch(scyllaTable, partValue, "DropTextSearch", func(backend db.TextSearchBackend, table, partition string) error {
+		return backend.Drop(context.Background(), table, partition)
+	})
+}
+
+// withTextSearch runs one index maintenance step, or nothing for a table without TextSearch.
+func withTextSearch(scyllaTable *ScyllaTable, partValue int32, step string, run func(backend db.TextSearchBackend, table, partition string) error) error {
+	if scyllaTable.TextSearchIndex == nil {
+		return nil
+	}
+	backend, err := db.GetTextSearchBackend()
+	if err != nil {
+		return err
+	}
+	partition := db.TextSearchPartition(int64(partValue))
+	start := time.Now()
+	if err := run(backend, scyllaTable.Name, partition); err != nil {
+		return Err(step, "failed for table", scyllaTable.Name, "partition", partition, ":", err)
+	}
+	fmt.Printf("%s | table=%s | partition=%s | %s\n", step, scyllaTable.Name, partition, time.Since(start))
+	return nil
+}
+
+// DeleteViewsAndIndexes is a shim over a non-generic body, for the same reason as ResetCounter.
+func (e *ScyllaController[T, E]) DeleteViewsAndIndexes() error {
+	return deleteViewsAndIndexesForTable(&e.Table)
+}
+
+func deleteViewsAndIndexesForTable(controllerTable *ScyllaTable) error {
+	scyllaTable := &(*controllerTable)
+
+	// Read the live catalog first so old DB artifacts are deleted even if the current schema no longer declares them.
+	session := getScyllaConnection()
+
+	liveMaterializedViewNames := []string{}
+	viewNamesSeen := map[string]bool{}
+	viewsQuery := fmt.Sprintf(
+		"SELECT keyspace_name, view_name, base_table_name FROM system_schema.views WHERE keyspace_name = '%s'",
+		scyllaTable.Namespace,
+	)
+	viewIterator := session.Query(viewsQuery).Iter()
+	var liveView ScyllaView
+	for viewIterator.Scan(&liveView.Keyspace, &liveView.Name, &liveView.BaseTable) {
+		if liveView.BaseTable != scyllaTable.Name || viewNamesSeen[liveView.Name] {
+			continue
+		}
+		viewNamesSeen[liveView.Name] = true
+		liveMaterializedViewNames = append(liveMaterializedViewNames, liveView.Name)
+	}
+	if err := viewIterator.Close(); err != nil {
+		return Err("DeleteViewsAndIndexes failed reading views catalog for table", scyllaTable.Name, ":", err)
+	}
+
+	indexQuery := fmt.Sprintf(
+		"SELECT keyspace_name, table_name, index_name, kind FROM system_schema.indexes WHERE keyspace_name = '%s'",
+		scyllaTable.Namespace,
+	)
+	indexIterator := session.Query(indexQuery).Iter()
+	liveIndexesByTable := map[string][]string{}
+	indexNamesSeenByTable := map[string]map[string]bool{}
+	var liveIndex ScyllaIndexes
+	for indexIterator.Scan(&liveIndex.Keyspace, &liveIndex.Table, &liveIndex.Name, &liveIndex.Kind) {
+		if _, exists := indexNamesSeenByTable[liveIndex.Table]; !exists {
+			indexNamesSeenByTable[liveIndex.Table] = map[string]bool{}
+		}
+		if indexNamesSeenByTable[liveIndex.Table][liveIndex.Name] {
+			continue
+		}
+		indexNamesSeenByTable[liveIndex.Table][liveIndex.Name] = true
+		liveIndexesByTable[liveIndex.Table] = append(liveIndexesByTable[liveIndex.Table], liveIndex.Name)
+	}
+	if err := indexIterator.Close(); err != nil {
+		return Err("DeleteViewsAndIndexes failed reading indexes catalog for table", scyllaTable.Name, ":", err)
+	}
+
+	// Drop live base-table indexes directly from the catalog instead of trusting only the current ORM metadata.
+	for _, indexName := range liveIndexesByTable[scyllaTable.Name] {
+		dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.Namespace, indexName)
+		fmt.Println("DeleteViewsAndIndexes |", dropIndexStatement)
+		if err := QueryExec(dropIndexStatement); err != nil {
+			return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for table", scyllaTable.Name, ":", err)
+		}
+	}
+
+	// Drop all live MVs that still depend on the base table so DROP TABLE is no longer blocked by stale dependencies.
+	for _, viewName := range liveMaterializedViewNames {
+		dropViewStatement := fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %v.%v", scyllaTable.Namespace, viewName)
+		fmt.Println("DeleteViewsAndIndexes |", dropViewStatement)
+		if err := QueryExec(dropViewStatement); err != nil {
+			return Err("DeleteViewsAndIndexes failed dropping live materialized view", viewName, "for table", scyllaTable.Name, ":", err)
+		}
+	}
+
+	// View-table cleanup still uses ORM metadata to know which derived tables belong to this base table.
+	for _, view := range scyllaTable.views {
+		if view.Type != TypeViewTable {
+			continue
+		}
+
+		for _, indexName := range liveIndexesByTable[view.Name] {
+			dropIndexStatement := fmt.Sprintf("DROP INDEX IF EXISTS %v.%v", scyllaTable.Namespace, indexName)
+			fmt.Println("DeleteViewsAndIndexes |", dropIndexStatement)
+			if err := QueryExec(dropIndexStatement); err != nil {
+				return Err("DeleteViewsAndIndexes failed dropping live index", indexName, "for view table", view.Name, ":", err)
+			}
+		}
+
+		dropViewTableStatement := fmt.Sprintf("DROP TABLE IF EXISTS %v.%v", scyllaTable.Namespace, view.Name)
+		fmt.Println("DeleteViewsAndIndexes |", dropViewTableStatement)
+		if err := QueryExec(dropViewTableStatement); err != nil {
+			return Err("DeleteViewsAndIndexes failed dropping view table", view.Name, "for table", scyllaTable.Name, ":", err)
+		}
+	}
+
+	return nil
+}
+
+func getSequenceCurrentValue(counterName string) (int64, error) {
+	result := []Increment{}
+	if err := Query(&result).Name.Equals(counterName).Exec(); err != nil {
+		return 0, err
+	}
+	if len(result) == 0 {
+		return 0, nil
+	}
+	return result[0].CurrentValue, nil
+}
+
+func (e *ScyllaController[T, E]) GetRecordsGob(partValue, limit int32, lastKey any) ([]byte, error) {
+	return getTableRecordsGob(&e.Table, reflect.TypeFor[T](), partValue, lastKey)
+}
+
+func getTableRecordsGob(scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, lastKey any) ([]byte, error) {
+	gob.Register(reflect.Zero(recordType).Interface())
+	records := getTableRecords(scyllaTable, recordType, partValue, lastKey)
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	var buffer bytes.Buffer
+	encoder := gob.NewEncoder(&buffer)
+	err := encoder.Encode(records)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	return buffer.Bytes(), nil
+}
+
+// RestoreRecordsColbin inserts one exported batch. deletePartitionFirst wipes the
+// partition before inserting and must be set on the first batch of a table and only
+// there — a later batch asking for it would erase the batches already restored.
+func (e *ScyllaController[T, E]) RestoreRecordsColbin(
+	partValue int32, encoded []byte, deletePartitionFirst bool,
+) (int, error) {
+	return restoreColbinBatch(&e.Table, reflect.TypeFor[T](), partValue, encoded, deletePartitionFirst)
+}
+
+func restoreColbinBatch(
+	scyllaTable *ScyllaTable, recordType reflect.Type, partValue int32, encoded []byte, deletePartitionFirst bool,
+) (int, error) {
+	records, err := colbinToRecords(scyllaTable, recordType, encoded, partValue)
+	if err != nil {
+		return 0, err
+	}
+
+	partKey := scyllaTable.GetPartKey()
+	if deletePartitionFirst && partValue > 0 && partKey != nil && !partKey.IsNil() {
+		statement := fmt.Sprintf(`DELETE FROM %v WHERE %v = %v`,
+			scyllaTable.GetFullName(), partKey.GetName(), partValue)
+		if err := QueryExec(statement); err != nil {
+			fmt.Println("Error en statement: ", statement)
+			return 0, Err("Error al eliminar registros:", err)
+		}
+		// The rows are gone, so their index entries go too; the inserts below put back the
+		// restored ones.
+		if err := dropTextSearchForTable(scyllaTable, partValue); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := insertTableRecords(scyllaTable, records, nil); err != nil {
+		return 0, Err("Error al insertar registros:", err)
+	}
+	return records.Len(), nil
+}
+
+type ScyllaColumns struct {
+	Name     string
+	Type     string
+	Keyspace string
+	Table    string
+}
+
+type ScyllaIndexes struct {
+	Name     string
+	Table    string
+	Keyspace string
+	Kind     string
+}
+
+type ScyllaView struct {
+	Keyspace  string
+	Name      string
+	BaseTable string
+}
+
+var cacheCodePrev int32
+var scyllaColumnsSaved []ScyllaColumns
+var scyllaIndexesSaved []ScyllaIndexes
+
+// getViewMissingColumns diffs a compiled view's declared columns against the live DB catalog and
+// returns the ones the DB is missing. A type mismatch on an existing column is only reported: the
+// same as the base table does, since changing a column type is not something deploy can decide.
+func getViewMissingColumns(view *viewInfo, liveViewColumns []ScyllaColumns) []viewExpectedColumn {
+	if view.getExpectedColumns == nil {
+		return nil
+	}
+
+	liveColumnTypes := map[string]string{}
+	for _, liveColumn := range liveViewColumns {
+		liveColumnTypes[liveColumn.Name] = liveColumn.Type
+	}
+
+	missingColumns := []viewExpectedColumn{}
+	for _, expectedColumn := range view.getExpectedColumns() {
+		liveType, exists := liveColumnTypes[expectedColumn.name]
+		if !exists {
+			missingColumns = append(missingColumns, expectedColumn)
+			continue
+		}
+		if liveType != expectedColumn.dbType {
+			Logx(5, fmt.Sprintf(`La columna "%v" de la view "%v" está en la BD como "%v" pero el Struct la declara como "%v".`+"\n",
+				expectedColumn.name, view.Name, liveType, expectedColumn.dbType))
+		}
+	}
+	return missingColumns
+}
+
+// repairViewMissingColumns realigns a live view with the columns its schema declares. Adding a
+// column to a base table never reaches that table's derived views on its own — a materialized view
+// only carries the columns named in its CREATE, and a view table is a separate physical table — so
+// without this every read or write touching the new column fails on the view while the base table
+// looks correct.
+//
+// The repair differs by view kind:
+//   - A materialized view cannot be ALTERed, so it is dropped and recreated. Scylla repopulates it
+//     from the base table, so nothing is lost, but the rebuild is not instant on a large table.
+//   - A view table holds rows only the ORM's write path produces and nothing rebuilds them in bulk,
+//     so it is ALTERed instead. Dropping it would empty the view until every base row is rewritten.
+func repairViewMissingColumns(table *ScyllaTable, view *viewInfo, liveViewColumns []ScyllaColumns) {
+	missingColumns := getViewMissingColumns(view, liveViewColumns)
+	if len(missingColumns) == 0 {
+		return
+	}
+
+	viewFullName := table.Namespace + "." + view.Name
+	missingColumnNames := []string{}
+	for _, missingColumn := range missingColumns {
+		missingColumnNames = append(missingColumnNames, missingColumn.name)
+	}
+	Logx(5, fmt.Sprintf(`A la view "%v" le faltan las columnas: %v. Reparando...`+"\n",
+		view.Name, strings.Join(missingColumnNames, ", ")))
+
+	if view.Type == TypeViewTable {
+		for _, missingColumn := range missingColumns {
+			alterStatement := fmt.Sprintf(`ALTER TABLE %v ADD %v %v`, viewFullName, missingColumn.name, missingColumn.dbType)
+			fmt.Println(alterStatement)
+			if err := QueryExec(alterStatement); err != nil {
+				panic(fmt.Sprintf(`Error agregando la columna "%v" a la view table "%v" | %v`, missingColumn.name, view.Name, err))
+			}
+		}
+		Logx(2, fmt.Sprintf(`View table columns added "%v": %v`+"\n", view.Name, strings.Join(missingColumnNames, ", ")))
+		return
+	}
+
+	// Build the CREATE before dropping so only the DB can fail between the two statements. If it
+	// does, the view is simply absent and the next run recreates it through the not-found branch.
+	createScript := view.getCreateScript()
+
+	dropStatement := fmt.Sprintf(`DROP MATERIALIZED VIEW IF EXISTS %v`, viewFullName)
+	fmt.Println(dropStatement)
+	if err := QueryExec(dropStatement); err != nil {
+		panic(fmt.Sprintf(`Error eliminando la view "%v" para recrearla | %v`, view.Name, err))
+	}
+
+	fmt.Println(createScript)
+	if err := QueryExec(createScript); err != nil {
+		panic(fmt.Sprintf(`Error recreando la view "%v" en %v | %v`, view.Name, table.GetFullName(), err))
+	}
+	Logx(2, fmt.Sprintf(`View rebuilt with the missing columns "%v"`+"\n", view.Name))
+}
+
+func DeployScylla(cacheCode int32, controllers ...db.Controller) {
+	// The ORM's own tables are raw CQL, so the homologation pass below can never discover them —
+	// it only sees the controllers it was handed. Creating them here is what makes a standalone
+	// deploy ("fn-homologate") produce a usable keyspace, not just one with the app tables in it.
+	if err := EnsureInternalTables(); err != nil {
+		panic("Error al crear las tablas internas del ORM: " + err.Error())
+	}
+
+	var scyllaColumns []ScyllaColumns
+	var scyllaIndexes []ScyllaIndexes
+	isFetched := false
+
+	if cacheCode > 0 && cacheCode == cacheCodePrev {
+		scyllaColumns = scyllaColumnsSaved
+		scyllaIndexes = scyllaIndexesSaved
+	} else {
+		fmt.Println("Obteniendo columnas...")
+		// Query system_schema.columns
+		query := fmt.Sprintf("SELECT keyspace_name, table_name, column_name, type FROM system_schema.columns WHERE keyspace_name = '%s'", connParams.Keyspace)
+
+		session := getScyllaConnection()
+		iter := session.Query(query).Iter()
+		var col ScyllaColumns
+		for iter.Scan(&col.Keyspace, &col.Table, &col.Name, &col.Type) {
+			scyllaColumns = append(scyllaColumns, col)
+		}
+		if err := iter.Close(); err != nil {
+			panic("Error al obtener columnas:" + err.Error())
+		}
+		fmt.Println("Scylla columns obtenidas::", len(scyllaColumns))
+
+		fmt.Println("Obteniendo Indices...")
+		// Query system_schema.indexes
+		indexQuery := fmt.Sprintf("SELECT keyspace_name, table_name, index_name, kind FROM system_schema.indexes WHERE keyspace_name = '%s'", connParams.Keyspace)
+
+		iter = session.Query(indexQuery).Iter()
+		var idx ScyllaIndexes
+		for iter.Scan(&idx.Keyspace, &idx.Table, &idx.Name, &idx.Kind) {
+			scyllaIndexes = append(scyllaIndexes, idx)
+		}
+		if err := iter.Close(); err != nil {
+			panic("Error al obtener índices:" + err.Error())
+		}
+		fmt.Println("Índices obtenidos:", len(scyllaIndexes))
+		isFetched = true
+	}
+
+	tableColumnsMap := map[string][]ScyllaColumns{}
+
+	for _, e := range scyllaColumns {
+		key := fmt.Sprintf("%v.%v", e.Keyspace, e.Table)
+		tableColumnsMap[key] = append(tableColumnsMap[key], e)
+	}
+
+	if isFetched {
+		tablesNames := []string{}
+
+		for tableName, columns := range tableColumnsMap {
+			tablesNames = append(tablesNames, tableName)
+
+			s1 := strings.Split(tableName, "_")
+			if s1[len(s1)-1] == "view" {
+				continue
+			}
+			fmt.Println("✔ Table =", tableName)
+			columnsNames := []string{}
+			for _, c := range columns {
+				columnsNames = append(columnsNames, fmt.Sprintf("%v(%v)", c.Name, c.Type))
+			}
+			fmt.Println("  Columns =", strings.Join(columnsNames, ", "))
+		}
+
+		fmt.Println("Tables::", tablesNames)
+	}
+
+	tableIndexesMap := map[string][]string{}
+	for _, e := range scyllaIndexes {
+		key := fmt.Sprintf("%v.%v", e.Keyspace, e.Table)
+		tableIndexesMap[key] = append(tableIndexesMap[key], e.Name)
+	}
+
+	for _, controller := range controllers {
+		// Deploy emits CQL, so it needs this driver's full metadata (views, packed
+		// indexes, the index-updated table). A table compiled by another driver has
+		// nothing to deploy here.
+		table, isScyllaTable := controller.GetTable().(ScyllaTable)
+		if !isScyllaTable {
+			fmt.Printf("DeployScylla: %q was not compiled by the scylla driver, skipping\n",
+				controller.GetTableName())
+			continue
+		}
+		tableName := table.GetFullName()
+		originColumns := tableColumnsMap[tableName]
+		fmt.Println("Struct Type:", controller.GetTableName(), "| Columns:", len(originColumns))
+
+		// Si no existe la tabla entonces la crea...
+		if len(originColumns) == 0 {
+			Logx(6, "No se encontró la tabla: "+tableName+"\n")
+			Logx(2, fmt.Sprintf(`Creando tabla "%v"...`+"\n", tableName))
+
+			columnsTypes := []string{}
+			for _, e := range table.Columns {
+				columnsTypes = append(columnsTypes, e.GetName()+" "+e.GetType().DBType)
+			}
+
+			keys := []string{}
+			for _, key := range table.Keys {
+				keys = append(keys, key.GetName())
+			}
+
+			pk := strings.Join(keys, ", ")
+			partKey := table.GetPartKey()
+			if partKey != nil && !partKey.IsNil() && len(partKey.GetName()) > 0 {
+				pk = fmt.Sprintf("(%v), %v", partKey.GetName(), pk)
+			}
+
+			query := `
+		CREATE TABLE %v (
+			%v,
+			PRIMARY KEY (%v)
+		)
+			WITH caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+			and compaction = {'class': 'SizeTieredCompactionStrategy'}
+			and compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}
+			and dclocal_read_repair_chance = 0
+			and speculative_retry = '99.0PERCENTILE';
+		`
+			query = fmt.Sprintf(query, tableName, strings.Join(columnsTypes, ", "), pk)
+			fmt.Println(query)
+
+			err := QueryExec(query)
+			if err != nil {
+				panic(fmt.Sprintf(`Error creando tabla "%v" | `, tableName) + err.Error())
+			}
+
+			Logx(2, fmt.Sprintf(`Tabla creada: "%v"`+"\n", tableName))
+		}
+
+		columnsSchemaMap := map[string]IColInfo{}
+		// Columns, not ColumnsMap: a computed column has no storage to create.
+		for _, col := range table.Columns {
+			columnsSchemaMap[col.GetName()] = col
+		}
+		columnsNoMapeadas := map[string]string{}
+
+		for _, originColumn := range originColumns {
+			if column, ok := columnsSchemaMap[originColumn.Name]; ok {
+				if column.GetType().DBType != originColumn.Type {
+					Logx(5, fmt.Sprintf(`La columna "%v" está definida con type "%v", pero en el Struct está con "%v" equivalente a "%v"`+"\n", originColumn.Name, originColumn.Type, column.GetType().FieldType, column.GetType().DBType))
+				}
+				delete(columnsSchemaMap, originColumn.Name)
+			} else {
+				columnsNoMapeadas[originColumn.Name] = originColumn.Type
+			}
+		}
+
+		if len(originColumns) > 0 {
+			// Revisa las columnas existentes en la BD pero no mapeadas
+			for name, dbType := range columnsNoMapeadas {
+				Logx(5, fmt.Sprintf(`La columna "%v" con type "%v" existe en la BD origen no está mapeada en el Struct.`+"\n", name, dbType))
+			}
+			// Revisa las columnas que deben crearse en BD
+			for _, column := range columnsSchemaMap {
+				Logx(5, fmt.Sprintf(`La columna "%v" con struct type "%v" no existe en la BD de origen.`+"\n", column.GetName(), column.GetType().FieldType))
+				query := fmt.Sprintf(`ALTER TABLE %v ADD %v %v`, tableName, column.GetName(), column.GetType().DBType)
+				fmt.Printf(`Ejecutando agregar columna "%v"...`+"\n", query)
+
+				if err := QueryExec(query); err != nil {
+					panic(fmt.Sprintf(`Error agregando columna "%v" | %v`, column.GetName(), err))
+				}
+				Logx(2, fmt.Sprintf(`Columna Agregada: "%v"`+"\n", column.GetName()))
+			}
+		}
+
+		// The DataFrame change log is written before the rows, so it must exist before any write.
+		if table.dataFrames != nil {
+			if err := QueryExec(dataFrameLogCreateScript(table)); err != nil {
+				panic(fmt.Sprintf(`Error creando la tabla de log de DataFrames "%v" | %v`, table.dataFrames.logTableName, err))
+			}
+		}
+
+		// The moves table is written after every write that moves a record out of a pinned prefix.
+		if hasDeltaMoves(table) {
+			if err := QueryExec(deltaMovesCreateScript(table)); err != nil {
+				panic(fmt.Sprintf(`Error creando la tabla de moves delta "%v" | %v`, deltaMovesTableName(table), err))
+			}
+		}
+
+		// The by-IDs slots are raised after every write, so their keyspace table must exist first.
+		if table.CacheByIDs {
+			if err := QueryExec(cacheSlotsCreateScript(resolveKeyspace(table))); err != nil {
+				panic(fmt.Sprintf(`Error creando la tabla de slots by-IDs "%v" | %v`, cacheSlotsTableName, err))
+			}
+		}
+
+		// Revisa si posee índices, en su defecto los crea
+		tableIndexes := tableIndexesMap[tableName]
+
+		if table.indexUpdatedTable != nil {
+			indexUpdatedTableName := fmt.Sprintf("%v.%v", table.Namespace, table.indexUpdatedTable.name)
+			if _, exists := tableColumnsMap[indexUpdatedTableName]; !exists {
+				Logx(5, fmt.Sprintf(`No se encontró la tabla de index updates "%v". Creando...`+"\n", indexUpdatedTableName))
+
+				createScript := getIndexUpdatedTableCreateScript(table.Namespace, table.indexUpdatedTable)
+				fmt.Println(createScript)
+				if err := QueryExec(createScript); err != nil {
+					fmt.Println(err)
+					panic(fmt.Sprintf(`Error creando la tabla de index updates "%v" en %v`, table.indexUpdatedTable.name, tableName))
+				}
+
+				tableColumnsMap[indexUpdatedTableName] = []ScyllaColumns{
+					{Name: "partition_id", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "index_id", Type: "smallint", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "index_hash", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+					{Name: "last_write", Type: "int", Keyspace: table.Namespace, Table: table.indexUpdatedTable.name},
+				}
+				Logx(2, fmt.Sprintf(`Index update table created "%v"`+"\n", table.indexUpdatedTable.name))
+			}
+		}
+
+		// TextSearch indexes live in the backend set with db.SetTextSearchBackend, which creates
+		// each partition's index on its first write, so deploy does nothing here.
+
+		for _, index := range table.indexes {
+			if slices.Contains(tableIndexes, index.Name) {
+				continue
+			}
+			Logx(5, fmt.Sprintf(`No se encontró el índice "%v" en "%v". Creando...`+"\n", index.Name, tableName))
+
+			createScript := index.getCreateScript()
+			fmt.Println(createScript)
+			if err := QueryExec(createScript); err != nil {
+				fmt.Println(err)
+				panic(fmt.Sprintf(`Error creando el índice "%v" en %v`, index.Name, tableName))
+			}
+			Logx(2, fmt.Sprintf(`Index created "%v"`+"\n", index.Name))
+		}
+
+		// Revisa si posee views, en su defecto las crea
+		for _, view := range table.views {
+			name := table.Namespace + "." + view.Name
+			if liveViewColumns, ok := tableColumnsMap[name]; ok {
+				repairViewMissingColumns(&table, view, liveViewColumns)
+			} else {
+				Logx(5, fmt.Sprintf(`No se encontró la view "%v" en la tabla "%v". Preparando creación...`+"\n", view.Name, table.Name))
+
+				createScript := view.getCreateScript()
+				fmt.Println(createScript)
+				if err := QueryExec(createScript); err != nil {
+					fmt.Println(err)
+					panic(fmt.Sprintf(`Error creando la view "%v" en %v`, view.Name, tableName))
+				}
+
+				Logx(2, fmt.Sprintf(`View created "%v"`+"\n", view.Name))
+			}
+
+			viewTableName := table.Namespace + "." + view.Name
+			if view.Type == 9 {
+				maintenanceIndexName := getViewTableMaintenanceIndexName(view)
+				viewTableIndexes := tableIndexesMap[viewTableName]
+				if slices.Contains(viewTableIndexes, maintenanceIndexName) {
+					continue
+				}
+				Logx(5, fmt.Sprintf(`No se encontró el índice "%v" en "%v". Creando...`+"\n", maintenanceIndexName, viewTableName))
+
+				createScript := getViewTableMaintenanceIndexCreateScript(view, table)
+				fmt.Println(createScript)
+				if err := QueryExec(createScript); err != nil {
+					fmt.Println(err)
+					panic(fmt.Sprintf(`Error creando el índice "%v" en %v`, maintenanceIndexName, viewTableName))
+				}
+
+				Logx(2, fmt.Sprintf(`Index created "%v"`+"\n", maintenanceIndexName))
+			}
+		}
+	}
+
+	// Cache the results if cacheCode is provided
+	if cacheCode > 0 {
+		cacheCodePrev = cacheCode
+		scyllaColumnsSaved = scyllaColumns
+		scyllaIndexesSaved = scyllaIndexes
+	}
+}

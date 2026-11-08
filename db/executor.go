@@ -14,7 +14,7 @@ import (
 // to be chosen at runtime, and two drivers to be live at once for the same record
 // type — declare one Executor variable per driver and pass it to Via().
 type Executor[TableT any, RecordT any] interface {
-	// Name identifies the driver in logs and errors ("mariadb", "dynamo").
+	// Name identifies the driver in logs and errors ("scylla", "dynamo").
 	Name() string
 	// Select runs the read described by ti and appends the rows to dst. When scan is
 	// non-nil it is called per decoded record, which lets callers stream a large

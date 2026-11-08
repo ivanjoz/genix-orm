@@ -896,7 +896,7 @@ type Controller interface {
     ReprocessBlobs(decodeLegacy func(data []byte, dst any) error, write bool) (ReprocessReport, error)
 }
 
-// Registry — the analogue of genix's MakeControllers().
+// Registry — the analogue of genix's MakeScyllaControllers().
 controllers := []dynamo.Controller{ models.Products, models.Orders }
 for _, c := range controllers {
     n, err := c.DeleteRecordsAll()   // wipe every record of the entity

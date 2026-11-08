@@ -13,7 +13,7 @@ import (
 	"github.com/ivanjoz/genix-orm/utils"
 )
 
-// The by-IDs cache (db/cache by_ids.go), kept the way the deleted Scylla driver kept it: every record
+// The by-IDs cache (db/cache by_ids.go) as Scylla keeps it (scylla/cache_by_ids.go): every record
 // belongs to the slot uint8(ID), and `<database>._cache_by_ids_slots` holds per table partition and
 // slot the full Updated of its latest write. A write raises its slots in its own transaction, so the
 // slot and the row commit together; a read converts each slot's Updated to the current cycle's year

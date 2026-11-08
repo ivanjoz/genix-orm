@@ -1,0 +1,376 @@
+package scylla
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/ivanjoz/genix-orm/db"
+)
+
+// storedPackedValue packs a prefix bound the way the view stores its key, sign bit flipped.
+func storedPackedValue(view *viewInfo, fillWithMax bool, values ...int64) int64 {
+	packed := db.PackSlotPrefixBound(values, view.PackedSlotBitsPerColumn, fillWithMax)
+	return db.ConvertToInt64(storeVirtualPacked(packed, view.PackedIsInt32))
+}
+
+type groupedMovementRecord struct {
+	TableStruct[groupedMovementSchema, groupedMovementRecord]
+	CompanyID int32   `db:"empresa_id"`
+	ID        int64   `db:"id"`
+	Date      int16   `db:"date"`
+	ProductID int32   `db:"producto_id"`
+	Cantidad  int32   `db:"cantidad"`
+	Promedio  float64 `db:"promedio"`
+}
+
+type groupedMovementSchema struct {
+	TableStruct[groupedMovementSchema, groupedMovementRecord]
+	CompanyID Col[*groupedMovementSchema, int32]
+	ID        Col[*groupedMovementSchema, int64]
+	Date      Col[*groupedMovementSchema, int16]
+	ProductID Col[*groupedMovementSchema, int32]
+	Cantidad  Col[*groupedMovementSchema, int32]
+	Promedio  Col[*groupedMovementSchema, float64]
+}
+
+func (e groupedMovementSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10004,
+		Name:      "grouped_movements",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes: []Index{
+			// Keep the packed grouping view minimal: partition + packed key + aggregated payload column.
+			{Type: TypeView, Keys: Cols(e.Date, e.ProductID.Size(31)), Cols: Cols(e.Cantidad)},
+		},
+	}
+}
+
+type fullViewRecord struct {
+	TableStruct[fullViewSchema, fullViewRecord]
+	CompanyID int32  `db:"empresa_id"`
+	ID        int64  `db:"id"`
+	Status    int8   `db:"status"`
+	Updated   int32  `db:"updated"`
+	Nombre    string `db:"nombre"`
+}
+
+type fullViewSchema struct {
+	TableStruct[fullViewSchema, fullViewRecord]
+	CompanyID Col[*fullViewSchema, int32]
+	ID        Col[*fullViewSchema, int64]
+	Status    Col[*fullViewSchema, int8]
+	Updated   Col[*fullViewSchema, int32]
+	Nombre    Col[*fullViewSchema, string]
+}
+
+func (e fullViewSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10005,
+		Name:      "full_view_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes: []Index{
+			// No Cols means the MV keeps the full base payload with an explicit non-virtual projection.
+			{Type: TypeView, Keys: Cols(e.Status, e.Updated.Size(31))},
+		},
+	}
+}
+
+type hashIndexedFullViewRecord struct {
+	TableStruct[hashIndexedFullViewSchema, hashIndexedFullViewRecord]
+	CompanyID  int32   `db:"empresa_id"`
+	ID         int64   `db:"id"`
+	Status     int8    `db:"status"`
+	Updated    int32   `db:"updated"`
+	Date       int16   `db:"date"`
+	ProductIDs []int32 `db:",list"`
+	Nombre     string  `db:"nombre"`
+}
+
+type hashIndexedFullViewSchema struct {
+	TableStruct[hashIndexedFullViewSchema, hashIndexedFullViewRecord]
+	CompanyID  Col[*hashIndexedFullViewSchema, int32]
+	ID         Col[*hashIndexedFullViewSchema, int64]
+	Status     Col[*hashIndexedFullViewSchema, int8]
+	Updated    Col[*hashIndexedFullViewSchema, int32]
+	Date       Col[*hashIndexedFullViewSchema, int16]
+	ProductIDs Col[*hashIndexedFullViewSchema, []int32]
+	Nombre     Col[*hashIndexedFullViewSchema, string]
+}
+
+func (e hashIndexedFullViewSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10006,
+		Name:      "hash_indexed_full_view_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes: []Index{
+			{Keys: Cols(e.ProductIDs, e.Date.CompositeBucketing(2, 6))},
+			// Full-payload packed view should keep only its own view key virtual column.
+			{Type: TypeView, Keys: Cols(e.Status.Int32(), e.Updated.Size(27))},
+		},
+	}
+}
+
+type int32PackedViewRecord struct {
+	TableStruct[int32PackedViewSchema, int32PackedViewRecord]
+	CompanyID   int32 `db:"empresa_id"`
+	ID          int64 `db:"id"`
+	StatusTrace int8  `db:"status_trace"`
+	Updated     int32 `db:"updated"`
+}
+
+type int32PackedViewSchema struct {
+	TableStruct[int32PackedViewSchema, int32PackedViewRecord]
+	CompanyID   Col[*int32PackedViewSchema, int32]
+	ID          Col[*int32PackedViewSchema, int64]
+	StatusTrace Col[*int32PackedViewSchema, int8]
+	Updated     Col[*int32PackedViewSchema, int32]
+}
+
+func (e int32PackedViewSchema) GetSchema() TableSchema {
+	return TableSchema{
+		ID:        10007,
+		Name:      "int32_packed_view_records",
+		Partition: e.CompanyID,
+		Keys:      Cols(e.ID),
+		Indexes: []Index{
+			// Match the sale-order status trace view: a small enum prefix packed with a 27-bit updated slot.
+			{Type: TypeView, Keys: Cols(e.StatusTrace.Int32(), e.Updated.Size(27))},
+		},
+	}
+}
+
+func findPackedGroupView(t *testing.T, scyllaTable ScyllaTable) *viewInfo {
+	t.Helper()
+	for _, view := range scyllaTable.indexViews {
+		if view.Type == 8 && slices.Equal(view.ColumnsNoPart, []string{"date", "producto_id"}) {
+			return view
+		}
+	}
+	t.Fatal("packed group view not found")
+	return nil
+}
+
+func TestBuildNativeGroupByPlanWithPackedView(t *testing.T) {
+	scyllaTable := MakeScyllaTable[groupedMovementRecord, groupedMovementSchema]()
+	records := []groupedMovementRecord{}
+	query := Query[groupedMovementRecord, groupedMovementSchema](&records)
+
+	query.CompanyID.Equals(7)
+	query.Date.GreaterEqual(15)
+	query.GroupBy(query.Date, query.ProductID, query.Cantidad.Sum())
+
+	plan, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().Statements, scyllaTable)
+	if err != nil {
+		t.Fatalf("buildNativeGroupByPlan returned error: %v", err)
+	}
+	if plan == nil {
+		t.Fatal("expected a GroupBy plan")
+	}
+	if plan.ViewTableName == "" {
+		t.Fatal("expected a packed view to be selected")
+	}
+	if len(plan.GroupByColumns) != 1 {
+		t.Fatalf("expected a single packed GroupBy column, got %v", plan.GroupByColumns)
+	}
+	if len(plan.SelectExpressions) != 2 {
+		t.Fatalf("expected packed key plus aggregate projection, got %v", plan.SelectExpressions)
+	}
+	if plan.SelectExpressions[1] != "SUM(cantidad) AS cantidad" {
+		t.Fatalf("unexpected aggregate projection: %v", plan.SelectExpressions[1])
+	}
+	if len(plan.ScanColumns) == 0 || plan.ScanColumns[0].DecomposeView == nil {
+		t.Fatal("expected the packed key scan column to decompose into primitive fields")
+	}
+
+	packedView := plan.ScanColumns[0].DecomposeView
+	expectedClause := fmt.Sprintf("empresa_id = ? AND %s >= ?", packedView.Column.GetName())
+	if len(plan.WhereStatements) != 1 || plan.WhereStatements[0].Clause != expectedClause {
+		t.Fatalf("unexpected packed where clauses: %v", plan.WhereStatements)
+	}
+	if got := plan.WhereStatements[0].Values; len(got) != 2 || db.ConvertToInt64(got[0]) != 7 || db.ConvertToInt64(got[1]) != storedPackedValue(packedView, false, 15) {
+		t.Fatalf("unexpected packed where values: %v", got)
+	}
+}
+
+func TestPackedGroupByDecomposesVirtualValue(t *testing.T) {
+	scyllaTable := MakeScyllaTable[groupedMovementRecord, groupedMovementSchema]()
+	packedView := findPackedGroupView(t, scyllaTable)
+
+	values := packedView.decomposeVirtualValue(storedPackedValue(packedView, false, 31, 4567))
+	if len(values) != 2 {
+		t.Fatalf("expected 2 decomposed values, got %v", values)
+	}
+	if values[0].(int64) != 31 || values[1].(int64) != 4567 {
+		t.Fatalf("unexpected decomposed values: %v", values)
+	}
+}
+
+func TestBuildNativeGroupByPlanRejectsAvgOnIntegerColumn(t *testing.T) {
+	scyllaTable := MakeScyllaTable[groupedMovementRecord, groupedMovementSchema]()
+	records := []groupedMovementRecord{}
+	query := Query[groupedMovementRecord, groupedMovementSchema](&records)
+
+	query.CompanyID.Equals(1)
+	query.GroupBy(query.Date, query.Cantidad.Avg())
+
+	_, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().Statements, scyllaTable)
+	if err == nil {
+		t.Fatal("expected Avg on an integer destination column to fail")
+	}
+	if !strings.Contains(err.Error(), "Avg() requires a float32 or float64") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildNativeGroupByPlanSupportsMax(t *testing.T) {
+	scyllaTable := MakeScyllaTable[groupedMovementRecord, groupedMovementSchema]()
+	records := []groupedMovementRecord{}
+	query := Query[groupedMovementRecord, groupedMovementSchema](&records)
+
+	query.GroupBy(query.CompanyID, query.ID.Max())
+
+	plan, err := buildNativeGroupByPlan(query.GetTableInfo(), query.GetTableInfo().Statements, scyllaTable)
+	if err != nil {
+		t.Fatalf("buildNativeGroupByPlan returned error: %v", err)
+	}
+	if len(plan.SelectExpressions) != 2 || plan.SelectExpressions[1] != "MAX(id) AS id" {
+		t.Fatalf("unexpected MAX projection: %v", plan.SelectExpressions)
+	}
+}
+
+func TestVirtualViewWithoutProjectedColsKeepsFullSelectablePayload(t *testing.T) {
+	scyllaTable := MakeScyllaTable[fullViewRecord, fullViewSchema]()
+
+	var packedView *viewInfo
+	for _, view := range scyllaTable.indexViews {
+		if view.Type == 8 {
+			packedView = view
+			break
+		}
+	}
+	if packedView == nil {
+		t.Fatal("expected a packed range view")
+	}
+
+	for _, expectedColumn := range []string{"empresa_id", "id", "status", "updated", "nombre"} {
+		if !slices.Contains(packedView.AvailableColumns, expectedColumn) {
+			t.Fatalf("expected view to expose column %q, available=%v", expectedColumn, packedView.AvailableColumns)
+		}
+	}
+}
+
+func TestVirtualViewCreateScriptExcludesUnrelatedVirtualColumns(t *testing.T) {
+	scyllaTable := MakeScyllaTable[hashIndexedFullViewRecord, hashIndexedFullViewSchema]()
+
+	var packedView *viewInfo
+	for _, view := range scyllaTable.indexViews {
+		if view.Type == 8 {
+			packedView = view
+			break
+		}
+	}
+	if packedView == nil {
+		t.Fatal("expected a packed range view")
+	}
+
+	createScript := packedView.getCreateScript()
+	if strings.Contains(createScript, "SELECT *") {
+		t.Fatalf("expected explicit view projection, got %q", createScript)
+	}
+	if !strings.Contains(createScript, packedView.Column.GetName()) {
+		t.Fatalf("expected view key virtual column %q in create script, got %q", packedView.Column.GetName(), createScript)
+	}
+	if strings.Contains(createScript, "zz_hb_product_ids_fecha_b2") || strings.Contains(createScript, "zz_hb_product_ids_fecha_b6") {
+		t.Fatalf("expected unrelated hash virtual columns to be excluded, got %q", createScript)
+	}
+	for _, expectedColumn := range []string{"empresa_id", "id", "status", "updated", "date", "product_ids", "nombre"} {
+		if !strings.Contains(createScript, expectedColumn) {
+			t.Fatalf("expected base column %q in create script, got %q", expectedColumn, createScript)
+		}
+	}
+}
+
+func TestPackedViewCapabilityMatchesEqualityPrefixPlusRange(t *testing.T) {
+	scyllaTable := MakeScyllaTable[fullViewRecord, fullViewSchema]()
+	results := []fullViewRecord{}
+	query := Query[fullViewRecord, fullViewSchema](&results)
+
+	query.CompanyID.Equals(1)
+	query.Status.Equals(6)
+	query.Updated.GreaterEqual(0)
+
+	bestCapability := db.MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
+	if bestCapability == nil {
+		t.Fatal("expected a packed view capability match")
+	}
+	if bestCapability.Source == nil || bestCapability.Source.Type != 8 {
+		t.Fatalf("expected a packed range view, got %+v", bestCapability.Source)
+	}
+
+	whereStatements := scyllaTable.viewOfSource(bestCapability.Source).prepareWhereClauses(query.GetTableInfo().Statements...)
+	if len(whereStatements) != 1 {
+		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
+	}
+
+	packedView := scyllaTable.viewOfSource(bestCapability.Source)
+	expectedLowerBound := storedPackedValue(packedView, false, 6, 0)
+	expectedUpperBound := storedPackedValue(packedView, true, 6)
+	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
+		packedView.Column.GetName(),
+		packedView.Column.GetName(),
+	)
+	if whereStatements[0].Clause != expectedWhere {
+		t.Fatalf("unexpected packed where clause: %v", whereStatements[0])
+	}
+	if got := whereStatements[0].Values; len(got) != 3 || db.ConvertToInt64(got[0]) != 1 || db.ConvertToInt64(got[1]) != expectedLowerBound || db.ConvertToInt64(got[2]) != expectedUpperBound {
+		t.Fatalf("unexpected packed where values: %v", got)
+	}
+}
+
+// An int32 packed view spends all 32 bits, so its bounds only fit an int once the sign bit is
+// flipped: StatusTrace 9 alone already lands past MaxInt32 in the unsigned layout.
+func TestInt32PackedViewBoundsAreSignFlippedInt32s(t *testing.T) {
+	scyllaTable := MakeScyllaTable[int32PackedViewRecord, int32PackedViewSchema]()
+	results := []int32PackedViewRecord{}
+	query := Query[int32PackedViewRecord, int32PackedViewSchema](&results)
+
+	query.CompanyID.Equals(1)
+	query.StatusTrace.Equals(9)
+	query.Updated.GreaterEqual(38768176)
+
+	bestCapability := db.MatchQueryCapability(query.GetTableInfo().Statements, scyllaTable.capabilities)
+	if bestCapability == nil || bestCapability.Source == nil || bestCapability.Source.Type != 8 {
+		t.Fatalf("expected an int32 packed range view, got %+v", bestCapability)
+	}
+	if bestCapability.Source.RequiresPostFilter {
+		t.Fatal("expected int32 packed range views to skip post-filtering")
+	}
+
+	whereStatements := scyllaTable.viewOfSource(bestCapability.Source).prepareWhereClauses(query.GetTableInfo().Statements...)
+	if len(whereStatements) != 1 {
+		t.Fatalf("expected a single packed where clause, got %v", whereStatements)
+	}
+
+	packedView := scyllaTable.viewOfSource(bestCapability.Source)
+	expectedWhere := fmt.Sprintf("empresa_id = ? AND %s >= ? AND %s <= ?",
+		packedView.Column.GetName(),
+		packedView.Column.GetName(),
+	)
+	if whereStatements[0].Clause != expectedWhere {
+		t.Fatalf("unexpected int32 packed where clause: %v", whereStatements[0])
+	}
+	got := whereStatements[0].Values
+	if len(got) != 3 || db.ConvertToInt64(got[0]) != 1 ||
+		db.ConvertToInt64(got[1]) != storedPackedValue(packedView, false, 9, 38768176) ||
+		db.ConvertToInt64(got[2]) != storedPackedValue(packedView, true, 9) {
+		t.Fatalf("unexpected int32 packed where values: %v", got)
+	}
+	if _, isInt32 := got[1].(int32); !isInt32 {
+		t.Fatalf("expected the bound to bind as an int32, got %T", got[1])
+	}
+}

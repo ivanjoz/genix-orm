@@ -52,43 +52,38 @@ does that — which is why driver selection is one `type` line, not one `func` c
 
 ## 2. Module layout
 
-One Go module per driver, so a consumer only downloads the drivers it uses.
+Three Go modules, so a consumer only downloads the drivers it uses.
 
 ```
 genix-orm/
-  db/             module github.com/ivanjoz/genix-orm/db             deps: xunsafe
-                  The driver-agnostic layer. Everything a table declaration, a query and
-                  a record access need. Knows nothing about any database.
+  db/       module github.com/ivanjoz/genix-orm/db      deps: xunsafe
+            The driver-agnostic layer. Everything a table declaration, a query and
+            a record access need. Knows nothing about any database.
 
-  mariadbdriver/  module github.com/ivanjoz/genix-orm/mariadbdriver  deps: + go-sql-driver/mysql
-                  MariaDB: the primary driver. DDL, transactions, packed keys, index
-                  groups, delta and by-IDs caches, DataFrames as aggregate tables.
+  scylla/   module github.com/ivanjoz/genix-orm         deps: + gocql, colbin
+            ScyllaDB / Cassandra driver: CQL generation, materialized views,
+            packed keys, index groups, text search, cache versions.
 
-  pgdriver/       module github.com/ivanjoz/genix-orm/pgdriver       deps: + pgx
-                  PostgreSQL, the same feature set.
-
-  dynamo/         module github.com/ivanjoz/genix-orm/dynamo         deps: + AWS SDK
-                  DynamoDB single-table driver.
-
-  fdbdriver/, ydbdriver/, obdriver/   experimental FoundationDB, YDB and OceanBase drivers.
+  dynamo/   module github.com/ivanjoz/genix-orm/dynamo  deps: + AWS SDK
+            DynamoDB single-table driver.
 ```
 
-The ScyllaDB driver (`scylla/`) was deleted on 2026-11-07; it is in the git history.
-
-The dependency direction is strictly driver → `db`. `db` never imports a driver; drivers register
-themselves into it at import time.
+The dependency direction is strictly `scylla → db` and `dynamo → db`. `db` never
+imports a driver; drivers register themselves into it at import time. Splitting
+`dynamo` into its own module keeps the AWS SDK out of Scylla-only consumers, and
+splitting `db` out keeps gocql out of DynamoDB-only consumers.
 
 ### Wiring
 
 ```go
 // go.mod of the consuming project
 require (
-    github.com/ivanjoz/genix-orm/db            v0.0.0
-    github.com/ivanjoz/genix-orm/mariadbdriver v0.0.0
+    github.com/ivanjoz/genix-orm    v0.0.0   // the scylla driver
+    github.com/ivanjoz/genix-orm/db v0.0.0
 )
 
-replace github.com/ivanjoz/genix-orm/db            => ./genix-orm/db
-replace github.com/ivanjoz/genix-orm/mariadbdriver => ./genix-orm/mariadbdriver
+replace github.com/ivanjoz/genix-orm    => ./genix-orm
+replace github.com/ivanjoz/genix-orm/db => ./genix-orm/db
 ```
 
 ---
@@ -104,15 +99,15 @@ package db
 
 import (
     orm "github.com/ivanjoz/genix-orm/db"
-    "github.com/ivanjoz/genix-orm/mariadbdriver"
+    "github.com/ivanjoz/genix-orm/scylla"
 )
 
 // THE DATABASE CHOICE. Point this at another driver's TableStruct and the whole
 // project switches — no table declaration and no query changes.
 //
-//   mariadbdriver.TableStruct  ->  MariaDB
-//   pgdriver.TableStruct       ->  PostgreSQL
-type TableStruct[TableT Schema[TableT], RecordT orm.TableBaseInterface[TableT, RecordT]] = mariadbdriver.TableStruct[TableT, RecordT]
+//   scylla.TableStruct  ->  ScyllaDB / Cassandra
+//   dynamo.TableStruct  ->  DynamoDB
+type TableStruct[TableT Schema[TableT], RecordT orm.TableBaseInterface[TableT, RecordT]] = scylla.TableStruct[TableT, RecordT]
 
 type (
     Schema[TableT any]                     = orm.TableSchemaInterface[TableT]
@@ -217,7 +212,7 @@ Indexes: []db.Index{{Type: db.TypeCacheGroup, Keys: db.Cols(e.Date, e.DetailProd
   recomputes the hashes.
 - A query on it (`DetailProductIDs.Contains(x)`) must be served by one of those index groups. Any
   other query on it returns an error.
-- MariaDB and PostgreSQL drivers (and obdriver).
+- Scylla driver only.
 
 For the full schema reference (key patterns, `KeyIntPacking`, `KeyConcatenated`,
 index kinds, column modifiers) see the `create-database-tables` skill.
@@ -318,10 +313,11 @@ rows, err := db.QueryFrame[Sale](empresaID, "sales-by-month").Between(q.Month, 2
 quantity := rows[0].Sum(q.Quantity)
 ```
 
-On MariaDB and PostgreSQL each frame is an aggregate table written in the record's own transaction
-(`mariadbdriver/data_frame.go`, `dataframe/aggregate_table.go`), so a read never waits for a
-compaction. The file-based frames with a change log and a compaction lock were the deleted Scylla
-driver's.
+Every write logs what it changed in `<table>__dtf_log` (scylla). No schedule moves the files
+forward: a read compacts the company's files first when its frame's `CompactOn{Records, Seconds}`
+is due, or when they are not built; `CompactDataFrames(partition)` on the controller is the manual
+compaction. The frames' lock, one per company and frame, is `scylla.AcquireFrameLock`, installed by
+the application; a read queues up to 40 s behind a compaction under way and then reads its files.
 
 ---
 
@@ -333,7 +329,7 @@ compile error.
 
 ```go
 var (
-    primary  db.Executor[ProductTable, Product] = mariadbdriver.Exec[ProductTable, Product]{}
+    primary  db.Executor[ProductTable, Product] = scylla.Exec[ProductTable, Product]{}
     fallback db.Executor[ProductTable, Product] = otherdriver.Exec[ProductTable, Product]{}
 )
 
@@ -349,7 +345,7 @@ Two drivers for one record type is only possible because the executor is a value
 Had the driver been a bare type parameter, it would be baked into the record's type
 and you would need a duplicate record struct per database.
 
-> **Status:** `mariadbdriver` and `pgdriver` implement `Executor` today. The `dynamo` package predates
+> **Status:** `scylla` implements `Executor` today. The `dynamo` package predates
 > this design and still carries its own `Col`/`Coln`/`Schema`/`Model` and accessor
 > engine; it does not implement `Executor` yet, so it cannot yet be the target of
 > the driver alias or of `.Via()`. Porting it is the remaining work — the contract
@@ -372,19 +368,20 @@ to compile.
 | Autoincrement IDs, `Status`/`Updated` delta-cache views | yes |
 | Whole-record insert / update / merge | yes |
 | Column projection, `Limit`, `OrderDesc` | yes |
-| `KeyIntPacking`, `KeyConcatenated` | MariaDB, PostgreSQL |
-| `TypeCacheGroupFromKey`, `CacheGroup`, `CompositeBucketing` | MariaDB, PostgreSQL |
-| Text search (`db.TextSearchBackend`: genix-s3 or the daemon) | MariaDB, PostgreSQL |
-| DataFrames (`dataframe/DATAFRAMES.md`), as aggregate tables | MariaDB, PostgreSQL |
-| `GenericRecord` by-IDs reads | no driver since Scylla's deletion (`errNotImplemented`) |
-| Views with arbitrary key reordering (`TypeView`, a composite index on SQL) | MariaDB, PostgreSQL |
+| `KeyIntPacking`, `KeyConcatenated` | Scylla-specific |
+| `TypeCacheGroupFromKey`, `CacheGroup`, `CompositeBucketing` | Scylla-specific |
+| Text search (`db.TextSearchBackend`: genix-s3 or the daemon) | both drivers |
+| DataFrames (`dataframe/DATAFRAMES.md`), per partition on scylla | both drivers |
+| `GenericRecord` by-IDs reads | Scylla-specific |
+| Materialized views with arbitrary key reordering | Scylla-specific |
 
 "Portable" here means the shared layer expresses it and any conforming driver can
 implement it — not that a second driver has already done so (see the status note in
 §6).
 
-Each driver keeps its own DDL, query rendering and index maintenance. That is the intended
-outcome: the abstraction sits at the *schema and record* layer, not the storage layer.
+Roughly 60% of the `scylla` package is CQL generation, view maintenance and query
+planning that has no counterpart elsewhere. That is the intended outcome: the
+abstraction sits at the *schema and record* layer, not the storage layer.
 
 Startup, deployment and backup are deliberately **not** behind the abstraction.
 Connecting, creating a keyspace, emitting DDL and dropping views are
@@ -395,5 +392,6 @@ database-specific by nature, so those call the driver directly.
 ## 8. Documentation
 
 - **`INTERNALS.md`** — architecture, the driver contract, and how to add a driver.
-- **`conformance/`** — one test suite run against every driver, with goldens recorded on MariaDB.
+- **`scylla/ORM_INTERNALS.md`** — deep dive into the ScyllaDB driver: memory model,
+  query routing, view compilation, write pipeline.
 - **`dynamo/README.md`** — the DynamoDB single-table design.
