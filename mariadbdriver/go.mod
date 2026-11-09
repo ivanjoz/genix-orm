@@ -12,7 +12,7 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
-	github.com/ivanjoz/colbin v0.9.2 // indirect
+	github.com/ivanjoz/colbin v0.10.0 // indirect
 	github.com/ivanjoz/genix-orm/utils v0.0.0 // indirect
 	github.com/viant/xunsafe v0.11.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect

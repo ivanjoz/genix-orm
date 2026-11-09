@@ -6,7 +6,7 @@ toolchain go1.27.0
 
 require (
 	github.com/go-sql-driver/mysql v1.10.1
-	github.com/ivanjoz/colbin v0.9.2
+	github.com/ivanjoz/colbin v0.10.0
 	github.com/ivanjoz/genix-orm/dataframe v0.0.0
 	github.com/ivanjoz/genix-orm/db v0.0.0
 	github.com/ivanjoz/genix-orm/utils v0.0.0
