@@ -17,10 +17,8 @@ github.com/golang/snappy v0.0.3/go.mod h1:/XxbfmMg8lxefKM7IXC3fBNl/7bRcc72aCRzEW
 github.com/google/go-cmp v0.4.0/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
 github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed h1:5upAirOpQc1Q53c0bnx2ufif5kANL7bfZWcc6VJWJd8=
 github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed/go.mod h1:tMWxXQ9wFIaZeTI9F+hmhFiGpFmhOHzyShyFUhRm0H4=
-github.com/ivanjoz/colbin v0.9.2 h1:VjVPDz9LZOJfsJPWg/Dl5V/3qRzAL6ezL9gXnpGexXA=
-github.com/ivanjoz/colbin v0.9.2/go.mod h1:l7eNG5MdstOAVGgbNeQrIiq7Hl/Ue9N8ZiUoun7eUMY=
-github.com/ivanjoz/colbin v0.10.0 h1:g18KuzYpdwDCqcNpQOMifNM4QGiga23UJ8RqZiizKFw=
-github.com/ivanjoz/colbin v0.10.0/go.mod h1:l7eNG5MdstOAVGgbNeQrIiq7Hl/Ue9N8ZiUoun7eUMY=
+github.com/ivanjoz/colbin v0.11.0 h1:ht0qFxzdaCLTTXR+QIvKG4RZGi+oU9hgtriEenz+aeE=
+github.com/ivanjoz/colbin v0.11.0/go.mod h1:l7eNG5MdstOAVGgbNeQrIiq7Hl/Ue9N8ZiUoun7eUMY=
 github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
 github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
 github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
