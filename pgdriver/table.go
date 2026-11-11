@@ -73,6 +73,7 @@ func compileTable(schema db.TableSchema, structRefValue reflect.Value) *PgTable 
 	if schema.SequenceColumn != nil || schema.CounterColumn != nil {
 		panic(fmt.Sprintf(`Table "%v": SequenceColumn / CounterColumn are not implemented on PostgreSQL yet`, schema.Name))
 	}
+	db.RefuseExpandedSlices(schema, "PostgreSQL")
 	table := &PgTable{}
 	table.CompileFromSchema(schema, structRefValue)
 	if table.Namespace == "" {

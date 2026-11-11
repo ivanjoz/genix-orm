@@ -108,7 +108,9 @@ func (table *MariaTable) resolveWrittenColumns(phase *writePhase) {
 		phase.writtenColumns = append(phase.writtenColumns, table.storedColumns[slices.IndexFunc(table.storedColumns, func(stored storedColumn) bool { return stored.name == keyColumn.GetName() })])
 	}
 	for _, stored := range table.storedColumns {
-		if writtenNames[stored.name] && !slices.ContainsFunc(table.primaryKeyColumns, func(keyColumn db.IColInfo) bool { return keyColumn.GetName() == stored.name }) {
+		// An expanded slice is written whole: every element column.
+		isWritten := writtenNames[stored.name] || (stored.isExpandedElement && writtenNames[stored.column.GetName()])
+		if isWritten && !slices.ContainsFunc(table.primaryKeyColumns, func(keyColumn db.IColInfo) bool { return keyColumn.GetName() == stored.name }) {
 			phase.writtenColumns = append(phase.writtenColumns, stored)
 		}
 	}

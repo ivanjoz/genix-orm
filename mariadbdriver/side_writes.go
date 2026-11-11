@@ -80,7 +80,8 @@ func (table *MariaTable) storedReadColumns() []db.IColInfo {
 func (table *MariaTable) prepareSideWrites(phase writePhase, chunkStart, chunkEnd int, storedByKey map[string]unsafe.Pointer) chunkSideWrites {
 	isWritten := map[string]bool{}
 	for _, stored := range phase.writtenColumns {
-		isWritten[stored.name] = true
+		// By ORM column too: an expanded slice's element columns all stand for it.
+		isWritten[stored.name], isWritten[stored.column.GetName()] = true, true
 	}
 	readColumns := table.storedReadColumns()
 	sideWrites := chunkSideWrites{packedDeltaValues: map[string][]uint64{}}
@@ -243,7 +244,7 @@ func (table *MariaTable) lockStoredRecords(transaction *writeTransaction, phase 
 	}
 	selectedColumns := []storedColumn{}
 	for _, stored := range table.storedColumns {
-		isRead := slices.Contains(keyNames, stored.name) || slices.ContainsFunc(readColumns, func(column db.IColInfo) bool { return column.GetName() == stored.name })
+		isRead := slices.Contains(keyNames, stored.name) || slices.ContainsFunc(readColumns, func(column db.IColInfo) bool { return column.GetName() == stored.column.GetName() })
 		if isRead && stored.hasField() {
 			selectedColumns = append(selectedColumns, stored)
 		}

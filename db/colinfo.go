@@ -21,6 +21,9 @@ type ColInfo struct {
 	// record field and no storage, it only feeds the index groups that name it.
 	IsComputed bool
 	HasView    bool
+	// ExpandedSize > 0 is a TableSchema.ExpandedSlices column: an integer slice stored as that many
+	// scalar columns, <name>_0 … <name>_<size-1>, so one element can be incremented in SQL (db.Increment).
+	ExpandedSize int8
 	ViewIdx      int8
 	Idx          int16
 	RefType      reflect.Type
@@ -60,10 +63,10 @@ type ColumnInfo struct {
 	// AutoincrementFirstID, set by Col.AutoincrementFrom, is the first generated ID: the
 	// sequence value is shifted by AutoincrementFirstID-1. 0 means the IDs start at 1.
 	AutoincrementFirstID int64
-	CompositeBucketSizes    []int8
-	IsWeek                  bool
-	UseInt32Packing         bool
-	AggregateFn             string
+	CompositeBucketSizes []int8
+	IsWeek               bool
+	UseInt32Packing      bool
+	AggregateFn          string
 }
 
 // Codec supplies everything about a column that depends on the storage engine

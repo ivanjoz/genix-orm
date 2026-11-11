@@ -111,6 +111,9 @@ func connectionConfig(params ConnParams) *mysql.Config {
 	// A write transaction sends its queued statements and the COMMIT as one multi-statement packet
 	// (writeTransaction). With interpolated arguments every statement of the packet may carry them.
 	config.MultiStatements = true
+	// Rows affected counts the rows an UPDATE matched, not the ones it changed: db.Increment tells a
+	// missing record by it, and an increment by 0 within the same updated tick changes nothing.
+	config.ClientFoundRows = true
 	return config
 }
 

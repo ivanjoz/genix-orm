@@ -36,6 +36,7 @@ func makeTable(schema db.TableSchema, structRefValue reflect.Value) ScyllaTable 
 		selectStatementCache: newSelectPlanCache(),
 	}
 	// db compiles what the table means to every driver; below are the parts only CQL has.
+	db.RefuseExpandedSlices(schema, "ScyllaDB")
 	dbTable.CompileFromSchema(schema, structRefValue)
 	if dbTable.Namespace == "" {
 		dbTable.Namespace = connParams.Keyspace

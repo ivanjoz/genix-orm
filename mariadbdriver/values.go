@@ -39,6 +39,9 @@ func bindStoredValue(table *MariaTable, stored storedColumn, recordPointer unsaf
 	if stored.isJSON {
 		return jsonArrayArgument(fieldValue.Interface())
 	}
+	if stored.isExpandedElement {
+		return expandedElementArgument(stored, fieldValue)
+	}
 	if fieldValue.Kind() == reflect.Pointer {
 		if fieldValue.IsNil() {
 			return nil, nil
@@ -91,6 +94,10 @@ func scanTarget(stored storedColumn) any {
 	if stored.isJSON {
 		return new([]byte)
 	}
+	// An expanded element scans as its element type.
+	if stored.isExpandedElement {
+		fieldType = fieldType.Elem()
+	}
 	switch fieldType.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return new(sql.NullInt64)
@@ -116,6 +123,10 @@ func assignScanned(stored storedColumn, recordPointer unsafe.Pointer, target any
 			return nil
 		}
 		return json.Unmarshal(encoded, fieldValue.Addr().Interface())
+	}
+	if stored.isExpandedElement {
+		assignExpandedElement(stored, fieldValue, target)
+		return nil
 	}
 
 	// A pointer field is allocated only for a non-NULL value.

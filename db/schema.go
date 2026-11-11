@@ -225,6 +225,9 @@ type TableSchema struct {
 	// the record, so a value derived from another column (the product IDs of the sale lines) can feed
 	// an index without being stored twice. See ComputedCol.
 	Computed []ComputedCol
+	// ExpandedSlices are integer slice columns stored as one scalar column per element (MariaDB only):
+	// db.Cols(e.Purchases.Expand(7)) stores purchases_0 … purchases_6. See db.Increment.
+	ExpandedSlices []Coln
 }
 
 // LogStorage is how a TableSchema.Log table is kept. On MariaDB it is a MyRocks table (ENGINE =

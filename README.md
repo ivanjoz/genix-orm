@@ -214,6 +214,31 @@ Indexes: []db.Index{{Type: db.TypeCacheGroup, Keys: db.Cols(e.Date, e.DetailProd
   other query on it returns an error.
 - Scylla driver only.
 
+### Expanded slices
+
+An integer slice of a fixed size can be stored as one scalar column per element, so a write adds to
+one element in SQL instead of reading the record and writing the whole slice back. A client-week row
+with 7 daily sums stays one row:
+
+```go
+// in GetSchema: purchases_0 … purchases_6, payments_0 … payments_6
+ExpandedSlices: db.Cols(e.Purchases.Expand(7), e.Payments.Expand(7)),
+
+// `purchases_3` = `purchases_3` + ?, plus updated / version
+t := db.TableOf[ClientWeek]()
+err := db.Increment(ClientWeek{CompanyID: 1, ID: clientWeekID}, t.Purchases.At(3).Add(amount))
+err = db.IncrementIn(transaction, key, t.Payments.At(3).Add(paid)) // inside db.RunTransaction
+```
+
+- Element indexes are 0-based. A read always returns the full size; a write of a shorter slice
+  stores 0 past its end, and a longer slice fails the write.
+- `Increment` fails when no record is stored under the key: it never creates one.
+- On a table with cache groups or a `ToFrames` DataFrame, the increment reads the stored record under
+  lock and writes it as an Update, so every mark and aggregate stays exact. Any other table, a
+  `TypeDelta` one included, takes a single `UPDATE` with no read.
+- An expanded column can't be a key or key an index, view or cache group.
+- MariaDB driver only. The other SQL drivers refuse the declaration when the table compiles.
+
 For the full schema reference (key patterns, `KeyIntPacking`, `KeyConcatenated`,
 index kinds, column modifiers) see the `create-database-tables` skill.
 

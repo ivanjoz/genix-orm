@@ -33,6 +33,10 @@ type dataFrameInfo struct {
 	// storedColumns are every persisted column with a field: a ToFrames method may read any of them,
 	// so a write reads whole stored records.
 	storedColumns []db.IColInfo
+	// hasToFrames: a frame is declared by a ToFrames method, which may read any column (an expanded
+	// slice too), so an increment must go through the stored record (expanded_slices.go). A frame
+	// declared by columns names scalars only.
+	hasToFrames bool
 	// aggregateTables are the frames' aggregate tables, by frame index.
 	aggregateTables []tableSpec
 }
@@ -103,7 +107,8 @@ func configureDataFrames(table *MariaTable, schema db.TableSchema, schemaStruct 
 	if err != nil {
 		fail("%v", err)
 	}
-	info := &dataFrameInfo{frames: frames, recordType: recordTyped.BaseStructType()}
+	info := &dataFrameInfo{frames: frames, recordType: recordTyped.BaseStructType(),
+		hasToFrames: slices.ContainsFunc(schema.DataFrames, func(declared db.DataFrame) bool { return declared.ToFrames != nil })}
 	for frameIndex := range frames.Frames {
 		frame := &frames.Frames[frameIndex]
 		if err := frame.CheckPackedKey(table.Name); err != nil {

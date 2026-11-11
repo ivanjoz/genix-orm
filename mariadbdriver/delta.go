@@ -61,7 +61,8 @@ func (table *MariaTable) readDeltaRecords(
 	}
 	selectedColumns := []storedColumn{}
 	for _, stored := range table.storedColumns {
-		if stored.hasField() && slices.Contains(projection, stored.name) {
+		// projection names ORM columns: an expanded slice reads all of its element columns.
+		if stored.hasField() && slices.Contains(projection, stored.column.GetName()) {
 			selectedColumns = append(selectedColumns, stored)
 		}
 	}
@@ -275,7 +276,7 @@ func (table *MariaTable) deltaProjection(tableInfo *db.TableInfo, deltaIndex db.
 	}
 	columnNames := []string{}
 	for _, stored := range table.projectedColumns(tableInfo) {
-		columnNames = append(columnNames, stored.name)
+		columnNames = append(columnNames, stored.column.GetName())
 	}
 	requiredNames := []string{table.GetPartKey().GetName(), table.Keys[0].GetName(), table.UpdatedCol.GetName(), table.VersionCol.GetName()}
 	for _, pinnedColumn := range deltaIndex.Pinned {

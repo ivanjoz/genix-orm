@@ -313,7 +313,9 @@ func (table *MariaTable) projectedColumns(tableInfo *db.TableInfo) []storedColum
 	}
 	projected := []storedColumn{}
 	for _, stored := range table.storedColumns {
-		if stored.hasField() && !isExcluded[stored.name] && (len(isIncluded) == 0 || isIncluded[stored.name]) {
+		// By ORM column name: an expanded slice is projected as all of its element columns.
+		columnName := stored.column.GetName()
+		if stored.hasField() && !isExcluded[columnName] && (len(isIncluded) == 0 || isIncluded[columnName]) {
 			projected = append(projected, stored)
 		}
 	}

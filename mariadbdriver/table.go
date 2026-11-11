@@ -33,10 +33,14 @@ type MariaTable struct {
 
 // storedColumn is one column of the main table. isJSON marks a slice stored as a JSON array, which
 // its element index is rebuilt from (write.go); every other slice or complex value is colbin bytes.
+// isExpandedElement marks element elementIndex of an expanded slice (column), stored as a scalar
+// (expanded_slices.go).
 type storedColumn struct {
-	name   string
-	column db.IColInfo
-	isJSON bool
+	name              string
+	column            db.IColInfo
+	isJSON            bool
+	isExpandedElement bool
+	elementIndex      int
 }
 
 // hasField: a column the record struct exposes. Managed DB-only and generated columns have none.
@@ -84,6 +88,7 @@ func compileTable(schema db.TableSchema, structRefValue reflect.Value) *MariaTab
 	}
 	indexCount := int8(1)
 	table.DescribeIndexes(&indexCount, schema.Indexes)
+	table.ConfigureExpandedSlices(schema)
 	table.FinalizeColumns()
 	configureDataFrames(table, schema, structRefValue)
 	table.mainTable, table.sideTables, table.elementIndexes, table.groupElementTables = mapTableObjects(table)
@@ -101,7 +106,18 @@ func compileTable(schema db.TableSchema, structRefValue reflect.Value) *MariaTab
 			generatedByName[source.Column.GetName()] = source.Column
 		}
 	}
+	expandedElementByName := map[string]storedColumn{}
+	for _, column := range table.Columns {
+		for elementIndex := range int(column.GetInfo().ExpandedSize) {
+			elementName := expandedElementName(column.GetName(), elementIndex)
+			expandedElementByName[elementName] = storedColumn{name: elementName, column: column, isExpandedElement: true, elementIndex: elementIndex}
+		}
+	}
 	for _, spec := range table.mainTable.columns {
+		if element, isElement := expandedElementByName[spec.name]; isElement {
+			table.storedColumns = append(table.storedColumns, element)
+			continue
+		}
 		column := table.ColumnsMap[spec.name]
 		if generatedColumn := generatedByName[spec.name]; generatedColumn != nil {
 			column = generatedColumn

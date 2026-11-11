@@ -273,6 +273,22 @@ func (q ColSlice[T, E]) Size(bits int8) Coln {
 	return colRef{q.GetInfo()}
 }
 
+// Expand declares, in TableSchema.ExpandedSlices, an integer slice stored as size scalar columns
+// <name>_0 … <name>_<size-1>: a read always returns size elements, and db.Increment adds to one of
+// them in SQL without reading the record.
+func (q ColSlice[T, E]) Expand(size int8) Coln {
+	if size < 1 {
+		panic(fmt.Sprintf("Expand(%v) must be at least 1 in: %v", size, q.info.Name))
+	}
+	q.info.ExpandedSize = size
+	return colRef{q.GetInfo()}
+}
+
+// At is one element of an expanded slice column, for db.Increment: e.Purchases.At(3).Add(amount).
+func (q ColSlice[T, E]) At(elementIndex int) ColSliceElement[E] {
+	return ColSliceElement[E]{columnName: q.info.Name, elementIndex: elementIndex}
+}
+
 func (q *ColSlice[T, E]) GetInfoPointer() *ColumnInfo {
 	if q.info.Type == 0 {
 		q.info = q.colCore.resolveSliceInfo(reflect.TypeFor[E]().String())

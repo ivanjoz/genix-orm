@@ -86,7 +86,6 @@ func mapTableObjects(table *MariaTable) (tableSpec, []tableSpec, []elementIndex,
 	// The real columns, in column order, then the generated columns an index keys on.
 	mainTable := tableSpec{database: table.Namespace, name: table.Name, primaryKey: primaryKey}
 	columnTypeByName := map[string]string{}
-	storedColumnNames := []string{}
 	addColumn := func(columnName, sqlType string) {
 		isKey := slices.Contains(primaryKey, columnName)
 		switch {
@@ -102,8 +101,13 @@ func mapTableObjects(table *MariaTable) (tableSpec, []tableSpec, []elementIndex,
 		if column.GetInfo().IsVirtual {
 			continue
 		}
+		if expandedSize := int(column.GetInfo().ExpandedSize); expandedSize > 0 {
+			for elementIndex := range expandedSize {
+				addColumn(expandedElementName(column.GetName(), elementIndex), expandedElementSQLType(column.(*db.ColumnInfo)))
+			}
+			continue
+		}
 		addColumn(column.GetName(), column.GetType().DBType)
-		storedColumnNames = append(storedColumnNames, column.GetName())
 	}
 	for _, source := range table.IndexSources {
 		if isGeneratedColumn(source.Column) && !isGroupOverSlice(source) && !isScalarGroupHash(source) && columnTypeByName[source.Column.GetName()] == "" {

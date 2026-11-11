@@ -73,6 +73,7 @@ func compileTable(schema db.TableSchema, structRefValue reflect.Value) *ObTable 
 	if schema.SequenceColumn != nil || schema.CounterColumn != nil {
 		panic(fmt.Sprintf(`Table "%v": SequenceColumn / CounterColumn are not implemented on OceanBase yet`, schema.Name))
 	}
+	db.RefuseExpandedSlices(schema, "OceanBase")
 	table := &ObTable{}
 	table.CompileFromSchema(schema, structRefValue)
 	if table.Namespace == "" {
