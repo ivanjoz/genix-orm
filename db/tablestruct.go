@@ -139,6 +139,18 @@ func (e *TableStruct[D, T, E]) Delta(cursor cache.DeltaWindowCursor, lastKeyValu
 	return e.schemaStruct
 }
 
+// ChangedSince turns the query into a read of the records written at or after updated (SUnixTime),
+// through a TypeDelta index picked as Delta() picks it: one range of the index per pinned prefix,
+// and with no Delta() values every value FixedValues enumerates for the last Key, so a record that
+// moved to another value (a soft delete) is still read. It answers the records only: no window
+// protocol, no Metadata record, no replace threshold, no moves. For a caller that keeps its own
+// cursor; a browser cache uses Delta(). Statements other than equalities on the index's columns are
+// not applied. Call it last.
+func (e *TableStruct[D, T, E]) ChangedSince(updated int32, lastKeyValues ...any) *T {
+	e.tableInfo.Delta = &DeltaRead{IsChangedSince: true, ChangedFrom: updated, LastKeyValues: lastKeyValues}
+	return e.schemaStruct
+}
+
 func (e *TableStruct[D, T, E]) SetTableInfo(t *TableInfo) {
 	e.tableInfo = t
 }

@@ -45,6 +45,10 @@ func (q ColumnStatement) GetValue() any {
 type DeltaRead struct {
 	Cursor        cache.DeltaWindowCursor
 	LastKeyValues []any
+	// IsChangedSince makes it a ChangedSince() read instead: the records with updated ≥ ChangedFrom,
+	// plain, with no window protocol.
+	IsChangedSince bool
+	ChangedFrom    int32
 }
 
 // TableInfo is the mutable per-query state collected by the fluent builder

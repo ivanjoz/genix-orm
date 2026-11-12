@@ -529,6 +529,10 @@ func selectExec(
 		return errors.New("no se ha especificado un keyspace")
 	}
 	if tableInfo.Delta != nil {
+		// Deprecated driver: ChangedSince() is implemented by the SQL drivers only.
+		if tableInfo.Delta.IsChangedSince {
+			return fmt.Errorf("table %q: ChangedSince() is not supported by the Scylla driver", scyllaTable.Name)
+		}
 		return execDelta(sink, tableInfo, scyllaTable)
 	}
 

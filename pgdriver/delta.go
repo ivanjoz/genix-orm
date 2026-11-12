@@ -140,8 +140,49 @@ func readDeltaPrefixes(prefixes [][]int64, reads []deltaPrefixRead, readPrefix f
 	return group.Wait()
 }
 
+// selectChangedSince is Select for a ChangedSince() read: every pinned prefix's index range from
+// ChangedFrom on, unlimited, appended as plain records.
+func selectChangedSince(table *PgTable, tableInfo *db.TableInfo, sink recordSink) error {
+	deltaPlan, err := table.PlanDeltaRead(tableInfo)
+	if err != nil {
+		return err
+	}
+	projection := table.deltaProjection(tableInfo, deltaPlan.Index)
+	if err := table.checkDeltaProjection(deltaPlan.Index, projection); err != nil {
+		return err
+	}
+	reads := make([]deltaPrefixRead, len(deltaPlan.Prefixes))
+	err = readDeltaPrefixes(deltaPlan.Prefixes, reads, func(prefix []int64, read *deltaPrefixRead) error {
+		return table.readDeltaRecords(sink.collectInto(&read.records), deltaPlan.Index, deltaPlan.Partition, prefix,
+			int64(tableInfo.Delta.ChangedFrom), deltaUpdatedMax, 0, projection)
+	})
+	if err != nil {
+		return err
+	}
+	for _, read := range reads {
+		for _, recordPointer := range read.records {
+			sink.appendRecord(recordPointer)
+		}
+	}
+	return nil
+}
+
+// checkDeltaProjection refuses a projection naming a column the delta index does not copy.
+func (table *PgTable) checkDeltaProjection(deltaIndex db.DeltaIndexInfo, projection []string) error {
+	for _, projectedName := range projection {
+		if !slices.ContainsFunc(deltaIndex.StoredColumns, func(column db.IColInfo) bool { return column.GetName() == projectedName }) {
+			return fmt.Errorf(`table %q: the delta read projects column %q, which the delta view %v does not copy: add it to the index Cols`,
+				table.Name, projectedName, deltaIndex.ViewName)
+		}
+	}
+	return nil
+}
+
 // selectDelta is Select for a Delta() read: Scylla's execDelta (scylla/delta_view.go), step for step.
 func selectDelta(table *PgTable, tableInfo *db.TableInfo, sink recordSink) error {
+	if tableInfo.Delta.IsChangedSince {
+		return selectChangedSince(table, tableInfo, sink)
+	}
 	deltaPlan, err := table.PlanDeltaRead(tableInfo)
 	if err != nil {
 		return err
@@ -165,11 +206,8 @@ func selectDelta(table *PgTable, tableInfo *db.TableInfo, sink recordSink) error
 	plan := cache.PlanDeltaSync(cursor)
 	metadata.IsReplace = cursor.Updated == 0
 	projection := table.deltaProjection(tableInfo, deltaIndex)
-	for _, projectedName := range projection {
-		if !slices.ContainsFunc(deltaIndex.StoredColumns, func(column db.IColInfo) bool { return column.GetName() == projectedName }) {
-			return fmt.Errorf(`table %q: Delta() projects column %q, which the delta view %v does not copy: add it to the index Cols`,
-				table.Name, projectedName, deltaIndex.ViewName)
-		}
+	if err := table.checkDeltaProjection(deltaIndex, projection); err != nil {
+		return err
 	}
 	recordIDOf := func(recordPointer unsafe.Pointer) int64 {
 		return db.ConvertToInt64(table.Keys[0].GetRawValue(recordPointer))
