@@ -208,10 +208,12 @@ func (e *TableStruct[D, T, E]) AllowFilter() *T {
 // maxAutoincrementRandBits caps the random suffix so the sequence keeps most of its slot.
 const maxAutoincrementRandBits = 26
 
-// Autoincrement declares the table's key as generated. randSuffixBits random low bits
-// follow the counter so concurrent writers rarely take the same value: with 8, sequence
-// 100 becomes 100<<8 | random(0..255).
-func (e *TableStruct[D, T, E]) Autoincrement(randSuffixBits int8) Coln {
+// Autoincrement declares a generated slot of the table's packed key. The optional randSuffixBits
+// adds that many random low bits after the counter: with 8, sequence 100 becomes
+// 100<<8 | random(0..255). Omitted or 0, the slot is the sequence itself — the default, since the
+// counter alone already guarantees uniqueness.
+func (e *TableStruct[D, T, E]) Autoincrement(randSuffixBitsOption ...int8) Coln {
+	randSuffixBits := optionalRandSuffixBits(randSuffixBitsOption)
 	if randSuffixBits > maxAutoincrementRandBits {
 		panic(fmt.Sprintf("Autoincrement(%v): the random suffix is capped at %v bits", randSuffixBits, maxAutoincrementRandBits))
 	}

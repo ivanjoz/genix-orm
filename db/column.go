@@ -148,11 +148,23 @@ func (q Col[T, E]) IsWeek() Coln {
 	return colRef{q.GetInfo()}
 }
 
-// Autoincrement marks the column as generated. randSuffixBits random low bits follow the
-// sequence: ID = sequence<<randSuffixBits | random.
-func (q Col[T, E]) Autoincrement(randSuffixBits int8) Coln {
-	q.setAutoincrement(randSuffixBits)
+// Autoincrement marks the column as generated. The optional randSuffixBits adds that many random
+// low bits after the sequence: ID = sequence<<randSuffixBits | random. Omitted or 0, the ID is the
+// sequence itself — the default, since the counter alone already guarantees uniqueness.
+func (q Col[T, E]) Autoincrement(randSuffixBits ...int8) Coln {
+	q.setAutoincrement(optionalRandSuffixBits(randSuffixBits))
 	return colRef{q.GetInfo()}
+}
+
+// optionalRandSuffixBits reads the optional random-suffix argument of Autoincrement: 0 when omitted.
+func optionalRandSuffixBits(randSuffixBits []int8) int8 {
+	if len(randSuffixBits) > 1 {
+		panic(fmt.Sprintf("Autoincrement takes at most one random-suffix size, got %v", randSuffixBits))
+	}
+	if len(randSuffixBits) == 0 {
+		return 0
+	}
+	return randSuffixBits[0]
 }
 
 // AutoincrementFrom marks the column as generated, with no random suffix, starting at firstID:

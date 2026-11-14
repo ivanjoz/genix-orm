@@ -268,6 +268,15 @@ func runTransactionOnce(pool *sql.DB, body func(transaction *writeTransaction) e
 		return err
 	}
 	defer connection.Close()
+	// A panicking body skips the ROLLBACK below. Its session, autocommit off, would go back to the
+	// pool mid-transaction, and the next START TRANSACTION on it would commit the half-done writes.
+	// Discarding the connection makes the server roll them back (as pgdriver gets from conn.Raw).
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			_ = connection.Raw(func(any) error { return driver.ErrBadConn })
+			panic(recovered)
+		}
+	}()
 	transaction := &writeTransaction{connection: connection, ctx: ctx}
 	err = body(transaction)
 	if err == nil {
